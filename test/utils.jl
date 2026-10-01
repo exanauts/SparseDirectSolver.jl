@@ -2,6 +2,7 @@
 # (TASKS.md "Shared test conventions").
 
 using LinearAlgebra
+using SparseArrays
 
 const ELTYPES = (Float32, Float64, ComplexF32, ComplexF64)
 const REAL_ELTYPES = (Float32, Float64)
@@ -90,4 +91,51 @@ function ipiv_permutation(ipiv::AbstractVector{<:Integer}, m::Integer)
         p[i], p[q] = p[q], p[i]
     end
     return p
+end
+
+# ---------------------------------------------------------------------------
+# symbolic engine (T05, T06)
+
+"""
+    brute_force_symbolic(A, perm) -> (parent, counts, F)
+
+Dense symbolic elimination of `A[perm, perm]`: the etree (parent = first
+off-diagonal nonzero of column `k` of `L`), the column counts (diagonal
+included) and the filled pattern `F` (a `BitMatrix`, both triangles).
+"""
+function brute_force_symbolic(A::SparseMatrixCSC, perm::AbstractVector{<:Integer})
+    n = size(A, 1)
+    B = A[perm, perm]
+    F = falses(n, n)
+    for j in 1:n, p in nzrange(B, j)
+        F[rowvals(B)[p], j] = true
+    end
+    for k in 1:n
+        F[k, k] = true
+    end
+    for k in 1:n
+        rows = [i for i in (k + 1):n if F[i, k]]
+        for i in rows, j in rows
+            F[i, j] = true
+        end
+    end
+    parent = zeros(Int, n)
+    counts = zeros(Int, n)
+    for k in 1:n
+        below = findfirst(view(F, (k + 1):n, k))
+        parent[k] = below === nothing ? 0 : k + below
+        counts[k] = count(view(F, k:n, k))
+    end
+    return parent, counts, F
+end
+
+"""
+    offdiag_pattern(A) -> SparseMatrixCSC{Bool}
+
+Off-diagonal stored pattern of `A` as a Boolean sparse matrix.
+"""
+function offdiag_pattern(A::SparseMatrixCSC)
+    I, J, _ = findnz(A)
+    keep = I .!= J
+    return sparse(I[keep], J[keep], trues(count(keep)), size(A)...)
 end

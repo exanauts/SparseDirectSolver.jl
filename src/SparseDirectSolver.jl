@@ -43,5 +43,6 @@ include("dense/capabilities.jl")
 include("symbolic/pattern.jl")
 include("symbolic/etree.jl")
 include("symbolic/ordering.jl")
+include("symbolic/supernodes.jl")
 
 end # module SparseDirectSolver

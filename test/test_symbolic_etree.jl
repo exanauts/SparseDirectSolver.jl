@@ -1,40 +1,5 @@
 # T05: symmetric pattern, orderings, elimination tree, column counts (host only).
 
-# Dense symbolic elimination of A[perm, perm]: the filled pattern, the etree
-# (parent = first off-diagonal nonzero of column k of L) and the column counts.
-function brute_force_symbolic(A::SparseMatrixCSC, perm::AbstractVector{<:Integer})
-    n = size(A, 1)
-    B = A[perm, perm]
-    F = falses(n, n)
-    for j in 1:n, p in nzrange(B, j)
-        F[rowvals(B)[p], j] = true
-    end
-    for k in 1:n
-        F[k, k] = true
-    end
-    for k in 1:n
-        rows = [i for i in (k + 1):n if F[i, k]]
-        for i in rows, j in rows
-            F[i, j] = true
-        end
-    end
-    parent = zeros(Int, n)
-    counts = zeros(Int, n)
-    for k in 1:n
-        below = findfirst(view(F, (k + 1):n, k))
-        parent[k] = below === nothing ? 0 : k + below
-        counts[k] = count(view(F, k:n, k))
-    end
-    return parent, counts
-end
-
-# Off-diagonal stored pattern of a SparseMatrixCSC as a Boolean sparse matrix.
-function offdiag_pattern(A::SparseMatrixCSC)
-    I, J, _ = findnz(A)
-    keep = I .!= J
-    return sparse(I[keep], J[keep], trues(count(keep)), size(A)...)
-end
-
 @testset "elimination tree and column counts vs brute force" begin
     for trial in 1:200
         n = rand(5:60)
@@ -45,7 +10,7 @@ end
         parent = SDS.etree(P, perm)
         post = SDS.postorder(parent)
         counts = SDS.colcounts(P, perm, parent, post)
-        ref_parent, ref_counts = brute_force_symbolic(A, perm)
+        ref_parent, ref_counts, _ = brute_force_symbolic(A, perm)
         @test parent == ref_parent
         @test counts == ref_counts
         @test isperm(post)
