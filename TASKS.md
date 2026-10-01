@@ -780,7 +780,7 @@ obtained on this machine (CUDSS.jl is in `../CUDSS.jl`).
 
 ---
 
-## T06 — Symbolic II: supernodes and GPU-tuned amalgamation   `[ ]`
+## T06 — Symbolic II: supernodes and GPU-tuned amalgamation   `[!]`
 
 **Reads**: PLAN §2.3 steps 3–4; RESEARCH section 4 (amalgamation).
 
@@ -807,6 +807,92 @@ obtained on this machine (CUDSS.jl is in `../CUDSS.jl`).
   number of supernodes is at least 2× smaller than with amalgamation disabled.
 * `flops` equals `cholesky_flops` of T05 when amalgamation is disabled and is
   ≥ it when enabled.
+
+### Report
+
+- Status: [!] (done; wide supernodes are split to `max_width`, an extra renumbering, see deviations)
+- What was built (`src/symbolic/supernodes.jl`, internal like the rest of the symbolic layer, nothing exported):
+  - `ColumnPartition(order, super_ptr, snparent)`: supernodes as contiguous column ranges after a renumbering;
+    `order` is a topological order of the column etree (column `k` of the supernodal numbering is etree
+    column `order[k]`). `nsupernodes`.
+  - `fundamental_supernodes(parent, post, counts)`: renumbers by `post` and joins `k+1` to `k` when `k` is
+    its only child and `counts[k] == counts[k+1] + 1` (written here, not CliqueTrees' `supernodetree`).
+  - `amalgamate(sn, parent, counts, params)` with `params = opts.amalgamation`: (1) supernodes wider than
+    `max_width` are split into a chain of near-equal panels; (2) bottom-up over the tree, the children of
+    each supernode are tried in decreasing order of their off-diagonal row count (= increasing explicit
+    zeros per column, an order merging does not change) and merged when the width stays `≤ max_width`,
+    the factor-wide explicit zeros stay `≤ zero_fraction · nnz(L)` (a global budget), and either the merged
+    panel has `≤ zero_fraction` explicit zeros per true nonzero or its width is `≤ min_width` (tiny panels
+    merge more eagerly, still inside the global budget). Merging child `c` into `p` adds
+    `w_c (w_c + f_p − f_c)` zeros and gives `f = w_c + f_p` rows. (3) The merged tree is postordered and
+    columns are renumbered so every merged supernode is contiguous.
+  - `SupernodePartition` (`n`, `perm`/`iperm` = T05 ordering composed with the supernodal renumbering,
+    `parent`/`counts` = column etree and true counts in that numbering, `super_ptr`, `col2sn`, `snparent`,
+    `snpost`, `rowptr`/`rowval` = sorted rows per supernode, own columns first, `nnz_stored` (lower-trapezoidal
+    panel entries incl. explicit zeros), `nnz_L` (true), `flops` (`Σ` over panel columns of rows², the
+    `cholesky_flops` convention), `amalgamated`); constructor
+    `SupernodePartition(P, perm, parent, counts, cp; amalgamated)` = supernodal symbolic factorization by
+    unions of the pattern columns and the children's rows; accessors `sncols`, `snrows`, `snwidth`,
+    `nsuperpanels` (the `"nsuperpanels"` data parameter, wired to `getparam` in T13).
+  - `supernode_partition(P, perm, opts)`: etree → postorder → colcounts → fundamental → amalgamate (unless
+    `use_superpanels == 0`) → symbolic.
+  - Tests: `test/test_symbolic_supernodes.jl`. `brute_force_symbolic` and `offdiag_pattern` moved from
+    `test/test_symbolic_etree.jl` to `test/utils.jl` (shared; `brute_force_symbolic` now also returns the
+    filled pattern); no T05 assertion changed.
+- Tests: `SDS_TEST_GPU=0 julia --project=. -e 'using Pkg; Pkg.test()'` (Julia 1.13.1, ubuntu-latest, CPU):
+  31062 pass / 0 fail / 0 broken (test_symbolic_supernodes: 10002, 3–11 s). Besides the listed checks the
+  tests verify `parent == etree(P, perm)` and `counts == colcounts(...)` for the composed permutation, that a
+  child's below-diagonal rows are a subset of its parent's rows (needed by T07 `relind`), `nnz_L` against
+  CHOLMOD for the composed permutation, the stored panels' exact structure without amalgamation, and the
+  amalgamation bounds on the 200 brute-force cases with four parameter sets. Julia 1.10 was not available
+  on the runner (not run). CUDA/AMDGPU: pending CI on the PR (the new tests are host-only).
+- Measurements (ubuntu-latest; `fund` = `use_superpanels = 0`, `amal` = defaults `(32, 0.25, 8)`;
+  `ns` supernodes, `w̄` mean width, `<8` fraction of supernodes narrower than 8, `lev` supernodal tree
+  height, `stored/L` = `nnz_stored / nnz_L`, `fl` = flops / `cholesky_flops`):
+
+  ```text
+  matrix          ord |  fund ns   w̄   <8   lev |  amal ns   w̄   <8   lev  stored/L   fl
+  lap2d 100²      amd |    7510  1.33 0.99  42  |    3407  2.94 0.93   45   1.250   1.18
+  lap2d 100²      nd  |    7654  1.31 0.99  27  |    3616  2.77 0.85   32   1.250   1.18
+  lap2d 300²      amd |   67510  1.33 0.99  54  |   13734  6.55 0.89   83   1.236   1.06
+  lap2d 300²      nd  |   69186  1.30 0.99  34  |   20781  4.33 0.69   48   1.250   1.07
+  lap3d 12³       amd |    1199  1.44 0.98  33  |     304  5.68 0.59   21   1.250   1.13
+  lap3d 12³       nd  |    1206  1.43 0.99  21  |     541  3.19 0.81   20   1.250   1.18
+  lap3d 30³       amd |   18240  1.48 0.99  38  |    4609  5.86 0.63   96   1.079   1.02
+  lap3d 30³       nd  |   17977  1.50 0.98  46  |    4569  5.91 0.57   70   1.115   1.03
+  kkt 3000+1000   amd |    2238  1.79 0.99 262  |     534  7.49 0.63   89   1.223   1.22
+  kkt 3000+1000   nd  |    2369  1.69 0.97 666  |     724  5.52 0.75  132   1.250   1.28
+  random_spd 2000 amd |    1026  1.95 0.98  35  |     253  7.91 0.57   47   1.155   1.10
+  random_spd 2000 nd  |    1007  1.99 0.96 144  |     257  7.78 0.60   53   1.176   1.15
+  ```
+
+  `supernode_partition` (etree + colcounts + supernodes + rows) takes 1–5 ms for n ≤ 4000, 3–70 ms for
+  n = 10⁴–9·10⁴ (GC noise between runs). The T06 target holds: lap2d 100² AMD 7510 → 3407 supernodes.
+- Deviations from PLAN.md / this task:
+  - The supernodal numbering differs from the T05 ordering: `SupernodePartition.perm = perm[order]`, a
+    topological reordering of the etree (same fill), because merged supernodes are only contiguous after
+    renumbering. Every later phase must use `SupernodePartition.perm`, not `Ordering.perm`.
+  - With amalgamation on, fundamental supernodes wider than `max_width` are split into chains (the test
+    requires every width `≤ max_width`). This lengthens the tree under big separators: lap3d 30³ AMD has
+    96 supernodal levels with the split and 15 without it (`max_width = 10⁶`, widest panel 2306 columns);
+    KKT levels still drop 262 → 89.
+  - `fundamental_supernodes` is our code (a dozen lines), not CliqueTrees' `supernodetree`, so the
+    partition is built directly on our etree/colcounts.
+  - `zero_fraction` is enforced as a global bound on `nnz_stored − nnz_L` (≤ `zero_fraction · nnz_L`), plus a
+    local per-panel ratio unless the panel is `≤ min_width` wide; `min_width` is a "merge eagerly below"
+    threshold, not a guarantee.
+- Open issues / follow-ups:
+  - The 25 % budget is exhausted on the 2D Laplacians while most panels stay narrower than 8 (lap2d 100²:
+    93 %); bottom-up greedy spends the budget in tree order. A global cheapest-first merge (priority queue)
+    or a larger budget for small fronts is a T25 tuning item; the KKT/random matrices reach `w̄ ≈ 6–8`.
+  - `max_lu_nnz` can now be checked against `nnz_stored` (`× 2 − n` for `"G"`); left to the phase code
+    (T07/T13), which owns the error reporting.
+  - T05's ordering cost model still uses column-etree height; `tree_levels(sp.snparent)` now gives the
+    supernodal level count if the owner wants the cost model to use it.
+- Suggested plan changes:
+  - PLAN §2.3 step 4: let `max_width` cap *merging* only and leave wide fundamental supernodes whole (they go
+    to regime C anyway), or split only above a separate regime-C width; the chain split adds levels.
+  - PLAN §2.3: state that the supernodal renumbering composes with the ordering (`perm[order]`).
 
 ---
 
