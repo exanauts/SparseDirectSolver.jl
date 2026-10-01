@@ -65,12 +65,12 @@ reviewing agent must pass. The moving parts:
 * **Implementer** (`.github/workflows/claude-implement.yml`, Claude Opus 5.5,
   effort medium) starts when a task issue gets the label `claude:implement`
   (the owner, or the pipeline after the previous merge). It works on
-  `ubuntu-latest` with Julia and the KA CPU backend only; CUDA/AMDGPU are
-  verified by CI on the PR. Branch `task/TNN-<slug>` from `main`; commits
+  `ubuntu-latest` with Julia and the KA CPU backend only; CUDA is verified
+  by CI on the PR. Branch `task/TNN-<slug>` from `main`; commits
   `TNN: …`; PR titled `TNN: …`, labelled `claude:pr`, milestone set, body from
   `.github/pull_request_template.md` with the exact line `Closes #<issue>`. The
-  Report block is filled in before the PR is opened ("CUDA/AMDGPU: pending CI
-  on the PR" under Tests). If the task cannot be finished, the PR is opened as
+  Report block is filled in before the PR is opened ("CUDA: pending CI on
+  the PR" under Tests). If the task cannot be finished, the PR is opened as
   a draft and the issue labelled `needs-owner`; never a silent stop.
 * **Reviewer** (`.github/workflows/claude-review.yml`, Claude Fable 5.1, effort
   high) reviews every push on a `task/**` or `claude:pr` PR against the task
@@ -106,7 +106,8 @@ reviewing agent must pass. The moving parts:
 * `ubuntu-latest`, Julia `1` from `julia-actions/setup-julia`, the project
   instantiated, `gh` authenticated as the Claude GitHub App. **CPU backend
   only**: no GPU, CUDA.jl is not installed; GPU results come from the
-  self-hosted `cuda` and `amdgpu` runners through `ci.yml` on the PR.
+  self-hosted `cuda` runner through `ci.yml` on the PR (the `amdgpu` runner is
+  disabled in `ci.yml` until the AMDGPU extension exists, T23).
 * Reference code is cloned next to the checkout, read-only: `../CUDSS.jl` and
   `../KrylovPreconditioners.jl` (same relative paths as below). MadNLPGPU's
   cuDSS integration is not checked out; when a task needs it, read it from the
