@@ -210,6 +210,11 @@ jobs:
           set -euo pipefail
           if gh pr merge "$PR" --squash --delete-branch --match-head-commit "$HEAD_SHA"; then
             echo "merged=true" >> "$GITHUB_OUTPUT"
+            # Close the task issue ourselves: GitHub's `Closes #N` auto-close did not
+            # fire on #42, and the next task's guard requires the previous issue closed.
+            for n in $(gh pr view "$PR" --json body --jq .body | grep -oiE '(close[sd]?|fix(e[sd])?|resolve[sd]?) #[0-9]+' | grep -oE '[0-9]+' | sort -u); do
+              gh issue close "$n" --reason completed --comment "Merged in #$PR." || true
+            done
           else
             gh pr edit "$PR" --add-label needs-owner
             gh pr comment "$PR" --body "CI is green and the reviewer approved, but the merge failed (conflict with \`main\` or a branch rule). Labelled \`needs-owner\`."

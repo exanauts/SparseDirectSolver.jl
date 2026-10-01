@@ -7,7 +7,7 @@ name: Claude review
 
 on:
   pull_request:
-    types: [opened, synchronize, ready_for_review, reopened]
+    types: [opened, synchronize, ready_for_review, reopened, labeled]
 
 permissions:
   contents: write
@@ -16,9 +16,12 @@ permissions:
   actions: read
   id-token: write
 
+# One review per PR at a time, and a newer event supersedes a running one: the
+# `opened` + `labeled` pair from `gh pr create --label` collapses to a single
+# review, and a label added after creation starts the review that was skipped.
 concurrency:
   group: claude-review-${{ github.event.pull_request.number }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 env:
   PR: ${{ github.event.pull_request.number }}
@@ -29,6 +32,7 @@ env:
 jobs:
   review:
     if: >-
+      (github.event.action != 'labeled' || github.event.label.name == 'claude:pr') &&
       github.event.pull_request.draft == false &&
       github.event.pull_request.head.repo.full_name == github.repository &&
       (startsWith(github.event.pull_request.head.ref, 'task/') ||
