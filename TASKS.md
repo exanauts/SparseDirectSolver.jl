@@ -306,7 +306,7 @@ so the **Report** block at the end of each task must be filled in honestly.
 
 ---
 
-## T03 — Dense-op interface, capability audit, KA fallbacks   `[ ]`
+## T03 — Dense-op interface, capability audit, KA fallbacks   `[!]`
 
 **Reads**: PLAN §2.6, §2.7, §2.4 (kernel design rules).
 
@@ -349,6 +349,91 @@ so the **Report** block at the end of each task must be filled in honestly.
 * The audit prints a table; asserts `generic_mul == true` on both backends and
   on CUDA `vendor_syrk == vendor_gemm_strided_batched == vendor_potrf == true`.
   Record the full CUDA table in the Report.
+
+### Report
+
+- Status: [!] (done on the CPU backend; CUDA results and the CUDA capability table come from CI)
+- What was built:
+  - `src/dense/interface.jl`: `gemm!(C, A, B, α, β; transA, transB, impl)`, `syrk!(C, A, α, β; uplo, impl)`,
+    `herk!` (real `α`, `β`; real `T` → `syrk!`), `trsm!(side, uplo, trans, diag, α, A, B; impl)`,
+    `potrf!(uplo, A; impl) -> info::Int`, `getrf!(A, ipiv; impl) -> info::Int` (m × n, LAPACK pivots),
+    `laswp!(A, ipiv; reverse, impl)`, `gemm_strided_batched!`, `trsm_strided_batched!` (3-D arrays, batch =
+    3rd dim), `strided_batch(buf, offset, m, n, stride, count)` (zero-copy 3-D view: data pointer + stride +
+    count), `dense_impls(op, backend, T)`, `select_impl(op, X, impl)`, table `DENSE_OPS`. Flags accept `'N'` or `:N`.
+    `:auto` = vendor, else generic, else KA; an explicit unavailable impl raises `NotSupportedError`.
+  - `src/dense/capabilities.jl`: `DenseCapabilities` (17 Bool probes), `capabilities(backend, T)` (cached per
+    `(backend, T)` under a lock; each probe is a 4×4 call in try/catch *and* checks the result against host
+    LinearAlgebra), `print_capabilities([io,] backend)`.
+  - `src/dense/vendor.jl`: `vendor_gemm!`, `vendor_syrk!`, `vendor_herk!`, `vendor_trsm!`, `vendor_potrf!`,
+    `vendor_getrf!`, `vendor_sytrf!`, `vendor_gemm_strided_batched!`, `vendor_trsm_batched!`,
+    `vendor_potrf_batched!`, `vendor_getrf_batched!`; fallback methods throw `NotSupportedError`; host
+    BLAS/LAPACK methods for host arrays (`Matrix` and views/reshapes with an `Array` parent; GPU arrays are
+    `DenseArray`s too and must never reach host BLAS).
+  - `src/dense/fallback/`: `common.jl` (`_get`/`_set!` serve matrices and 3-D batches with one kernel),
+    `gemm.jl` (`ka_gemm!` tiled with `Val(16)`/`Val(32)` (32 when both dims of C ≥ 64), `ka_syrk!` (same
+    kernel, triangle mask, `conjugate` for herk), `ka_gemm_strided_batched!`), `trsm.jl` (`ka_trsm!`,
+    `ka_trsm_strided_batched!`: one workgroup per RHS line, both sides reduced to one substitution kernel),
+    `potrf.jl` (`ka_potrf!(uplo, A, info)`), `getrf.jl` (`ka_getrf!(A, ipiv, info)` with a `@localmem`
+    argmax tree reduction, `ka_laswp!`). All kernels: 1-D workgroups, `@localmem` sized from `Val`, no atomics,
+    no subgroup ops, batch index = second ndrange dimension; `ka_potrf!`/`ka_getrf!` also take 3-D batches and
+    write `info` to a device `Int32` vector without host synchronization.
+  - `ext/SparseDirectSolverCUDAExt.jl`: methods of every `vendor_*` function for `StridedCuArray`s (cuBLAS
+    gemm/syrk/herk/trsm/gemm_strided_batched, `cublas?trsmBatched` on a pointer array built from the strides,
+    cuSOLVER potrf/getrf/sytrf/`cusolverDn?potrfBatched`, cuBLAS `getrf_batched!`); non-`Cint` pivot vectors go
+    through a `Cint` temporary. `Project.toml`: `cuBLAS`, `cuSOLVER` added to `[weakdeps]`, the extension
+    trigger list and `[compat]` (`"6"`).
+  - Tests: `test/test_dense.jl`; shared helpers `dense_tol`, `DENSE_SIZES`, `ipiv_permutation` (`utils.jl`),
+    `dense_hpd`, `dense_triangular` (`matrices.jl`), `to_panel` and `to_host(::SubArray)` (`backends.jl`).
+- Tests: `SDS_TEST_GPU=0 julia --project=. -e 'using Pkg; Pkg.test()'` (Julia 1.13.1, ubuntu-latest, CPU):
+  19115 pass / 0 fail / 0 broken (test_dense: 17228, 172 s). Julia 1.10.10, `test_dense` + `test_aqua`:
+  17232 pass. The CUDA extension was loaded in a scratch environment with CUDA.jl 6.4.1 (no GPU): all
+  `vendor_*` methods are defined. CUDA/AMDGPU: pending CI on the PR.
+- Measurements: capability table of the KA CPU backend (printed by `test_dense`):
+
+  ```text
+  capability                  | Float32 | Float64 | ComplexF32 | ComplexF64
+  generic_mul/_trsm/_cholesky/_lu | yes | yes | yes | yes
+  vendor_gemm/_syrk/_trsm/_potrf/_getrf/_sytrf | yes | yes | yes | yes   (host BLAS/LAPACK)
+  vendor_herk                 | no      | no      | yes        | yes
+  vendor_*_batched (4 probes) | no      | no      | no         | no
+  reshape_view_mul            | yes     | yes     | yes        | yes
+  atomic_add                  | yes     | yes     | no         | no
+  ```
+
+  The full CUDA table is printed by the `capability audit (CUDA)` testset in the CI log of the `cuda` job;
+  it could not be recorded here (no GPU on the implementer runner).
+- Deviations from PLAN.md / this task:
+  - The KA CPU backend gets "vendor" bindings: host BLAS/LAPACK through LinearAlgebra (in the core, no new
+    dependency). On CPU, `:vendor` and `:generic` therefore both reach LAPACK; batched vendor probes are `false`.
+  - Batched ops have no `:generic` path (a per-member loop of generic calls would be `count` launches);
+    `:auto` picks vendor, else KA. `laswp!` has only `:ka` (no LinearAlgebra entry point, no cuSOLVER binding
+    in CUDA.jl); both are listed in `DENSE_OPS`.
+  - `syrk!` with `impl = :generic` uses `mul!` and overwrites the opposite triangle with the same symmetric
+    update; `:vendor`/`:ka` leave it untouched (documented, tested).
+  - `sytrf` and the batched potrf/getrf are vendor bindings + probes only, as asked; `ka_potrf!`/`ka_getrf!`
+    accept 3-D batches anyway (one workgroup per member), which the batched tests exercise on the KA path.
+  - `strided_batch` needs `stride` to be a multiple of `m` when `stride > m n` (the padded batch is a view
+    of a reshaped contiguous range; Julia cannot express arbitrary member strides otherwise).
+  - Test tolerances (`dense_tol = 50·eps`) multiply Frobenius norms of the operands: `|α|‖A‖‖B‖ + |β|‖C‖`
+    for gemm/syrk, `‖ref‖` for trsm (well-conditioned `dense_triangular`), `‖L‖²` for potrf and `‖L‖‖U‖`
+    for getrf (backward-error form).
+  - Nothing is exported: the dense layer is internal (`SparseDirectSolver.gemm!`, …), PLAN §3.1 lists no
+    dense names in the public API.
+- Open issues / follow-ups:
+  - The interface allocates small device scalars (`info`, `Cint` pivot temporaries, cuBLAS pointer arrays)
+    and `potrf!`/`getrf!` read `info` on the host. T09 should call `ka_potrf!`/`ka_getrf!` with
+    preallocated `info` and keep the reads at phase boundaries (PLAN §3.9).
+  - cuBLAS' own `trsm_batched!` accepts only `Vector{<:CuArray}` (its `unsafe_batch` has no method for
+    views), so the extension calls `cublas?trsmBatched[_64]` directly; check on CI that the pointer-array
+    path works for padded `strided_batch` views.
+  - The KA kernels are correctness-first (unblocked potrf/getrf, one workgroup per matrix; one workgroup per
+    RHS column in trsm). Blocked/tiled large-front kernels belong to T09–T11.
+  - `atomic_add` is `false` for complex types on CPU (Atomix has no complex atomics); the default forward
+    solve (T12) must split complex accumulation into real/imag parts or use the atomic-free variant.
+- Suggested plan changes:
+  - PLAN §2.6: state that the KA CPU backend uses host BLAS/LAPACK as its "vendor" library.
+  - PLAN §2.6: list `laswp` as KA-only on CUDA (CUDA.jl has no `laswp` binding) unless a raw
+    `cusolverDn?laswp` binding is added.
 
 ---
 

@@ -59,3 +59,35 @@ function thrown(f)
     end
     return nothing
 end
+
+# ---------------------------------------------------------------------------
+# dense layer (T03)
+
+"""
+    dense_tol(T)
+
+Relative tolerance of the dense-op tests: `50·eps(real(T))`, applied to a
+Frobenius norm of the operands (TASKS.md T03).
+"""
+dense_tol(::Type{T}) where {T} = 50 * eps(real(T))
+
+"""
+    DENSE_SIZES
+
+`(m, n, k)` shapes every dense op is tested on (TASKS.md T03).
+"""
+const DENSE_SIZES = ((1, 1, 1), (7, 5, 3), (32, 32, 32), (100, 64, 33), (257, 17, 9))
+
+"""
+    ipiv_permutation(ipiv, m) -> Vector{Int}
+
+Row permutation `p` of the LAPACK pivot sequence `ipiv` (host vector): applying
+the interchanges `i ↔ ipiv[i]` to `1:m` in order, so that `A[p, :] == P * A`.
+"""
+function ipiv_permutation(ipiv::AbstractVector{<:Integer}, m::Integer)
+    p = collect(1:m)
+    for (i, q) in enumerate(ipiv)
+        p[i], p[q] = p[q], p[i]
+    end
+    return p
+end

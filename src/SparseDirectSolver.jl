@@ -26,4 +26,14 @@ include("types.jl")
 include("options.jl")
 include("matrix.jl")
 
+# dense layer (PLAN §2.6): vendor bindings, KA fallbacks, interface, capability audit
+include("dense/vendor.jl")
+include("dense/fallback/common.jl")
+include("dense/fallback/gemm.jl")
+include("dense/fallback/trsm.jl")
+include("dense/fallback/potrf.jl")
+include("dense/fallback/getrf.jl")
+include("dense/interface.jl")
+include("dense/capabilities.jl")
+
 end # module SparseDirectSolver
