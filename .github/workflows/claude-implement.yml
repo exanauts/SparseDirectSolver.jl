@@ -87,6 +87,7 @@ jobs:
           git config user.email "claude[bot]@users.noreply.github.com"
 
       - name: Implement the task with Claude
+        id: claude
         if: steps.guard.outputs.go == 'true'
         uses: anthropics/claude-code-action@v1
         env:
@@ -137,3 +138,27 @@ jobs:
                (`gh issue edit ${{ env.ISSUE }} --add-label needs-owner`).
 
             A Claude reviewer reviews the PR and CI runs the GPU suites; the pipeline merges when both pass.
+
+      - name: Save the Claude execution log
+        if: always() && steps.guard.outputs.go == 'true' && steps.claude.outputs.execution_file != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: claude-execution-${{ steps.guard.outputs.task }}-${{ github.run_id }}
+          path: ${{ steps.claude.outputs.execution_file }}
+          retention-days: 14
+
+      - name: Check that a pull request was opened
+        if: always() && steps.guard.outputs.go == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TASK: ${{ steps.guard.outputs.task }}
+        run: |
+          set -euo pipefail
+          pr=$(gh pr list --state all --limit 100 --json number,headRefName,createdAt \
+            --jq "[.[] | select(.headRefName | startswith(\"task/$TASK-\"))] | sort_by(.createdAt) | last | .number // empty")
+          if [ -n "$pr" ]; then echo "PR #$pr exists for $TASK."; exit 0; fi
+          branch=$(git ls-remote --heads origin "task/$TASK-*" | awk '{print $2}' | head -1)
+          gh issue edit "$ISSUE" --add-label needs-owner
+          gh issue comment "$ISSUE" --body "Claude implement finished without opening a pull request (run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}; pushed branch: \`${branch:-none}\`). The execution log is attached to the run as an artifact. Labelled \`needs-owner\`."
+          echo "::error::No pull request for $TASK after the Claude step"
+          exit 1
