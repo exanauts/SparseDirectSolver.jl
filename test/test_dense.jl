@@ -128,6 +128,13 @@ end
                     @test to_host(Y) == A[perm, :]
                     SDS.laswp!(Y, ipiv; reverse = true)
                     @test to_host(Y) == A
+                    # oversized pivot buffer: only the first npiv = min(m, n) entries are applied
+                    X = dev(A)
+                    ipiv2 = to_device(backend, zeros(IP, kmin + 3))
+                    @test SDS.getrf!(X, ipiv2; impl) == 0
+                    Y = dev(A)
+                    SDS.laswp!(Y, ipiv2; npiv = kmin)
+                    @test to_host(Y) == A[perm, :]
                 end
             end
         end
@@ -197,8 +204,7 @@ end
     end
 end
 
-@testset "KA batched factorizations and tiles ($(backend_name(backend)))" for backend in BACKENDS
-    T = Float64
+@testset "KA batched factorizations and tiles ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
     nb, n = 3, 20
     S = cat((dense_hpd(T, n) for _ in 1:nb)...; dims = 3)
     X = to_device(backend, S)
@@ -238,13 +244,13 @@ end
     end
 end
 
-@testset "impl = :auto ($(backend_name(backend)))" for backend in BACKENDS
-    A = to_device(backend, randn(Float64, 5, 5))
+@testset "impl = :auto ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
+    A = to_device(backend, randn(T, 5, 5))
     for op in (:gemm, :potrf, :laswp, :trsm_strided_batched)
-        @test SDS.select_impl(op, A, :auto) === first(SDS.dense_impls(op, backend, Float64))
+        @test SDS.select_impl(op, A, :auto) === first(SDS.dense_impls(op, backend, T))
     end
     @test SDS.select_impl(:laswp, A, :auto) === :ka
-    C = to_device(backend, zeros(5, 5))
+    C = to_device(backend, zeros(T, 5, 5))
     SDS.gemm!(C, A, A)
     @test to_host(C) ≈ to_host(A) * to_host(A)
 end
@@ -255,11 +261,15 @@ end
     @test_throws InvalidValueError SDS.gemm!(A, A, A; transA = :X)
     @test_throws InvalidValueError SDS.trsm!(:L, :L, :N, :Q, 1, A, A)
     @test_throws NotSupportedError SDS.laswp!(A, [1, 2]; impl = :vendor)
+    @test_throws DimensionMismatch SDS.laswp!(A, [1, 2]; npiv = 3)
+    # host BLAS accepts strided views only; a non-strided view is not a vendor operand
+    @test_throws NotSupportedError SDS.gemm!(A, view(A, [1, 3, 2, 4], :), A; impl = :vendor)
+    @test SDS.gemm!(zeros(4, 4), view(A, [1, 3, 2, 4], :), A; impl = :generic) == zeros(4, 4)
     @test_throws NotSupportedError SDS.gemm_strided_batched!(zeros(2, 2, 1), zeros(2, 2, 1), zeros(2, 2, 1); impl = :generic)
     @test_throws NotSupportedError SDS.vendor_potrf_batched!('L', zeros(2, 2, 1), zeros(Int32, 1))
     @test_throws DimensionMismatch SDS.gemm!(zeros(3, 4), A, A)
     @test_throws DimensionMismatch SDS.trsm!(:R, :L, :N, :N, 1, A, zeros(4, 3))
-    @test_throws ArgumentError SDS.dense_impls(:nope, CPU(), Float64)
+    @test_throws InvalidValueError SDS.dense_impls(:nope, CPU(), Float64)
     buf = collect(1.0:40.0)
     Bt = SDS.strided_batch(buf, 2, 3, 2, 9, 4)
     @test size(Bt) == (3, 2, 4)

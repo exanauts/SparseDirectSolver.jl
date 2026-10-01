@@ -35,10 +35,12 @@ array types (host BLAS/LAPACK for `Array`s, cuBLAS/cuSOLVER for `CuArray`s).
 """ vendor_gemm!
 
 # Host arrays the CPU BLAS/LAPACK accept: plain matrices and the panel views
-# `reshape(view(buf, a:b), f, w)` / `view(A, i, j)` of host arrays. Backends whose
+# `reshape(view(buf, a:b), f, w)` / `view(A, i, j)` of host arrays with `Int` or
+# range indices (strided; `view(A, [1, 3], :)` is not and falls outside). Backends whose
 # arrays are `DenseArray`s (GPU arrays) must not reach host BLAS, hence the
 # explicit `Array` parent.
-const HostMatrix{T} = Union{Matrix{T}, SubArray{T, 2, <:Array{T}},
+const HostStridedIndex = Tuple{Vararg{Union{Int, AbstractRange{Int}}}}
+const HostMatrix{T} = Union{Matrix{T}, SubArray{T, 2, <:Array{T}, <:HostStridedIndex},
                             Base.ReshapedArray{T, 2, <:SubArray{T, 1, <:Array{T}}}}
 
 const BlasT = LinearAlgebra.BlasFloat

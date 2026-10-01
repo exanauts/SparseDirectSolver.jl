@@ -76,7 +76,7 @@ available for element type `T` on `backend` according to
 `:ka`). `:ka` is always present.
 """
 function dense_impls(op::Symbol, backend, ::Type{T}) where {T}
-    haskey(DENSE_OPS, op) || throw(ArgumentError("unknown dense op :$op; expected one of $(keys(DENSE_OPS))"))
+    haskey(DENSE_OPS, op) || throw(InvalidValueError("unknown dense op :$op; expected one of $(keys(DENSE_OPS))"))
     spec = DENSE_OPS[op]
     caps = capabilities(backend, T)
     impls = Symbol[]
@@ -261,16 +261,19 @@ function getrf!(A::AbstractMatrix, ipiv::AbstractVector{<:Integer}; impl::Symbol
 end
 
 """
-    laswp!(A, ipiv; reverse = false, impl = :auto) -> A
+    laswp!(A, ipiv; npiv = length(ipiv), reverse = false, impl = :auto) -> A
 
 Apply the row interchanges of `ipiv` (as returned by [`getrf!`](@ref)) to `A`:
-for `i = 1:length(ipiv)` swap rows `i` and `ipiv[i]`, so that `laswp!(A, ipiv)`
-computes `P A`; `reverse = true` applies them backwards (`Pᵀ A`). Only `:ka`
-exists (no generic entry point; vendor bindings may be added per backend).
+for `i = 1:npiv` swap rows `i` and `ipiv[i]`, so that `laswp!(A, ipiv)`
+computes `P A`; `reverse = true` applies them backwards (`Pᵀ A`). `npiv` is
+LAPACK's `k2` (with `k1 = 1`): pass `npiv = min(m, n)` when `ipiv` is an
+oversized buffer filled by `getrf!`. Only `:ka` exists (no generic entry point;
+vendor bindings may be added per backend).
 """
-function laswp!(A::AbstractMatrix, ipiv::AbstractVector{<:Integer}; reverse::Bool = false, impl::Symbol = :auto)
+function laswp!(A::AbstractMatrix, ipiv::AbstractVector{<:Integer}; npiv::Integer = length(ipiv),
+                reverse::Bool = false, impl::Symbol = :auto)
     select_impl(:laswp, A, impl)
-    return ka_laswp!(A, ipiv; reverse)
+    return ka_laswp!(A, ipiv; npiv, reverse)
 end
 
 """
