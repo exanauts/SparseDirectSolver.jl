@@ -71,7 +71,7 @@ so the **Report** block at the end of each task must be filled in honestly.
 
 ---
 
-## T01 — Package scaffolding, option tables, test infrastructure   `[ ]`
+## T01 — Package scaffolding, option tables, test infrastructure   `[!]`
 
 **Reads**: PLAN §1.3, §1.4, §1.7, §3.1, §3.2, §4.
 
@@ -130,6 +130,90 @@ so the **Report** block at the end of each task must be filled in honestly.
 * Generators in `test/matrices.jl`: `issymmetric`, `isposdef` (small sizes),
   `eigvals` sign counts for `random_symindef` (both signs present), each
   generator returns the requested `T` and `Int` indices.
+
+### Report
+
+- Status: [!] (done; deviations listed below are small and mostly additive)
+- What was built:
+  - `Project.toml` (UUID `dc8e0fd9-41f1-440b-9624-22817132f700`, v0.1.0, deps/weakdeps/compat
+    exactly as specified; resolves to KA 0.9.43, GPUArrays 11.5, CliqueTrees 1.19, CUDA 6.4.1
+    in the test env), `LICENSE` (MIT, Michel Schanen), `README.md` stub.
+  - `src/SparseDirectSolver.jl`; `src/errors.jl` (`SparseDirectSolverError`, `NotSupportedError`,
+    `InvalidValueError`, `FactorizationError(info[, msg])` (parametric so `info` can be a batch
+    vector), `InterruptedError`).
+  - `src/types.jl`: enums `Structure`, `MatrixView`, `IndexBase`, `Phase`, `PivotType`,
+    `ReorderingAlg`, `MatchingAlg`, `ScheduleKind`, plus `FactorizationAlg`, `SolveAlg`,
+    `PivotEpsilonAlg`, `IRMode`, all with the cuDSS 0.8 integer values. `enum_spellings(E)` is the
+    single table behind `convert(E, "SPD")`/`convert(E, 'L')` and `convert(String, x)`/`convert(Char, x)`;
+    `phase_includes(phase, part)` tests phase bits.
+  - `src/options.jl`: `CONFIG_PARAMETERS`, `DATA_PARAMETERS` (verbatim), `CUDSS08_DATA_PARAMETERS`,
+    `EXTRA_PARAMETERS`; `Options` (typed fields for every §1.3/§1.7 config parameter and the
+    user-input data parameters `user_perm`, `user_schur_indices`, `user_nd_partition_tree`,
+    `user_host_interrupt`, `ubatch_mask`, `pivot_sign`; keyword constructor validates through
+    `setparam!`; `copy`; `show` prints non-default values); `setparam!`/`getparam` driven by one
+    `PARAMETER_SPECS` table (port / reinterpret / deferred / not_planned / output / solver);
+    `default_pivot_epsilon`, `resolved_pivot_epsilon(opts, T)`.
+  - `ext/SparseDirectSolverCUDAExt.jl`: empty stub (declared now, filled in T02), loads with CUDA.
+  - `test/Project.toml`, `test/runtests.jl` (auto-discovers `test_*.jl`; `SDS_TEST_GPU`,
+    `SDS_TEST_ONLY`, clear error for unknown names; seeds 666 per file), `test/backends.jl`
+    (`BACKENDS`, `to_device(backend, x)`, `to_device(backend, A, INT)`, `to_host`, `backend_name`;
+    CUDA and AMDGPU guarded by `Base.find_package` + `functional()`), `test/utils.jl` (`ELTYPES`,
+    `REAL_ELTYPES`, `COMPLEX_ELTYPES`, `INTTYPES`, `tol`, `relres`, `spd_structure`, `sym_structure`,
+    `eigen_inertia`, `thrown`), `test/matrices.jl` (all generators of the conventions, each with a
+    `Float64` method without `T` and an `rng` keyword; `kkt_matrix(...; hessian = :spd | :indefinite)`;
+    `random_symindef` is diagonally dominant with known inertia; `singular_block_matrix(...;
+    stored_zero)`; `schur_example_lu/_ldlt/_cholesky`, `ubatch_example`), `test/test_options.jl`,
+    `test/test_aqua.jl`, `test/test_helpers.jl`.
+- Tests: `julia --project=. -e 'using Pkg; Pkg.test()'` with CUDA added to the test env:
+  932 pass / 0 fail / 0 broken (CPU + CUDA, RTX 4080; test_aqua 8.8 s, test_helpers 27 s,
+  test_options 5 s). `SDS_TEST_GPU=0`: 922 pass. Julia 1.10.12 (lts), CPU only, CUDA absent from
+  the test env: 922 pass.
+- Measurements: none asked.
+- Deviations from PLAN.md / this task:
+  - Defaults test checks `opts.schedule == SCHEDULE_AUTO`, not `== :auto`: the task asks both for a
+    `ScheduleKind` enum and for a Symbol default; I kept the enum (same representation as
+    `pivot_type == PIVOT_AUTO`). `getparam(opts, "schedule") == "auto"`.
+  - Generator/backend checks live in a third file, `test/test_helpers.jl`, not in `test_options.jl`.
+  - Extra enums `FactorizationAlg`, `SolveAlg`, `PivotEpsilonAlg` (mirroring cuDSS 0.8's
+    per-parameter enums) and `IRMode`; `Phase` also has `PHASE_SOLVE_FWD_SCHUR = 48` and
+    `PHASE_SOLVE_BWD_SCHUR = 384` for the CUDSS.jl shorthands.
+  - `CUDSS08_DATA_PARAMETERS = ("ir_n_steps", "ubatch_mask", "flops")`: PLAN §1.4 ports these but
+    CUDSS.jl's tuple does not list them.
+  - `getparam(opts, …)` returns the spelling `setparam!` accepts (`"algo3"`, `'B'`), not the cuDSS
+    integer that `cudss_get` returns; enum conversion errors are `InvalidValueError` (CUDSS.jl:
+    `ArgumentError`). Unknown *names* are `ArgumentError` as required.
+  - `setparam!(opts, "device_count", 1)` is accepted as a no-op (single device is what we do);
+    any other value, `"device_indices"`, `"comm_device"`, `"comm_host"` and `pivot_type` `'C'`/`'R'`
+    raise `NotSupportedError`.
+  - Deferred hybrid parameters (`hybrid_memory_mode`, `hybrid_device_memory_limit`,
+    `hybrid_execute_mode`) are stored and warn once per name on a non-default value;
+    `reordering_alg = "algo1"/"algo2"` warns once (PLAN §1.3).
+  - Defaults chosen where PLAN is silent (please confirm): `pivot_threshold = 0.01` (from T14;
+    no upper bound, CUDSS.jl's own test sets 2.0), `ir_tol = 0` (no early exit),
+    `max_lu_nnz = -1` (negative = no limit), `nd_nlevels = 10`, `nd_ubfactor = -1` (library
+    default), `host_nthreads = 0` (= `Threads.nthreads()`), `ubatch_size = 0` (deduced from
+    `nzVal`, as PLAN §3.1 auto-detects batches), `use_cuda_register_memory = 1`.
+  - The CUDSS.jl docs have three 5×5 Schur examples (LU, LDLᵀ, LLᵀ), not two; all three are in
+    `test/matrices.jl`. Symmetric examples return the full matrix (the docs pass `tril`/`triu`).
+- Open issues / follow-ups:
+  - Local GPU runs need CUDA in the test env: `julia --project=test -e 'using Pkg; Pkg.add("CUDA")'`,
+    then do not commit `test/Project.toml` (Pkg.test's sandbox hides the global environment).
+    I restored the clean file before committing.
+  - The AMDGPU branch of `test/backends.jl` is written by analogy with ExaPF and untested here.
+    Once the `amdgpu` runner sees `ROCBackend()` in `BACKENDS`, numeric tests from T02 on will run
+    on ROCm before the AMDGPU extension exists (T23).
+  - T13: the ported `cudss_solver` loop sets `"algo1"`–`"algo5"` for every algorithm parameter,
+    `pivot_type` `'C'`/`'R'`; our validation rejects algorithms beyond each cuDSS 0.8 enum and
+    global pivoting, so that loop must be restricted (T13 already says "implemented parameters").
+  - T16: `"ir_n_steps"` is both a config name (requested steps) and a cuDSS 0.8 data name (steps
+    performed); `getparam(opts, "ir_n_steps")` is the config value, the solver-level getter must
+    decide how to expose both.
+  - All test files are included into `Main`; shared helpers belong in `utils.jl`/`matrices.jl`/
+    `backends.jl` to avoid top-level name clashes between test files.
+- Suggested plan changes:
+  - TASKS T01: write the default as `schedule == SCHEDULE_AUTO` (or drop `ScheduleKind`).
+  - PLAN §1.4: note the `ir_n_steps` config/data name collision and how the flat getter resolves it.
+  - AGENTS.md "Commands": add the local `Pkg.add("CUDA")` step for the test env.
 
 ---
 

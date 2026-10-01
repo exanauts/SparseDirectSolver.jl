@@ -1,0 +1,34 @@
+name = "SparseDirectSolver"
+uuid = "dc8e0fd9-41f1-440b-9624-22817132f700"
+authors = ["Michel Schanen <Michel.Schanen@gmail.com>"]
+version = "0.1.0"
+
+[deps]
+Adapt = "79e6a3ab-5dfb-504d-930d-738a2a938a0e"
+Atomix = "a9b6321e-bd34-4604-b9c9-b65b8de01458"
+CliqueTrees = "60701a23-6482-424a-84db-faee86b9b1f8"
+GPUArrays = "0c68f7d7-f131-5f86-a1c3-88cf8149b2d7"
+GPUArraysCore = "46192b85-c4d5-4398-a991-12ede77f4527"
+KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
+
+[weakdeps]
+CUDACore = "bd0ed864-bdfe-4181-a5ed-ce625a5fdea2"
+cuSPARSE = "b26da814-b3bc-49ef-b0ee-c816305aa060"
+
+[extensions]
+SparseDirectSolverCUDAExt = ["CUDACore", "cuSPARSE"]
+
+[compat]
+Adapt = "4"
+Atomix = "1"
+CUDACore = "6"
+CliqueTrees = "1"
+GPUArrays = "11"
+GPUArraysCore = "0.2"
+KernelAbstractions = "0.9"
+LinearAlgebra = "1.10"
+SparseArrays = "1.10"
+cuSPARSE = "6"
+julia = "1.10"
