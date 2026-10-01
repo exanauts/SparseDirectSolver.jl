@@ -256,13 +256,14 @@ so the **Report** block at the end of each task must be filled in honestly.
 - Status: [!] (done; small deviations below)
 - What was built:
   - `src/matrix.jl`: `CSR{T,INT,VI,VT}` (fields as specified; inner constructor validates lengths
-    only, never reads device memory); `CSR(rowptr, colval, nzval[, nrows, ncols]; index, transposed)`
+    and that `nrows`, `ncols`, `nnz` fit in `INT`, never reads device memory); `CSR(rowptr, colval, nzval[, nrows, ncols]; index, transposed)`
     (zero-copy, `index` as `'O'`/`'Z'` or `IndexBase`), `CSR(A::SparseMatrixCSC; index)` (host
     conversion), `csr_of_transpose(A)` (zero-copy, `transposed = true`), `to_backend(A, backend)` for
     `SparseMatrixCSC` and `CSR` (generic through `KernelAbstractions.allocate` + `copyto!`, no copy if
     already on `backend`), `SparseMatrixCSC(A::CSR[, k])` (host copy of batch member `k`, rebased to 1),
     `size`, `eltype`, `nnz`, `nbatch`, `get_backend`, `Adapt.adapt_structure`, `show`.
-  - `MatrixDescriptor{T,A}` (mutable; `data::Union{Nothing,A}`, `nrows, ncols, nbatch, transposed`),
+  - `MatrixDescriptor{T,A}` (mutable; `data::Union{Nothing,A}`, `nrows, ncols, nbatch, transposed`;
+    explicit inner constructor so Aqua `unbound_args` passes on Julia 1.10),
     `MatrixDescriptor(T, n; nbatch)`, `MatrixDescriptor(T, m, n; nbatch, transposed)`,
     `MatrixDescriptor(x; transposed)`, `update!(desc, x)` (re-points, no copy; checks eltype, array
     type, length and shape, `InvalidValueError` otherwise), `size`, `nbatch`, `get_backend`.
@@ -272,7 +273,8 @@ so the **Report** block at the end of each task must be filled in honestly.
   - Exports: `CSR, csr_of_transpose, to_backend, nbatch, MatrixDescriptor, update!`.
   - `test/test_matrix.jl`.
 - Tests: `SDS_TEST_GPU=0 julia --project=. -e 'using Pkg; Pkg.test()'` (Julia 1.13.1, ubuntu-latest):
-  1884 pass / 0 fail / 0 broken (test_matrix alone: 962). The CUDA extension was checked to load
+  1885 pass / 0 fail / 0 broken (test_matrix alone: 963); same counts with Julia 1.10.10 (Aqua
+  included). The CUDA extension was checked to load
   and define its methods in a scratch environment with CUDA.jl 6 (no GPU, `CUDA.functional() == false`).
   CUDA/AMDGPU: pending CI on the PR.
 - Measurements: none asked.
@@ -290,7 +292,9 @@ so the **Report** block at the end of each task must be filled in honestly.
     strided vector of the right length or an array with exactly the descriptor's shape.
   - The CUDA test builds `CuSparseMatrixCSR{T,INT}`/`CuSparseMatrixCSC{T,INT}` from host arrays
     instead of `to_device(backend, A, INT)`: cuSPARSE 6 ignores `Ti` in
-    `CuSparseMatrixCSR{Tv,Ti}(::SparseMatrixCSC)` and always uses `Cint` (issue #30).
+    `CuSparseMatrixCSR{Tv,Ti}(::SparseMatrixCSC)` and always uses `Cint` (issue #30). Likewise
+    cuSPARSE's own `SparseMatrixCSC(::CuSparseMatrixCSR{T,Int64})` goes through `Int32` buffers and
+    fails, so tests convert device matrices back through `SparseMatrixCSC(CSR(dA))` (noted on #30).
 - Open issues / follow-ups:
   - #30: `test/backends.jl` `to_device(::CUDABackend, A, Int64)` returns Int32 indices.
   - No ROCm adapters (`CSR(::ROCSparseMatrixCSR)`) until T23; on the `amdgpu` runner the generic

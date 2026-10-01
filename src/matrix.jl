@@ -44,6 +44,8 @@ struct CSR{T, INT <: Integer, VI <: AbstractVector{INT}, VT <: AbstractVecOrMat{
         length(rowptr) == nrows + 1 ||
             throw(InvalidValueError("length(rowptr) = $(length(rowptr)) does not match nrows + 1 = $(nrows + 1)"))
         nz = length(colval)
+        max(nrows, ncols, nz) <= typemax(INT) ||
+            throw(InvalidValueError("CSR sizes $nrows × $ncols with nnz = $nz do not fit in $INT"))
         if nzval isa AbstractMatrix
             size(nzval, 1) == nz ||
                 throw(InvalidValueError("batched nzval has $(size(nzval, 1)) rows, expected nnz = $nz"))
@@ -210,6 +212,11 @@ mutable struct MatrixDescriptor{T, A <: AbstractArray{T}}
     ncols::Int
     nbatch::Int
     transposed::Bool
+
+    function MatrixDescriptor{T, A}(data::Union{Nothing, A}, nrows::Integer, ncols::Integer, nbatch::Integer,
+                                    transposed::Bool) where {T, A <: AbstractArray{T}}
+        return new{T, A}(data, nrows, ncols, nbatch, transposed)
+    end
 end
 
 function _check_descriptor_sizes(m, n, nb)

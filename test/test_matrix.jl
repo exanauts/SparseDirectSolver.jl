@@ -1,7 +1,5 @@
 # T02: CSR container, backend adapters, matrix descriptors.
 
-const CSR = SDS.CSR
-
 # The stored CSR matrix with its `transposed` flag applied.
 logical_matrix(B) = B.transposed ? copy(transpose(SparseMatrixCSC(B))) : SparseMatrixCSC(B)
 
@@ -77,6 +75,7 @@ end
     @test thrown(() -> CSR(Int32[1, 2, 3], [1, 2], [1.0, 2.0])) isa InvalidValueError # mixed index types
     @test thrown(() -> CSR([1, 2, 3], [1, 2], [1.0, 2.0]; index = 'X')) isa InvalidValueError
     @test thrown(() -> CSR(sparse([1.0 0; 0 1]); index = "O")) isa InvalidValueError
+    @test thrown(() -> CSR(ones(Int8, 201), Int8[], Float64[], 200, 200)) isa InvalidValueError  # sizes overflow INT
 end
 
 @testset "to_backend ($(backend_name(backend)), $T, $INT)" for backend in BACKENDS, T in ELTYPES, INT in INTTYPES
@@ -123,7 +122,10 @@ end
     @test pointer(dA2.nzVal) == pointer(dA.nzVal)
     @test SparseMatrixCSC(CSR(dA2)) == A
     Bz = to_backend(A, backend; index = 'Z')
-    @test SparseMatrixCSC(CuSparseMatrixCSR(Bz)) == A   # rebased copy
+    dZ = CuSparseMatrixCSR(Bz)
+    @test dZ isa CuSparseMatrixCSR{T, INT}
+    @test pointer(dZ.rowPtr) != pointer(Bz.rowptr)   # rebased copy
+    @test SparseMatrixCSC(CSR(dZ)) == A
     Bd = to_backend(A, backend)
     @test Bd.rowptr isa CuVector{INT}
     @test SparseMatrixCSC(Bd) == A
