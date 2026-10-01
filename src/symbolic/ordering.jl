@@ -1,0 +1,172 @@
+# Symbolic step 2 (PLAN §2.3): fill-reducing ordering through CliqueTrees.jl,
+# user permutations, and the automatic AMD/ND choice by a cost model.
+#
+# AMD and MMD are always available (CliqueTrees + AMD.jl). Nested dissection
+# needs Metis.jl: `ext/SparseDirectSolverMetisExt.jl` stores the function that
+# builds the CliqueTrees algorithm object in `ND_PROVIDER` when Metis is loaded.
+
+"""
+    ND_PROVIDER
+
+`Ref` holding `nothing` or a function `(nd_nlevels, nd_ubfactor) -> alg` that
+returns the CliqueTrees nested-dissection algorithm. Set by the Metis extension.
+"""
+const ND_PROVIDER = Ref{Any}(nothing)
+
+"""
+    nd_available() -> Bool
+
+Whether nested dissection can be used (Metis.jl is loaded, which activates
+`SparseDirectSolverMetisExt`).
+"""
+nd_available() = ND_PROVIDER[] !== nothing
+
+function _nd_algorithm(opts::Options)
+    nd_available() ||
+        throw(NotSupportedError("nested dissection (reordering_alg = \"algo4\") needs Metis.jl; " *
+                                "run `using Metis` to load SparseDirectSolverMetisExt"))
+    return ND_PROVIDER[](opts.nd_nlevels, opts.nd_ubfactor)
+end
+
+"""
+    OrderingCandidate
+
+Evaluation of one ordering by the cost model of [`compute_ordering`](@ref):
+fields `alg::Symbol`, `nnz_L::Int`, `flops::Float64`, `nlevels::Int`, `cost::Float64`.
+"""
+const OrderingCandidate = @NamedTuple{alg::Symbol, nnz_L::Int, flops::Float64, nlevels::Int, cost::Float64}
+
+"""
+    Ordering
+
+Result of [`compute_ordering`](@ref):
+
+* `perm`, `iperm`: the fill-reducing permutation (`perm[k]` is the original index
+  of the `k`-th pivot, so the factorized matrix is `A[perm, perm]`) and its inverse;
+* `alg_used`: `:natural`, `:amd`, `:mmd`, `:nd` or `:user`;
+* `stats::NamedTuple`: `nnz_L`, `flops`, `nlevels`, `cost` of the chosen
+  ordering, `candidates::Vector{OrderingCandidate}` (every ordering evaluated,
+  the chosen one included), `auto::Bool` (whether the automatic choice ran) and
+  `nd_available::Bool`.
+"""
+struct Ordering
+    perm::Vector{Int}
+    iperm::Vector{Int}
+    alg_used::Symbol
+    stats::@NamedTuple{nnz_L::Int, flops::Float64, nlevels::Int, cost::Float64,
+                       candidates::Vector{OrderingCandidate}, auto::Bool, nd_available::Bool}
+end
+
+Base.show(io::IO, o::Ordering) =
+    print(io, "Ordering($(o.alg_used), n = $(length(o.perm)), nnz_L = $(o.stats.nnz_L), ",
+          "flops = $(o.stats.flops), nlevels = $(o.stats.nlevels))")
+
+_flop_factor(::Type{T}) where {T} = T <: Complex ? 4.0 : 1.0
+
+"""
+    ordering_cost(flops, nlevels, n) -> Float64
+
+Cost model of the automatic ordering choice (PLAN §2.3 step 2): predicted
+flops weighted by the relative critical path, `flops × (1 + nlevels / n)`.
+"""
+ordering_cost(flops::Real, nlevels::Integer, n::Integer) = Float64(flops) * (1 + nlevels / max(n, 1))
+
+"""
+    evaluate_ordering(P::SymmetricPattern, perm; T = Float64) -> (; nnz_L, flops, nlevels, cost)
+
+Elimination tree, column counts and tree height of `A[perm, perm]`, condensed
+into the quantities of the cost model ([`ordering_cost`](@ref)). `flops` counts
+real operations (`4×` for complex `T`).
+"""
+function evaluate_ordering(P::SymmetricPattern, perm::AbstractVector{<:Integer}; T::Type = Float64)
+    parent = etree(P, perm)
+    post = postorder(parent)
+    counts = colcounts(P, perm, parent, post)
+    _, nlevels = tree_levels(parent)
+    flops = cholesky_flops(counts) * _flop_factor(T)
+    return (nnz_L = nnz_L(counts), flops = flops, nlevels = nlevels, cost = ordering_cost(flops, nlevels, P.n))
+end
+
+function _validate_user_perm(v::AbstractVector{<:Integer}, n::Integer)
+    length(v) == n ||
+        throw(InvalidValueError("user_perm has length $(length(v)), expected the matrix size $n"))
+    p = Vector{Int}(v)
+    isperm(p) && return p                       # 1-based (contains n, not 0)
+    p .+= 1
+    isperm(p) && return p                       # 0-based (contains 0, not n)
+    throw(InvalidValueError("user_perm is not a permutation of 1:$n or 0:$(n - 1)"))
+end
+
+function _cliquetrees_perm(P::SymmetricPattern, alg)
+    P.n == 0 && return Int[]
+    order, _ = CliqueTrees.permutation(SparseMatrixCSC(P); alg)
+    return Vector{Int}(order)
+end
+
+function _ordering_perm(P::SymmetricPattern, alg::Symbol, opts::Options)
+    alg === :natural && return collect(1:P.n)
+    alg === :amd && return _cliquetrees_perm(P, CliqueTrees.AMD())
+    alg === :mmd && return _cliquetrees_perm(P, CliqueTrees.MMD())
+    alg === :nd && return _cliquetrees_perm(P, _nd_algorithm(opts))
+    throw(InvalidValueError("unknown ordering algorithm $(repr(alg)); expected :natural, :amd, :mmd, :nd or :auto"))
+end
+
+# Ordering requested by the options (user_perm first, then reordering_alg).
+function _requested_alg(opts::Options)
+    opts.user_perm !== nothing && return :user
+    a = opts.reordering_alg
+    a == REORDERING_NATURAL && return :natural
+    a == REORDERING_AMD && return :amd
+    a == REORDERING_ND && return :nd
+    # COLAMD variants were warned about in `setparam!`; the symmetric-pattern path uses AMD
+    (a == REORDERING_BTF_COLAMD || a == REORDERING_COLAMD) && return :amd
+    return :auto
+end
+
+"""
+    compute_ordering(P::SymmetricPattern, opts::Options; T = Float64, alg = nothing) -> Ordering
+
+Fill-reducing ordering of the pattern `P` (PLAN §2.3 step 2):
+
+* `opts.user_perm` set: that permutation, validated, accepted 0- or 1-based and
+  returned 1-based (`alg_used = :user`);
+* `reordering_alg = "algo5"`: natural ordering; `"algo3"`: AMD
+  (`CliqueTrees.AMD()`); `"algo4"`: nested dissection with Metis (needs
+  `using Metis`, otherwise [`NotSupportedError`](@ref)): `METIS_NodeND` with
+  `ufactor = nd_ubfactor` (`-1`: METIS default); `nd_nlevels` is the cuDSS
+  *minimum* number of dissection levels, which METIS' full recursion meets on
+  every graph large enough to be split that often;
+  `"algo1"`/`"algo2"`: AMD on the symmetric pattern;
+* `"default"`: AMD and, if Metis is loaded, ND are both evaluated with
+  [`evaluate_ordering`](@ref) and the one with the lower
+  `flops × (1 + nlevels / n)` is chosen; `stats.candidates` lists both.
+
+The keyword `alg` (`:natural`, `:amd`, `:mmd`, `:nd`, `:auto`) overrides
+`reordering_alg` (MMD has no cuDSS spelling); `T` scales the flop counts in
+`stats` (complex: `4×`) and does not change the choice.
+"""
+function compute_ordering(P::SymmetricPattern, opts::Options; T::Type = Float64,
+                          alg::Union{Nothing, Symbol} = nothing)
+    requested = alg === nothing ? _requested_alg(opts) : alg
+    candidates = OrderingCandidate[]
+    if requested === :user
+        opts.user_perm === nothing && throw(InvalidValueError("alg = :user needs opts.user_perm"))
+        perms = [:user => _validate_user_perm(opts.user_perm, P.n)]
+    elseif requested === :auto
+        algs = nd_available() ? (:amd, :nd) : (:amd,)
+        perms = [a => _ordering_perm(P, a, opts) for a in algs]
+    else
+        perms = [requested => _ordering_perm(P, requested, opts)]
+    end
+    best = 0
+    for (k, (a, perm)) in enumerate(perms)
+        e = evaluate_ordering(P, perm; T)
+        push!(candidates, (alg = a, nnz_L = e.nnz_L, flops = e.flops, nlevels = e.nlevels, cost = e.cost))
+        (best == 0 || e.cost < candidates[best].cost) && (best = k)
+    end
+    alg_used, perm = perms[best]
+    c = candidates[best]
+    stats = (nnz_L = c.nnz_L, flops = c.flops, nlevels = c.nlevels, cost = c.cost,
+             candidates = candidates, auto = requested === :auto, nd_available = nd_available())
+    return Ordering(perm, invperm(perm), alg_used, stats)
+end

@@ -16,6 +16,9 @@ using KernelAbstractions
 using LinearAlgebra
 using SparseArrays
 
+# AMD.jl activates CliqueTrees' AMD extension (`CliqueTrees.AMD()` orderings)
+import AMD
+
 export SparseDirectSolverError, NotSupportedError, InvalidValueError, FactorizationError, InterruptedError
 export CONFIG_PARAMETERS, DATA_PARAMETERS, CUDSS08_DATA_PARAMETERS, EXTRA_PARAMETERS
 export Options, setparam!, getparam, default_pivot_epsilon
@@ -35,5 +38,10 @@ include("dense/fallback/potrf.jl")
 include("dense/fallback/getrf.jl")
 include("dense/interface.jl")
 include("dense/capabilities.jl")
+
+# host symbolic engine (PLAN §2.3)
+include("symbolic/pattern.jl")
+include("symbolic/etree.jl")
+include("symbolic/ordering.jl")
 
 end # module SparseDirectSolver

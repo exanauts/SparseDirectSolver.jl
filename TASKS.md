@@ -584,7 +584,7 @@ obtained on this machine (CUDSS.jl is in `../CUDSS.jl`).
 
 ---
 
-## T05 — Symbolic I: pattern, ordering, elimination tree, column counts   `[ ]`
+## T05 — Symbolic I: pattern, ordering, elimination tree, column counts   `[!]`
 
 **Reads**: PLAN §2.3 steps 1–3; RESEARCH section 4 (ordering).
 
@@ -630,6 +630,88 @@ obtained on this machine (CUDSS.jl is in `../CUDSS.jl`).
   `A + Aᵀ`; 0-based input gives the same pattern as 1-based.
 * `full_pattern_map` reconstructs the full matrix values exactly from `nzval`
   for `'L'`, `'U'`, `'F'` and for `"H"` with conjugation.
+
+### Report
+
+- Status: [!] (done; one new dependency and the `nd_nlevels` interpretation below)
+- What was built:
+  - `src/symbolic/pattern.jl`: `SymmetricPattern` (`n`, `colptr`, `rowval`: host `Int`, 1-based, sorted,
+    no diagonal, no duplicates, both triangles; the raw constructor validates these invariants),
+    `SymmetricPattern(A::CSR, structure; view)` and `SymmetricPattern(rowptr, colval, n, structure; view, index)`
+    (structure/view/index as strings, chars or enums; `'L'`/`'U'` select a triangle, `'F'` on symmetric
+    structures reads the lower triangle, `"G"` gives A + Aᵀ and requires `'F'`; non-square, out-of-range
+    columns, bad `rowptr` → `InvalidValueError`), `neighbors(P, j)`, `nnz`, `==`, `SparseMatrixCSC(P)`.
+    `FullPatternMap` + `full_pattern_map(A::CSR | rowptr, colval, n, structure; view, index)`: 1-based CSR of
+    the full matrix plus a source list per entry (`srcptr`, `src` = position in the user's `nzval`,
+    `conjflag` for mirrored `"H"`/`"HPD"` entries); duplicated user entries become several sources and are
+    summed, so the T16 SpMV can gather without atomics. `full_values(F, nzval)` and
+    `SparseMatrixCSC(F, nzval)` evaluate it on the host.
+  - `src/symbolic/etree.jl`: `etree(P, perm)` (Liu, path compression, permuted numbering, roots = 0),
+    `postorder(parent)` (non-recursive, children in increasing order, detects cycles),
+    `colcounts(P, perm, parent, post)` (Gilbert–Ng–Peyton, CSparse `cs_counts` skeleton/leaf scheme,
+    diagonal included), `nnz_L(counts)`, `cholesky_flops(counts) = Σ cⱼ²` (CHOLMOD convention),
+    `tree_levels(parent) -> (height, nlevels)` (leaves height 1).
+  - `src/symbolic/ordering.jl`: `compute_ordering(P, opts; T, alg) -> Ordering` (`perm`, `iperm`,
+    `alg_used ∈ (:natural, :amd, :mmd, :nd, :user)`, `stats = (nnz_L, flops, nlevels, cost, candidates,
+    auto, nd_available)`), `evaluate_ordering(P, perm; T)`, `ordering_cost(flops, nlevels, n) =
+    flops × (1 + nlevels/n)`, `nd_available()`, `ND_PROVIDER`. `user_perm` wins over `reordering_alg`
+    and is accepted 0- or 1-based (returned 1-based); `"algo5"` natural, `"algo3"` AMD
+    (`CliqueTrees.AMD()`), `"algo4"` ND (Metis extension, `NotSupportedError` without it),
+    `"algo1"/"algo2"` AMD on the symmetric pattern (setparam! already warns), `"default"` evaluates AMD
+    and ND (if loaded) and keeps the lower cost. Keyword `alg = :mmd` reaches `CliqueTrees.MMD()` (no cuDSS
+    spelling). `T` complex multiplies the reported flops by 4.
+  - `ext/SparseDirectSolverMetisExt.jl` (weakdep `Metis`): sets `ND_PROVIDER` to a function returning
+    `CliqueTrees.METIS(ufactor = nd_ubfactor)`.
+  - Nothing new is exported (the symbolic layer is internal, like the dense layer).
+  - Tests: `test/test_symbolic_etree.jl`; `test/runtests.jl` loads `Metis` (added to `test/Project.toml`).
+- New dependencies:
+  - `AMD` (hard dep, compat `0.5`): `CliqueTrees.AMD()` throws "`import AMD` to use algorithm AMD" unless
+    AMD.jl is loaded (it is CliqueTrees' `AMDExt`); AMD.jl only wraps SuiteSparse_jll, already a dependency
+    of SparseArrays.
+  - `Metis` (weakdep + extension, compat `1`; test dependency): ND orderings as planned.
+- Tests: `SDS_TEST_GPU=0 julia --project=. -e 'using Pkg; Pkg.test()'` (Julia 1.13.1, ubuntu-latest, CPU):
+  21060 pass / 0 fail / 0 broken (test_symbolic_etree: 1047, 6–13 s). Julia 1.10.10,
+  `test_symbolic_etree` + `test_aqua`: 1057 pass. CUDA/AMDGPU: pending CI on the PR (the new tests are
+  host-only and do not touch a GPU).
+- Measurements (ubuntu-latest, Julia 1.13, `"default"` after a warm-up; times include both candidates and
+  their etree/colcount evaluation; pattern = `SymmetricPattern` from a `CSR`):
+
+  ```text
+  matrix            n      pattern  default  chosen | AMD nnz(L)  flops   levels | ND nnz(L)  flops   levels
+  lap2d 300×300   90000  14–94 ms 338 ms   nd     |  2 928 059  4.67e8  1997  |  2 465 905  3.49e8   863
+  lap3d 40³       64000  10–96 ms 381 ms   nd     | 20 614 676  3.27e10 6178  | 14 387 160  1.62e10 3311
+  lap2d 50×50      2500   0.3 ms   5.9 ms   amd    |     35 913  1.04e6   249  |     40 203  1.32e6   139
+  lap3d 12³        1728   0.2 ms   6.2 ms   nd     |     76 038  8.54e6   376  |     62 653  5.19e6   241
+  random_spd 2000  2000   0.6 ms    12 ms   amd    |    489 460  2.96e8   966  |    573 264  3.60e8  1058
+  kkt 3000+1000    4000   1.8 ms    29 ms   amd    |  2 111 983  2.77e9  2028  |  2 625 611  3.80e9  2298
+  ```
+
+  (pattern times varied between two runs, GC.) AMD alone: 20 ms (lap2d 300²), 46 ms (lap3d 40³); METIS: 280 ms / 420 ms; etree + colcounts: 10–16 ms.
+  `levels` here is the height of the column elimination tree (before supernodes, T06).
+- Deviations from PLAN.md / this task:
+  - `nd_nlevels`: ND is `METIS_NodeND` (`CliqueTrees.METIS(ufactor = nd_ubfactor)`), which has no level
+    parameter; `nd_nlevels` is read as cuDSS documents it, a *minimum* number of dissection levels, which
+    NodeND's full recursion meets whenever the graph is large enough. I first used CliqueTrees'
+    level-capped `ND{3}(AMD(), METISND(); level = nd_nlevels)`; it was 4–13× slower than NodeND and gave
+    more fill than AMD (lap2d 300²: 4.50 M vs NodeND 2.47 M; lap3d 40³: 23.8 M vs 14.4 M), so I dropped it.
+    `nd_nlevels` becomes meaningful with the partition-tree export (T24).
+  - `view`/`index` refer to the *stored* CSR arrays (cuDSS semantics; MadNLP passes CSC as CSR with `'U'`).
+    `SymmetricPattern` ignores `CSR.transposed` (same pattern either way); `full_pattern_map` describes
+    the stored matrix and leaves `transposed` to the solver (`solve_mode`, T16).
+  - `"G"` with view `'L'`/`'U'` raises `InvalidValueError` (no silent fallback).
+  - The random symmetric patterns of the etree test come from the existing `random_symindef(n, density)`
+    with densities 0.02–0.4; odd trials use a random permutation, even ones the natural order.
+  - `compute_ordering` takes an extra `alg` keyword (MMD has no `reordering_alg` spelling).
+- Open issues / follow-ups:
+  - `max_lu_nnz` is not checked yet: it needs the post-amalgamation `lu_nnz` (T06/T07).
+  - Analysis copies `rowptr`/`colval` to the host (`Array(...)`) once; that is the planned phase boundary.
+  - The cost model keeps AMD on the KKT and random matrices (lower flops and fewer levels there) and ND on
+    the big Laplacians; the `nlevels/n` term is small for these sizes, so the choice is flop-driven. T06
+    should revisit it with supernodal levels (the number of launches) instead of column-etree height.
+  - `FullPatternMap.src` indexes the first batch member; T16 adds `(k - 1) * nnz` per member.
+- Suggested plan changes:
+  - PLAN §2.3 step 2: name AMD.jl as a dependency (CliqueTrees' AMD needs it) and state that ND is
+    `METIS_NodeND` with `nd_nlevels` as a minimum.
 
 ---
 

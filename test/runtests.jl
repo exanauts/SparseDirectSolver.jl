@@ -9,6 +9,7 @@ using SparseArrays
 using Aqua
 using KernelAbstractions
 using SparseDirectSolver
+using Metis  # activates SparseDirectSolverMetisExt (nested-dissection orderings, T05)
 
 const SDS = SparseDirectSolver
 
