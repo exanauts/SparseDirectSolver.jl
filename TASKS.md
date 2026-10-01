@@ -1047,7 +1047,7 @@ obtained on this machine (CUDSS.jl is in `../CUDSS.jl`).
 
 ---
 
-## T08 — CPU reference multifrontal Cholesky (the oracle)   `[ ]`
+## T08 — CPU reference multifrontal Cholesky (the oracle)   `[!]`
 
 **Reads**: PLAN §2.4, §3.9, §7 (oracle).
 
@@ -1073,6 +1073,54 @@ obtained on this machine (CUDSS.jl is in `../CUDSS.jl`).
 * `info` equals the known column for `singular_block_matrix` made non-SPD
   (negate one diagonal entry) and `0` otherwise.
 * Amalgamation on and off give the same solution.
+
+### Report
+
+- Status: [!] (done; minor deviations: `Numeric` type parameters and location, host contribution blocks)
+- What was built (`src/reference/cholesky.jl`, internal like the symbolic layer, nothing exported):
+  - `Numeric{T, VT, VS}`: `factor` (panels, `layout.factor_len`), `d` (`2n`, unused by Cholesky), `stack`
+    (`layout.stack_len`), `stats` (`FRONT_STATS_FIELDS × ns` `Int64`: `npos, nneg, nzero, nperturbed, n2x2, info`
+    per front; Cholesky fills `npos` and the local failed column).
+  - `allocate_numeric(symbolic, T, backend = CPU())`: zero-filled `KernelAbstractions.zeros` buffers on any backend.
+  - `ref_factorize!(numeric, symbolic, nzval | CSR) -> info`: multifrontal LLᵀ/LLᴴ over `snpost`, one dense `f×f`
+    host front per supernode; assembly through `amap_ptr`/`amap_src`/`amap` (negative offset = conjugate),
+    extend-add of the children in `child_list` order through `relind`, then `LAPACK.potrf!`, `BLAS.trsm!`,
+    `BLAS.syrk!`/`herk!`; the first `w` columns go to the panel. `info` = original column (`perm[k]`) of the first
+    failed pivot; the factorization stops there. Structure must be `"SPD"` (real) or `"HPD"`, else
+    `InvalidValueError`; non-BLAS `T` → `NotSupportedError`.
+  - `ref_solve!(X, symbolic, numeric, B)`: permute, supernodal forward (`trsm` + `gemm` scatter) and backward
+    (gather + `gemm` + `trsm`) sweeps, inverse permutation; vectors or `n × nrhs`, `X === B` allowed.
+  - `extract_L(symbolic, numeric)`: `SparseMatrixCSC` of `L` with `P A Pᵀ = L Lᴴ`, `P = symbolic.partition.perm`
+    (supernodal numbering), every stored panel entry (`nnz == nnz_stored`, amalgamation zeros kept); a device
+    `factor` is copied to the host once (for T09).
+  - Tests: `test/test_reference_cholesky.jl`.
+- Tests: `SDS_TEST_GPU=0 julia --project=. -e 'using Pkg; Pkg.test()'` (Julia 1.13.1, ubuntu-latest, CPU):
+  42101 pass / 0 fail / 0 broken (test_reference_cholesky: 385, 22 s). Covered: allocation sizes; `‖PAPᵀ − LLᴴ‖_F/‖A‖_F`
+  ≤ 1e-12 / 1e-5 on `laplacian2d(40,40)`, `random_spd(500,0.01)`, `random_hpd(400,0.02)` (complex); `relres ≤ tol(T)`
+  for `nrhs ∈ {1,5}`, Float64/ComplexF64 within `1e-8` of CHOLMOD, in-place solve; views `'L'`/`'U'`/`'F'` × index
+  `'O'`/`'Z'` give `==` factors; refactorization with new values (and back to the old ones, `==`); `info == j` for
+  `singular_block_matrix` with `A[j,j] = -3` and `= 0`, `0` with `+3`, for default, natural and no-amalgamation
+  analyses, plus a pivot that turns negative only after elimination; amalgamation on/off solutions agree within
+  `tol(T)`; schedules with other regime mixes give `==` factors. Julia 1.10 not run. CUDA/AMDGPU: pending CI on the
+  PR (the new tests are host-only).
+- Measurements (ubuntu-latest, Float64, default analysis, warm, best of 3): lap2d 100² (3407 supernodes,
+  2.6e5 stored) factor 6.1 ms / solve 1.9 ms (CHOLMOD refactor 5.4 ms); lap3d 20³ (1380, 9.6e5) 89 ms / 1.8 ms
+  (CHOLMOD 19 ms); random_spd(2000, 0.002) (254, 5.7e5) 61 ms / 0.7 ms (CHOLMOD 12 ms). The oracle allocates a dense
+  front per supernode and is not meant to be fast.
+- Deviations from PLAN.md / this task:
+  - `Numeric` has a third type parameter `VS` for the `Int64` statistics vector (PLAN §3.2 lists `Numeric{T, VT}`).
+  - `Numeric` lives in `src/reference/cholesky.jl` as the task says (PLAN §4 puts it in `types.jl`); it can move
+    when `src/numeric/` exists (T09).
+  - The reference keeps contribution blocks in host matrices, not on `numeric.stack`: regime-A blocks have no stack
+    slot in the layout, and the oracle should not depend on the schedule. It ignores regimes entirely.
+  - `info` is the first failed pivot in factor-column order (supernodal numbering, = postorder processing order),
+    reported as the original column; later panels stay zero. Since columns increase along `snpost`, this equals the
+    minimum failed factor column, which is what a device reduction (T09) can compute.
+- Open issues / follow-ups:
+  - T09 needs a device-side `info` reduction matching "smallest failed factor column"; fronts above a failed front
+    are computed from garbage there, but their columns are larger, so the minimum is unaffected.
+  - `stats` layout (`FRONT_STATS_FIELDS` per front, column-major by front) is fixed here; T14 fills the LDLᵀ fields.
+- Suggested plan changes: none.
 
 ---
 
