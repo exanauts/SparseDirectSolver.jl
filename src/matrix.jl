@@ -210,6 +210,10 @@ mutable struct MatrixDescriptor{T, A <: AbstractArray{T}}
     ncols::Int
     nbatch::Int
     transposed::Bool
+    # Explicit inner constructor: the implicit outer one leaves `T` unbound for `data = nothing`.
+    function MatrixDescriptor{T, A}(data, nrows, ncols, nbatch, transposed) where {T, A <: AbstractArray{T}}
+        return new{T, A}(data, nrows, ncols, nbatch, transposed)
+    end
 end
 
 function _check_descriptor_sizes(m, n, nb)

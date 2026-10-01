@@ -123,7 +123,11 @@ end
     @test pointer(dA2.nzVal) == pointer(dA.nzVal)
     @test SparseMatrixCSC(CSR(dA2)) == A
     Bz = to_backend(A, backend; index = 'Z')
-    @test SparseMatrixCSC(CuSparseMatrixCSR(Bz)) == A   # rebased copy
+    # rebased copy; read back through CSR because cuSPARSE's own
+    # `SparseMatrixCSC(::CuSparseMatrixCSR{T,Int64})` returns invalid Int32 buffers
+    dz = CuSparseMatrixCSR(Bz)
+    @test dz isa CuSparseMatrixCSR{T, INT}
+    @test SparseMatrixCSC(CSR(dz)) == A
     Bd = to_backend(A, backend)
     @test Bd.rowptr isa CuVector{INT}
     @test SparseMatrixCSC(Bd) == A

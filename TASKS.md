@@ -275,6 +275,9 @@ so the **Report** block at the end of each task must be filled in honestly.
   1884 pass / 0 fail / 0 broken (test_matrix alone: 962). The CUDA extension was checked to load
   and define its methods in a scratch environment with CUDA.jl 6 (no GPU, `CUDA.functional() == false`).
   CUDA/AMDGPU: pending CI on the PR.
+  CI fix round 1: `test_aqua` + `test_matrix` also pass on Julia 1.10.12 (972 / 0 / 0); the Aqua
+  unbound-type-parameter failure on 1.10 (implicit `MatrixDescriptor` constructor with
+  `data = nothing`) is fixed with an explicit inner constructor.
 - Measurements: none asked.
 - Deviations from PLAN.md / this task:
   - `size`, `nnz` and `SparseMatrixCSC(::CSR)` describe the *stored* CSR matrix; the `transposed`
@@ -296,6 +299,8 @@ so the **Report** block at the end of each task must be filled in honestly.
   - No ROCm adapters (`CSR(::ROCSparseMatrixCSR)`) until T23; on the `amdgpu` runner the generic
     `to_backend`/`MatrixDescriptor` tests run on ROCm through `KernelAbstractions.allocate`.
   - `SparseMatrixCSC(::CSR)` on a device copies arrays to the host; it is a test/debug helper only.
+  - cuSPARSE's own `SparseMatrixCSC(::CuSparseMatrixCSR{T,Int64})` builds invalid `Int32` buffers
+    (CI round 1); the CUDA test reads device matrices back through `SparseMatrixCSC(CSR(·))`.
 - Suggested plan changes:
   - PLAN §1.1 / T02: decide whether `offsetType` (separate `rowptr` eltype) is needed for v1; if so,
     give `CSR` separate `VP`/`VI` parameters.
