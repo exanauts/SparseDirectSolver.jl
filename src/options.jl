@@ -71,6 +71,12 @@ const AmalgamationParams = @NamedTuple{max_width::Int, zero_fraction::Float64, m
 
 const DEFAULT_AMALGAMATION = AmalgamationParams((32, 0.25, 8))
 
+# regime A local-memory budgets (bytes): 16, 32 and 48 KiB (PLAN §2.3 step 5)
+const DEFAULT_SUBTREE_BUDGETS = [16 * 1024, 32 * 1024, 48 * 1024]
+
+# `Options` fields that are analysis tuning knobs, not parameter strings (T07)
+const TUNING_OPTIONS = (:regime_c_width, :regime_c_rows, :subtree_budgets, :memory_budget)
+
 """
     Options(; kwargs...)
 
@@ -110,11 +116,20 @@ defaults below. Keyword arguments are applied through [`setparam!`](@ref), so
 | `factor_precision` | `nothing` | factors in the input precision |
 | `amalgamation` | `(max_width = 32, zero_fraction = 0.25, min_width = 8)` | |
 | `schedule` | `SCHEDULE_AUTO` | |
+| `regime_c_width` | `64` | fronts wider than this go to regime C (vendor dense calls) |
+| `regime_c_rows` | `512` | fronts with more rows than this go to regime C |
+| `subtree_budgets` | `[16384, 32768, 49152]` | regime A local-memory budgets in bytes; empty disables regime A |
+| `memory_budget` | `-1` | update-stack bytes per level chunk (negative: no limit, no chunking) |
 | `user_perm`, `user_schur_indices`, `user_nd_partition_tree`, `ubatch_mask`, `pivot_sign` | `nothing` | not provided |
 | `user_host_interrupt` | `nothing` | not provided |
 
 Vectors are stored as host copies; `user_host_interrupt` is stored by reference
 because it is polled while a phase runs.
+
+The last four rows are analysis tuning knobs of the schedule (PLAN §2.3 step 5,
+TASKS T07). They are not cuDSS parameter strings, so [`setparam!`](@ref) does not
+know them; set them with `Options(; regime_c_width = 128)` (validated) or by
+assigning the field.
 """
 mutable struct Options
     # configuration parameters of CUDSS.jl (PLAN §1.3)
@@ -147,6 +162,11 @@ mutable struct Options
     factor_precision::Union{Nothing, DataType}
     amalgamation::AmalgamationParams
     schedule::ScheduleKind
+    # analysis tuning knobs of the schedule (T07; not parameter strings)
+    regime_c_width::Int
+    regime_c_rows::Int
+    subtree_budgets::Vector{Int}
+    memory_budget::Int64
     # user-provided data parameters (inputs of the phases)
     user_perm::Union{Nothing, Vector{Int}}
     user_schur_indices::Union{Nothing, Vector{Int}}
@@ -161,10 +181,15 @@ mutable struct Options
             0, 0, 0.0, PIVOT_AUTO, 0.01, nothing, PIVOT_EPSILON_DEFAULT, -1,
             0, 0, 1, 0, 0, 10, 0, -1, 1, 0, 0, -1,
             IR_PLAIN, nothing, DEFAULT_AMALGAMATION, SCHEDULE_AUTO,
+            64, 512, copy(DEFAULT_SUBTREE_BUDGETS), -1,
             nothing, nothing, nothing, nothing, nothing, nothing,
         )
         for (name, value) in kwargs
-            setparam!(opts, String(name), value)
+            if name in TUNING_OPTIONS
+                setfield!(opts, name, _parse_tuning(Val(name), value))
+            else
+                setparam!(opts, String(name), value)
+            end
         end
         return opts
     end
@@ -428,6 +453,22 @@ end
 function _parse_option(::Val{:user_host_interrupt}, value, _)
     (value === nothing || value isa Threads.Atomic{Bool}) && return value
     throw(_invalid("user_host_interrupt", value, "a Threads.Atomic{Bool} or nothing"))
+end
+
+# tuning knobs (keywords of `Options`, not parameter strings)
+for field in (:regime_c_width, :regime_c_rows)
+    @eval _parse_tuning(::Val{$(QuoteNode(field))}, value) =
+        _parse_int($(String(field)), value, 1, typemax(Int), "an integer ≥ 1")
+end
+
+_parse_tuning(::Val{:memory_budget}, value) =
+    Int64(_parse_int("memory_budget", value, typemin(Int64), typemax(Int64), "an integer (negative: no limit)"))
+
+function _parse_tuning(::Val{:subtree_budgets}, value)
+    expected = "a vector of positive byte counts (empty: no regime A)"
+    (value isa AbstractVector || value isa Tuple) || throw(_invalid("subtree_budgets", value, expected))
+    all(x -> x isa Integer && x > 0, value) || throw(_invalid("subtree_budgets", value, expected))
+    return sort!(unique!(Vector{Int}(collect(value))))
 end
 
 # --- value formatting (stored value -> value returned by getparam) -------------

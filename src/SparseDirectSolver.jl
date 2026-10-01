@@ -44,5 +44,8 @@ include("symbolic/pattern.jl")
 include("symbolic/etree.jl")
 include("symbolic/ordering.jl")
 include("symbolic/supernodes.jl")
+include("symbolic/schedule.jl")
+include("symbolic/layout.jl")
+include("symbolic/maps.jl")
 
 end # module SparseDirectSolver
