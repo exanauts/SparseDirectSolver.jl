@@ -565,9 +565,10 @@ obtained on this machine (CUDSS.jl is in `../CUDSS.jl`).
   - `bench/matrices.jl` has its own Laplacian generators (the bench env cannot include the test helpers);
     the smoke test checks they equal `test/matrices.jl`'s `laplacian2d`/`laplacian3d`.
 - Open issues / follow-ups:
-  - Owner: run the cuDSS baseline on the RTX 4080 and record it; `flops` via `CUDSS_DATA_FLOPS` (read
-    as a `Float64`) and the cudss closures are untested here. If `flops` comes back empty, check the
-    data type cuDSS uses for it.
+  - Owner: run the cuDSS baseline on the RTX 4080 and record it (tracked in #40); `flops` via
+    `CUDSS_DATA_FLOPS` (read as a `Float64`) and the cudss closures are untested here. A value that is
+    not a plausible double (wrong size written, non-finite or < 1) is recorded as empty and a one-time
+    warning prints it reinterpreted as `Int64`, so a wrong data type shows up on the first GPU run.
   - The condensed case118 KKTs are badly conditioned at late iterations (CHOLMOD relres 4e-2 at
     iteration 20 without refinement); cuDSS comparisons on condensed systems should report the residual
     after refinement (T16) as well.
