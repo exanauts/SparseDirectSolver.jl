@@ -1,0 +1,224 @@
+name: Claude pipeline
+
+# Drives task PRs (label `claude:pr`) to merge, unattended:
+#   * CI failed on the PR head          -> Claude Opus 5.5 fixes it (max 3 rounds, then `needs-owner`)
+#   * CI green + reviewer VERDICT: APPROVE -> squash-merge, then start the next task issue
+# Pause everything with the repository variable CLAUDE_AUTOPILOT=false, or label the next task
+# issue `on-hold`. See AGENTS.md, section "GitHub workflow".
+
+on:
+  workflow_run:
+    workflows: ["Run tests", "Aqua", "Claude review"]
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: write
+  id-token: write
+
+concurrency:
+  group: claude-pipeline-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+
+env:
+  HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+  MAX_ROUNDS: 3
+
+jobs:
+  resolve:
+    if: github.event.workflow_run.event == 'pull_request' && vars.CLAUDE_AUTOPILOT != 'false'
+    runs-on: ubuntu-latest
+    outputs:
+      pr: ${{ steps.pr.outputs.pr }}
+      head_ref: ${{ steps.pr.outputs.head_ref }}
+      title: ${{ steps.pr.outputs.title }}
+      eligible: ${{ steps.pr.outputs.eligible }}
+      ci_failed: ${{ steps.ci.outputs.ci_failed }}
+      all_green: ${{ steps.ci.outputs.all_green }}
+      verdict: ${{ steps.verdict.outputs.verdict }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/scripts
+
+      - name: Find the task PR for this head
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          pr=$(gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/pulls" \
+            --jq '[.[] | select(.state == "open" and .head.sha == "'"$HEAD_SHA"'" and (.labels | map(.name) | index("claude:pr")) and ((.labels | map(.name) | index("needs-owner")) | not))][0]')
+          if [ -z "$pr" ] || [ "$pr" = "null" ]; then
+            echo "No open, current task PR for $HEAD_SHA; nothing to do."
+            echo "eligible=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "eligible=$(jq -r 'if .draft then "false" else "true" end' <<<"$pr")" >> "$GITHUB_OUTPUT"
+          echo "pr=$(jq -r .number <<<"$pr")" >> "$GITHUB_OUTPUT"
+          echo "head_ref=$(jq -r .head.ref <<<"$pr")" >> "$GITHUB_OUTPUT"
+          echo "title=$(jq -r .title <<<"$pr")" >> "$GITHUB_OUTPUT"
+          jq -r '"PR #\(.number) \(.title) on \(.head.ref) draft=\(.draft)"' <<<"$pr"
+
+      - name: Inspect CI on this head
+        id: ci
+        if: steps.pr.outputs.eligible == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_WORKFLOW: ${{ github.event.workflow_run.name }}
+          EVENT_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+        run: |
+          set -euo pipefail
+          ci_failed=false
+          case "$EVENT_WORKFLOW" in "Run tests"|"Aqua") [ "$EVENT_CONCLUSION" = "failure" ] && ci_failed=true ;; esac
+          echo "ci_failed=$ci_failed" >> "$GITHUB_OUTPUT"
+          # Latest run of every CI workflow on this exact head must have concluded successfully.
+          all_green=true
+          for wf in "Run tests" "Aqua"; do
+            c=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$HEAD_SHA&event=pull_request&per_page=50" \
+              --jq '[.workflow_runs[] | select(.name == "'"$wf"'")] | sort_by(.run_number) | last | "\(.status)/\(.conclusion)"')
+            echo "$wf: ${c:-no run}"
+            [ "$c" = "completed/success" ] || all_green=false
+          done
+          echo "all_green=$all_green" >> "$GITHUB_OUTPUT"
+
+      - name: Read the reviewer's verdict for this head
+        id: verdict
+        if: steps.pr.outputs.eligible == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          verdict=$(bash .github/scripts/pr-verdict.sh "${{ steps.pr.outputs.pr }}" "$HEAD_SHA")
+          echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
+          echo "Verdict: ${verdict:-none yet}"
+
+  ci-fix:
+    needs: resolve
+    if: needs.resolve.outputs.eligible == 'true' && needs.resolve.outputs.ci_failed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      PR: ${{ needs.resolve.outputs.pr }}
+      HEAD_REF: ${{ needs.resolve.outputs.head_ref }}
+      RUN_URL: ${{ github.event.workflow_run.html_url }}
+      RUN_ID: ${{ github.event.workflow_run.id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.HEAD_REF }}
+          fetch-depth: 0
+
+      - name: Count CI fix rounds
+        id: rounds
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          n=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR/comments" \
+            --jq '[.[] | select(.body | startswith("CI-FIX round"))] | length')
+          n=$((n + 1))
+          if [ "$n" -gt "$MAX_ROUNDS" ]; then
+            gh pr edit "$PR" --add-label needs-owner
+            gh pr comment "$PR" --body "CI failed again ($RUN_URL) after $MAX_ROUNDS automatic fix rounds; stopping. Labelled \`needs-owner\`."
+            echo "go=false" >> "$GITHUB_OUTPUT"
+          else
+            gh pr comment "$PR" --body "CI-FIX round $n of $MAX_ROUNDS: $RUN_URL failed on $HEAD_SHA; Claude is diagnosing it."
+            echo "go=true" >> "$GITHUB_OUTPUT"
+            echo "round=$n" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: julia-actions/setup-julia@latest
+        if: steps.rounds.outputs.go == 'true'
+        with:
+          version: '1'
+      - uses: julia-actions/cache@v2
+        if: steps.rounds.outputs.go == 'true'
+
+      - name: Instantiate the project and clone the reference repositories
+        if: steps.rounds.outputs.go == 'true'
+        run: |
+          set -euo pipefail
+          julia --project=. -e 'using Pkg; Pkg.instantiate(); Pkg.precompile()'
+          git clone --quiet --depth 1 https://github.com/exanauts/CUDSS.jl ../CUDSS.jl
+          git clone --quiet --depth 1 https://github.com/JuliaSmoothOptimizers/KrylovPreconditioners.jl ../KrylovPreconditioners.jl
+          git config user.name "claude[bot]"
+          git config user.email "claude[bot]@users.noreply.github.com"
+
+      - name: Fix the CI failure with Claude
+        if: steps.rounds.outputs.go == 'true'
+        uses: anthropics/claude-code-action@v1
+        env:
+          CLAUDE_CODE_EFFORT_LEVEL: medium
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          allowed_bots: "claude[bot],github-actions[bot]"
+          claude_args: |
+            --model claude-opus-5-5
+            --effort medium
+            --allowedTools "Bash,Edit,MultiEdit,Write,Read,Glob,Grep,LS,WebFetch"
+          prompt: |
+            You are the implementing agent of exanauts/SparseDirectSolver.jl, running unattended in
+            GitHub Actions. CI failed on pull request #${{ env.PR }} (branch `${{ env.HEAD_REF }}`,
+            checked out): ${{ env.RUN_URL }}. This is CI fix round ${{ steps.rounds.outputs.round }} of ${{ env.MAX_ROUNDS }}.
+
+            Read AGENTS.md. Get the failure with `gh run view ${{ env.RUN_ID }} --log-failed` (and
+            `gh run view ${{ env.RUN_ID }} --json jobs` for the job names: `test-github-cpuonly` is the
+            KA CPU backend on GitHub runners, `test-gpu (… cuda)` and `test-gpu (… amdgpu)` are the
+            self-hosted GPU runners). Root-cause it. Only the KA CPU backend exists here, so a GPU-only
+            failure must be reasoned about from the log and the code; prefer fixes that keep the
+            CPU and GPU paths identical. Never skip, weaken or delete a test to get green; if a test
+            cannot pass for a documented reason, mark it `@test_broken` with a comment and list it in
+            the Report block. If the failure is in the runner itself (no test body ran: checkout,
+            install, runner lost), change nothing and say so in a PR comment.
+            Run `SDS_TEST_GPU=0 julia --project=. -e 'using Pkg; Pkg.test()'` until green, update the
+            Report block in TASKS.md if the change affects it, commit as
+            `<TNN>: fix CI round ${{ steps.rounds.outputs.round }}` (never commit Manifest.toml) and
+            `git push origin ${{ env.HEAD_REF }}`. No rebase, no force-push, no new PR. Finish with one
+            PR comment (`gh pr comment ${{ env.PR }} --body ...`) stating the root cause and the fix.
+
+  merge:
+    needs: resolve
+    if: >-
+      needs.resolve.outputs.eligible == 'true' &&
+      needs.resolve.outputs.all_green == 'true' &&
+      needs.resolve.outputs.verdict == 'APPROVE'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PR: ${{ needs.resolve.outputs.pr }}
+      TITLE: ${{ needs.resolve.outputs.title }}
+    steps:
+      - name: Squash-merge the PR
+        id: merge
+        run: |
+          set -euo pipefail
+          if gh pr merge "$PR" --squash --delete-branch --match-head-commit "$HEAD_SHA"; then
+            echo "merged=true" >> "$GITHUB_OUTPUT"
+          else
+            gh pr edit "$PR" --add-label needs-owner
+            gh pr comment "$PR" --body "CI is green and the reviewer approved, but the merge failed (conflict with \`main\` or a branch rule). Labelled \`needs-owner\`."
+            echo "merged=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Start the next task
+        if: steps.merge.outputs.merged == 'true'
+        run: |
+          set -euo pipefail
+          task=$(sed -nE 's/^(T[0-9]{2}):.*/\1/p' <<<"$TITLE")
+          if [ -z "$task" ]; then echo "PR title has no task id; nothing to chain."; exit 0; fi
+          next=$(printf 'T%02d' $((10#${task#T} + 1)))
+          issue=$(gh issue list --state open --label task --limit 100 --json number,title,labels \
+            --jq '[.[] | select(.title | startswith("'"$next"' — "))][0]')
+          if [ -z "$issue" ] || [ "$issue" = "null" ]; then echo "No open task issue for $next."; exit 0; fi
+          n=$(jq -r .number <<<"$issue")
+          if jq -e '.labels | map(.name) | index("on-hold") or index("external")' <<<"$issue" >/dev/null; then
+            echo "Issue #$n ($next) is on-hold or external; not chaining."; exit 0
+          fi
+          gh issue edit "$n" --add-label claude:implement
+          gh workflow run claude-implement.yml -f issue_number="$n"
+          gh issue comment "$n" --body "Previous task merged in #$PR; the Claude implementer was started for this issue by the pipeline."
+          echo "Started $next (#$n)."

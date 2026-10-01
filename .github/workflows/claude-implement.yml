@@ -1,0 +1,139 @@
+name: Claude implement
+
+# Implements one task issue (label `task`, title `TNN — …`) with Claude Opus 5.5 at
+# effort "medium" and opens a PR. Started by adding the label `claude:implement` to
+# the issue, or by the Claude pipeline (workflow_dispatch) after the previous task
+# merged. See AGENTS.md, section "GitHub workflow".
+
+on:
+  issues:
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: Number of the task issue to implement
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: read
+  id-token: write
+
+concurrency:
+  group: claude-implement
+  cancel-in-progress: false
+
+jobs:
+  implement:
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'claude:implement'
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      ISSUE: ${{ github.event.inputs.issue_number || github.event.issue.number }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check that the issue is the next task
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          issue=$(gh issue view "$ISSUE" --json number,title,state,labels,milestone)
+          title=$(jq -r .title <<<"$issue")
+          state=$(jq -r .state <<<"$issue")
+          labels=$(jq -r '[.labels[].name] | join(",")' <<<"$issue")
+          milestone=$(jq -r '.milestone.title // ""' <<<"$issue")
+          fail() { gh issue comment "$ISSUE" --body "Claude implement did not start: $1"; echo "go=false" >> "$GITHUB_OUTPUT"; exit 0; }
+          task=$(sed -nE 's/^(T[0-9]{2}) — .*/\1/p' <<<"$title")
+          [ -n "$task" ] || fail "the title does not start with \`TNN — \`."
+          [ "$state" = "OPEN" ] || fail "the issue is not open."
+          case ",$labels," in *,task,*) ;; *) fail "the issue has no \`task\` label.";; esac
+          case ",$labels," in *,on-hold,*) fail "the issue is \`on-hold\`.";; esac
+          num=$((10#${task#T}))
+          if [ "$num" -gt 1 ]; then
+            prev=$(printf 'T%02d' $((num - 1)))
+            prev_state=$(gh issue list --state all --label task --limit 100 --json title,state \
+              --jq ".[] | select(.title | startswith(\"$prev — \")) | .state")
+            [ "$prev_state" = "CLOSED" ] || fail "the previous task $prev is not closed (state: ${prev_state:-not found})."
+          fi
+          open_pr=$(gh pr list --state open --limit 100 --json headRefName --jq "[.[] | select(.headRefName | startswith(\"task/$task-\")) | .headRefName] | first // \"\"")
+          [ -z "$open_pr" ] || fail "an open PR already exists on branch \`$open_pr\`."
+          echo "go=true" >> "$GITHUB_OUTPUT"
+          echo "task=$task" >> "$GITHUB_OUTPUT"
+          echo "milestone=$milestone" >> "$GITHUB_OUTPUT"
+          echo "Implementing $task ($title), milestone '$milestone'"
+
+      - uses: julia-actions/setup-julia@latest
+        if: steps.guard.outputs.go == 'true'
+        with:
+          version: '1'
+      - uses: julia-actions/cache@v2
+        if: steps.guard.outputs.go == 'true'
+
+      - name: Instantiate the project and clone the reference repositories
+        if: steps.guard.outputs.go == 'true'
+        run: |
+          set -euo pipefail
+          julia --project=. -e 'using Pkg; Pkg.instantiate(); Pkg.precompile()'
+          git clone --quiet --depth 1 https://github.com/exanauts/CUDSS.jl ../CUDSS.jl
+          git clone --quiet --depth 1 https://github.com/JuliaSmoothOptimizers/KrylovPreconditioners.jl ../KrylovPreconditioners.jl
+          git config user.name "claude[bot]"
+          git config user.email "claude[bot]@users.noreply.github.com"
+
+      - name: Implement the task with Claude
+        if: steps.guard.outputs.go == 'true'
+        uses: anthropics/claude-code-action@v1
+        env:
+          CLAUDE_CODE_EFFORT_LEVEL: medium
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          allowed_bots: "claude[bot],github-actions[bot]"
+          claude_args: |
+            --model claude-opus-5-5
+            --effort medium
+            --allowedTools "Bash,Edit,MultiEdit,Write,Read,Glob,Grep,LS,WebFetch"
+          prompt: |
+            You are the implementing agent of exanauts/SparseDirectSolver.jl, running unattended in
+            GitHub Actions. Nobody can answer questions: decide, and document the decision in the Report.
+
+            TASK: ${{ steps.guard.outputs.task }} — GitHub issue #${{ env.ISSUE }} (milestone "${{ steps.guard.outputs.milestone }}").
+
+            Read AGENTS.md first (all of it, including "GitHub workflow"), then the "Session protocol"
+            of TASKS.md, the task's own section, the PLAN.md sections it names, and the Report blocks
+            of the previous tasks. Do exactly this one task.
+
+            Environment: ubuntu-latest, Julia 1 on PATH, the project is instantiated, only the
+            KernelAbstractions CPU backend exists here (no GPU, CUDA.jl is not installed). The
+            CUDA/AMDGPU results come from CI on the pull request. Reference checkouts (read-only):
+            ../CUDSS.jl and ../KrylovPreconditioners.jl.
+
+            Steps:
+            1. You are on `main`. Create the branch `task/${{ steps.guard.outputs.task }}-<short-slug>`.
+            2. Implement the task. Iterate with
+               `SDS_TEST_GPU=0 SDS_TEST_ONLY="<files>" julia --project=. -e 'using Pkg; Pkg.test()'`
+               and finish with the full `SDS_TEST_GPU=0 julia --project=. -e 'using Pkg; Pkg.test()'`.
+               Never weaken, skip or delete tests to get green.
+            3. In TASKS.md set the task's status marker and fill in its Report block (template at the
+               top of the file). Under "Tests" give the CPU counts you measured and write
+               "CUDA/AMDGPU: pending CI on the PR". Do not edit PLAN.md or other tasks.
+            4. Bugs or follow-ups outside the task's scope: open an issue with
+               `gh issue create --label found-by-agent --title "..." --body "..."` (fields in
+               .github/ISSUE_TEMPLATE/agent-finding.md) and cite it in the Report. Do not fix them silently.
+            5. Commit with a message starting with `${{ steps.guard.outputs.task }}: ` (never commit
+               Manifest.toml), then `git push -u origin <branch>`.
+            6. Open the pull request:
+               `gh pr create --title "${{ steps.guard.outputs.task }}: <summary>" --label claude:pr --milestone "${{ steps.guard.outputs.milestone }}" --body "<body>"`
+               following .github/pull_request_template.md. The body must contain the exact line
+               `Closes #${{ env.ISSUE }}`.
+            7. If you cannot finish, still push and open the PR as a draft (`--draft`) with the state
+               described honestly in the body and the Report, and label the issue `needs-owner`
+               (`gh issue edit ${{ env.ISSUE }} --add-label needs-owner`).
+
+            A Claude reviewer reviews the PR and CI runs the GPU suites; the pipeline merges when both pass.
