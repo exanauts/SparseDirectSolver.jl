@@ -98,8 +98,10 @@ GPU-tuned relaxed amalgamation (Ashcraft–Grimes) of the *exact* supernodes `sn
 `counts` are in the etree numbering. `params = (max_width, zero_fraction,
 min_width)` is `opts.amalgamation`:
 
-1. supernodes wider than `max_width` are split into a chain of near-equal
-   panels of width `≤ max_width` (no explicit zeros);
+1. the units are the fundamental supernodes themselves. A supernode wider than
+   `max_width` stays whole: it is a dense separator that goes to regime C as a
+   single front; splitting it into a chain of `max_width` panels multiplied the
+   update-stack footprint by the chain length and added tree levels (issue #48);
 2. bottom-up over the supernodal tree, the children `c` of each supernode `p`
    are tried in decreasing order of their off-diagonal row count (the order of
    increasing explicit zeros per column, which merging does not change) and
@@ -123,19 +125,15 @@ function amalgamate(sn::ColumnPartition, parent::AbstractVector{<:Integer}, coun
     (length(parent) == n && length(counts) == n) ||
         throw(InvalidValueError("parent and counts must have length $n"))
     cnt = counts[sn.order]
-    # 1. units: supernodes split into panels of width ≤ max_width (still exact)
+    # 1. units: the exact fundamental supernodes; `max_width` only caps merging (step 2)
     uptr = Int[1]
     for s in 1:nsupernodes(sn)
         first, last = sn.super_ptr[s], sn.super_ptr[s + 1] - 1
-        w = last - first + 1
         for j in first:last
             cnt[j] == cnt[first] - (j - first) ||
                 throw(InvalidValueError("amalgamate needs exact supernodes; supernode $s has a padded column $j"))
         end
-        nchunks = cld(w, max_width)
-        for c in 1:nchunks
-            push!(uptr, first + (c * w) ÷ nchunks)
-        end
+        push!(uptr, last + 1)
     end
     nu = length(uptr) - 1
     par = _relabel_parent(parent, sn.order)

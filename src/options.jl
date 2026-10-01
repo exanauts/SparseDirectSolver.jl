@@ -64,8 +64,9 @@ default_pivot_epsilon(::Type{Complex{R}}) where {R <: Union{Float32, Float64}} =
     AmalgamationParams
 
 Type of the `"amalgamation"` parameter: `(max_width, zero_fraction, min_width)`,
-the relaxed-amalgamation limits of PLAN §2.3 step 4 (maximum panel width,
-maximum fraction of explicit zeros added to the factor, target minimum width).
+the relaxed-amalgamation limits of PLAN §2.3 step 4 (maximum width of a
+*merged* panel; a fundamental supernode wider than that stays whole, maximum
+fraction of explicit zeros added to the factor, target minimum width).
 """
 const AmalgamationParams = @NamedTuple{max_width::Int, zero_fraction::Float64, min_width::Int}
 

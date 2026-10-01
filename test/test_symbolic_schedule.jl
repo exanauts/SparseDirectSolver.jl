@@ -297,7 +297,11 @@ end
     println("  nlaunches laplacian2d(100, 100) AMD: $nA with regime A ($(SDS.nsubtrees(S.schedule)) subtrees), ",
             "$n0 without; ", S.schedule)
     @test nA < n0
-    @test n0 == length(S0.schedule.groups)                          # no regime C on this matrix
+    # the top separator (about 100 columns) is one regime-C front since wide
+    # fundamental supernodes stay whole (issue #48): its vendor calls add launches
+    sc0 = S0.schedule
+    extra = sum(SDS._c_front_launches(sc0.rows[s], sc0.width[s]) for s in 1:length(sc0.regime) if sc0.regime[s] == SDS.REGIME_C; init = 0)
+    @test n0 == length(sc0.groups) + extra
 end
 
 @testset "adapt: $(backend_name(backend)) $INT" for backend in BACKENDS, INT in INTTYPES
@@ -321,4 +325,29 @@ end
     @test SDS.memory_estimates(Sd, Float64)[10] == SDS.device_map_bytes(S, INT)
     # offsets that do not fit the index type
     @test thrown(() -> SDS.adapt(backend, S, Int8)) isa InvalidValueError
+end
+
+@testset "update stack vs factor (issue #48)" begin
+    # Regression guard for the update-stack high-water mark relative to the
+    # factor. Keeping wide fundamental supernodes whole (no chain of max_width
+    # panels) brought the KKT ratio from 7.8 to 5.6 (T07 Report vs this test);
+    # the random SPD ratio is unchanged (6.4). The remaining excess is the level
+    # schedule itself: every contribution block of a level stays live until its
+    # parent's step, so a wide level with many fan-in children holds all their
+    # full m×m blocks at once. That part is tracked in issue #48 (schedule- or
+    # parent-chunked consumption, packed blocks). Bounds are just above the
+    # measured values so a regression shows up; print the values for the Report.
+    # The random generators depend on the RNG state left by the preceding
+    # testsets, which differs with the backend list (CI measured 5.6-6.2 on the
+    # KKT matrix and 6.1-6.5 on the random one), so reseed here.
+    Random.seed!(666)
+    for (name, A, bound) in (("kkt_matrix(3000, 1000)", kkt_matrix(3000, 1000, 1.0e-8), 7.0),
+                             ("random_spd(2000, 0.002)", random_spd(2000, 0.002), 7.5),
+                             ("laplacian2d(100, 100)", laplacian2d(100, 100), 1.0))
+        S = SDS.symbolic_analysis(SDS.CSR(A), "S", 'L'; opts = Options(reordering_alg = "algo3"))
+        ratio = S.layout.stack_len / S.layout.factor_len
+        println("  update stack / factor on $name (AMD): $(round(ratio; digits = 2))")
+        @test ratio <= bound
+        check_schedule(S)
+    end
 end
