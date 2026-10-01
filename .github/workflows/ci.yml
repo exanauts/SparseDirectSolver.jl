@@ -41,7 +41,9 @@ jobs:
         os: [ubuntu-latest]
         julia-version: ['lts', '1']
         julia-arch: [x64]
-        backend: ['cuda', 'amdgpu']
+        # 'amdgpu' is disabled until the AMDGPU extension exists (T23); add it
+        # back here and to the required checks of the branch ruleset.
+        backend: ['cuda']
     runs-on: [self-hosted, linux, X64, gpu, '${{ matrix.backend }}']
 
     steps:
