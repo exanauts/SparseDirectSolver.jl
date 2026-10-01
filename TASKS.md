@@ -627,6 +627,15 @@ obtained on this machine (CUDSS.jl is in `../CUDSS.jl`).
 
 **Reads**: PLAN §2.5, §3.4.
 
+**Owner note (issue #36)**: `Atomix.@atomic` has no complex element types on
+any backend (`capabilities(backend, T).atomic_add` is `false` for `ComplexF32`
+and `ComplexF64`), so the default forward sweep below cannot accumulate complex
+values directly. Decide here, and record the decision in the Report: either
+accumulate into a real view of the RHS with two real atomics per entry (keeps
+one code path; on the CPU backend pass a plain real array, not a
+`ReinterpretArray`, into the kernel), or select the atomic-free variant
+whenever `atomic_add` is `false`. Close #36 in this task's PR.
+
 #### Deliverables
 
 * `src/solve/permute.jl`: `permute_rhs!`, `unpermute_solution!` (strided and
