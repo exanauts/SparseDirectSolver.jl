@@ -882,6 +882,9 @@ obtained on this machine (CUDSS.jl is in `../CUDSS.jl`).
     local per-panel ratio unless the panel is `≤ min_width` wide; `min_width` is a "merge eagerly below"
     threshold, not a guarantee.
 - Open issues / follow-ups:
+  - Owner note: the chain split of wide fundamental supernodes (step 1 of `amalgamate`) was removed after
+    T07 measured its cost (issue #48, PR #50); `max_width` now caps merging only, so "every supernode
+    width ≤ max_width" above and in the task text no longer holds for wide fundamental supernodes.
   - The 25 % budget is exhausted on the 2D Laplacians while most panels stay narrower than 8 (lap2d 100²:
     93 %); bottom-up greedy spends the budget in tree order. A global cheapest-first merge (priority queue)
     or a larger budget for small fronts is a T25 tuning item; the KKT/random matrices reach `w̄ ≈ 6–8`.

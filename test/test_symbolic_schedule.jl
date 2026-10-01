@@ -299,7 +299,9 @@ end
     @test nA < n0
     # the top separator (about 100 columns) is one regime-C front since wide
     # fundamental supernodes stay whole (issue #48): its vendor calls add launches
-    @test n0 >= length(S0.schedule.groups)
+    sc0 = S0.schedule
+    extra = sum(SDS._c_front_launches(sc0.rows[s], sc0.width[s]) for s in 1:length(sc0.regime) if sc0.regime[s] == SDS.REGIME_C; init = 0)
+    @test n0 == length(sc0.groups) + extra
 end
 
 @testset "adapt: $(backend_name(backend)) $INT" for backend in BACKENDS, INT in INTTYPES
