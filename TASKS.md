@@ -896,7 +896,7 @@ obtained on this machine (CUDSS.jl is in `../CUDSS.jl`).
 
 ---
 
-## T07 — Symbolic III: schedule, static layout, device maps   `[ ]`
+## T07 — Symbolic III: schedule, static layout, device maps   `[!]`
 
 **Reads**: PLAN §2.3 steps 5–8, §2.2 (regimes), §3.4.
 
@@ -939,6 +939,111 @@ obtained on this machine (CUDSS.jl is in `../CUDSS.jl`).
   arrays and the round trip to host is identical.
 * `nlaunches` on `laplacian2d(100,100)` with AMD is reported in the Report
   with and without regime A.
+
+### Report
+
+- Status: [!] (done; the regime thresholds and `memory_budget` are `Options` fields but not parameter strings,
+  `"G"` maps deferred to T19, see deviations)
+- What was built (internal like the rest of the symbolic layer, nothing exported):
+  - `src/symbolic/schedule.jl`: `Schedule`, `ScheduleGroup`, `REGIME_A/B/C`, `tree_height(parent)`,
+    `build_schedule(sp, opts, T)`, `nlaunches(schedule)`, `nsubtrees`. `level` = height above the leaves of the
+    supernodal tree. Regime C: `w > regime_c_width (64)` or `f > regime_c_rows (512)`, or every non-A front with
+    `factorization_alg = "algo2"` (`"algo1"` sets `vendor_c = false`: C fronts use the KA tiled path). Regime A:
+    a front is eligible when it is not C, all children are eligible and its subtree's serial multifrontal stack
+    peak (full `f×f` front + the `m×m` blocks waiting on the stack, children visited by decreasing `peak − cb`,
+    Liu's order) fits the largest budget; the maximal eligible subtrees are the regime-A subtrees, each with the
+    smallest budget class (16/32/48 KiB for `T`) holding its peak. `subtree_nodes` stores that processing order.
+    Regime B: bins `(wclass ∈ 8,16,32,64, fclass ∈ 64,…,512)` (extended by powers of two if the thresholds are
+    raised). B/C fronts get a *schedule level* = height counting only B/C fronts (the A subtrees run first,
+    step 0), split into chunks whose produced update-stack bytes stay `≤ memory_budget` (single oversized front =
+    own chunk). Each (level, chunk) is a step; launch groups: A per class, then per step B per bin and one C group.
+    `nlaunches` = 1 per A class + 1 per B group + per C group 1 batched assembly + per front `potrf` (+ `trsm`,
+    `syrk` when it has a CB).
+  - `src/symbolic/layout.jl`: `Layout`, `build_layout(sp, schedule)`. Element offsets, 1-based: panels
+    contiguous col-major `f×w` in supernode order; D buffer `2n` (diagonal at `j`, 2×2 subdiagonal at `n + j`);
+    contribution blocks (full `m×m`, ld `m`) on the update stack only for B/C fronts and A-subtree roots with a
+    parent, alive from their step to their parent's step (inclusive), first-fit allocated over those intervals;
+    `step_top` per step and `stack_len` = high-water mark.
+  - `src/symbolic/maps.jl`: `Symbolic{INT,VI}` (host: `partition`, `schedule`, `layout`, structure/view/index,
+    `elsize`; device maps `DEVICE_MAPS`: `perm`, `iperm`, `super_ptr`, `snparent`, solve gather lists
+    `rowptr`/`rowval`, front descriptors `front_ptr`/`front_nrows`/`front_ncols`/`cb_ptr`, `child_ptr`/`child_list`
+    (owner-pull order), `relind_ptr`/`relind`, `amap` (offset, `−offset` = add the conjugate, `0` = ignored by the
+    view), `amap_ptr`/`amap_src` (amap grouped per supernode, sorted by destination, for deterministic owner-pull
+    assembly with duplicates summed), `subtree_ptr`/`subtree_nodes`, `group_ptr`/`group_nodes`).
+    `relative_indices(sp)`, `assembly_map(...)`, `Symbolic(sp, schedule, layout, rowptr, colval, n, structure;
+    view, index)`, `symbolic_analysis(A::CSR, structure, view; opts, T)` (the whole host analysis),
+    `Adapt.adapt(backend, S, INT)` (overflow-checked, host fields shared), `device_map_bytes`,
+    `memory_estimates(S, T[, INT])` (16 slots; 1–6 follow cuDSS: permanent/peak device, permanent/peak host,
+    hybrid min device, hybrid max host; 7–12: panels, D, update stack, maps, per-front stats, largest regime-A
+    budget; 13–16 zero; documented in the docstring).
+  - `src/options.jl`: `Options` fields `regime_c_width = 64`, `regime_c_rows = 512`,
+    `subtree_budgets = [16384, 32768, 49152]` (bytes; empty disables regime A), `memory_budget = -1` (no limit),
+    settable as `Options(; kw...)` keywords (validated) or by field assignment.
+  - Tests: `test/test_symbolic_schedule.jl`.
+- Tests: `SDS_TEST_GPU=0 julia --project=. -e 'using Pkg; Pkg.test()'` (Julia 1.13.1, ubuntu-latest, CPU):
+  41716 pass / 0 fail / 0 broken (test_symbolic_schedule: 10654, 15 s). Beyond the listed checks: subtree peaks
+  are recomputed by simulating the stack in `subtree_nodes` order, regime A is closed under descendants, bins
+  are the tightest classes, chunk budgets hold, every B/C/A-root CB that must go through global memory has a
+  stack slot with the right lifetime, child lists, the owner-pull grouping reproduces the `amap` scatter,
+  complex-symmetric `"S"` as well as `"H"`, duplicated entries are summed, the reconstruction also with
+  amalgamation off, tiny regime-C thresholds and a 64-byte memory budget, and `adapt` to `Int8` raises
+  `InvalidValueError`. Julia 1.10 not run. CUDA/AMDGPU: pending CI on the PR (the `adapt` testset loops over
+  `BACKENDS` and checks `CuVector{INT}` on CUDA).
+- Measurements (ubuntu-latest; `symbolic_analysis` defaults with AMD/ND forced, `"SPD"`, `T = Float64`;
+  `slev` = schedule levels, `noA` = `subtree_budgets = Int[]`, `stack/fac` = update-stack high-water mark /
+  factor entries, `peak` = `memory_estimates[2]` with `Int32` maps, `t` = whole analysis incl. ordering):
+
+  ```text
+  matrix          ord   ns     A/B/C          subtrees slev launches (noA, slev) stack/fac (noA) peak MB  t
+  lap2d 100²      amd   3407   3338/69/0        91      25     37    ( 89,  45)  0.62 (0.74)    4.7   13 ms
+  lap2d 100²      nd    3616   3559/57/0        70      11     22    ( 72,  32)  0.62 (0.75)    4.7   36 ms
+  lap2d 300²      amd  13734  13002/732/0     1203      74    117    (141,  83)  0.63 (0.68)   58.2  181 ms
+  lap2d 300²      nd   20781  20241/540/0      677      32     61    (133,  48)  0.62 (0.69)   51.7  465 ms
+  lap3d 12³       amd    304    268/36/0        55      15     24    ( 32,  21)  1.83 (1.44)    2.5    3 ms
+  lap3d 30³       amd   4609   3932/530/147    906      91    566    (586,  96)  2.07 (2.13)  150.1   55 ms
+  lap3d 30³       nd    4569   3759/693/117    953      67    457    (468,  70)  1.90 (1.84)  109.5  230 ms
+  kkt 3000+1000   amd    534    341/113/80     311      87    334    (337,  89)  7.81 (8.12)  176.3   66 ms
+  random_spd 2000 amd    253    164/63/26      135      45    132    (132,  47)  6.42 (5.95)   35.1    8 ms
+  ```
+
+  **`nlaunches` on `laplacian2d(100,100)` with AMD: 37 with regime A (91 subtrees in 3 classes, 34 B groups),
+  89 without regime A.** On the KKT/random matrices the launch count is dominated by regime-C fronts (3 vendor
+  calls each), most of them links of the `max_width` chains T06 cuts big separators into.
+- Deviations from PLAN.md / this task:
+  - The regime thresholds, budgets and `memory_budget` are `Options` fields (keywords of `Options(...)`) but not
+    `setparam!` strings: PLAN §1.7 fixes the parameter names beyond cuDSS and `test_options` checks the tables, so
+    I did not add public names. `setparam!(opts, "memory_budget", …)` raises `ArgumentError`.
+  - "per level: lists per bin and per class": the regime-A subtrees are not per level (they all run first, in one
+    launch per budget class), so "per class" lists are step 0. B/C fronts use the schedule level (height over
+    the A subtrees), not the full-tree level, which removes the A levels from the level loop; `level` (full tree
+    height) is kept and tested as asked.
+  - Level chunking bounds the update-stack bytes *produced* per chunk; with everything on the device it does not
+    lower the high-water mark (blocks live until their parent's step), it only splits launches. It becomes a
+    memory lever with hybrid memory (M12).
+  - `amap` encodes conjugation as a negative offset (one `INT` vector); conjugation depends on the permutation
+    (an `'L'` entry can land in the upper triangle of `P A Pᵀ`), not only on `'U'` input. `amap_ptr`/`amap_src`
+    (owner-pull grouping) were added so T09 can assemble without atomics, as PLAN §3.4 requires.
+  - `"G"` (`assembly_map`) raises `NotSupportedError` until T19 adds U panels; the schedule/layout do not depend
+    on the structure.
+  - `factorization_alg = "algo1"` keeps large fronts in regime C with `vendor_c = false` (they cannot fit regime-B
+    local memory), `"algo2"` sends every non-A front to C.
+  - Contribution blocks are stored as full `m×m` squares (vendor `syrk` writes one triangle of a square), and the
+    regime-A peak counts full `f×f` fronts; packing would halve both.
+- Open issues / follow-ups:
+  - #48: the update stack is 5–8× the factor on KKT/random matrices (chain splits of wide supernodes + full-square
+    CBs); see the T06 suggestion on `max_width`.
+  - `max_lu_nnz` is still not enforced (T13 owns phase error reporting; `nnz_stored` and `layout.factor_len` are
+    available).
+  - `memory_estimates` slot 11 (per-front stats, 6 `Int64` per supernode) and slot 3 (`Base.summarysize` of the
+    host data) are estimates; T09/T13 should adjust slot 11 when the stats arrays exist. The data parameter is
+    not wired to `getparam` yet (T13).
+  - The regime-A test of "fits local memory" uses full `f×f` fronts; T11 must allocate `budget ÷ sizeof(T)`
+    entries of `@localmem` per class and process `subtree_nodes` in order with a stack of CBs.
+- Suggested plan changes:
+  - PLAN §1.7 / §2.3 step 5: decide whether the regime thresholds and the memory budget become public parameter
+    strings (e.g. one `"regime_params"` NamedTuple like `"amalgamation"`) or stay internal knobs.
+  - PLAN §2.3 step 6: state that the B/C level loop uses levels counted above the regime-A subtrees and that
+    level chunking only bounds per-chunk bytes until hybrid memory exists.
 
 ---
 
