@@ -452,7 +452,7 @@ so the **Report** block at the end of each task must be filled in honestly.
 
 ---
 
-## T04 — Benchmark harness and cuDSS baselines   `[ ]`
+## T04 — Benchmark harness and cuDSS baselines   `[!]`
 
 **Reads**: PLAN §5 (M0), §7; RESEARCH "Phase 0" and section 2.
 
@@ -485,6 +485,102 @@ so the **Report** block at the end of each task must be filled in honestly.
 
 **Report must include** the baseline table for every matrix that could be
 obtained on this machine (CUDSS.jl is in `../CUDSS.jl`).
+
+### Report
+
+- Status: [!] (harness done and exercised end to end on the CPU; the cuDSS table itself needs a GPU
+  and could not be measured on the implementer runner)
+- What was built:
+  - `bench/Project.toml` (CUDA 6, CUDSS 0.8, MatrixDepot 1, DelimitedFiles, LinearAlgebra, Random,
+    SparseArrays, Statistics; resolves and loads on ubuntu-latest, `CUDA.functional() == false`).
+    MadNLP/ExaModels/ExaModelsPower are not in it (separate `bench/kkt` env, gitignored).
+  - `bench/matrices.jl`, module `BenchMatrices`: `BenchMatrix(name, source, structures, A)`;
+    `generated_matrices()` (`lap2d_300`: n = 90 000, nnz = 448 800; `lap3d_40`: n = 64 000,
+    nnz = 438 400; table `GENERATED`); `suitesparse_matrices()` through MatrixDepot (optional, guarded by
+    `Base.find_package`) for `SUITESPARSE` = `HB/bcsstk17`, `Boeing/bcsstk38`, `GHS_psdef/apache2`
+    (`SPD`,`S`), `Rajat/rajat21`, `TSOPF/TSOPF_RS_b39_c7` (`G`); `dump_matrices(dir)` for
+    `bench/data/kkt_<case>_<kind>_<iter>.{mtx,jld2}` (`k2` → `S`, `condensed` → `SPD`,`S`; `.jld2` needs
+    JLD2, key `"A"`); `dump_name`, `parse_dump_name`, dependency-free `read_mtx`/`write_mtx`,
+    `symmetrize_triangle` (keeps explicit zeros), `bench_matrices(; generated, suitesparse, dumps)`.
+  - `bench/harness.jl`, module `BenchHarness`: `time_phases(make_solver, A, b; nruns = 5, nwarmup = 1,
+    synchronize)` → `(analysis, factorization, refactorization, solve, samples, nruns, lu_nnz, flops,
+    nsuperpanels, relres)` (medians in seconds; `make_solver(A, b)` returns closures `analysis`,
+    `factorization`, `refactorization`, `solve` (returns `x`), optional `stats`); `cholmod_solver(structure)`
+    CPU reference; `CSV_COLUMNS`, `csv_row`, `write_csv`.
+  - `bench/cudss_baseline.jl` (`--solver=cudss|cholmod`, `--nruns`, `--only`, `--no-suitesparse`,
+    `--no-dumps`, `--out`): every matrix × applicable structure, symmetric structures pass the lower
+    triangle with view `'L'`; `lu_nnz`, `nsuperpanels` via `cudss_get`, `flops` via the C API
+    (`cudssDataGet(..., CUDSS_DATA_FLOPS, Ref{Float64})`, CUDSS.jl has no getter); a failing matrix
+    becomes a CSV row with its error as status. Writes `bench/results/<solver>_baseline.csv`.
+  - `bench/report.jl` (Markdown table of the CSVs, ms), `bench/dump_madnlp_kkt.jl`, `bench/README.md`.
+  - `test/test_bench_smoke.jl`; `Statistics` added to `test/Project.toml` (the harness uses `median`).
+- Tests: `SDS_TEST_GPU=0 julia --project=. -e 'using Pkg; Pkg.test()'` (Julia 1.13.1, ubuntu-latest, CPU):
+  20013 pass / 0 fail / 0 broken (test_bench_smoke: 71, 7 s). CUDA/AMDGPU: pending CI on the PR
+  (the smoke test is CPU-only and does not touch the GPU).
+  Scripts run by hand: `dump_madnlp_kkt.jl` without the packages prints the install hint and exits 0;
+  with MadNLP 0.10.1 / ExaModels 0.12.1 / ExaModelsPower 0.3.1 it wrote six case118 dumps (23 s);
+  `cudss_baseline.jl` (cudss) stops with "CUDA is not functional … use --solver=cholmod";
+  `cudss_baseline.jl --solver=cholmod` ran on all 13 matrices (MatrixDepot downloads worked).
+- Measurements:
+  - **cuDSS baseline: not measured** — no GPU on the implementer runner. Run
+    `julia --project=bench bench/cudss_baseline.jl && julia --project=bench bench/report.jl` on the
+    RTX 4080 / `cuda` runner and paste the table here (owner).
+  - CPU reference (`--solver=cholmod`, CHOLMOD supernodal Cholesky for `SPD`, UMFPACK for `G`;
+    ubuntu-latest, 4 cores, 2 BLAS threads; median of 5 after 1 warm-up, ms):
+
+    ```text
+    matrix                         struct       n       nnz  analysis  factor  refactor   solve      lu_nnz  relres
+    lap2d_300                      SPD      90000    448800      19.5    45.0      34.1   7.56     4117190  1.6e-12
+    lap3d_40                       SPD      64000    438400      35.0   383.3     320.8  16.3     22073203  5.9e-14
+    HB/bcsstk17                    SPD      10974    428650      10.3    10.9      10.7   1.08     1124822  3.2e-11
+    Boeing/bcsstk38                SPD       8032    355460      11.0    11.2      11.5   0.73      805686  1.2e-10
+    GHS_psdef/apache2              SPD     715176   4817870     694.6  4666.0    4215.0 194.5    191800254  1.5e-10
+    Rajat/rajat21                  G       411676   1893370   20910.0 11440.0   11210.0  10.3      3176760  3.4e-6
+    TSOPF/TSOPF_RS_b39_c7          G        14098    252446      17.7    11.6      11.6   0.38      298985  1.1e-12
+    kkt_..._case118_ieee_condensed_1  SPD    1088     12860      0.68    0.38      0.32  0.025       11634  3.4e-5
+    kkt_..._case118_ieee_condensed_10 SPD    1088     12860      0.65    0.37      0.30  0.020       11634  1.4e-5
+    kkt_..._case118_ieee_condensed_20 SPD    1088     12860      0.69    0.37      0.30  0.019       11634  4.0e-2
+    kkt_..._case118_ieee_k2_{1,10,20} S      3150     17714   FAILED: ZeroPivotException (CHOLMOD ldlt, no pivoting)
+    ```
+
+    (`S` rows of the SPD matrices were measured once before the skip was added: CHOLMOD `ldlt` is
+    simplicial, lap2d_300 219 ms, lap3d_40 18.8 s factorization; on apache2 it did not finish in 30 min.)
+- Deviations from PLAN.md / this task:
+  - The dump script builds the pglib-opf AC-OPF models with **ExaModelsPower** (`ac_opf_model`, fetches
+    pglib-opf 23.07 through ExaPowerIO) instead of PGLib.jl: PGLib.jl only returns PowerModels data and
+    would need a hand-written ExaModels OPF formulation. Default iterations are 1, 10, 20 (case118
+    converges at 22 (condensed) / 29 (K2), so 30 did not exist); when MadNLP stops earlier the file is
+    named after the actual iteration. The dumped matrix is `kkt.aug_com` after `max_iter = k`, i.e. the
+    last factorized KKT (lower triangle, explicit zeros kept so every iteration has the same pattern).
+  - Unsymmetric SuiteSparse matrices (rajat21, TSOPF_RS_b39_c7) run with structure `G` (neither `SPD`
+    nor `S` applies); `structures` per matrix is in the `SUITESPARSE` table. The SuiteSparse
+    TSOPF_RS_b39_c7 has n = 14 098 (checked on load).
+  - Added a CPU reference solver (`--solver=cholmod`) to the same harness so the harness is exercised
+    without a GPU and PLAN §7's CHOLMOD comparison has a starting point. It skips `S` where `SPD`
+    applies (simplicial `ldlt`), and UMFPACK has no separate analysis in SparseArrays, so its
+    "analysis" is a full `lu` and factorization/refactorization are `lu!`.
+  - A fresh solver object is created (untimed) for every run, so each run times analysis →
+    factorization → refactorization (same values) → solve on a new solver.
+  - The 10×10 Laplacian of the smoke test is the 2-D Laplacian on a 10 × 10 grid (n = 100).
+  - `bench/matrices.jl` has its own Laplacian generators (the bench env cannot include the test helpers);
+    the smoke test checks they equal `test/matrices.jl`'s `laplacian2d`/`laplacian3d`.
+- Open issues / follow-ups:
+  - Owner: run the cuDSS baseline on the RTX 4080 and record it (tracked in #40); `flops` via
+    `CUDSS_DATA_FLOPS` (read as a `Float64`) and the cudss closures are untested here. A value that is
+    not a plausible double (wrong size written, non-finite or < 1) is recorded as empty and a one-time
+    warning prints it reinterpreted as `Int64`, so a wrong data type shows up on the first GPU run.
+  - The condensed case118 KKTs are badly conditioned at late iterations (CHOLMOD relres 4e-2 at
+    iteration 20 without refinement); cuDSS comparisons on condensed systems should report the residual
+    after refinement (T16) as well.
+  - NREL opf_matrices and a CUTEst subset (PLAN M0) are not in the harness yet; the dump loader accepts
+    any `kkt_<case>_<kind>_<iter>.mtx`, other `.mtx` sources need a small loader. MA57 refinement counts
+    (M0) are not measured (no HSL).
+  - Julia 1.13 quirk: `abspath(PROGRAM_FILE) == @__FILE__ && main()` failed to parse as a script in an
+    environment without a `julia` compat entry; the scripts use an `if … end` block instead.
+- Suggested plan changes:
+  - PLAN §5 M0 / T04: name ExaModelsPower (not PGLib.jl) as the source of pglib-opf models for the dumps.
+  - PLAN §7: list the CHOLMOD/UMFPACK CPU reference as part of the harness (`--solver=cholmod`), and
+    note that CHOLMOD `ldlt` is simplicial, so it is not a meaningful LDLᵀ performance reference.
 
 ---
 
