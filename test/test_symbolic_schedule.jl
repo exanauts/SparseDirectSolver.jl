@@ -322,3 +322,21 @@ end
     # offsets that do not fit the index type
     @test thrown(() -> SDS.adapt(backend, S, Int8)) isa InvalidValueError
 end
+
+@testset "update stack vs factor (issue #48)" begin
+    # Before the fix, wide fundamental supernodes were split into chains of
+    # max_width panels and the update-stack high-water mark reached 7.8× the
+    # factor on this KKT matrix and 6.4× on the random SPD one (T07 Report).
+    # With wide supernodes kept whole the contribution blocks are those of the
+    # elimination tree itself; the stack must stay within a small multiple of
+    # the factor, and the 2-D Laplacian ratio must not regress.
+    for (name, A, bound) in (("kkt_matrix(3000, 1000)", kkt_matrix(3000, 1000, 1.0e-8), 2.0),
+                             ("random_spd(2000, 0.002)", random_spd(2000, 0.002), 2.0),
+                             ("laplacian2d(100, 100)", laplacian2d(100, 100), 1.0))
+        S = SDS.symbolic_analysis(SDS.CSR(A), "S", 'L'; opts = Options(reordering_alg = "algo3"))
+        ratio = S.layout.stack_len / S.layout.factor_len
+        println("  update stack / factor on $name (AMD): $(round(ratio; digits = 2))")
+        @test ratio <= bound
+        check_schedule(S)
+    end
+end
