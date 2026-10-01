@@ -99,6 +99,10 @@ jobs:
     needs: resolve
     if: needs.resolve.outputs.eligible == 'true' && needs.resolve.outputs.ci_failed == 'true'
     runs-on: ubuntu-latest
+    # Shared with the review workflow's fix job: never two agents pushing to one branch.
+    concurrency:
+      group: claude-fix-${{ needs.resolve.outputs.head_ref }}
+      cancel-in-progress: false
     timeout-minutes: 240
     env:
       PR: ${{ needs.resolve.outputs.pr }}

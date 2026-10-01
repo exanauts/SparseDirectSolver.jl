@@ -117,6 +117,10 @@ jobs:
     needs: review
     if: needs.review.outputs.verdict == 'CHANGES_REQUESTED'
     runs-on: ubuntu-latest
+    # Shared with the pipeline's ci-fix job: never two agents pushing to one branch.
+    concurrency:
+      group: claude-fix-${{ github.event.pull_request.head.ref }}
+      cancel-in-progress: false
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
