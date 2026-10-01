@@ -111,14 +111,16 @@ end
     end
 end
 
-@testset "wide supernodes are split to max_width" begin
+@testset "wide supernodes stay whole (issue #48)" begin
+    # a dense 100×100 matrix is one fundamental supernode; max_width = 32 caps
+    # merging only and must not split it into a chain of panels
     A = sparse(ones(100, 100) + 100I)
     P = SDS.SymmetricPattern(SDS.CSR(A), "SPD"; view = 'F')
     sp = SDS.supernode_partition(P, 1:100, NO_AMALGAMATION)
     @test SDS.nsupernodes(sp) == 1
     spa = SDS.supernode_partition(P, 1:100, Options())
-    @test SDS.nsupernodes(spa) == 4
-    @test all(s -> SDS.snwidth(spa, s) == 25, 1:4)
+    @test SDS.nsupernodes(spa) == 1
+    @test SDS.snwidth(spa, 1) == 100
     @test spa.nnz_stored == spa.nnz_L == sp.nnz_L
     @test spa.flops == sp.flops
     check_partition(spa, P)
@@ -153,9 +155,10 @@ end
         @test covers_fill(spa, Fa)
         @test spa.nnz_L == sp.nnz_L
         @test spa.nnz_stored <= (1 + prm.zero_fraction) * spa.nnz_L
-        @test all(s -> SDS.snwidth(spa, s) <= prm.max_width, 1:SDS.nsupernodes(spa))
+        # merging never exceeds max_width; a fundamental supernode wider than that stays whole
+        @test all(s -> SDS.snwidth(spa, s) <= max(prm.max_width, maximum(diff(sp.super_ptr))), 1:SDS.nsupernodes(spa))
         @test spa.flops >= SDS.cholesky_flops(counts)
-        @test SDS.nsupernodes(spa) <= SDS.nsupernodes(sp) || prm.max_width < maximum(diff(sp.super_ptr))
+        @test SDS.nsupernodes(spa) <= SDS.nsupernodes(sp)
         check_partition(spa, P)
     end
 end
@@ -179,7 +182,8 @@ end
                 @test sp.flops == ord.stats.flops
                 @test spa.nnz_L == sp.nnz_L
                 @test spa.nnz_stored <= (1 + zf) * spa.nnz_L
-                @test all(s -> SDS.snwidth(spa, s) <= opts.amalgamation.max_width, 1:SDS.nsupernodes(spa))
+                @test all(s -> SDS.snwidth(spa, s) <= max(opts.amalgamation.max_width, maximum(diff(sp.super_ptr))),
+                          1:SDS.nsupernodes(spa))
                 @test spa.flops >= sp.flops
                 @test SDS.nsupernodes(spa) < SDS.nsupernodes(sp)
                 # nnz(L) of the composed permutation agrees with CHOLMOD
