@@ -23,6 +23,7 @@
             dA = to_device(backend, A, INT)
             @test to_host(dA) == A
             @test eltype(dA) == ComplexF64
+            @test index_eltype(dA) == INT   # issue #30: vendor constructors silently use Int32
         end
     end
 end

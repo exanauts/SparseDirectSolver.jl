@@ -66,32 +66,48 @@ sparse matrices.
 to_host(x::AbstractArray) = Array(x)
 to_host(A::SparseMatrixCSC) = copy(A)
 
+"""
+    index_eltype(A)
+
+Index type of a host or device sparse matrix (`Int32` or `Int64`).
+"""
+index_eltype(::SparseMatrixCSC{<:Any, INT}) where {INT} = INT
+
+# The vendor host-to-device sparse constructors do not honour a requested index
+# type: cuSPARSE's `CuSparseMatrixCSR{T, INT}(::SparseMatrixCSC)` and AMDGPU's
+# `ROCSparseMatrixCSR` both upload `Cint` indices (issue #30), and cuSPARSE's
+# `SparseMatrixCSC(::CuSparseMatrixCSR{T, Int64})` fails. So the CSR arrays are
+# built on the host (the CSC of the transpose is the CSR of `A`) and uploaded
+# with the requested type, and the inverse goes the same way.
+host_csr_arrays(A::SparseMatrixCSC{T}, ::Type{INT}) where {T, INT} =
+    (At = SparseMatrixCSC{T, INT}(sparse(transpose(A))); (At.colptr, At.rowval, At.nzval))
+function host_csc(rowptr, colval, nzval::AbstractVector{T}, m, n) where {T}
+    At = SparseMatrixCSC{T, Int}(n, m, Array{Int}(rowptr), Array{Int}(colval), Array{T}(nzval))
+    return SparseMatrixCSC{T, Int}(sparse(transpose(At)))
+end
+
 if CUDA_LOADED
     backend_name(::CUDABackend) = "CUDA"
     to_device(::CUDABackend, x::Array) = CuArray(x)
-    to_device(::CUDABackend, A::SparseMatrixCSC) = CuSparseMatrixCSR(A)
-    to_device(::CUDABackend, A::SparseMatrixCSC{T}, ::Type{INT}) where {T, INT} = CuSparseMatrixCSR{T, INT}(A)
-    to_host(A::CuSparseMatrixCSR) = SparseMatrixCSC(A)
+    to_device(backend::CUDABackend, A::SparseMatrixCSC{T, INT}) where {T, INT} = to_device(backend, A, INT)
+    function to_device(::CUDABackend, A::SparseMatrixCSC{T}, ::Type{INT}) where {T, INT}
+        rowptr, colval, nzval = host_csr_arrays(A, INT)
+        return CuSparseMatrixCSR{T, INT}(CuVector{INT}(rowptr), CuVector{INT}(colval), CuVector{T}(nzval), size(A))
+    end
+    to_host(A::CuSparseMatrixCSR) = host_csc(A.rowPtr, A.colVal, A.nzVal, size(A)...)
+    index_eltype(A::CuSparseMatrixCSR) = eltype(A.rowPtr)
 end
 
 if AMDGPU_LOADED
     backend_name(::ROCBackend) = "ROCm"
     to_device(::ROCBackend, x::Array) = ROCArray(x)
-    # AMDGPU.jl converts host indices to Cint eagerly and has no
-    # `ROCSparseMatrixCSR{T, INT}(::SparseMatrixCSC)`, so the CSR arrays are
-    # built on the host (CSC of the transpose) and uploaded with the requested
-    # index type; the inverse goes the same way, without rocSPARSE.
     to_device(backend::ROCBackend, A::SparseMatrixCSC{T, INT}) where {T, INT} = to_device(backend, A, INT)
     function to_device(::ROCBackend, A::SparseMatrixCSC{T}, ::Type{INT}) where {T, INT}
-        At = SparseMatrixCSC{T, INT}(sparse(transpose(A)))
-        return ROCSparseMatrixCSR{T, INT}(ROCVector{INT}(At.colptr), ROCVector{INT}(At.rowval),
-                                          ROCVector{T}(At.nzval), size(A))
+        rowptr, colval, nzval = host_csr_arrays(A, INT)
+        return ROCSparseMatrixCSR{T, INT}(ROCVector{INT}(rowptr), ROCVector{INT}(colval), ROCVector{T}(nzval), size(A))
     end
-    function to_host(A::ROCSparseMatrixCSR{T}) where {T}
-        m, n = size(A)
-        At = SparseMatrixCSC{T, Int}(n, m, Array{Int}(A.rowPtr), Array{Int}(A.colVal), Array{T}(A.nzVal))
-        return SparseMatrixCSC{T, Int}(sparse(transpose(At)))
-    end
+    to_host(A::ROCSparseMatrixCSR) = host_csc(A.rowPtr, A.colVal, A.nzVal, size(A)...)
+    index_eltype(A::ROCSparseMatrixCSR) = eltype(A.rowPtr)
 end
 
 let gpus = String[]
