@@ -217,7 +217,7 @@ so the **Report** block at the end of each task must be filled in honestly.
 
 ---
 
-## T02 — CSR container, backend adapters, matrix descriptors   `[ ]`
+## T02 — CSR container, backend adapters, matrix descriptors   `[!]`
 
 **Reads**: PLAN §1.1, §2.3 step 1 (only the input side), §3.1.
 
@@ -250,6 +250,55 @@ so the **Report** block at the end of each task must be filled in honestly.
   an `nnz×3` matrix.
 * `MatrixDescriptor` shape checks: `update!` with a wrong length throws
   `InvalidValueError`; 3-D array `(n, p, nb)` sets `nbatch = nb`.
+
+### Report
+
+- Status: [!] (done; small deviations below)
+- What was built:
+  - `src/matrix.jl`: `CSR{T,INT,VI,VT}` (fields as specified; inner constructor validates lengths
+    only, never reads device memory); `CSR(rowptr, colval, nzval[, nrows, ncols]; index, transposed)`
+    (zero-copy, `index` as `'O'`/`'Z'` or `IndexBase`), `CSR(A::SparseMatrixCSC; index)` (host
+    conversion), `csr_of_transpose(A)` (zero-copy, `transposed = true`), `to_backend(A, backend)` for
+    `SparseMatrixCSC` and `CSR` (generic through `KernelAbstractions.allocate` + `copyto!`, no copy if
+    already on `backend`), `SparseMatrixCSC(A::CSR[, k])` (host copy of batch member `k`, rebased to 1),
+    `size`, `eltype`, `nnz`, `nbatch`, `get_backend`, `Adapt.adapt_structure`, `show`.
+  - `MatrixDescriptor{T,A}` (mutable; `data::Union{Nothing,A}`, `nrows, ncols, nbatch, transposed`),
+    `MatrixDescriptor(T, n; nbatch)`, `MatrixDescriptor(T, m, n; nbatch, transposed)`,
+    `MatrixDescriptor(x; transposed)`, `update!(desc, x)` (re-points, no copy; checks eltype, array
+    type, length and shape, `InvalidValueError` otherwise), `size`, `nbatch`, `get_backend`.
+  - `ext/SparseDirectSolverCUDAExt.jl`: `CSR(::CuSparseMatrixCSR)` and `CSR(::CuSparseMatrixCSC)`
+    (shared arrays, CSC → `transposed = true`), `CuSparseMatrixCSR(::CSR)` (shares one-based arrays,
+    rebases zero-based ones into a copy, rejects batches), `to_backend(::SparseMatrixCSC, ::CUDABackend)`.
+  - Exports: `CSR, csr_of_transpose, to_backend, nbatch, MatrixDescriptor, update!`.
+  - `test/test_matrix.jl`.
+- Tests: `SDS_TEST_GPU=0 julia --project=. -e 'using Pkg; Pkg.test()'` (Julia 1.13.1, ubuntu-latest):
+  1884 pass / 0 fail / 0 broken (test_matrix alone: 962). The CUDA extension was checked to load
+  and define its methods in a scratch environment with CUDA.jl 6 (no GPU, `CUDA.functional() == false`).
+  CUDA/AMDGPU: pending CI on the PR.
+- Measurements: none asked.
+- Deviations from PLAN.md / this task:
+  - `size`, `nnz` and `SparseMatrixCSC(::CSR)` describe the *stored* CSR matrix; the `transposed`
+    flag is left to consumers (the test applies it, as the task text says "after honoring the flag").
+    For complex `T` the flag means plain transpose, not adjoint.
+  - `rowptr` and `colval` share the type `VI`, so PLAN §1.1's `offsetType` (Int64 `rowPtr` with Int32
+    `colVal`) is not representable yet; mixed index types raise `InvalidValueError`. Adding a fifth
+    type parameter later is mechanical.
+  - `MatrixDescriptor` follows CUDSS.jl for `transposed`: `MatrixDescriptor(T, m, n; transposed = true)`
+    has logical size `n × m` and expects an `(m, n)` column-major buffer (row-major `n × m`).
+    Descriptors created from sizes only have `A = AbstractArray{T}` (accept any array of `T`);
+    descriptors created from an array accept only that array type. `update!` accepts either a
+    strided vector of the right length or an array with exactly the descriptor's shape.
+  - The CUDA test builds `CuSparseMatrixCSR{T,INT}`/`CuSparseMatrixCSC{T,INT}` from host arrays
+    instead of `to_device(backend, A, INT)`: cuSPARSE 6 ignores `Ti` in
+    `CuSparseMatrixCSR{Tv,Ti}(::SparseMatrixCSC)` and always uses `Cint` (issue #30).
+- Open issues / follow-ups:
+  - #30: `test/backends.jl` `to_device(::CUDABackend, A, Int64)` returns Int32 indices.
+  - No ROCm adapters (`CSR(::ROCSparseMatrixCSR)`) until T23; on the `amdgpu` runner the generic
+    `to_backend`/`MatrixDescriptor` tests run on ROCm through `KernelAbstractions.allocate`.
+  - `SparseMatrixCSC(::CSR)` on a device copies arrays to the host; it is a test/debug helper only.
+- Suggested plan changes:
+  - PLAN §1.1 / T02: decide whether `offsetType` (separate `rowptr` eltype) is needed for v1; if so,
+    give `CSR` separate `VP`/`VI` parameters.
 
 ---
 

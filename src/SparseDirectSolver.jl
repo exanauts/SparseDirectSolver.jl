@@ -19,9 +19,11 @@ using SparseArrays
 export SparseDirectSolverError, NotSupportedError, InvalidValueError, FactorizationError, InterruptedError
 export CONFIG_PARAMETERS, DATA_PARAMETERS, CUDSS08_DATA_PARAMETERS, EXTRA_PARAMETERS
 export Options, setparam!, getparam, default_pivot_epsilon
+export CSR, csr_of_transpose, to_backend, nbatch, MatrixDescriptor, update!
 
 include("errors.jl")
 include("types.jl")
 include("options.jl")
+include("matrix.jl")
 
 end # module SparseDirectSolver
