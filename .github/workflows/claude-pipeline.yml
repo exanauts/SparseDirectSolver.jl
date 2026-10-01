@@ -47,6 +47,7 @@ jobs:
         id: pr
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           pr=$(gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/pulls" \
@@ -193,9 +194,16 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
       PR: ${{ needs.resolve.outputs.pr }}
       TITLE: ${{ needs.resolve.outputs.title }}
     steps:
+      # gh resolves the repository and runs git for `pr merge --delete-branch`,
+      # so the job needs a checkout (PR #35 failed here without one).
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/scripts
+
       - name: Squash-merge the PR
         id: merge
         run: |
