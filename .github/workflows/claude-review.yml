@@ -1,0 +1,192 @@
+name: Claude review
+
+# Reviews every task PR with Claude Fable 5.1 at effort "high". The review ends with a
+# `VERDICT:` line. On CHANGES_REQUESTED, Claude Opus 5.5 (effort "medium") addresses the
+# review on the same branch, at most 3 rounds, then the PR is labelled `needs-owner`.
+# See AGENTS.md, section "GitHub workflow".
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened, labeled]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: read
+  id-token: write
+
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+env:
+  PR: ${{ github.event.pull_request.number }}
+  HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+  HEAD_REF: ${{ github.event.pull_request.head.ref }}
+  MAX_ROUNDS: 3
+
+jobs:
+  review:
+    if: >-
+      (github.event.action != 'labeled' || github.event.label.name == 'claude:pr') &&
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      (startsWith(github.event.pull_request.head.ref, 'task/') ||
+       contains(github.event.pull_request.labels.*.name, 'claude:pr'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs:
+      verdict: ${{ steps.verdict.outputs.verdict }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Review with Claude
+        uses: anthropics/claude-code-action@v1
+        env:
+          CLAUDE_CODE_EFFORT_LEVEL: high
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          allowed_bots: "claude[bot],github-actions[bot]"
+          claude_args: |
+            --model claude-fable-5-1
+            --effort high
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Read,Glob,Grep,LS,Bash(git:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr checks:*),Bash(gh pr review:*),Bash(gh pr comment:*),Bash(gh issue view:*),Bash(gh api:*),Bash(cat:*),Bash(sed:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Bash(diff:*)"
+          prompt: |
+            You are the reviewer of exanauts/SparseDirectSolver.jl, running unattended in GitHub Actions.
+            REPO: ${{ github.repository }}   PR: #${{ env.PR }}   HEAD: ${{ env.HEAD_SHA }}   BRANCH: ${{ env.HEAD_REF }}
+            TITLE: ${{ github.event.pull_request.title }}
+
+            The PR implements one task of TASKS.md (its id `TNN` is the title prefix). Read AGENTS.md,
+            the task's section in TASKS.md on `main` (`git show origin/main:TASKS.md`), the PLAN.md
+            sections it names, and the diff (`git diff origin/main...HEAD`, `gh pr diff ${{ env.PR }}`).
+            The implementer could only run the KA CPU backend; CUDA/AMDGPU run in CI on this PR.
+
+            Review for, in this order:
+            1. Scope: exactly the task's deliverables, nothing from later tasks; PLAN.md untouched;
+               TASKS.md changed only in the task's own section (status marker, Report, "Open issues"
+               notes); no Manifest.toml; public names, parameter strings and phase strings as in
+               PLAN.md §1.2–§1.4 and §3.1.
+            2. Tests: every test the task lists exists and is not weakened; `@test_broken` only with a
+               documented reason that the Report lists; shared helpers from test/utils.jl,
+               test/matrices.jl, test/backends.jl; loops over BACKENDS and ELTYPES where required;
+               `Random.seed!(666)`; tolerances from `tol(T)`.
+            3. AGENTS.md code conventions: generic `T` and `INT` (no hard-coded Float64/Int in kernels
+               or layouts), host symbolic analysis in `Int` with an overflow check before casting,
+               KernelAbstractions rules (1-D workgroups, `@localmem` sized by `Val`, no subgroup
+               intrinsics, no allocation or host synchronization inside numeric/solve phases, no
+               atomics in assembly/extend-add), dense ops only through src/dense/interface.jl, no
+               `@allowscalar` in library code, errors from src/errors.jl, docstrings on public API,
+               backend code only in ext/.
+            4. Correctness, read critically: the mathematics of the factorization and solve, index
+               arithmetic and 0/1-based conversions, Int32 overflow, complex conjugation vs
+               transposition, aliasing, determinism where PLAN.md promises it.
+            5. The Report block: every claim matches the diff; test counts are plausible; deviations
+               and follow-ups are listed and follow-ups have issues.
+            6. CI (`gh pr checks ${{ env.PR }}`): pending or failing checks are handled by the
+               pipeline and are not by themselves a reason to request changes, but a Report that
+               claims green tests which CI contradicts is.
+
+            Output:
+            - One inline comment per concrete defect (use the inline-comment tool), each stating
+              the problem and the fix. Mark nits explicitly as "nit (non-blocking)".
+            - Then exactly one verdict, posted as a neutral review so that it never blocks the
+              merge by itself: `gh pr review ${{ env.PR }} --comment --body "$BODY"`; if that
+              command fails, post the same body with `gh pr comment ${{ env.PR }} --body "$BODY"`.
+              The first line of the body must be exactly
+              `VERDICT: APPROVE (head ${{ env.HEAD_SHA }})` or
+              `VERDICT: CHANGES_REQUESTED (head ${{ env.HEAD_SHA }})`, followed by a short summary
+              of what you checked and the list of blocking findings.
+            Request changes only for defects that must be fixed before merging: correctness, scope,
+            convention violations, missing or weakened tests, a Report that does not match the diff.
+            Do not change code, do not push, do not merge.
+
+      - name: Read the verdict for this head
+        id: verdict
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          verdict=$(bash .github/scripts/pr-verdict.sh "$PR" "$HEAD_SHA")
+          echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
+          echo "Verdict for $HEAD_SHA: ${verdict:-none}"
+
+  fix:
+    needs: review
+    if: needs.review.outputs.verdict == 'CHANGES_REQUESTED'
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.HEAD_REF }}
+          fetch-depth: 0
+
+      - name: Count review rounds
+        id: rounds
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          n=$(bash .github/scripts/pr-verdict.sh "$PR" --count-changes-requested)
+          echo "Review rounds with CHANGES_REQUESTED so far: $n (max $MAX_ROUNDS)"
+          if [ "$n" -gt "$MAX_ROUNDS" ]; then
+            gh pr edit "$PR" --add-label needs-owner
+            gh pr comment "$PR" --body "The Claude reviewer requested changes $n times; the automatic fix loop stops here (max $MAX_ROUNDS). Labelled \`needs-owner\`."
+            echo "go=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "go=true" >> "$GITHUB_OUTPUT"
+            echo "round=$n" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: julia-actions/setup-julia@latest
+        if: steps.rounds.outputs.go == 'true'
+        with:
+          version: '1'
+      - uses: julia-actions/cache@v2
+        if: steps.rounds.outputs.go == 'true'
+
+      - name: Instantiate the project and clone the reference repositories
+        if: steps.rounds.outputs.go == 'true'
+        run: |
+          set -euo pipefail
+          julia --project=. -e 'using Pkg; Pkg.instantiate(); Pkg.precompile()'
+          git clone --quiet --depth 1 https://github.com/exanauts/CUDSS.jl ../CUDSS.jl
+          git clone --quiet --depth 1 https://github.com/JuliaSmoothOptimizers/KrylovPreconditioners.jl ../KrylovPreconditioners.jl
+          git config user.name "claude[bot]"
+          git config user.email "claude[bot]@users.noreply.github.com"
+
+      - name: Address the review with Claude
+        if: steps.rounds.outputs.go == 'true'
+        uses: anthropics/claude-code-action@v1
+        env:
+          CLAUDE_CODE_EFFORT_LEVEL: medium
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          allowed_bots: "claude[bot],github-actions[bot]"
+          claude_args: |
+            --model claude-opus-5-5
+            --effort medium
+            --allowedTools "Bash,Edit,MultiEdit,Write,Read,Glob,Grep,LS,WebFetch"
+          prompt: |
+            You are the implementing agent of exanauts/SparseDirectSolver.jl, running unattended in
+            GitHub Actions. Pull request #${{ env.PR }} (branch `${{ env.HEAD_REF }}`, checked out) received
+            `VERDICT: CHANGES_REQUESTED` from the Claude reviewer; this is fix round ${{ steps.rounds.outputs.round }} of ${{ env.MAX_ROUNDS }}.
+
+            Read AGENTS.md, then the review: `gh pr view ${{ env.PR }} --comments`,
+            `gh api repos/${{ github.repository }}/pulls/${{ env.PR }}/reviews`,
+            `gh api repos/${{ github.repository }}/pulls/${{ env.PR }}/comments` (inline threads).
+            Address every blocking finding for the current head (${{ env.HEAD_SHA }}) in code, tests or
+            the Report block of TASKS.md. Where a finding is wrong, leave the code and reply on that
+            thread (`gh api -X POST repos/${{ github.repository }}/pulls/${{ env.PR }}/comments/<id>/replies -f body=...`)
+            explaining why. Never weaken, skip or delete tests. Only the KA CPU backend exists here:
+            run `SDS_TEST_GPU=0 julia --project=. -e 'using Pkg; Pkg.test()'` until green.
+            Update the Report block if the changes affect it. Commit with the message
+            `<TNN>: address review round ${{ steps.rounds.outputs.round }}` (never commit Manifest.toml)
+            and `git push origin ${{ env.HEAD_REF }}`. No rebase, no force-push, no new PR.
+            Finish with one PR comment (`gh pr comment ${{ env.PR }} --body ...`) listing what changed
+            and which findings you rejected and why.

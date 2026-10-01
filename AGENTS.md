@@ -18,8 +18,10 @@ Three documents define the work. Read them in this order before touching code:
    analysis, three-regime multifrontal numeric phase, solve, backends), API,
    milestones, risks. Section numbers are referenced from the tasks.
 2. `TASKS.md` — consecutive tasks, one per session, each with the tests that
-   must pass and a Report block to fill in. **Your job is the first task whose
-   status marker is `[ ]` (or `[~]` if a previous session left it unfinished).**
+   must pass and a Report block to fill in. **Your job is the task you were
+   given (the GitHub issue, see "GitHub workflow"); without one, it is the first
+   task whose status marker is `[ ]` (or `[~]` if a previous session left it
+   unfinished).**
 3. `RESEARCH.md` — background: state of the art, workload evidence, portability
    hazards. Consult when a design choice in `PLAN.md` needs its rationale.
 
@@ -46,9 +48,71 @@ Three documents define the work. Read them in this order before touching code:
 * The repository is `github.com/exanauts/SparseDirectSolver.jl` (remote
   `origin`, branch `main`). Commit at the end of the task with a message
   starting with the task id, e.g. `T05: symbolic pattern, ordering, etree,
-  column counts`. Do not push unless asked. Do not commit `Manifest.toml`.
+  column counts`. Do not commit `Manifest.toml`. In a GitHub Actions session
+  push and open the PR as described under "GitHub workflow"; in a local
+  session do not push unless asked.
 
-## Environment on this machine
+## GitHub workflow
+
+Every task is tracked on GitHub and lands through a pull request that CI and a
+reviewing agent must pass. The moving parts:
+
+* **Milestones** are `PLAN.md` §5 (`M0 — …` to `M13 — …`). **Issues**: one per
+  task, title `TNN — <task title>` (`External — …` for the MadNLP task), label
+  `task`, milestone set. The issue only points at `TASKS.md`; the task text
+  there stays the single source of truth. Tasks are strictly sequential: the
+  previous task's issue must be closed before the next one starts.
+* **Implementer** (`.github/workflows/claude-implement.yml`, Claude Opus 5.5,
+  effort medium) starts when a task issue gets the label `claude:implement`
+  (the owner, or the pipeline after the previous merge). It works on
+  `ubuntu-latest` with Julia and the KA CPU backend only; CUDA/AMDGPU are
+  verified by CI on the PR. Branch `task/TNN-<slug>` from `main`; commits
+  `TNN: …`; PR titled `TNN: …`, labelled `claude:pr`, milestone set, body from
+  `.github/pull_request_template.md` with the exact line `Closes #<issue>`. The
+  Report block is filled in before the PR is opened ("CUDA/AMDGPU: pending CI
+  on the PR" under Tests). If the task cannot be finished, the PR is opened as
+  a draft and the issue labelled `needs-owner`; never a silent stop.
+* **Reviewer** (`.github/workflows/claude-review.yml`, Claude Fable 5.1, effort
+  high) reviews every push on a `task/**` or `claude:pr` PR against the task
+  text, this file and `PLAN.md`, posts inline comments and a verdict (a
+  neutral review comment, so it never blocks a merge by itself) whose first
+  line is `VERDICT: APPROVE (head <sha>)` or
+  `VERDICT: CHANGES_REQUESTED (head <sha>)`. On changes requested the
+  implementer (same workflow, job `fix`) addresses every finding on the same
+  branch, replies on threads it rejects, and pushes; at most 3 rounds, then the
+  PR is labelled `needs-owner`.
+* **Pipeline** (`.github/workflows/claude-pipeline.yml`) reacts to completed CI
+  and review runs. A red `Run tests`/`Aqua` run on a task PR triggers a CI-fix
+  round by the implementer (at most 3, comments `CI-FIX round k`). Green CI on
+  the current head plus `VERDICT: APPROVE` for that head squash-merges the PR
+  (which closes the issue) and starts the next task issue unless it is labelled
+  `on-hold` or `external`. The repository variable `CLAUDE_AUTOPILOT=false`
+  pauses merging and chaining. Only the status checks are required by the
+  branch rules; approval is the verdict line, since a bot cannot approve its
+  own PR.
+* **Issues opened by agents**: anything found outside the task's scope (a bug
+  in earlier code, a limit hit, a plan problem) becomes an issue with label
+  `found-by-agent` using `.github/ISSUE_TEMPLATE/agent-finding.md`, cited in
+  the Report. Do not fix it in the task's PR and do not edit `PLAN.md`; the
+  owner decides what becomes a task.
+* The owner re-evaluates `PLAN.md` and `TASKS.md` between tasks by pausing the
+  chain (`CLAUDE_AUTOPILOT=false` or `on-hold` on the next issue), editing on
+  `main`, and relabelling.
+
+## Environment
+
+### GitHub Actions (where the agents run)
+
+* `ubuntu-latest`, Julia `1` from `julia-actions/setup-julia`, the project
+  instantiated, `gh` authenticated as the Claude GitHub App. **CPU backend
+  only**: no GPU, CUDA.jl is not installed; GPU results come from the
+  self-hosted `cuda` and `amdgpu` runners through `ci.yml` on the PR.
+* Reference code is cloned next to the checkout, read-only: `../CUDSS.jl` and
+  `../KrylovPreconditioners.jl` (same relative paths as below). MadNLPGPU's
+  cuDSS integration is not checked out; when a task needs it, read it from the
+  `MadNLP/MadNLP.jl` repository on GitHub (`lib/MadNLPGPU`).
+
+### The owner's machine
 
 * Julia 1.13 via juliaup (`/home/michel/.juliaup/bin/julia`); package compat is
   `julia = "1.10"`, so do not use syntax or stdlib features newer than 1.10.
@@ -64,10 +128,10 @@ Three documents define the work. Read them in this order before touching code:
   Use these as weak dependencies; tests load the umbrella `CUDA`.
 * Reference code next to this repository:
   `../CUDSS.jl` (the API being mirrored; tests and docs are the contract),
-  `../MadNLP-cudss-matching/lib/MadNLPGPU/ext/MadNLPGPUCUDAExt/cudss.jl`
-  (how the main consumer uses the solver),
   `../KrylovPreconditioners.jl` (KA kernels and extension layout in the same
-  ecosystem). Read them; never modify them.
+  ecosystem). Read them; never modify them. How the main consumer uses the
+  solver: MadNLPGPU's cuDSS binding in the `MadNLP/MadNLP.jl` repository
+  (`lib/MadNLPGPU`).
 
 ## Commands
 
@@ -131,4 +195,7 @@ julia --project=bench bench/cudss_baseline.jl
 ```text
 PLAN.md  TASKS.md  RESEARCH.md  AGENTS.md
 Project.toml  src/  ext/  test/  bench/  docs/
+.github/workflows/   ci.yml Aqua.yml (checks)  claude-implement.yml claude-review.yml claude-pipeline.yml (agents)
+.github/scripts/     pr-verdict.sh (reads the reviewer's verdict)
+.github/ISSUE_TEMPLATE/agent-finding.md  .github/pull_request_template.md
 ```
