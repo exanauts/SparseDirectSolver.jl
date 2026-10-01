@@ -77,9 +77,21 @@ end
 if AMDGPU_LOADED
     backend_name(::ROCBackend) = "ROCm"
     to_device(::ROCBackend, x::Array) = ROCArray(x)
-    to_device(::ROCBackend, A::SparseMatrixCSC) = ROCSparseMatrixCSR(A)
-    to_device(::ROCBackend, A::SparseMatrixCSC{T}, ::Type{INT}) where {T, INT} = ROCSparseMatrixCSR{T, INT}(A)
-    to_host(A::ROCSparseMatrixCSR) = SparseMatrixCSC(A)
+    # AMDGPU.jl converts host indices to Cint eagerly and has no
+    # `ROCSparseMatrixCSR{T, INT}(::SparseMatrixCSC)`, so the CSR arrays are
+    # built on the host (CSC of the transpose) and uploaded with the requested
+    # index type; the inverse goes the same way, without rocSPARSE.
+    to_device(backend::ROCBackend, A::SparseMatrixCSC{T, INT}) where {T, INT} = to_device(backend, A, INT)
+    function to_device(::ROCBackend, A::SparseMatrixCSC{T}, ::Type{INT}) where {T, INT}
+        At = SparseMatrixCSC{T, INT}(sparse(transpose(A)))
+        return ROCSparseMatrixCSR{T, INT}(ROCVector{INT}(At.colptr), ROCVector{INT}(At.rowval),
+                                          ROCVector{T}(At.nzval), size(A))
+    end
+    function to_host(A::ROCSparseMatrixCSR{T}) where {T}
+        m, n = size(A)
+        At = SparseMatrixCSC{T, Int}(n, m, Array{Int}(A.rowPtr), Array{Int}(A.colVal), Array{T}(A.nzVal))
+        return SparseMatrixCSC{T, Int}(sparse(transpose(At)))
+    end
 end
 
 let gpus = String[]
