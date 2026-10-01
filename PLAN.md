@@ -261,7 +261,7 @@ runtime decisions.
    8–32-column panels, which is the main lever against tiny-front overhead.
    `max_width` caps merging only: a fundamental supernode wider than that (a
    dense separator) stays one front for regime C; splitting it into a chain of
-   panels multiplies the update-stack footprint and adds levels (issue #48).
+   panels adds tree levels and update-stack traffic (issue #48).
 5. **Assembly-tree partition** into regimes: leaf subtrees whose live front set
    fits a local-memory budget (a few `Val`-selected budgets, since KA local
    memory is static), mid-level fronts binned by (rows, cols) size class, root
