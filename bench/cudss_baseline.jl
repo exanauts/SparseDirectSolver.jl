@@ -48,20 +48,22 @@ if parse_args(ARGS)["solver"] == "cudss"
     using CUDA, CUDA.cuSPARSE, CUDSS
 end
 
-# CUDSS.jl has no getter for CUDSS_DATA_FLOPS (cuDSS ≥ 0.7, a double); read it
-# through the C API. `missing` if this cuDSS does not provide it or the value is
-# not a plausible double (e.g. cuDSS stores an int64, which would read as a
-# denormal); the raw bits are printed once so the right type can be told apart.
+# CUDSS.jl has no getter for CUDSS_DATA_FLOPS; read it through the C API. The
+# header does not document its type; cuDSS 0.8.0 writes an int64 (checked on an
+# RTX 4080: lap2d_300 SPD gives 3.18e8 with lu_nnz = 2.43e6, consistent with
+# Σ colcount² = 5.18e8 of CHOLMOD's 4.12e6-entry factor; read as a double the
+# same bits are a denormal). `missing` if this cuDSS does not provide it or the
+# value is not positive; the raw bits are printed once in that case.
 const FLOPS_WARNED = Ref(false)
 function cudss_flops(solver)
     try
-        ref = Ref{Float64}(0.0)
+        ref = Ref{Int64}(0)
         nw = Ref{Csize_t}(0)
         CUDSS.cudssDataGet(solver.data.handle, solver.data, CUDSS.CUDSS_DATA_FLOPS, ref, 8, nw)
-        nw[] == 8 && isfinite(ref[]) && ref[] >= 1 && return ref[]
+        nw[] == 8 && ref[] > 0 && return ref[]
         if !FLOPS_WARNED[]
             FLOPS_WARNED[] = true
-            @warn "CUDSS_DATA_FLOPS is not a plausible Float64; recording missing" written = Int(nw[]) as_float64 = ref[] as_int64 = reinterpret(Int64, ref[])
+            @warn "CUDSS_DATA_FLOPS is not a positive Int64; recording missing" written = Int(nw[]) as_int64 = ref[] as_float64 = reinterpret(Float64, ref[])
         end
         return missing
     catch

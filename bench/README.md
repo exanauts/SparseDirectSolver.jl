@@ -41,7 +41,7 @@ For each matrix and structure, after one warm-up run, five runs each of
 analysis, factorization, refactorization (same values) and solve (`nrhs = 1`,
 `b = rand(n)` with seed 666). A fresh solver is created per run (not timed);
 GPU phases are bracketed by `CUDA.synchronize()`. The CSV holds the medians in
-seconds, `lu_nnz`, `flops` (cuDSS `CUDSS_DATA_FLOPS`, read through the C API
+seconds, `lu_nnz`, `flops` (cuDSS `CUDSS_DATA_FLOPS`, an `Int64` read through the C API
 since CUDSS.jl has no getter) and `nsuperpanels`, the relative residual of the
 last solve and a status (`ok` or the error message; a failing matrix does not
 stop the run). Symmetric structures pass the lower triangle (view `'L'`).

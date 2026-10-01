@@ -488,8 +488,8 @@ obtained on this machine (CUDSS.jl is in `../CUDSS.jl`).
 
 ### Report
 
-- Status: [!] (harness done and exercised end to end on the CPU; the cuDSS table itself needs a GPU
-  and could not be measured on the implementer runner)
+- Status: [!] (harness done and exercised end to end on the CPU; the cuDSS table was measured
+  afterwards on the owner's RTX 4080, issue #40)
 - What was built:
   - `bench/Project.toml` (CUDA 6, CUDSS 0.8, MatrixDepot 1, DelimitedFiles, LinearAlgebra, Random,
     SparseArrays, Statistics; resolves and loads on ubuntu-latest, `CUDA.functional() == false`).
@@ -510,7 +510,8 @@ obtained on this machine (CUDSS.jl is in `../CUDSS.jl`).
   - `bench/cudss_baseline.jl` (`--solver=cudss|cholmod`, `--nruns`, `--only`, `--no-suitesparse`,
     `--no-dumps`, `--out`): every matrix × applicable structure, symmetric structures pass the lower
     triangle with view `'L'`; `lu_nnz`, `nsuperpanels` via `cudss_get`, `flops` via the C API
-    (`cudssDataGet(..., CUDSS_DATA_FLOPS, Ref{Float64})`, CUDSS.jl has no getter); a failing matrix
+    (`cudssDataGet(..., CUDSS_DATA_FLOPS, Ref{Int64})`, CUDSS.jl has no getter; first read as a
+    `Float64`, corrected to `Int64` in #40); a failing matrix
     becomes a CSV row with its error as status. Writes `bench/results/<solver>_baseline.csv`.
   - `bench/report.jl` (Markdown table of the CSVs, ms), `bench/dump_madnlp_kkt.jl`, `bench/README.md`.
   - `test/test_bench_smoke.jl`; `Statistics` added to `test/Project.toml` (the harness uses `median`).
@@ -522,9 +523,72 @@ obtained on this machine (CUDSS.jl is in `../CUDSS.jl`).
   `cudss_baseline.jl` (cudss) stops with "CUDA is not functional … use --solver=cholmod";
   `cudss_baseline.jl --solver=cholmod` ran on all 13 matrices (MatrixDepot downloads worked).
 - Measurements:
-  - **cuDSS baseline: not measured** — no GPU on the implementer runner. Run
-    `julia --project=bench bench/cudss_baseline.jl && julia --project=bench bench/report.jl` on the
-    RTX 4080 / `cuda` runner and paste the table here (owner).
+  - cuDSS baseline (issue #40; `julia --project=bench bench/cudss_baseline.jl`, all 39 matrix ×
+    structure rows `ok`): NVIDIA GeForce RTX 4080, WSL2, CUDA driver/runtime 13.4, cuDSS 0.8.0
+    (CUDSS.jl 0.8.1, CUDA.jl 6.4.1), Julia 1.13.1; default cuDSS configuration; median of 5 after 1
+    warm-up, times in ms; `flops` = `CUDSS_DATA_FLOPS`, `nsp` = `nsuperpanels`. KKT dumps of
+    pglib_opf_case14_ieee / case118_ieee / case1354_pegase written by `bench/dump_madnlp_kkt.jl
+    --iters=1,10,20` with MadNLP 0.9.2, ExaModels 0.9.7, ExaModelsPower 0.3.1 (case14 stops at 11
+    (condensed) / 15 (K2)).
+
+    ```text
+    matrix                            struct       n      nnz  analysis  factor  refactor  solve     lu_nnz    flops nsp   relres
+    lap2d_300                         SPD      90000   448800     271.0    6.05      4.15  0.655    2428175   3.18e8   0  1.8e-12
+    lap2d_300                         S        90000   448800     300.0    16.5      14.2   1.38    2428175   3.18e8   0  1.6e-12
+    lap3d_40                          SPD      64000   438400     342.0    50.3      45.6   1.38   17527585  2.19e10   2  8.3e-14
+    lap3d_40                          S        64000   438400     345.0    63.7      58.7   1.46   17527585  2.19e10   2  7.7e-14
+    HB/bcsstk17                       SPD      10974   428650      42.0    3.53      2.34  0.419    1077096   1.67e8   0  3.7e-11
+    HB/bcsstk17                       S        10974   428650      41.5    4.53      3.31   0.39    1077096   1.67e8   0  4.3e-11
+    Boeing/bcsstk38                   SPD       8032   355460      35.8    3.34      2.31  0.464     798965    1.3e8   0  2.2e-10
+    Boeing/bcsstk38                   S         8032   355460      36.1    4.21      3.23   0.48     798965    1.3e8   0  8.2e-11
+    GHS_psdef/apache2                 SPD     715176  4817870    4350.0   447.0     418.0   6.57  144624555  2.29e11  21  1.8e-10
+    GHS_psdef/apache2                 S       715176  4817870    4380.0   520.0     491.0   6.77  144624555  2.29e11  21  1.6e-10
+    Rajat/rajat21                     G       411676  1893370    1780.0    31.8      29.4   2.03    6891584   5.21e9   2    3.9e7
+    TSOPF/TSOPF_RS_b39_c7             G        14098   252446      85.4    2.32       1.0  0.301    1470000   9.55e7   0   3.8e29
+    kkt_case118_ieee_condensed_1      SPD       1088    12860      11.5   0.908     0.281  0.183      15200 272000.0   0   4.5e-5
+    kkt_case118_ieee_condensed_1      S         1088    12860      12.2    1.04     0.329  0.212      15200 272000.0   0   1.9e-5
+    kkt_case118_ieee_condensed_10     SPD       1088    12860      12.2    1.02     0.319  0.242      15200 272000.0   0   1.2e-5
+    kkt_case118_ieee_condensed_10     S         1088    12860      12.0   0.814     0.324  0.202      15200 272000.0   0   1.0e-5
+    kkt_case118_ieee_condensed_20     SPD       1088    12860      11.8   0.846     0.296  0.193      15200 272000.0   0      0.3
+    kkt_case118_ieee_condensed_20     S         1088    12860      11.5   0.774     0.311  0.348      15200 272000.0   0     0.12
+    kkt_case118_ieee_k2_1             S         3150    17714      16.5   0.938     0.315  0.211      20211 197000.0   0      1.9
+    kkt_case118_ieee_k2_10            S         3150    17714      15.9   0.792     0.336  0.307      20211 197000.0   0      7.3
+    kkt_case118_ieee_k2_20            S         3150    17714      15.9   0.749     0.323  0.329      20211 197000.0   0      8.5
+    kkt_case1354_pegase_condensed_1   SPD      11192   136724      52.1     1.1     0.582  0.342     155201   3.33e6   0  0.00034
+    kkt_case1354_pegase_condensed_1   S        11192   136724      53.2    1.31     0.616  0.261     155201   3.33e6   0  0.00031
+    kkt_case1354_pegase_condensed_10  SPD      11192   136724      51.8    1.09     0.652  0.319     155201   3.33e6   0  0.00014
+    kkt_case1354_pegase_condensed_10  S        11192   136724      52.0    1.32     0.616  0.351     155201   3.33e6   0  0.00014
+    kkt_case1354_pegase_condensed_20  SPD      11192   136724      57.1    1.46     0.796   0.36     155201   3.33e6   0   6.8e-5
+    kkt_case1354_pegase_condensed_20  S        11192   136724      58.1    1.73     0.953  0.387     155201   3.33e6   0   8.6e-5
+    kkt_case1354_pegase_k2_1          S        33811   188063     108.0     2.2      1.38  0.527     202300   2.33e6   0     85.0
+    kkt_case1354_pegase_k2_10         S        33811   188063     113.0    2.44      1.58  0.619     202300   2.33e6   0     57.0
+    kkt_case1354_pegase_k2_20         S        33811   188063     115.0    2.69      1.82  0.641     202300   2.33e6   0    170.0
+    kkt_case14_ieee_condensed_1       SPD        118     1282      17.8   0.326     0.282  0.204       1268  15300.0   0   7.1e-7
+    kkt_case14_ieee_condensed_1       S          118     1282      17.4   0.291     0.313  0.281       1268  15300.0   0   6.1e-7
+    kkt_case14_ieee_condensed_10      SPD        118     1282      7.26   0.135     0.131  0.122       1268  15300.0   0   8.5e-5
+    kkt_case14_ieee_condensed_10      S          118     1282      7.24   0.135     0.138  0.144       1268  15300.0   0   0.0001
+    kkt_case14_ieee_condensed_11      SPD        118     1282      7.27   0.169     0.142  0.139       1268  15300.0   0   2.1e-5
+    kkt_case14_ieee_condensed_11      S          118     1282      7.34   0.136      0.13  0.139       1268  15300.0   0   1.0e-5
+    kkt_case14_ieee_k2_1              S          344     1924      7.85   0.643     0.337  0.236       2024  15100.0   0     0.26
+    kkt_case14_ieee_k2_10             S          344     1924      7.44   0.516     0.155  0.151       2024  15100.0   0     0.28
+    kkt_case14_ieee_k2_15             S          344     1924      7.48   0.508      0.13  0.145       2024  15100.0   0     0.31
+    ```
+
+    Notes on the cuDSS run:
+    - `CUDSS_DATA_FLOPS` is an `int64` in cuDSS 0.8.0, not a double (read as `Float64` it gave the
+      denormal 1.57e-315, i.e. the `Int64` 317 918 802 for lap2d_300). The value is plausible: with
+      cuDSS's 2.43e6-entry factor it compares to Σ colcount² = 5.18e8 of CHOLMOD's 4.12e6-entry
+      factor. `bench/cudss_baseline.jl` now reads an `Int64`.
+    - `analysis` is never re-run on the same `CudssSolver`: `time_phases` builds a fresh solver per
+      run, so each solver sees analysis → factorization → refactorization → solve once.
+    - The large residuals are cuDSS's default configuration (static pivoting with perturbation, no
+      matching, no refinement), not the harness: UMFPACK solves the same systems to 3e-6 (rajat21),
+      1e-12 (TSOPF_RS_b39_c7), 1e-11 (case118 K2) and 1e-10 (case1354 K2). cuDSS reports `npivots` =
+      1517 (rajat21), 9 (TSOPF), 1036 (case118 K2 10), 8059 (case1354 K2 10). With `"matching_alg" =
+      "algo5"` they become 2.7e-5, 2.2e-12, 5.4e-13 and 7.7e-3 (`npivots` 0, 0, 0, 14); with
+      `"ir_n_steps" = 5` on top, 4.4e-7, 9.8e-13, 3.7e-13 and 4.6e-11 (one-off check by hand, not in
+      the CSV). The condensed case118 KKT at iteration 20 is close to singular (`cond₁` ≈ 9e19,
+      UMFPACK relres 0.13), so its 0.3 / 0.12 are not a cuDSS defect.
   - CPU reference (`--solver=cholmod`, CHOLMOD supernodal Cholesky for `SPD`, UMFPACK for `G`;
     ubuntu-latest, 4 cores, 2 BLAS threads; median of 5 after 1 warm-up, ms):
 
@@ -565,10 +629,11 @@ obtained on this machine (CUDSS.jl is in `../CUDSS.jl`).
   - `bench/matrices.jl` has its own Laplacian generators (the bench env cannot include the test helpers);
     the smoke test checks they equal `test/matrices.jl`'s `laplacian2d`/`laplacian3d`.
 - Open issues / follow-ups:
-  - Owner: run the cuDSS baseline on the RTX 4080 and record it (tracked in #40); `flops` via
-    `CUDSS_DATA_FLOPS` (read as a `Float64`) and the cudss closures are untested here. A value that is
-    not a plausible double (wrong size written, non-finite or < 1) is recorded as empty and a one-time
-    warning prints it reinterpreted as `Int64`, so a wrong data type shows up on the first GPU run.
+  - Owner: run the cuDSS baseline on the RTX 4080 and record it (tracked in #40). Done, see
+    Measurements; `CUDSS_DATA_FLOPS` turned out to be an `Int64`.
+  - Accuracy comparisons against cuDSS (M1/M3) should use the same configuration on both sides: with
+    the default configuration cuDSS does not solve the unsymmetric SuiteSparse matrices or the K2 KKTs
+    accurately (see the notes under Measurements), matching (`matching_alg`) does.
   - The condensed case118 KKTs are badly conditioned at late iterations (CHOLMOD relres 4e-2 at
     iteration 20 without refinement); cuDSS comparisons on condensed systems should report the residual
     after refinement (T16) as well.
