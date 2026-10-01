@@ -1,0 +1,65 @@
+name: Run tests
+
+on:
+  push:
+    branches:
+      - main
+    tags: '*'
+  pull_request:
+    types: [opened, synchronize, reopened]
+  schedule:
+    - cron: '0 0 * * 0'
+
+jobs:
+  test-github-cpuonly:
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SDS_TEST_GPU: '0'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        julia-version: ['lts', '1']
+        julia-arch: [x64]
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@latest
+        with:
+          version: ${{ matrix.julia-version }}
+      - uses: julia-actions/cache@v2
+      - uses: julia-actions/julia-buildpkg@latest
+      - uses: julia-actions/julia-runtest@latest
+
+  test-gpu:
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        julia-version: ['lts', '1']
+        julia-arch: [x64]
+        backend: ['cuda', 'amdgpu']
+    runs-on: [self-hosted, linux, X64, gpu, '${{ matrix.backend }}']
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@latest
+        with:
+          version: ${{ matrix.julia-version }}
+          arch: ${{ matrix.julia-arch }}
+      - name: Add CUDA.jl to the test environment
+        if: matrix.backend == 'cuda'
+        run: |
+          julia --project=test -e 'using Pkg; Pkg.add("CUDA")'
+      - name: Add AMDGPU.jl to the test environment
+        if: matrix.backend == 'amdgpu'
+        run: |
+          julia --project=test -e 'using Pkg; Pkg.add("AMDGPU")'
+      - uses: julia-actions/julia-runtest@latest
+      - uses: julia-actions/julia-processcoverage@v1
+      - uses: codecov/codecov-action@v4
+        with:
+          file: lcov.info
