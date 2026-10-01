@@ -48,4 +48,7 @@ include("symbolic/schedule.jl")
 include("symbolic/layout.jl")
 include("symbolic/maps.jl")
 
+# CPU reference multifrontal factorization (PLAN §7, the oracle)
+include("reference/cholesky.jl")
+
 end # module SparseDirectSolver
