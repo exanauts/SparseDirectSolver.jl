@@ -222,10 +222,13 @@ function potrf!(uplo, A::AbstractMatrix; impl::Symbol = :auto)
     ul = _uplo_char(uplo)
     LinearAlgebra.checksquare(A)
     p = select_impl(:potrf, A, impl)
-    if p === :vendor
-        return vendor_potrf!(ul, A)
-    elseif p === :generic
-        return Int(cholesky!(Hermitian(A, ul == 'L' ? :L : :U), NoPivot(); check = false).info)
+    if p === :vendor || p === :generic
+        info = p === :vendor ? vendor_potrf!(ul, A) :
+               Int(cholesky!(Hermitian(A, ul == 'L' ? :L : :U), NoPivot(); check = false).info)
+        info == 0 || return info
+        # cuSOLVER zpotrf (n = 32) returns info = 0 when only the last pivot is
+        # not positive (T03 CI); accept the factor only if its diagonal is.
+        return Int(only(Array(ka_chol_diag_info!(_device_info(A), A))))
     else
         info = ka_potrf!(ul, A, _device_info(A))
         return Int(only(Array(info)))

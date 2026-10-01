@@ -205,11 +205,17 @@ end
     info = to_device(backend, zeros(Int32, nb))
     SDS.ka_potrf!('L', X, info)
     @test to_host(info) == zeros(Int32, nb)
+    @test to_host(SDS.ka_chol_diag_info!(to_device(backend, ones(Int32, nb)), X)) == zeros(Int32, nb)
     Xh = to_host(X)
     for i in 1:nb
         L = LowerTriangular(Xh[:, :, i])
         @test norm(L * L' - S[:, :, i]) <= dense_tol(T) * norm(L)^2
     end
+    # diagonal pivot check of a factor: first non-positive / non-finite pivot per member
+    D = copy(Xh)
+    D[7, 7, 1] = -one(T)
+    D[n, n, 3] = T(NaN)
+    @test to_host(SDS.ka_chol_diag_info!(to_device(backend, zeros(Int32, nb)), to_device(backend, D))) == Int32[7, 0, n]
     A = randn(T, n, n, nb)
     X = to_device(backend, A)
     ipiv = to_device(backend, zeros(Int32, n, nb))

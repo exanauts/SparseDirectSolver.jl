@@ -388,6 +388,10 @@ so the **Report** block at the end of each task must be filled in honestly.
   19115 pass / 0 fail / 0 broken (test_dense: 17228, 172 s). Julia 1.10.10, `test_dense` + `test_aqua`:
   17232 pass. The CUDA extension was loaded in a scratch environment with CUDA.jl 6.4.1 (no GPU): all
   `vendor_*` methods are defined. CUDA/AMDGPU: pending CI on the PR.
+  CI fix round 1: the first CUDA run failed 4 tests (`potrf 32`, ComplexF64, `j = 32`, panel and plain):
+  the cuSOLVER-backed `:vendor`/`:generic` paths returned `info = 0` for a matrix whose last pivot is
+  negative. `potrf!` now validates `info = 0` from vendor/generic with `ka_chol_diag_info!` (first
+  diagonal entry of the factor that is not a finite positive real). After the fix, CPU: 19117 pass.
 - Measurements: capability table of the KA CPU backend (printed by `test_dense`):
 
   ```text
@@ -428,6 +432,9 @@ so the **Report** block at the end of each task must be filled in honestly.
     path works for padded `strided_batch` views.
   - The KA kernels are correctness-first (unblocked potrf/getrf, one workgroup per matrix; one workgroup per
     RHS column in trsm). Blocked/tiled large-front kernels belong to T09–T11.
+  - cuSOLVER `zpotrf` (n = 32) did not report a non-positive last pivot (CUDA CI of T03); `potrf!` checks
+    the factor diagonal after vendor/generic. The batched vendor potrf (`cusolverDn?potrfBatched`) may need
+    the same check (`ka_chol_diag_info!` accepts 3-D batches) when T09 uses it.
   - `atomic_add` is `false` for complex types on CPU (Atomix has no complex atomics); the default forward
     solve (T12) must split complex accumulation into real/imag parts or use the atomic-free variant.
 - Suggested plan changes:

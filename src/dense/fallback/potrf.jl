@@ -76,3 +76,36 @@ function ka_potrf!(uplo, A::AbstractArray, info::AbstractVector{Int32}; workgrou
     kernel!(A, info, Val(ul == 'L'), workgroup, n; ndrange = (WG, nb))
     return info
 end
+
+@kernel function _ka_chol_diag_kernel!(info, A, n)
+    gi = @index(Group, NTuple)
+    li = @index(Local, Linear)
+    if li == 1
+        st = Int32(0)
+        for j in 1:n
+            d = _get(A, j, j, gi[2])
+            if !(isfinite(real(d)) && real(d) > 0 && iszero(imag(d)))
+                st = Int32(j)
+                break
+            end
+        end
+        @inbounds info[gi[2]] = st
+    end
+end
+
+"""
+    ka_chol_diag_info!(info, L) -> info
+
+Pivot check of a computed Cholesky factor `L` (matrix or 3-D strided batch):
+`info[b]` is set to the first `j` whose diagonal entry `L[j, j]` is not a
+finite positive real, 0 if there is none. Used to validate the `info = 0` of
+vendor and generic factorizations (see [`potrf!`](@ref)). Asynchronous.
+"""
+function ka_chol_diag_info!(info::AbstractVector{Int32}, L::AbstractArray)
+    nb = _nbatch(L)
+    length(info) >= nb || throw(DimensionMismatch("info has length $(length(info)) < batch count $nb"))
+    nb == 0 && return info
+    kernel! = _ka_chol_diag_kernel!(KernelAbstractions.get_backend(L), (1, 1))
+    kernel!(info, L, size(L, 1); ndrange = (1, nb))
+    return info
+end
