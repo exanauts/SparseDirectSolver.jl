@@ -242,3 +242,34 @@ function ubatch_example(::Type{T}) where {T}
     b = T.(collect(1:9))
     return (A = A, rowptr = rowptr, colval = colval, nzval = nzval, b = b, Λ = Λ, n = 3, nbatch = 3)
 end
+
+# ---------------------------------------------------------------------------
+# dense generators (T03)
+
+"""
+    dense_hpd(T, n; rng)
+
+Dense Hermitian (real: symmetric) positive definite `n × n` matrix `G Gᴴ + n I`
+with `G` standard normal; exactly Hermitian with a real diagonal.
+"""
+function dense_hpd(::Type{T}, n::Integer; rng::AbstractRNG = Random.default_rng()) where {T}
+    G = randn(rng, T, n, n)
+    return Matrix{T}(Hermitian(G * G' + n * I))
+end
+
+"""
+    dense_triangular(T, n; uplo = :L, unit = false, rng)
+
+Well-conditioned dense triangular `n × n` matrix (the other triangle is random
+garbage that a triangular solve must ignore): off-diagonal entries standard
+normal scaled by `1/n`, diagonal in `[1, 2]` (`unit = true`: the stored
+diagonal is random too and must be ignored).
+"""
+function dense_triangular(::Type{T}, n::Integer; uplo::Symbol = :L, unit::Bool = false,
+                          rng::AbstractRNG = Random.default_rng()) where {T}
+    A = randn(rng, T, n, n) ./ n
+    tri = uplo === :L ? tril(A, -1) : triu(A, 1)
+    garbage = uplo === :L ? triu(randn(rng, T, n, n), 1) : tril(randn(rng, T, n, n), -1)
+    d = unit ? randn(rng, T, n) : one(T) .+ rand(rng, real(T), n)
+    return tri + garbage + Diagonal(d)
+end

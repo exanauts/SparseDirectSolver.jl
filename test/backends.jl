@@ -64,6 +64,8 @@ Inverse of [`to_device`](@ref): `Array` for dense arrays, `SparseMatrixCSC` for
 sparse matrices.
 """
 to_host(x::AbstractArray) = Array(x)
+# strided device views (panels, padded batches): copy the parent, index on the host
+to_host(x::SubArray) = Array(parent(x))[x.indices...]
 to_host(A::SparseMatrixCSC) = copy(A)
 
 """
@@ -118,4 +120,17 @@ let gpus = String[]
     TEST_GPU || push!(gpus, "GPU backends disabled by SDS_TEST_GPU=0")
     println("Backends under test: ", join(backend_name.(BACKENDS), ", "),
             isempty(gpus) ? "" : "  [" * join(gpus, "; ") * "]")
+end
+
+"""
+    to_panel(backend, X; lead = 3, trail = 2)
+
+Copy the host matrix `X` (`f × w`) into a flat device buffer with `lead`
+entries before and `trail` after it, and return the panel view
+`reshape(view(buf, lead+1:lead+f*w), f, w)`, the way fronts are laid out in the
+factor buffer.
+"""
+function to_panel(backend, X::Matrix{T}; lead::Integer = 3, trail::Integer = 2) where {T}
+    buf = to_device(backend, vcat(zeros(T, lead), vec(X), zeros(T, trail)))
+    return reshape(view(buf, (lead + 1):(lead + length(X))), size(X)...)
 end

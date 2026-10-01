@@ -15,10 +15,12 @@ SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
 
 [weakdeps]
 CUDACore = "bd0ed864-bdfe-4181-a5ed-ce625a5fdea2"
+cuBLAS = "182d3088-87b7-4494-8cad-fc6afaa545bc"
+cuSOLVER = "887afef0-6a32-4de5-add4-7827692ba8fc"
 cuSPARSE = "b26da814-b3bc-49ef-b0ee-c816305aa060"
 
 [extensions]
-SparseDirectSolverCUDAExt = ["CUDACore", "cuSPARSE"]
+SparseDirectSolverCUDAExt = ["CUDACore", "cuBLAS", "cuSOLVER", "cuSPARSE"]
 
 [compat]
 Adapt = "4"
@@ -30,5 +32,7 @@ GPUArraysCore = "0.2"
 KernelAbstractions = "0.9"
 LinearAlgebra = "1.10"
 SparseArrays = "1.10"
+cuBLAS = "6"
+cuSOLVER = "6"
 cuSPARSE = "6"
 julia = "1.10"

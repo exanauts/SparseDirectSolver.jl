@@ -1,12 +1,19 @@
 module SparseDirectSolverCUDAExt
 
-# CUDA support: CSR adapters (T02); vendor dense bindings follow in T03.
+# CUDA support: CSR adapters (T02) and the vendor dense bindings of the dense
+# layer (T03, PLAN §2.6): cuBLAS gemm/syrk/herk/trsm/strided-batched gemm/
+# batched trsm, cuSOLVER potrf/getrf/sytrf/potrfBatched, cuBLAS getrfBatched.
 
 using SparseDirectSolver
 using SparseDirectSolver: CSR, INDEX_ONE, INDEX_ZERO, InvalidValueError
 using SparseArrays
+using LinearAlgebra
 using CUDACore
 using cuSPARSE
+using cuBLAS
+using cuSOLVER
+
+const SDS = SparseDirectSolver
 
 """
     CSR(A::CuSparseMatrixCSR)
@@ -57,6 +64,108 @@ function SparseDirectSolver.to_backend(A::SparseMatrixCSC, ::CUDABackend; index 
     B = CSR(A; index)
     return CSR(CuVector(B.rowptr), CuVector(B.colval), CuVector(B.nzval), B.nrows, B.ncols;
                index = B.index, transposed = B.transposed)
+end
+
+# ---------------------------------------------------------------------------
+# vendor dense bindings (see `src/dense/vendor.jl` for the contracts)
+
+const CuBlasT = Union{Float32, Float64, ComplexF32, ComplexF64}
+const CuBlasC = Union{ComplexF32, ComplexF64}
+
+SDS.vendor_gemm!(tA::Char, tB::Char, α, A::StridedCuMatrix{T}, B::StridedCuMatrix{T}, β,
+                 C::StridedCuMatrix{T}) where {T <: CuBlasT} = cuBLAS.gemm!(tA, tB, T(α), A, B, T(β), C)
+SDS.vendor_syrk!(uplo::Char, α, A::StridedCuMatrix{T}, β, C::StridedCuMatrix{T}) where {T <: CuBlasT} =
+    cuBLAS.syrk!(uplo, 'N', T(α), A, T(β), C)
+SDS.vendor_herk!(uplo::Char, α, A::StridedCuMatrix{T}, β, C::StridedCuMatrix{T}) where {T <: CuBlasC} =
+    cuBLAS.herk!(uplo, 'N', real(T)(α), A, real(T)(β), C)
+SDS.vendor_trsm!(side::Char, uplo::Char, trans::Char, diag::Char, α, A::StridedCuMatrix{T},
+                 B::StridedCuMatrix{T}) where {T <: CuBlasT} = cuBLAS.trsm!(side, uplo, trans, diag, T(α), A, B)
+
+SDS.vendor_potrf!(uplo::Char, A::StridedCuMatrix{<:CuBlasT}) = Int(cuSOLVER.potrf!(uplo, A)[2])
+
+# cuSOLVER pivots are `Cint`; other index vectors go through a temporary
+function _with_cint(f, ipiv::CuVector, k::Integer)
+    ipiv isa CuVector{Cint} && return f(ipiv)
+    p = CuVector{Cint}(undef, k)
+    info = f(p)
+    view(ipiv, 1:k) .= p
+    return info
+end
+
+function SDS.vendor_getrf!(A::StridedCuMatrix{<:CuBlasT}, ipiv::CuVector{<:Integer})
+    return _with_cint(ipiv, min(size(A)...)) do p
+        Int(cuSOLVER.getrf!(A, p)[3])
+    end
+end
+
+function SDS.vendor_sytrf!(uplo::Char, A::StridedCuMatrix{<:CuBlasT}, ipiv::CuVector{<:Integer})
+    return _with_cint(ipiv, LinearAlgebra.checksquare(A)) do p
+        Int(cuSOLVER.sytrf!(uplo, A, p)[3])
+    end
+end
+
+SDS.vendor_gemm_strided_batched!(tA::Char, tB::Char, α, A::StridedCuArray{T, 3}, B::StridedCuArray{T, 3}, β,
+                                 C::StridedCuArray{T, 3}) where {T <: CuBlasT} =
+    cuBLAS.gemm_strided_batched!(tA, tB, T(α), A, B, T(β), C)
+
+function _check_square_batch(A::AbstractArray{<:Any, 3})
+    size(A, 1) == size(A, 2) || throw(DimensionMismatch("batch members are $(size(A, 1))×$(size(A, 2)), not square"))
+    return size(A, 1)
+end
+
+# device vector of member pointers of a strided 3-D batch (members `stride(A, 3)` apart)
+function _batch_pointers(A::StridedCuArray{T, 3}) where {T}
+    base = Base.unsafe_convert(CuPtr{T}, A)
+    s = stride(A, 3) * sizeof(T)
+    return CuArray([base + (i - 1) * s for i in 1:size(A, 3)])
+end
+
+for (fname, fname_64, elty) in ((:cublasStrsmBatched, :cublasStrsmBatched_64, :Float32),
+                                (:cublasDtrsmBatched, :cublasDtrsmBatched_64, :Float64),
+                                (:cublasCtrsmBatched, :cublasCtrsmBatched_64, :ComplexF32),
+                                (:cublasZtrsmBatched, :cublasZtrsmBatched_64, :ComplexF64))
+    @eval function SDS.vendor_trsm_batched!(side::Char, uplo::Char, trans::Char, diag::Char, α,
+                                            A::StridedCuArray{$elty, 3}, B::StridedCuArray{$elty, 3})
+        m, n, nb = size(B)
+        nb == 0 && return B
+        lda, ldb = max(1, stride(A, 2)), max(1, stride(B, 2))
+        GC.@preserve A B begin
+            Aptrs = _batch_pointers(A)
+            Bptrs = _batch_pointers(B)
+            if cuBLAS.version() >= v"12.0"
+                cuBLAS.$fname_64(cuBLAS.handle(), side, uplo, trans, diag, m, n, $elty(α), Aptrs, lda, Bptrs, ldb, nb)
+            else
+                cuBLAS.$fname(cuBLAS.handle(), side, uplo, trans, diag, m, n, $elty(α), Aptrs, lda, Bptrs, ldb, nb)
+            end
+            CUDACore.unsafe_free!(Aptrs)
+            CUDACore.unsafe_free!(Bptrs)
+        end
+        return B
+    end
+end
+
+for (fname, elty) in ((:cusolverDnSpotrfBatched, :Float32), (:cusolverDnDpotrfBatched, :Float64),
+                      (:cusolverDnCpotrfBatched, :ComplexF32), (:cusolverDnZpotrfBatched, :ComplexF64))
+    @eval function SDS.vendor_potrf_batched!(uplo::Char, A::StridedCuArray{$elty, 3}, info::CuVector{Cint})
+        n = _check_square_batch(A)
+        nb = size(A, 3)
+        nb == 0 && return info
+        GC.@preserve A begin
+            Aptrs = _batch_pointers(A)
+            cuSOLVER.$fname(cuSOLVER.dense_handle(), uplo, n, Aptrs, max(1, stride(A, 2)), info, nb)
+            CUDACore.unsafe_free!(Aptrs)
+        end
+        return info
+    end
+end
+
+function SDS.vendor_getrf_batched!(A::StridedCuArray{T, 3}, ipiv::CuMatrix{Cint}, info::CuVector{Cint}) where {T <: CuBlasT}
+    n = _check_square_batch(A)
+    size(A, 3) == 0 && return info
+    GC.@preserve A begin
+        cuBLAS.getrf_batched!(n, _batch_pointers(A), max(1, stride(A, 2)), ipiv, info)
+    end
+    return info
 end
 
 end # module SparseDirectSolverCUDAExt
