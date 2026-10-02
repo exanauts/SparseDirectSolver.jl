@@ -1,0 +1,62 @@
+name: Claude triage
+
+# Resumes the task chain after the owner triages the found-by-agent issues that
+# held it: when a found-by-agent issue gets the `triaged` label or is closed and
+# no untriaged one remains, the next task issue (lowest TNN whose predecessor is
+# closed) is started unless a task is already running or has an open PR.
+# See AGENTS.md, section "GitHub workflow".
+
+on:
+  issues:
+    types: [labeled, closed]
+
+permissions:
+  issues: write
+  pull-requests: read
+  actions: write
+
+jobs:
+  resume:
+    if: >-
+      contains(github.event.issue.labels.*.name, 'found-by-agent') &&
+      (github.event.action == 'closed' || github.event.label.name == 'triaged') &&
+      vars.CLAUDE_AUTOPILOT != 'false'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Start the next task if nothing holds it
+        run: |
+          set -euo pipefail
+          untriaged=$(gh issue list --state open --label found-by-agent --limit 100 --json number,labels \
+            --jq '[.[] | select(.labels | map(.name) | index("triaged") | not) | "#\(.number)"] | join(" ")')
+          if [ -n "$untriaged" ]; then echo "Still untriaged: $untriaged."; exit 0; fi
+          running=$(gh run list --workflow claude-implement.yml --status in_progress --json databaseId --jq 'length')
+          queued=$(gh run list --workflow claude-implement.yml --status queued --json databaseId --jq 'length')
+          if [ "$running" != "0" ] || [ "$queued" != "0" ]; then echo "An implementer run is active."; exit 0; fi
+          open_pr=$(gh pr list --state open --limit 100 --json headRefName --jq '[.[] | select(.headRefName | startswith("task/"))] | length')
+          if [ "$open_pr" != "0" ]; then echo "A task PR is open."; exit 0; fi
+          # next task: the lowest open TNN issue whose predecessor is closed
+          n=$(gh issue list --state all --label task --limit 100 --json number,title,state,labels | python3 -c '
+          import json, re, sys
+          issues = json.load(sys.stdin)
+          byid = {}
+          for i in issues:
+              m = re.match(r"^T(\d\d) — ", i["title"])
+              if m:
+                  byid[int(m.group(1))] = i
+          for k in sorted(byid):
+              i = byid[k]
+              labels = {l["name"] for l in i["labels"]}
+              if i["state"] != "OPEN" or "on-hold" in labels or "external" in labels:
+                  continue
+              prev = byid.get(k - 1)
+              if prev is None or prev["state"] == "CLOSED":
+                  print(i["number"]); break
+          ')
+          if [ -z "$n" ]; then echo "No startable task issue."; exit 0; fi
+          gh issue edit "$n" --add-label claude:implement
+          gh workflow run claude-implement.yml -f issue_number="$n"
+          gh issue comment "$n" --body "All \`found-by-agent\` issues are triaged; the Claude implementer was started for this issue by the pipeline."
+          echo "Started #$n."
