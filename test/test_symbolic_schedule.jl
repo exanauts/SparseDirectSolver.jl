@@ -330,24 +330,34 @@ end
 @testset "update stack vs factor (issue #48)" begin
     # Regression guard for the update-stack high-water mark relative to the
     # factor. Keeping wide fundamental supernodes whole (no chain of max_width
-    # panels) brought the KKT ratio from 7.8 to 5.6 (T07 Report vs this test);
-    # the random SPD ratio is unchanged (6.4). The remaining excess is the level
-    # schedule itself: every contribution block of a level stays live until its
-    # parent's step, so a wide level with many fan-in children holds all their
-    # full m×m blocks at once. That part is tracked in issue #48 (schedule- or
-    # parent-chunked consumption, packed blocks). Bounds are just above the
-    # measured values so a regression shows up; print the values for the Report.
-    # The random generators depend on the RNG state left by the preceding
-    # testsets, which differs with the backend list (CI measured 5.6-6.2 on the
-    # KKT matrix and 6.1-6.5 on the random one), so reseed here.
+    # panels) brought the KKT ratio from 7.8 to 5.6 (T07 Report); placing the
+    # contribution blocks offline over their known lifetimes (best of first fit,
+    # largest first, largest size × lifetime first) removed the fragmentation of
+    # the step-by-step first fit: 6.2 -> 4.5 (KKT) and 6.1 -> 4.5 (random SPD) on
+    # an RTX 4080 / CPU run. The rest is live data: the sum of the contribution
+    # blocks live in the fullest step, which the level schedule fixes (a serial
+    # Liu postorder would need 4.1 on the KKT matrix and the same 4.4 on the
+    # random one) and which packed triangular blocks would halve (issue #48).
+    # Bounds are just above the measured values so a regression shows up; print
+    # the values for the Report. The random generators depend on the RNG state
+    # left by the preceding testsets, which differs with the backend list, so
+    # reseed here.
     Random.seed!(666)
-    for (name, A, bound) in (("kkt_matrix(3000, 1000)", kkt_matrix(3000, 1000, 1.0e-8), 7.0),
-                             ("random_spd(2000, 0.002)", random_spd(2000, 0.002), 7.5),
-                             ("laplacian2d(100, 100)", laplacian2d(100, 100), 1.0))
+    for (name, A, bound) in (("kkt_matrix(3000, 1000)", kkt_matrix(3000, 1000, 1.0e-8), 5.0),
+                             ("random_spd(2000, 0.002)", random_spd(2000, 0.002), 5.0),
+                             ("laplacian2d(100, 100)", laplacian2d(100, 100), 0.7))
         S = SDS.symbolic_analysis(SDS.CSR(A), "S", 'L'; opts = Options(reordering_alg = "algo3"))
-        ratio = S.layout.stack_len / S.layout.factor_len
-        println("  update stack / factor on $name (AMD): $(round(ratio; digits = 2))")
+        L = S.layout
+        ratio = L.stack_len / L.factor_len
+        # entries live in the fullest step: no placement can go below it
+        live = zeros(Int, S.schedule.nsteps + 1)
+        for s in eachindex(L.cb_len), t in L.cb_first[s]:L.cb_last[s]
+            L.cb_len[s] > 0 && (live[t + 1] += L.cb_len[s])
+        end
+        println("  update stack / factor on $name (AMD): $(round(ratio; digits = 2)), ",
+                "live bound $(round(maximum(live) / L.factor_len; digits = 2))")
         @test ratio <= bound
+        @test maximum(live) <= L.stack_len <= 1.05 * maximum(live)
         check_schedule(S)
     end
 end
