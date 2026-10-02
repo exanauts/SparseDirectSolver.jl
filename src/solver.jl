@@ -81,6 +81,8 @@ vector of `n · nrhs · nbatch` entries, an `n × (nrhs · nbatch)` matrix, an
 `"ubatch_index"` (0-based member, `-1` = all) and `"ubatch_mask"` (one 0/1
 flag per member) restrict the factorization and solve phases to a subset of
 the members: the other members' factors and solutions are left untouched.
+`"pivot_sign"` and the other options apply to every member; the 2×2 pivot
+pairs of `"S"`/`"H"` (`"pivot_pairs"`) come from the first member's values.
 
 Fields: `A` (the current [`CSR`](@ref), re-pointed by [`update!`](@ref)),
 `structure`, `view` (as given), `options` ([`Options`](@ref), set through

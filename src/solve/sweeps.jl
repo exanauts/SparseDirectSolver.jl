@@ -726,11 +726,17 @@ function _dense_front_batch(ws::SolveWorkspace, S::Symbolic, N::Numeric, s::Int,
     m = f - w
     p0 = panel_offset(S.layout.panel_ptr, s, N.plan.members_host[j0], N.nbatch)
     c0 = S.partition.super_ptr[s]
-    cols = ((j0 - 1) * nrhs + 1):((j0 + count - 1) * nrhs)
     P = reshape(view(N.factor, p0:(p0 + f * w * count - 1)), f, w, count)
-    Y3 = reshape(view(ws.Y, :, cols), size(ws.Y, 1), nrhs, count)
-    T3 = reshape(view(ws.tmp, :, cols), size(ws.tmp, 1), nrhs, count)
+    Y3 = _column_batch(ws.Y, (j0 - 1) * nrhs, nrhs, count)
+    T3 = _column_batch(ws.tmp, (j0 - 1) * nrhs, nrhs, count)
     return view(P, 1:w, 1:w, :), view(P, (w + 1):f, 1:w, :), view(Y3, c0:(c0 + w - 1), :, :), view(T3, 1:m, :, :)
+end
+
+# the columns `c0 + 1 : c0 + nrhs count` of the matrix `M` as an `size(M, 1) × nrhs × count` array (a contiguous
+# range of its memory, so a strided device array for the vendor calls)
+function _column_batch(M::AbstractMatrix, c0::Int, nrhs::Int, count::Int)
+    m = size(M, 1)
+    return reshape(view(vec(M), (c0 * m + 1):((c0 + nrhs * count) * m)), m, nrhs, count)
 end
 
 # the dense calls of front `s` for each run of consecutive active members: one strided-batched call per run, or

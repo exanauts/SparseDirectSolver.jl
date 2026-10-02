@@ -113,7 +113,7 @@ end
             same(a, b) = a.factor == b.factor && a.d == b.d && a.piv == b.piv && a.pivot_kind == b.pivot_kind &&
                          a.stats == b.stats && a.info == b.info
             before = snapshot()
-            fresh = batch_members(A, nb)                      # new values for every member
+            fresh = batch_members(A, nb + 1)[2:end]           # new values for every member (member 1 of a draw is A)
             update!(solver, api_batch_matrix(backend, fresh, 'L'))
             # ubatch_index = 2 (0-based): only member 3 is refactorized and solved
             setparam!(solver, "ubatch_index", 2)
