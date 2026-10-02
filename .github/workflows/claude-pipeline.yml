@@ -235,6 +235,13 @@ jobs:
           if jq -e '.labels | map(.name) | index("on-hold") or index("external")' <<<"$issue" >/dev/null; then
             echo "Issue #$n ($next) is on-hold or external; not chaining."; exit 0
           fi
+          # triage gate: every open found-by-agent issue must carry `triaged` (or be closed)
+          untriaged=$(gh issue list --state open --label found-by-agent --limit 100 --json number,labels \
+            --jq '[.[] | select(.labels | map(.name) | index("triaged") | not) | "#\(.number)"] | join(" ")')
+          if [ -n "$untriaged" ]; then
+            gh issue comment "$n" --body "Previous task merged in #$PR, but $next is **held**: open \`found-by-agent\` issues without the \`triaged\` label: $untriaged. Label them \`triaged\` (or close them) and the pipeline starts this task automatically (claude-triage.yml)."
+            echo "Held $next (#$n): untriaged issues $untriaged."; exit 0
+          fi
           gh issue edit "$n" --add-label claude:implement
           gh workflow run claude-implement.yml -f issue_number="$n"
           gh issue comment "$n" --body "Previous task merged in #$PR; the Claude implementer was started for this issue by the pipeline."
