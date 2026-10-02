@@ -28,6 +28,11 @@ panel_error(Nh, Nr) = maximum(abs, Nh.factor - Nr.factor) / maximum(abs, Nr.fact
 
 numeric_c_allocated(N, S, nz) = @allocated SDS.factorize!(N, S, nz)
 
+# upper bound on the KA launches of one `factorize!` with `impl = :auto` on the CPU backend (3 assembly
+# launches per step, one `ka_chol_check_info!` per front, the statistics) and their `@localmem` bytes
+numeric_c_launches(S) = 3 * S.schedule.nsteps + SDS.nsupernodes(S) + 1
+const NUMERIC_C_LOCALMEM = SDS.STATS_WORKGROUP * sizeof(Int64)
+
 @testset "storage and plan" begin
     A = laplacian2d(Float64, 20, 20)
     S, _, _, _, Nd, _ = numeric_c_setup(CPU(), A)
@@ -64,6 +69,7 @@ end
             @test info_ref == 0
             @test SDS.factorize!(Nd, Sd, nz) == 0
             Nh = SDS.host_numeric(Nd)
+            F1 = copy(Nh.factor)                         # `host_numeric` aliases host storage
             @test panel_error(Nh, Nr) <= panel_tol(T)
             @test Nh.stats == Nr.stats
             @test SDS.extract_L(Sd, Nd) == SDS.extract_L(S, Nh)
@@ -75,7 +81,7 @@ end
             end
             # determinism: the same values give bitwise identical panels
             @test SDS.factorize!(Nd, Sd, nz) == 0
-            @test SDS.host_numeric(Nd).factor == Nh.factor
+            @test SDS.host_numeric(Nd).factor == F1
         end
     end
 end
@@ -87,18 +93,19 @@ end
     for impl in SDS.dense_impls(:potrf, backend, T)
         @test SDS.factorize!(Nd, Sd, nz; impl) == 0
         Nh = SDS.host_numeric(Nd)
+        F1 = copy(Nh.factor)
         @test panel_error(Nh, Nr) <= panel_tol(T)
         @test relres(A, SDS.ref_solve!(similar(b), S, Nh, b), b) <= tol(T)
         @test SDS.factorize!(Nd, Sd, nz; impl) == 0
-        @test SDS.host_numeric(Nd).factor == Nh.factor
+        @test SDS.host_numeric(Nd).factor == F1
     end
 end
 
 @testset "views, index bases, refactorization ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
     A = random_spd(T, 300, 0.02)
-    _, Nr, _, Sd, Nd, nz = numeric_c_setup(backend, A)
+    S, Nr, _, Sd, Nd, nz = numeric_c_setup(backend, A)
     @test SDS.factorize!(Nd, Sd, nz) == 0
-    F0 = SDS.host_numeric(Nd).factor
+    F0 = copy(SDS.host_numeric(Nd).factor)
     @test maximum(abs, F0 - Nr.factor) <= panel_tol(T) * maximum(abs, Nr.factor)
     for view in ('U', 'F'), index in ('O', 'Z')
         _, _, _, Sv, Nv, nzv = numeric_c_setup(backend, A; view, index)
@@ -120,9 +127,10 @@ end
     @test SDS.factorize!(Nd, Sd, nz) == 0                # and back
     @test SDS.host_numeric(Nd).factor == F0
     if backend isa CPU
-        # no allocation in the numeric phase (the first call compiles)
+        # no allocation in the numeric phase (the first call compiles) beyond what the KA CPU backend
+        # itself allocates per launch on Julia 1.10 and under coverage (`ka_cpu_alloc_budget`)
         numeric_c_allocated(Nd, Sd, nz)
-        @test numeric_c_allocated(Nd, Sd, nz) <= 1024
+        @test numeric_c_allocated(Nd, Sd, nz) <= ka_cpu_alloc_budget(numeric_c_launches(S), NUMERIC_C_LOCALMEM)
     end
 end
 

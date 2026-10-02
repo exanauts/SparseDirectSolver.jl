@@ -1181,20 +1181,27 @@ obtained on this machine (CUDSS.jl is in `../CUDSS.jl`).
     pointer(info, idx)` and the handle's cached workspace, no host read); `ka_potrf!(...; offset)`; the
     `vendor_potrf` capability probe now also checks `vendor_potrf_info!`; `HostMatrix` accepts index views of
     panels (`view(reshape(view(buf, r), f, w), i, j)`, the `F11`/`F21` blocks); `select_impl` no longer builds the
-    `dense_impls` vector (it allocated 176 bytes per dense call).
+    `dense_impls` vector (it allocated 176 bytes per dense call); internal `_potrf_info_impl!`, `_trsm_impl!`,
+    `_herk_impl!`/`_syrk_impl!` take an already resolved impl, and `factorize!` resolves the three impls once per
+    call (`_front_impls`), so the per-front calls do no capability lookup (review round 1).
   - `memory_estimates` slot 11 includes the `Int32` status vector.
   - Tests: `test/test_numeric_cholesky_c.jl`, a `potrf_info!` testset in `test/test_dense.jl`, `panel_tol(T)` in
     `test/utils.jl`.
 - Tests: `SDS_TEST_GPU=0 julia --project=. -e 'using Pkg; Pkg.test()'` (Julia 1.13.1, ubuntu-latest, CPU):
   43099 pass / 0 fail / 0 broken (test_numeric_cholesky_c: 458, 29 s; test_dense +540 for `potrf_info!`).
+  Review round 1, under CI's flags (`Pkg.test(; coverage = true, julia_args = ["--check-bounds=yes"])`,
+  `SDS_TEST_ONLY=test_numeric_cholesky_c`): Julia 1.10.10 458 pass / 0 fail, Julia 1.12.1 458 pass / 0 fail.
+  The first CI run on this PR failed the allocation assertion (4 per job: 2176 B on Julia 1, 9696 B on 1.10);
+  see the measurements below.
   Covered, per backend and `T ∈ ELTYPES`: panels within `100·eps·max|L|` of the T08 reference on
   `laplacian2d(40,40)` (Int32 and Int64 maps), `random_spd(500,0.01)`, `laplacian3d(10,10,10)`, equal `stats`,
   `extract_L`, `relres ≤ tol(T)` with `ref_solve!` on the copied-back factor (`nrhs` 1 and 5); two factorizations
-  give `==` panels (all backends, so CUDA in CI); every `impl` in `dense_impls(:potrf, …)` (CPU: vendor, generic,
-  ka); views `'U'`/`'F'` × index `'O'`/`'Z'` give `==` panels; refactorization with new values and back (`==`);
+  give `==` panels (all backends; the first result is copied, since `host_numeric` returns a host `Numeric` as is); every `impl` in `dense_impls(:potrf, …)` (CPU: vendor, generic,
+  ka, also against a copy); views `'U'`/`'F'` × index `'O'`/`'Z'` give `==` panels; refactorization with new
+  values and back (`==` against a copy of the first factor);
   `info == j` (and the front's local `info` in `stats`) for `singular_block_matrix` with `A[j,j] ∈ {-3, 0}` under
   three analyses, plus a pivot that turns negative only after elimination; regime-A analyses raise
-  `NotSupportedError`; the plan covers every front once. Julia 1.10 not run.
+  `NotSupportedError`; the plan covers every front once.
   CUDA/AMDGPU: pending CI on the PR.
 - Measurements (ubuntu-latest CPU backend, Float64, `subtree_budgets = Int[]`, best of 3; `:auto` = host LAPACK):
 
@@ -1205,9 +1212,24 @@ obtained on this machine (CUDSS.jl is in `../CUDSS.jl`).
   random_spd 2000     254    42     43.4 ms          68.5 ms           361 ms            64 B
   ```
 
-  With `:auto` the CPU panels are bitwise equal to the reference (same LAPACK calls on the same data). The
-  allocation test asserts `≤ 1024` bytes for the default impl; `:generic` (LinearAlgebra wrappers,
-  `cholesky!` objects) and `:ka` (fallback launches) allocate ~0.3–1.1 MB per factorization of lap2d 40² on CPU.
+  With `:auto` the CPU panels are bitwise equal to the reference (same LAPACK calls on the same data).
+  `@allocated factorize!(:auto)` of the allocation test (`random_spd(300, 0.02)`, 21–26 fronts, 10–12 steps,
+  over the four `T`), review round 1:
+
+  ```text
+  Julia    plain             --code-coverage --check-bounds=yes (CI)
+  1.13.1   64 B              not run
+  1.12.1   64 B              2176 B (constant: 2112 B = the stats kernel's @localmem MArray on the heap)
+  1.10.10  9632–11488 B      11744–13600 B (80–288 B per KA CPU launch: args boxed behind KA's `__run`)
+  ```
+
+  Resolving the impls once per phase did not change these numbers (the capability lookup did not allocate
+  after compilation); the allocations are inside the KA 0.9 CPU backend. The test asserts
+  `≤ ka_cpu_alloc_budget(launches, localmem)` (`test/utils.jl`): 1024 B, plus 320 B per launch on Julia < 1.12
+  and, under coverage, the `@localmem` bytes plus 64 B per launch; the launch count is bounded by
+  `3·nsteps + nfronts + 1`. So the strict 1024 B holds on Julia ≥ 1.12 without coverage. `:generic`
+  (LinearAlgebra wrappers, `cholesky!` objects) and `:ka` (fallback launches) allocate 9–39 KB per
+  factorization of that matrix on Julia 1.12/1.13 (1.4–4.7 MB for `:ka` on 1.10 under coverage).
 - Deviations from PLAN.md / this task:
   - Regime-A subtrees have no update-stack slots in the T07 layout (their CBs are meant to stay in local memory),
     so the regime-C driver cannot run them: `factorize!` raises `NotSupportedError` unless the analysis has no
@@ -1228,8 +1250,8 @@ obtained on this machine (CUDSS.jl is in `../CUDSS.jl`).
     `potrf_info!` testset and the T09 tests.
   - Per-front dense calls dominate on CPU (14.5 ms vs 5.2 ms for the reference on lap2d 100²: ~3400 fronts × 3
     calls + 135 launches). On a GPU this is ~10k small vendor launches per factorization; T10/T11 fuse them.
-  - `:ka` and `:generic` allocate per front on CPU (see measurements); only `:auto` is allocation-free. If the
-    graph-capture plan (PLAN §3.9) needs other impls, they need the same treatment as `select_impl`.
+  - `:ka` and `:generic` allocate per front on CPU, and the KA CPU backend allocates per launch on Julia 1.10
+    and for `@localmem` under coverage (see measurements): issue #53 (`found-by-agent`).
 - Suggested plan changes:
   - PLAN §2.6: add the asynchronous `potrf_info!` (device status, no host read) to the dense interface list;
     the same will be needed for `getrf`/`sytrf` (T15/T19).

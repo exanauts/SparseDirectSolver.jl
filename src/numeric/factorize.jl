@@ -77,22 +77,29 @@ function _check_numeric(N::Numeric{T}, S::Symbolic, nzval::AbstractVector) where
     return nothing
 end
 
-# regime-C dense kernels of front `s` (assembled panel + contribution block)
-function _factor_front_c!(N::Numeric{T}, S::Symbolic, s::Int, impl::Symbol) where {T}
+# the dense implementations of the regime-C front kernels, resolved once per phase (backend and `T` are
+# fixed), so the per-front calls do no capability lookup (its lock and closure allocate)
+function _front_impls(N::Numeric{T}, impl::Symbol) where {T}
+    return (potrf = select_impl(:potrf, N.factor, impl), trsm = select_impl(:trsm, N.factor, impl),
+            herk = select_impl(T <: Real ? :syrk : :herk, N.factor, impl))
+end
+
+# regime-C dense kernels of front `s` (assembled panel + contribution block), `p` from `_front_impls`
+function _factor_front_c!(N::Numeric{T}, S::Symbolic, s::Int, p::NamedTuple) where {T}
     L, sc = S.layout, S.schedule
     f, w = sc.rows[s], sc.width[s]
     m = f - w
     p0 = L.panel_ptr[s]
     P = reshape(view(N.factor, p0:(p0 + f * w - 1)), f, w)
     F11 = view(P, 1:w, 1:w)
-    potrf_info!('L', F11, N.info, s; impl)
+    _potrf_info_impl!(p.potrf, 'L', F11, N.info, s)
     m > 0 || return nothing
     F21 = view(P, (w + 1):f, 1:w)
-    trsm!('R', 'L', 'C', 'N', one(T), F11, F21; impl)
+    _trsm_impl!(p.trsm, 'R', 'L', 'C', 'N', one(T), F11, F21)
     c0 = L.cb_ptr[s]
     c0 > 0 || return nothing                                  # no parent: nothing to update
     C = reshape(view(N.stack, c0:(c0 + m * m - 1)), m, m)
-    herk!(C, F21, -one(real(T)), one(real(T)); uplo = 'L', impl)
+    _herk_impl!(p.herk, 'L', C, F21, -one(real(T)), one(real(T)))
     return nothing
 end
 
@@ -107,7 +114,7 @@ each of [`zero_fronts!`](@ref), [`scatter_A!`](@ref) and
 [`extend_add!`](@ref) over the step's fronts, then per front
 [`potrf_info!`](@ref), [`trsm!`](@ref) and [`herk!`](@ref)/[`syrk!`](@ref) on
 its panel and contribution block through the dense interface (`impl` is passed
-on: `:auto`, `:generic`, `:vendor`, `:ka`); every front takes this regime-C
+on: `:auto`, `:generic`, `:vendor`, `:ka`, resolved once per call); every front takes this regime-C
 path. Then [`cholesky_stats!`](@ref) and one read of the reduced status.
 
 Returns `info = 0` on success, else the original column of the smallest
@@ -119,6 +126,7 @@ allocated on the device; the panels are bitwise reproducible for a fixed
 """
 function factorize!(N::Numeric{T}, S::Symbolic, nzval::AbstractVector; impl::Symbol = :auto) where {T}
     _check_numeric(N, S, nzval)
+    p = _front_impls(N, impl)
     plan = N.plan
     nodes = S.schedule.group_nodes
     for t in 1:S.schedule.nsteps
@@ -128,7 +136,7 @@ function factorize!(N::Numeric{T}, S::Symbolic, nzval::AbstractVector; impl::Sym
         scatter_A!(N, S, nzval, a, b - a + 1)
         extend_add!(N, S, a, b - a + 1, plan.step_maxchild[t])
         for q in a:b
-            _factor_front_c!(N, S, nodes[q], impl)
+            _factor_front_c!(N, S, nodes[q], p)
         end
     end
     cholesky_stats!(N, S)

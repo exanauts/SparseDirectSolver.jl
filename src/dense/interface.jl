@@ -147,8 +147,12 @@ overwrites it with the same symmetric update.
 function syrk!(C::AbstractMatrix, A::AbstractMatrix, α, β; uplo = 'L', impl::Symbol = :auto)
     ul = _uplo_char(uplo)
     _check_syrk_dims(C, A)
+    return _syrk_impl!(select_impl(:syrk, C, impl), ul, C, A, α, β)
+end
+
+# `syrk!` with an already resolved implementation `p` (no capability lookup)
+function _syrk_impl!(p::Symbol, ul::Char, C::AbstractMatrix, A::AbstractMatrix, α, β)
     T = eltype(C)
-    p = select_impl(:syrk, C, impl)
     if p === :vendor
         vendor_syrk!(ul, T(α), A, T(β), C)
     elseif p === :generic
@@ -171,7 +175,13 @@ function herk!(C::AbstractMatrix, A::AbstractMatrix, α::Real, β::Real; uplo = 
     T <: Real && return syrk!(C, A, α, β; uplo, impl)
     ul = _uplo_char(uplo)
     _check_syrk_dims(C, A)
-    p = select_impl(:herk, C, impl)
+    return _herk_impl!(select_impl(:herk, C, impl), ul, C, A, α, β)
+end
+
+# `herk!` with an already resolved implementation `p` (`:syrk` for real `T`), no capability lookup
+function _herk_impl!(p::Symbol, ul::Char, C::AbstractMatrix, A::AbstractMatrix, α::Real, β::Real)
+    T = eltype(C)
+    T <: Real && return _syrk_impl!(p, ul, C, A, α, β)
     if p === :vendor
         vendor_herk!(ul, real(T)(α), A, real(T)(β), C)
     elseif p === :generic
@@ -206,7 +216,11 @@ or upper triangular, with unit diagonal if `diag = :U`; `trans ∈ (:N, :T, :C)`
 function trsm!(side, uplo, trans, diag, α, A::AbstractMatrix, B::AbstractMatrix; impl::Symbol = :auto)
     sd, ul, tr, dg = _side_char(side), _uplo_char(uplo), _trans_char(trans), _diag_char(diag)
     _check_trsm_dims(sd, A, B)
-    p = select_impl(:trsm, B, impl)
+    return _trsm_impl!(select_impl(:trsm, B, impl), sd, ul, tr, dg, α, A, B)
+end
+
+# `trsm!` with an already resolved implementation `p` (no capability lookup)
+function _trsm_impl!(p::Symbol, sd::Char, ul::Char, tr::Char, dg::Char, α, A::AbstractMatrix, B::AbstractMatrix)
     if p === :vendor
         vendor_trsm!(sd, ul, tr, dg, eltype(B)(α), A, B)
     elseif p === :generic
@@ -261,7 +275,11 @@ function potrf_info!(uplo, A::AbstractMatrix, info::AbstractVector{Int32}, idx::
     ul = _uplo_char(uplo)
     LinearAlgebra.checksquare(A)
     1 <= idx <= length(info) || throw(DimensionMismatch("info index $idx outside 1:$(length(info))"))
-    p = select_impl(:potrf, A, impl)
+    return _potrf_info_impl!(select_impl(:potrf, A, impl), ul, A, info, idx)
+end
+
+# `potrf_info!` with an already resolved implementation `p` (no capability lookup)
+function _potrf_info_impl!(p::Symbol, ul::Char, A::AbstractMatrix, info::AbstractVector{Int32}, idx::Integer)
     if p === :vendor
         vendor_potrf_info!(ul, A, info, idx)
         ka_chol_check_info!(info, idx, A)
