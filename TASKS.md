@@ -1402,6 +1402,21 @@ obtained on this machine (CUDSS.jl is in `../CUDSS.jl`).
 
 **Reads**: PLAN §2.2 (regime A), §2.3 step 5, §2.7.
 
+**Owner note (issue #48, packed contribution blocks)**: before the regime-A
+kernels, switch the contribution blocks on the update stack from full `m×m`
+to packed lower-triangular storage (column-major packed, `m(m+1)/2` entries,
+column `j` of the triangle at offset `j(j-1)/2 + (2m-j)(j-1)/2`, or an
+equivalent documented formula). Measured on `main` after #50 and #54 the
+stack is 4.5× the factor on KKT/random SPD matrices and 8.7× on
+`kkt_matrix(60000, 25000)`, almost all of it live data, so packing is the
+one remaining halving. Touch every producer and consumer in one change:
+`build_layout` (`cb_len`), the T09 extend-add kernel (packed reads), the T10
+regime-B kernel (packed SYRK output), the regime-C path (a pack kernel after
+the vendor `syrk`, the only extra launch) and the CPU reference of T08 if it
+mirrors the device layout. Then regime A writes packed blocks directly. Keep
+the T07 testset "update stack vs factor (issue #48)" and lower its bounds to
+the new values; close #48 in this task's PR.
+
 #### Deliverables
 
 * `src/numeric/subtree.jl`: `subtree_cholesky_kernel!` parametrized by the
@@ -1667,6 +1682,15 @@ inertia with matching enabled equals the eigenvalue count (the cuDSS defect).
 Block-diagonal packing, forest schedule; `test_nonuniform_batch_cudss.jl` ported.
 
 ### T23 — AMDGPU, oneAPI and Metal extensions   `[ ]`
+
+**Owner note (issue #53)**: the `impl = :ka` dense fallbacks of T03
+(`ka_potrf!`, `ka_trsm!`, `ka_gemm!`, batched variants) allocate per call;
+on oneAPI and Metal they are the only path, so they must become
+allocation-free here (preallocated workspace in `Numeric`, static launch
+configurations), asserted with `ka_cpu_alloc_budget` from `test/utils.jl`.
+`:generic` stays the allocating reference path (PLAN §3.9). The Julia 1.10 /
+coverage allowances in that budget are KernelAbstractions 0.9 artefacts and go
+away with KA 0.10.
 
 Written by analogy with the CUDA extension (sparse adapters, vendor dense
 bindings, capability probes). Test on this machine: a temporary environment

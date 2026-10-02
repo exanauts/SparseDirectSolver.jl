@@ -276,7 +276,10 @@ runtime decisions.
    each panel a contiguous column-major `f×w` block (leading dimension `f`) so a
    `reshape(view(...))` is a valid strided matrix for vendor BLAS; D separate;
    batch stride for uniform batches. The front's first `w` columns *are* the
-   factor panel; only the contribution block lives on the update stack.
+   factor panel; only the contribution block lives on the update stack, in
+   packed lower-triangular storage (`m(m+1)/2` entries; regime C packs after
+   the vendor `syrk`), since the stack is otherwise 4–9× the factor on KKT
+   matrices (issue #48).
 
 ### 2.4 Numeric phase (device)
 
@@ -482,7 +485,9 @@ Everything from analysis is reused: permutation, scaling, etree, supernodes,
 front sizes, extend-add maps, layout, schedule. The numeric phase and the solve
 are pure "values in, factors/solution out" kernel sequences with no allocation
 and no host synchronization, so the CUDA and ROCm extensions can capture the
-refactorize+solve sequence in a graph and replay it per IPM iteration.
+refactorize+solve sequence in a graph and replay it per IPM iteration. This
+holds for the dense implementations `:auto`, `:vendor` and `:ka`; `:generic`
+(host LinearAlgebra) is the reference path and may allocate (issue #53).
 
 ---
 
