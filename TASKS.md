@@ -2220,7 +2220,7 @@ repeat it once T21 has landed. The bar is cuDSS with `"matching_alg" =
   - `test/test_api.jl`: the assertions that `"solve_refinement"`, complex `solve_mode = 1`, complex Hermitian CSC
     input raise `NotSupportedError` and that `ir_n_steps` warns are replaced by assertions of the results.
 - Tests: `SDS_TEST_GPU=0 SDS_TEST_ONLY=test_refinement`: 453 pass, 1 broken (CPU). Full
-  `SDS_TEST_GPU=0 julia --project=. -e 'using Pkg; Pkg.test()'`: FULL_COUNTS. CUDA/AMDGPU: pending CI on the PR.
+  `SDS_TEST_GPU=0 julia --project=. -e 'using Pkg; Pkg.test()'`: 60433 pass, 0 fail, 1 broken (the one above), 11.5 min. CUDA/AMDGPU: pending CI on the PR.
 - Measurements: relres `‖b − Ax‖/‖b‖`, `b = A·1`, handle layer `"S"`, view `'L'`, default pivoting, KA CPU
   backend, after `ir_n_steps` steps (`bench/refinement.jl`; dumps generated in this session with
   `bench/dump_madnlp_kkt.jl`, MadNLP/ExaModelsPower current releases):
@@ -2238,8 +2238,8 @@ repeat it once T21 has landed. The bar is cuDSS with `"matching_alg" =
   its bar (4.6e-11) and needs T21's scaling (repeat this table then). On a badly scaled SPD matrix
   (`badly_scaled_spd(Float64, 300, 0.02)`) one step changes relres by 2×–7× only (3e-16 → 6e-17); on the KKT
   generator with perturbed pivots (`kkt_matrix(150, 60, 0)`, `pivot_pairs = "none"`) relres goes 1.5e-4 → 2.4e-9
-  → … and `ir_tol = 1e-14` stops after 3 steps. `test_refinement` takes ~6 min on the CPU runner (mostly
-  compilation of the kernel variants over 4 element types × structures × flags).
+  → … and `ir_tol = 1e-14` stops after 3 steps. `test_refinement` takes 9 s inside the full run, ~6 min alone
+  (compilation of the kernel variants over 4 element types × structures × flags).
 - Deviations from PLAN.md / this task:
   - "On a badly row-scaled SPD matrix one refinement step reduces relres by ≥ 100×" cannot be observed: Cholesky
     is backward stable and invariant under symmetric diagonal scaling (the only scaling that keeps the matrix
