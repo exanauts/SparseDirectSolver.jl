@@ -212,7 +212,7 @@ element type `T` and `impl = :auto` on the CPU backend: at most three
 assembly launches per launch group, one `ka_chol_check_info!` and one
 `pack_add!` per front and the statistics launch; `@localmem` of the statistics
 kernel plus, per group, that of the largest fused regime-B kernel (packed
-64×64 triangle, status, pivot) or of the largest regime-A kernel (64 KiB).
+64×64 triangle, status, pivot) or of the largest regime-A kernel (48 KiB).
 """
 function numeric_alloc_budget(S, ::Type{T}) where {T}
     ngroups = length(S.schedule.groups)

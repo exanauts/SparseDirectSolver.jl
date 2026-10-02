@@ -62,6 +62,9 @@ end
 
 function _check_numeric(N::Numeric{T}, S::Symbolic, nzval::AbstractVector) where {T}
     _check_reference_cholesky(S, T)
+    sizeof(T) <= S.elsize ||
+        throw(InvalidValueError("the analysis was built for $(S.elsize)-byte elements, the numeric storage has " *
+                                "$(sizeof(T))-byte $T"))
     length(nzval) == S.nnz ||
         throw(InvalidValueError("nzval has $(length(nzval)) entries, the analysis expects $(S.nnz)"))
     length(N.factor) == S.layout.factor_len && length(N.stack) == S.layout.stack_len &&

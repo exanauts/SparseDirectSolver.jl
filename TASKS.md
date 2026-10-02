@@ -1461,8 +1461,8 @@ the new values; close #48 in this task's PR.
     its work-item loops), and no launch-wide maxima are needed. No atomics; deterministic.
     `factorize_subtrees!(numeric, symbolic, nzval, first, count, local_bytes)`; the local size becomes a `Val`
     through explicit branches (`Base.Cartesian.@nif`, no dynamic dispatch, no allocation).
-  - Schedule/layout: `SUBTREE_LOCAL_SIZES = (8, 16, 32, 48, 64 KiB)`, `subtree_local_bytes(budget)` (largest size
-    `≤ budget`), `subtree_capacity(budget, elsize)` (minus `SUBTREE_LOCAL_RESERVE = 256` B for the control words and
+  - Schedule/layout: `SUBTREE_LOCAL_SIZES = (8, 16, 32, 48 KiB)` (capped at CUDA's 48 KiB static shared memory,
+    review round 1), `subtree_local_bytes(budget)` (largest size `≤ budget`), `subtree_capacity(budget, elsize)` (minus `SUBTREE_LOCAL_RESERVE = 256` B for the control words and
     pivot); the regime-A peak is now counted in packed fronts and blocks against that capacity.
     `subtree_local_layout` (in `build_layout`): `Layout.local_front`, `local_cb`, `local_len` (checked against
     `subtree_peak`); `Symbolic` gets the device maps `local_front`, `local_cb`; `NumericPlan` gets the regime-A
@@ -1472,17 +1472,19 @@ the new values; close #48 in this task's PR.
   - Tests: `test/test_numeric_cholesky_a.jl` (new); `pack_lower`/`unpack_lower` in `test/utils.jl`,
     `numeric_alloc_budget` counts the `pack_add!` launches and the regime-A `@localmem`.
 - Tests: `SDS_TEST_GPU=0 julia --project=. -e 'using Pkg; Pkg.test()'` (Julia 1.13.1, ubuntu-latest, CPU):
-  45796 pass / 0 fail / 0 broken (5 min 11 s). Under CI's flags (`coverage = true`, `--check-bounds=yes`) test_numeric_cholesky_a + _b + _c: 2960 pass / 0 fail. Julia 1.10 not run locally (CI). test_numeric_cholesky_a: 835 pass / 0 fail (106 s). Covered per backend and `T ∈ ELTYPES`: the
+  45802 pass / 0 fail / 0 broken (6 min 12 s, after review round 1). Under CI's flags (`coverage = true`, `--check-bounds=yes`) test_numeric_cholesky_a + _b + _c: 2960 pass / 0 fail. Julia 1.10 not run locally (CI). test_numeric_cholesky_a: 835 pass / 0 fail (106 s). Covered per backend and `T ∈ ELTYPES`: the
   plan's regime-A groups (one per class in use, before B/C, every subtree once, local size holds `local_len`,
   estimate slot 12); the T09/T10 correctness suite with regimes A+B+C (`laplacian2d(40,40)` with small budgets and
   C thresholds, Int32/Int64 maps; `laplacian2d(40,40)` all in one subtree; `random_spd(500,0.01)`,
   `laplacian3d(10,10,10)` with the default budgets): panels within `100·eps·max|L|` of the reference, equal
   `stats`, `extract_L`, `relres ≤ tol(T)` (`nrhs` 1, 5), bitwise determinism; four budget settings (8 KiB only,
-  64 KiB, odd budgets `[8192, 20000, 2^20]`, `"algo2"` with A) give the reference factor; `laplacian2d(100,100)`
+  a 64 KiB budget (48 KiB class), odd budgets `[8192, 20000, 2^20]`, `"algo2"` with A) give the reference factor; `laplacian2d(100,100)`
   AMD with and without regime A: same solution, `3·nlaunches(A) ≤ nlaunches(no A)` (Float32 14 vs 80, Float64 and
   ComplexF32 20 vs 80; see deviations for ComplexF64), local moves with more than one round occur; views ×
   index bases give `==` panels, refactorization and back, allocation budget; `info == j` with the failing front
-  in a subtree (4 analyses, negative and zero pivot, local `info` and `npos`), pivot failing after elimination.
+  in a subtree (4 analyses, negative and zero pivot, local `info` and `npos`), pivot failing after elimination;
+  a `Numeric` with wider elements than the analysis was built for (`sizeof(T) > S.elsize`) raises
+  `InvalidValueError` (the regime-A local capacity depends on it), narrower ones factor.
   T07 schedule tests check the packed peak against `subtree_capacity` and the local layout; the "update stack vs
   factor (issue #48)" bounds are lowered to the packed values (see measurements).
   CUDA/AMDGPU: pending CI on the PR.
@@ -1495,24 +1497,26 @@ the new values; close #48 in this task's PR.
   - **CUDA table (A+B+C vs B+C vs C only on the T04 matrices): not measured** (no GPU here). The owner should run
     `julia --project=bench bench/regimes.jl --backend=cuda` (and `--T=Float32`). KA CPU backend table (1 thread,
     Float64, `:auto`, median of 3), which only shows launch counts and correctness: the CPU backend runs work items
-    serially, so fused kernels lose to per-front host LAPACK there:
+    serially, so fused kernels lose to per-front host LAPACK there (launch column recomputed in review round 1:
+    `nlaunches` now counts the `pack_add!` of every regime-C front with a contribution block, 4 launches per such
+    front instead of 3):
 
     ```text
     matrix     regimes  fronts A/B/C     subtrees  launches  factorize! ms  max rel. diff to A+B+C
-    lap2d_300  A+B+C    13300/309/22       387        117        475          0
-    lap2d_300  B+C      0/13609/22           0        161        402          3.1e-15
-    lap2d_300  C only   0/0/13631            0      40931        244          5.4e-15
-    lap3d_40   A+B+C    9566/821/135      1675        466       3524          0
-    lap3d_40   B+C      0/10387/135          0        492       2815          1.8e-16
-    lap3d_40   C only   0/0/10522            0      31593       2765          5.4e-16
+    lap2d_300  A+B+C    13300/309/22       387        138        475          0
+    lap2d_300  B+C      0/13609/22           0        182        402          3.1e-15
+    lap2d_300  C only   0/0/13631            0      54561        244          5.4e-15
+    lap3d_40   A+B+C    9566/821/135      1675        600       3524          0
+    lap3d_40   B+C      0/10387/135          0        626       2815          1.8e-16
+    lap3d_40   C only   0/0/10522            0      42114       2765          5.4e-16
     ```
 
   - `@allocated factorize!` (second call, CPU, Julia 1.13): 64 B with regime A active.
 - Deviations from PLAN.md / this task:
   - Regime-A fronts live in local memory as packed lower triangles too (not only the blocks), so the regime-A
     peak model of the T07 schedule changed from `f² + Σm²` to `f(f+1)/2 + Σm(m+1)/2` entries, measured against
-    `subtree_capacity` (local size minus a 256 B reserve) instead of the raw budget. Budgets are mapped to five
-    kernel instances (8–64 KiB, `subtree_local_bytes`) because the local size must be a `Val` and every branch of the
+    `subtree_capacity` (local size minus a 256 B reserve) instead of the raw budget. Budgets are mapped to four
+    kernel instances (8–48 KiB, `subtree_local_bytes`) because the local size must be a `Val` and every branch of the
     dispatch compiles on the first launch (16 sizes cost ~10 s of compilation per element/index type); a budget
     below 8 KiB disables its class. The T07 tests were adapted to the packed model (peak simulation, class bounds,
     `cb_len`, the arrow example's numbers), not loosened.
@@ -1530,13 +1534,13 @@ the new values; close #48 in this task's PR.
   - CUDA timings of `bench/regimes.jl` and `bench/front_bins.jl` are owed; regime thresholds and budgets stay at the
     T07 defaults until then.
   - The 48 KiB default budget fits CUDA's static shared-memory limit (local size + control words ≤ 48 KiB) but not
-    Metal's 32 KiB: T23 must cap `subtree_budgets` per backend.
+    Metal's 32 KiB: T23 must cap `subtree_budgets` per backend. A 64 KiB kernel class (AMDGPU LDS allows it)
+    can come back behind such a per-backend capability; it was dropped because CUDA rejects > 48 KiB of static
+    shared memory. Tracked together with the owed CUDA timings in #60.
   - Extend-add (global and local) and the regime-B SYRK still iterate the full `m×m` square of a block and skip the
     upper half (half the work items idle); a packed index → (i, j) map would remove that (T25).
   - Regime-A workgroups of one launch run very different subtree sizes; the launch lasts as long as the largest
     subtree (on `lap3d_40`, 1675 subtrees). A split of large classes or a size-sorted order is a T25 item.
-  - PR #54 (`build_layout` offline placement) touches the same function; it will need a rebase on the packed
-    `cb_len` (one line).
 - Suggested plan changes:
   - PLAN §2.3 step 5: regime-A budgets are compared with the packed serial stack (fronts too) minus a small
     reserve, and map to a fixed list of kernel local sizes.

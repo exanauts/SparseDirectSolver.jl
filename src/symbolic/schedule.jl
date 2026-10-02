@@ -30,8 +30,11 @@ const REGIME_C = Int8(3)
 "Largest front width with a fused regime-B kernel; wider bins (raised `regime_c_width`) take the regime-C path."
 const REGIME_B_MAX_WIDTH = 64
 
-"`@localmem` sizes (bytes) of the regime-A kernel instances; a budget uses the largest one it holds."
-const SUBTREE_LOCAL_SIZES = (8192, 16384, 32768, 49152, 65536)
+"""
+`@localmem` sizes (bytes) of the regime-A kernel instances; a budget uses the largest one it holds.
+Capped at 48 KiB: `@localmem` is static shared memory on CUDA, where ptxas rejects more than 48 KiB.
+"""
+const SUBTREE_LOCAL_SIZES = (8192, 16384, 32768, 49152)
 
 "Bytes of a regime-A kernel's local memory kept for its control words and pivot (not for fronts)."
 const SUBTREE_LOCAL_RESERVE = 256
@@ -40,7 +43,7 @@ const SUBTREE_LOCAL_RESERVE = 256
     subtree_local_bytes(budget) -> Int
 
 `@localmem` bytes of the regime-A kernel of a budget class: the largest of
-`SUBTREE_LOCAL_SIZES` (8, 16, 32, 48, 64 KiB) that is `≤ budget`, `0` below
+`SUBTREE_LOCAL_SIZES` (8, 16, 32, 48 KiB) that is `≤ budget`, `0` below
 8 KiB. The size is a `Val` parameter of the kernel, so a short list of
 instances serves every budget.
 """
@@ -199,8 +202,8 @@ function tree_height(parent::AbstractVector{<:Integer})
     return h
 end
 
-# number of launches of a C front: potrf, plus trsm and syrk/herk when it has a contribution block
-_c_front_launches(f::Int, w::Int) = f > w ? 3 : 1
+# number of launches of a C front: potrf, plus trsm, syrk/herk and pack_add! when it has a contribution block
+_c_front_launches(f::Int, w::Int) = f > w ? 4 : 1
 
 """
     nlaunches(schedule) -> Int
@@ -209,7 +212,8 @@ Number of kernel and vendor launches of one numeric factorization following
 `schedule`: one per regime-A budget class, one per regime-B group (fused
 assemble + factor + update kernel), and per regime-C group one batched
 assembly/extend-add launch plus, per front, `potrf` and, when the front has a
-contribution block, `trsm` and `syrk`/`herk`.
+contribution block, `trsm`, `syrk`/`herk` and the `pack_add!` of the
+workspace product into the packed contribution block.
 """
 function nlaunches(sc::Schedule)
     total = 0

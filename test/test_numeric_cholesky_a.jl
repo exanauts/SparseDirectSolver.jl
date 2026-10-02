@@ -50,11 +50,19 @@ end
     # the budget classes map to the kernel sizes, smaller budgets disable regime A
     @test SDS.subtree_local_bytes(16 * 1024) == 16384
     @test SDS.subtree_local_bytes(20000) == 16384
-    @test SDS.subtree_local_bytes(1 << 20) == 65536
+    @test SDS.subtree_local_bytes(1 << 20) == 49152
     @test SDS.subtree_local_bytes(4096) == 0 && SDS.subtree_capacity(4096, 8) == 0
     S = SDS.symbolic_analysis(SDS.CSR(tril(laplacian2d(Float64, 10, 10))), "SPD", 'L';
                               opts = Options(subtree_budgets = [4096]))
     @test SDS.nsubtrees(S.schedule) == 0
+    # the local capacity depends on the element size: wider numeric elements than the analysis's are rejected
+    C = SDS.CSR(tril(laplacian2d(Float32, 10, 10)))
+    S32 = SDS.symbolic_analysis(C, "SPD", 'L')
+    @test S32.elsize == sizeof(Float32) && SDS.nsubtrees(S32.schedule) > 0
+    @test thrown(() -> SDS.factorize!(SDS.allocate_numeric(S32, Float64), S32, Float64.(C.nzval))) isa
+          InvalidValueError
+    S64 = SDS.symbolic_analysis(SDS.CSR(tril(laplacian2d(Float64, 10, 10))), "SPD", 'L')
+    @test SDS.factorize!(SDS.allocate_numeric(S64, Float32), S64, Float32.(C.nzval)) == 0
 end
 
 @testset "panels, solves, determinism ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES

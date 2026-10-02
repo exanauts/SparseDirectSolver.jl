@@ -234,7 +234,7 @@ end
     S2 = SDS.symbolic_analysis(SDS.CSR(A), "SPD", 'L'; opts = Options(reordering_alg = "algo5", use_superpanels = 0,
                                                                       subtree_budgets = Int[], factorization_alg = "algo2"))
     @test all(==(SDS.REGIME_C), S2.schedule.regime)
-    @test SDS.nlaunches(S2.schedule) == (1 + 4 * 3) + (1 + 1)
+    @test SDS.nlaunches(S2.schedule) == (1 + 4 * 4) + (1 + 1)   # potrf, trsm, syrk, pack_add!
     check_schedule(S2)
     # "G" maps are not implemented yet
     @test thrown(() -> SDS.symbolic_analysis(SDS.CSR(A), "G", 'F')) isa NotSupportedError
