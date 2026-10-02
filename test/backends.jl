@@ -95,7 +95,31 @@ function host_csc(rowptr, colval, nzval::AbstractVector{T}, m, n) where {T}
     return SparseMatrixCSC{T, Int}(sparse(transpose(At)))
 end
 
+"""
+    api_matrix(backend, A, INT = index type of A)
+
+The sparse matrix a user of the public API passes on `backend` (T13): a host
+[`CSR`](@ref) on the CPU backend (`cholesky(::SparseMatrixCSC)` belongs to
+CHOLMOD), the vendor CSR matrix of [`to_device`](@ref) on a GPU.
+"""
+api_matrix(backend, A::SparseMatrixCSC{<:Any, INT}) where {INT} = api_matrix(backend, A, INT)
+api_matrix(backend, A::SparseMatrixCSC, ::Type{INT}) where {INT} = to_device(backend, A, INT)
+api_matrix(::CPU, A::SparseMatrixCSC{T}, ::Type{INT}) where {T, INT} = CSR(SparseMatrixCSC{T, INT}(A))
+
+"""
+    device_allocated(backend, f) -> Union{Int, Missing}
+
+Bytes of device memory allocated by `f()` (T13): `@allocated` on the CPU
+backend (device memory is host memory), `CUDA.@allocated` on CUDA; `missing`
+when the backend offers no counter.
+"""
+device_allocated(::CPU, f) = @allocated f()
+device_allocated(backend, f) = missing
+
 if CUDA_LOADED
+    if isdefined(CUDA, Symbol("@allocated"))
+        @eval device_allocated(::CUDABackend, f) = CUDA.@allocated f()
+    end
     backend_name(::CUDABackend) = "CUDA"
     to_device(::CUDABackend, x::Array) = CuArray(x)
     to_device(backend::CUDABackend, A::SparseMatrixCSC{T, INT}) where {T, INT} = to_device(backend, A, INT)

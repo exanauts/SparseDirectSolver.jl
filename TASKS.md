@@ -1701,7 +1701,7 @@ whenever `atomic_add` is `false`. Close #36 in this task's PR.
 
 ---
 
-## T13 — Public API v0.1: `DirectSolver`, phases, generic Cholesky, ported tests   `[ ]`
+## T13 — Public API v0.1: `DirectSolver`, phases, generic Cholesky, ported tests   `[!]`
 
 **Reads**: PLAN §1.2, §1.3, §1.4, §1.5, §3.1, §3.2; `../CUDSS.jl/src/interfaces.jl`,
 `generic.jl`, `test/test_cudss.jl`.
@@ -1743,6 +1743,98 @@ whenever `atomic_add` is `false`. Close #36 in this task's PR.
 * Phase-order errors are raised; unknown phase strings raise `ArgumentError`.
 * `getparam(solver, "perm_reorder_row")` is a valid permutation and
   `getparam(solver, "lu_nnz") == nnz_L`.
+
+### Report
+
+- Status: [!] (done on the CPU backend; deviations below; CUDA from CI)
+- What was built:
+  - `src/solver.jl`: `AbstractDirectSolver{T,INT} <: Factorization{T}`; `DirectSolver(A::CSR, structure, view; index)`,
+    `DirectSolver(rowptr, colval, nzval, structure, view; index = 'O')`, `DirectSolver(::SparseMatrixCSC, …)` (host
+    copy). The struct is concretely typed: the device `Symbolic`, `Numeric` and `SolveWorkspace` types are derived
+    from the backend at construction (`KernelAbstractions.allocate(backend, T, 0)`), so the phases are type-stable.
+    Stages none → reordered → analyzed → factorized. `execute!(phase, solver, X, B; asynchronous = true)`:
+    `"reordering"` (pattern + `compute_ordering`), `"symbolic_factorization"` (supernodes, schedule, layout, maps,
+    `adapt` to the backend with the CSR's `INT`, `allocate_numeric`, `allocate_solve`: the only allocations),
+    `"analysis"`, `"factorization"`, `"refactorization"` (info reset first), `"solve"` and the sub-phases
+    `"solve_fwd_perm"`/`"solve_fwd"`/`"solve_bwd"`/`"solve_bwd_perm"` (→ `permute_rhs!`, `forward_sweep!`,
+    `backward_sweep!`, `unpermute_solution!` on the solver's workspace). `X`/`B`: vectors, matrices, strided vectors
+    or `MatrixDescriptor`s (row-major when `transposed`); the workspace is reallocated only when `nrhs` grows (T12
+    follow-up). `deterministic_mode = 1` → deterministic forward sweep. `asynchronous = false` →
+    `KernelAbstractions.synchronize`. Named wrappers `analyze!`, `factorize!`, `refactorize!`, `solve!`;
+    `update!(solver, A::CSR | SparseMatrixCSC)`, `update!(solver, rowptr, colval, nzval)` (re-point, no copy; size,
+    nnz, index base, orientation and array type checked). `setparam!(solver, …)` (options + `"info"`),
+    `getparam(solver, …)` (`info`, `lu_nnz`, `flops`, `nsuperpanels`, `memory_estimates`, `perm_reorder_row/col`,
+    `perm_row/col`, `diag`, `user_perm` and every config parameter), `getparam!(buffer, solver, name)` (host or
+    device buffer, element type converted). `diag` is one KA launch (one work item per supernode) into a new vector
+    on the backend. `Base.show`, `size`.
+  - `src/generic.jl`: `cholesky(A::CSR, NoPivot(); view = 'F', check = false)`, `cholesky!(solver, A; check)`
+    (`fresh_factorization` → `"factorization"`, then `"refactorization"`), `ldiv!(solver, B)`, `ldiv!(X, solver, B)`
+    (vectors, matrices, `MatrixDescriptor`s), `\`, `diag`, `nnz` (= `lu_nnz`), `logabsdet` (`2 Σ log Lₖₖ`, sign
+    `one(T)`; throws on a failed factorization), `logdet`.
+  - `ext/SparseDirectSolverCUDAExt.jl`: `DirectSolver(::CuSparseMatrixCSR | ::CuSparseMatrixCSC, …)`,
+    `update!(solver, ::CuSparseMatrixCSR | CSC)`, `cholesky(::CuSparseMatrixCSR; view, check)`,
+    `cholesky(Symmetric/Hermitian(::CuSparseMatrixCSR))` (view = `uplo`), as CUDSS.jl.
+  - Tests: `test/test_api.jl`; `test/test_ported.jl` runs `test/ported/{cudss_execution, cudss_generic,
+    small_matrices, refactorization_cholesky, cudss_solver}.jl` (each file's header lists its changes from
+    CUDSS.jl); `api_matrix` and `device_allocated` helpers in `test/backends.jl`.
+- Tests: `SDS_TEST_GPU=0 julia --project=. -e 'using Pkg; Pkg.test()'` (Julia 1.13.1, ubuntu-latest, CPU): 52050 pass /
+  0 fail / 0 broken (8 min 29 s); test_api 1946 pass (~200 s, mostly compilation), test_ported 3748 pass. Covered for
+  every backend, `T ∈ ELTYPES` and (where indices matter) `INT ∈ INTTYPES`: all constructors, zero-based arrays,
+  invalid structure/view/index/size, batches refused; the phases one by one and as `"analysis"` for views `L`, `U`,
+  `F`; the four sub-phases `==` `"solve"`, in place `X === B`, the named wrappers; phase-order errors
+  (`FactorizationError` for every phase and data parameter used too early, refactorization before factorization,
+  solve after a re-analysis), unknown phase strings (`ArgumentError`), `"solve_diag"`, `"solve_refinement"`, the
+  Schur shorthands, matching, Schur mode, batches, `"syncfree"`, `solve_alg = "algo1"`, `"S"`/`"H"` and complex
+  `"SPD"` refused; `perm_*` valid permutations equal to the factor's, `lu_nnz == nnz_L` of a brute-force symbolic
+  factorization of `A[perm, perm]` `== nnz(solver)`, `nsuperpanels`, `flops`, `memory_estimates`, `diag` against
+  dense Cholesky of `A[perm, perm]`, `getparam!` into host/device buffers, `info` get/set/reset, `user_perm` (device,
+  0-based) driving the next analysis; failed factorization `info` equal to `ref_factorize!`'s, recovery through
+  `update!` (CSR/vendor matrix, raw arrays, values written in place); right-hand-side layouts (vector, `n × nrhs`,
+  `MatrixDescriptor` column- and row-major, strided), workspace growth, `deterministic_mode` reproducible,
+  `solve_mode` 1/2, `ir_n_steps` warning; CSC input (`csr_of_transpose`); the LinearAlgebra layer for every view,
+  `check = true`; the MadNLP-like loop (20 refactorizations of `kkt_matrix(T, 300, 100, 1e-8)`'s `H` with a changing
+  diagonal written into the solver's `nzval`, `info == 0`, `relres ≤ tol(T)`, iterations 2–20 within
+  `numeric_alloc_budget + solve_alloc_budget` on CPU (measured 64 B per iteration on Julia 1.13, all inside the T09
+  `factorize!`); on CUDA `CUDA.@allocated == 0` is asserted). CUDA/AMDGPU: pending CI on the PR.
+- Measurements: none asked for. Per refactorize+solve iteration of the MadNLP loop on the CPU backend: 64 B host
+  allocation (Julia 1.13.1), the same as the bare T09–T11 `factorize!`; the API layer adds nothing.
+- Deviations from PLAN.md / this task:
+  - `Symmetric`/`Hermitian` wrappers exist for the vendor sparse types only (CUDA extension) and are tested on GPU
+    backends only: the in-package `CSR` is not an `AbstractMatrix` (so it cannot be wrapped), and
+    `cholesky(Hermitian(::SparseMatrixCSC))` is CHOLMOD's (overriding it would be piracy). On the CPU backend the
+    generic layer takes a `CSR` (`cholesky(CSR(A); view)`); the ported `cudss_generic` passes a `CSR` there.
+  - `"solve_diag"` raises `NotSupportedError` as the task lists it among the phases of later tasks, although it
+    would be the identity for Cholesky (it is run inside `"solve"`).
+  - `ir_n_steps`: the LinearAlgebra layer keeps the handle default 0 until T16; a positive value is stored and the
+    solve warns once that refinement is not implemented (instead of silently ignoring it).
+  - `"info"` follows PLAN §1.4 (original column of the first failed pivot), so the ported
+    `refactorization_cholesky` expects `perm_row[1]` where CUDSS.jl expects cuDSS's `1`.
+  - Ported tests: global pivoting `'C'`/`'R'` raises `NotSupportedError` (PLAN §3.3) and is asserted as such;
+    `matching_alg = "algo6"` (T21) is asserted to be refused by the analysis instead of being enabled; algorithm
+    strings with no meaning here (`factorization_alg` `"algo3"`–`"algo5"`, …) are asserted to raise
+    `InvalidValueError`; matrices come from `random_spd` instead of `A A' + I`.
+  - CSC input (`CuSparseMatrixCSC`, `transposed` CSR) is read with the view flipped; for complex Hermitian matrices
+    this would factor `conj(A)`, which needs the conjugated solve of `solve_mode` (T16), so it raises
+    `NotSupportedError` for now. `solve_mode = 1` with complex `T` likewise; modes 1 (real) and 2 are the same
+    system for SPD/HPD and are accepted.
+  - Permutations are returned 1-based (`Vector{Int}`); `user_perm` is accepted 0- or 1-based (T05).
+  - Options no phase implements yet (`matching_alg`, `schur_mode`, `ubatch_size > 1`, `user_nd_partition_tree`,
+    `schedule = "syncfree"`, `factor_precision ≠ real(T)`, `solve_alg = "algo1"`) raise `NotSupportedError` when the
+    phase runs; `pivot_type`/`pivot_epsilon`/`max_lu_nnz` have no effect on Cholesky (as in cuDSS);
+    `user_host_interrupt` is stored and not polled yet (T16).
+- Open issues / follow-ups:
+  - The CUDA extension defines `LinearAlgebra.cholesky(::CuSparseMatrixCSR)` and its wrappers, the same signatures
+    as CUDSS.jl. Loading both packages makes one overwrite the other, and a package that loads both while it
+    precompiles would hit Julia's method-overwrite error; relevant while MadNLPGPU migrates (it uses the handle layer,
+    which does not clash).
+  - T14/T15: `npivots`, `inertia`, `pivot_stats` raise `NotSupportedError` in `getparam` (`_output_task`), and
+    `_check_analysis_supported` refuses `"S"`/`"H"`; both need updating. `"diag"` must return D for LDLᵀ.
+  - T16: `solve_diag`/`solve_refinement` phases, `ir_n_steps` (remove the warning), the complex `solve_mode = 1`,
+    complex CSC input, `user_host_interrupt`.
+- Suggested plan changes:
+  - PLAN §1.5/§3.1: the `Symmetric`/`Hermitian` wrappers apply to the backend sparse matrix types of the extensions;
+    on the CPU backend the generic layer takes `CSR` (no piracy of CHOLMOD's `cholesky`).
+  - PLAN §1.2: `"solve_diag"` could be enabled now for SPD/HPD (identity) instead of waiting for T16.
 
 ---
 

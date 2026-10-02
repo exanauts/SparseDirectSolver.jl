@@ -6,7 +6,7 @@ module SparseDirectSolverCUDAExt
 # cuBLAS getrfBatched.
 
 using SparseDirectSolver
-using SparseDirectSolver: CSR, INDEX_ONE, INDEX_ZERO, InvalidValueError
+using SparseDirectSolver: CSR, DirectSolver, INDEX_ONE, INDEX_ZERO, InvalidValueError
 using SparseArrays
 using LinearAlgebra
 using CUDACore
@@ -66,6 +66,48 @@ function SparseDirectSolver.to_backend(A::SparseMatrixCSC, ::CUDABackend; index 
     return CSR(CuVector(B.rowptr), CuVector(B.colval), CuVector(B.nzval), B.nrows, B.ncols;
                index = B.index, transposed = B.transposed)
 end
+
+# ---------------------------------------------------------------------------
+# public API (T13, PLAN §3.1): solver constructors, update!, the LinearAlgebra layer
+
+"""
+    DirectSolver(A::CuSparseMatrixCSR, structure::String, view::Char; index = 'O')
+    DirectSolver(A::CuSparseMatrixCSC, structure::String, view::Char; index = 'O')
+
+Solver on `A`'s arrays, without copies (≅ `CudssSolver(A, structure, view)`). A
+`CuSparseMatrixCSC` is read as the CSR of its transpose with the view flipped
+(MadNLP's lower-triangle CSC becomes an upper-triangle CSR), see
+[`DirectSolver`](@ref).
+"""
+SparseDirectSolver.DirectSolver(A::CuSparseMatrixCSR, structure, view; index = INDEX_ONE) =
+    DirectSolver(CSR(A), structure, view; index)
+SparseDirectSolver.DirectSolver(A::CuSparseMatrixCSC, structure, view; index = INDEX_ONE) =
+    DirectSolver(CSR(A), structure, view; index)
+
+"""
+    update!(solver::DirectSolver, A::CuSparseMatrixCSR)
+    update!(solver::DirectSolver, A::CuSparseMatrixCSC)
+
+Point `solver` at the arrays of `A` (≅ `cudss_update(solver, A)`), see
+[`update!`](@ref).
+"""
+SparseDirectSolver.update!(solver::DirectSolver, A::Union{CuSparseMatrixCSR, CuSparseMatrixCSC}) =
+    SparseDirectSolver.update!(solver, CSR(A))
+
+"""
+    cholesky(A::CuSparseMatrixCSR, NoPivot(); view = 'F', check = false) -> DirectSolver
+    cholesky(Symmetric(A::CuSparseMatrixCSR)) / cholesky(Hermitian(A::CuSparseMatrixCSR))
+
+LLᵀ/LLᴴ factorization of `A` on the GPU (≅ CUDSS.jl's `cholesky`); the wrappers
+pass their `uplo` as the view. See `cholesky(::CSR)`.
+"""
+LinearAlgebra.cholesky(A::CuSparseMatrixCSR, p::NoPivot = NoPivot(); view::Char = 'F', check::Bool = false) =
+    cholesky(CSR(A), p; view, check)
+LinearAlgebra.cholesky(A::Symmetric{T, <:CuSparseMatrixCSR{T}}, p::NoPivot = NoPivot();
+                       check::Bool = false) where {T <: Union{Float32, Float64}} =
+    cholesky(CSR(A.data), p; view = A.uplo, check)
+LinearAlgebra.cholesky(A::Hermitian{T, <:CuSparseMatrixCSR{T}}, p::NoPivot = NoPivot(); check::Bool = false) where {T} =
+    cholesky(CSR(A.data), p; view = A.uplo, check)
 
 # ---------------------------------------------------------------------------
 # vendor dense bindings (see `src/dense/vendor.jl` for the contracts)
