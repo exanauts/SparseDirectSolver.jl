@@ -2223,6 +2223,10 @@ repeat it once T21 has landed. The bar is cuDSS with `"matching_alg" =
     input raise `NotSupportedError` and that `ir_n_steps` warns are replaced by assertions of the results.
 - Tests (after review round 1): `SDS_TEST_GPU=0 SDS_TEST_ONLY=test_refinement`: 517 pass, 1 broken (CPU). Full
   `SDS_TEST_GPU=0 julia --project=. -e 'using Pkg; Pkg.test()'`: 60490 pass, 0 fail, 1 broken (the one above), 13.8 min. CUDA/AMDGPU: pending CI on the PR.
+  CI round 2 (CUDA H200): the five bitwise `==` checks between solves (X === B, row-major, strided, sub-phases vs
+  `"solve"`) failed for Float64 by last-bit differences: the default atomic forward sweep sums in a run-dependent
+  order on GPUs. Those two testsets now set `deterministic_mode = 1` (the documented reproducible path); test counts
+  unchanged.
 - Measurements: relres `‖b − Ax‖/‖b‖`, `b = A·1`, handle layer `"S"`, view `'L'`, default pivoting, KA CPU
   backend, after `ir_n_steps` steps (`bench/refinement.jl`; dumps generated in this session with
   `bench/dump_madnlp_kkt.jl`, MadNLP/ExaModelsPower current releases):

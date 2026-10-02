@@ -89,7 +89,9 @@ end
                                                                                            T in ELTYPES
     n = 200
     for (A, structure) in ((random_spd(T, n, 0.02), spd_structure(T)), (random_symindef(T, n, 0.02), sym_structure(T)))
-        solver = ir_solver(backend, A, structure; params = (("ir_n_steps", 2),))
+        # bitwise comparisons between solves: the atomic forward sweep (default on GPUs for real T)
+        # sums in a run-dependent order, so these solves use the deterministic variant
+        solver = ir_solver(backend, A, structure; params = (("ir_n_steps", 2), ("deterministic_mode", 1)))
         for nrhs in (1, 3)
             b = nrhs == 1 ? rand(T, n) : rand(T, n, nrhs)
             x = ir_solve(backend, solver, b)
@@ -150,7 +152,8 @@ end
 @testset "solve sub-phases compose to \"solve\" ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
     n = 150
     for (A, structure) in ((random_spd(T, n, 0.03), spd_structure(T)), (random_symindef(T, n, 0.03), sym_structure(T)))
-        solver = ir_solver(backend, A, structure)
+        # bitwise comparison: deterministic forward sweep (the atomic one is run-dependent on GPUs)
+        solver = ir_solver(backend, A, structure; params = (("deterministic_mode", 1),))
         for steps in (0, 2), nrhs in (1, 2)
             setparam!(solver, "ir_n_steps", steps)
             b = to_device(backend, nrhs == 1 ? rand(T, n) : rand(T, n, nrhs))
