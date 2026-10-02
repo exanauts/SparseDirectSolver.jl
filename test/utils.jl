@@ -209,14 +209,40 @@ panel_error(Nh, Nr) = maximum(abs, Nh.factor - Nr.factor) / maximum(abs, Nr.fact
 
 [`ka_cpu_alloc_budget`](@ref) for one `factorize!` of the analysis `S` with
 element type `T` and `impl = :auto` on the CPU backend: at most three
-assembly launches per launch group, one `ka_chol_check_info!` per front and
-the statistics launch; `@localmem` of the statistics kernel plus, per group,
-that of the largest fused regime-B kernel (packed 64×64 triangle, status, pivot).
+assembly launches per launch group, one `ka_chol_check_info!` and one
+`pack_add!` per front and the statistics launch; `@localmem` of the statistics
+kernel plus, per group, that of the largest fused regime-B kernel (packed
+64×64 triangle, status, pivot) or of the largest regime-A kernel (64 KiB).
 """
 function numeric_alloc_budget(S, ::Type{T}) where {T}
     ngroups = length(S.schedule.groups)
-    launches = 3 * ngroups + SparseDirectSolver.nsupernodes(S) + 1
+    launches = 3 * ngroups + 2 * SparseDirectSolver.nsupernodes(S) + 1
     localmem = SparseDirectSolver.STATS_WORKGROUP * sizeof(Int64) +
-               ngroups * (64 * 65 ÷ 2 * sizeof(T) + sizeof(Int32) + sizeof(real(T)))
+               ngroups * max(64 * 65 ÷ 2 * sizeof(T) + sizeof(Int32) + sizeof(real(T)),
+                             maximum(SparseDirectSolver.SUBTREE_LOCAL_SIZES))
     return ka_cpu_alloc_budget(launches, localmem)
+end
+
+"""
+    pack_lower(C) -> Vector
+
+Column-major packed lower triangle of the square matrix `C` (`m(m+1)/2`
+entries), the storage of contribution blocks on the update stack (T11).
+"""
+pack_lower(C::AbstractMatrix) = [C[i, j] for j in axes(C, 2) for i in j:size(C, 1)]
+
+"""
+    unpack_lower(v, m) -> Matrix
+
+The `m×m` lower-triangular matrix (zero strict upper triangle) of the packed
+vector `v` ([`pack_lower`](@ref)).
+"""
+function unpack_lower(v::AbstractVector{T}, m::Integer) where {T}
+    C = zeros(T, m, m)
+    q = 1
+    for j in 1:m, i in j:m
+        C[i, j] = v[q]
+        q += 1
+    end
+    return C
 end

@@ -59,7 +59,7 @@ end
             push!(front_ptr, front_ptr[end] + (w + m) * w)
             if cb
                 cb_ptr[s] = stack_len
-                stack_len += m * m
+                stack_len += m * (m + 1) ÷ 2                 # packed lower triangle (T11)
             end
         end
         factor = zeros(T, front_ptr[end] - 1)
@@ -71,7 +71,7 @@ end
             push!(fronts, F)
             P = reshape(view(factor, front_ptr[s]:(front_ptr[s + 1] - 1)), w + m, w)
             P .= tril(F[:, 1:w])
-            cb && (reshape(view(stack, cb_ptr[s]:(cb_ptr[s] + m * m - 1)), m, m) .= tril(F[(w + 1):end, (w + 1):end]))
+            cb && (stack[cb_ptr[s]:(cb_ptr[s] + m * (m + 1) ÷ 2 - 1)] .= pack_lower(F[(w + 1):end, (w + 1):end]))
         end
         # the fifth front (w = W ÷ 2 + 1, no contribution block) gets a negative pivot at its last column
         bad = 5
@@ -103,10 +103,9 @@ end
             Lref = tril(F[:, 1:w])
             @test maximum(abs, P - Lref) <= panel_tol(T) * maximum(abs, Lref)
             if cb
-                C = reshape(hstack[cb_ptr[s]:(cb_ptr[s] + m * m - 1)], m, m)
+                C = unpack_lower(hstack[cb_ptr[s]:(cb_ptr[s] + m * (m + 1) ÷ 2 - 1)], m)
                 Cref = tril(F[(w + 1):end, (w + 1):end])
-                @test maximum(abs, tril(C) - Cref) <= panel_tol(T) * maximum(abs, Cref)
-                @test all(iszero, triu(C, 1))            # the upper triangle is not touched
+                @test maximum(abs, C - Cref) <= panel_tol(T) * maximum(abs, Cref)
                 @test all(k -> isreal(C[k, k]), 1:m)
             end
         end

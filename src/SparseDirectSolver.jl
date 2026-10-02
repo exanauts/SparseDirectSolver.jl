@@ -55,6 +55,7 @@ include("reference/cholesky.jl")
 # numeric phase on the device (PLAN §2.4)
 include("numeric/assembly.jl")
 include("numeric/front.jl")
+include("numeric/subtree.jl")
 include("numeric/factorize.jl")
 include("numeric/extract.jl")
 

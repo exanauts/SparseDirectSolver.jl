@@ -15,7 +15,7 @@ Names of the index vectors of a [`Symbolic`](@ref) that live on the device
 """
 const DEVICE_MAPS = (:perm, :iperm, :super_ptr, :snparent, :rowptr, :rowval, :front_ptr, :front_nrows,
                      :front_ncols, :cb_ptr, :child_ptr, :child_list, :relind_ptr, :relind, :amap, :amap_ptr,
-                     :amap_src, :subtree_ptr, :subtree_nodes, :group_ptr, :group_nodes)
+                     :amap_src, :subtree_ptr, :subtree_nodes, :local_front, :local_cb, :group_ptr, :group_nodes)
 
 """
     Symbolic{INT, VI <: AbstractVector{INT}}
@@ -52,6 +52,8 @@ Device maps (`DEVICE_MAPS`; supernodal numbering, 1-based, element offsets):
   (positions in `nzval`, sorted by destination, then by position);
 * `subtree_ptr`, `subtree_nodes`: regime-A subtree descriptors (the supernodes of
   subtree `t` in processing order, see [`Schedule`](@ref));
+* `local_front`, `local_cb`: local-memory offsets of the packed front and of the
+  contribution block of a regime-A supernode (see [`Layout`](@ref));
 * `group_ptr`, `group_nodes`: the launch groups of the schedule (group `g`
   covers `group_nodes[group_ptr[g]:(group_ptr[g+1]-1)]`: subtree ids for regime
   A, supernode ids otherwise).
@@ -85,6 +87,8 @@ struct Symbolic{INT, VI <: AbstractVector{INT}}
     amap_src::VI
     subtree_ptr::VI
     subtree_nodes::VI
+    local_front::VI
+    local_cb::VI
     group_ptr::VI
     group_nodes::VI
 end
@@ -218,7 +222,8 @@ function Symbolic(sp::SupernodePartition, sc::Schedule, layout::Layout, rowptr::
                                       copy(sp.rowptr), copy(sp.rowval), copy(layout.panel_ptr), copy(sc.rows),
                                       copy(sc.width), copy(layout.cb_ptr), child_ptr, child_list, relind_ptr,
                                       relind, amap, amap_ptr, amap_src, copy(sc.subtree_ptr),
-                                      copy(sc.subtree_nodes), group_ptr, copy(sc.group_nodes))
+                                      copy(sc.subtree_nodes), copy(layout.local_front), copy(layout.local_cb),
+                                      group_ptr, copy(sc.group_nodes))
 end
 
 """
@@ -287,7 +292,7 @@ element type `T` and device indices `INT` (default: the index type of
 
 | slot | content |
 | --- | --- |
-| 1 | permanent device memory: factor panels + D + device maps + per-front statistics |
+| 1 | permanent device memory: factor panels + D + device maps + per-front statistics + regime-C workspace |
 | 2 | peak device memory: slot 1 + update stack high-water mark |
 | 3 | permanent host memory (the host analysis data) |
 | 4 | peak host memory (= slot 3) |
@@ -298,7 +303,7 @@ element type `T` and device indices `INT` (default: the index type of
 | 9 | update stack (`Layout.stack_len` entries of `T`) |
 | 10 | device maps (`INT`) |
 | 11 | per-front statistics (6 `Int64` per supernode) and status (`ns + 1` `Int32`) |
-| 12 | largest regime-A local-memory budget in use (per workgroup) |
+| 12 | largest regime-A local memory in use (per workgroup, [`subtree_local_bytes`](@ref) of its class) |
 | 13–16 | 0 (reserved) |
 
 Slots 1–6 follow cuDSS's `CUDSS_DATA_MEMORY_ESTIMATES`.
@@ -313,8 +318,8 @@ function memory_estimates(S::Symbolic{INT0}, ::Type{T}, ::Type{INT} = INT0) wher
     est[10] = device_map_bytes(S, INT)
     est[11] = Int64(nsupernodes(S)) * FRONT_STATS_FIELDS * sizeof(Int64) +
               Int64(nsupernodes(S) + 1) * sizeof(Int32)
-    est[12] = Int64(maximum((sc.budgets[c] for c in sc.subtree_class); init = 0))
-    est[1] = est[7] + est[8] + est[10] + est[11]
+    est[12] = Int64(maximum((subtree_local_bytes(sc.budgets[c]) for c in sc.subtree_class); init = 0))
+    est[1] = est[7] + est[8] + est[10] + est[11] + Int64(L.work_len) * sizeof(T)
     est[2] = est[1] + est[9]
     est[3] = Int64(Base.summarysize(S.partition) + Base.summarysize(S.schedule) + Base.summarysize(S.layout))
     est[4] = est[3]

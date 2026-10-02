@@ -1,9 +1,11 @@
 # Level driver of the numeric phase (PLAN §2.4, §3.9): a fixed sequence of
 # launches over the steps of the schedule, no allocation, no host
-# synchronization except the final read of the reduced `info`. Regime-B groups
-# run the fused per-front kernel (`src/numeric/front.jl`, one launch per group);
-# regime-C groups run the assembly kernels, then `potrf`/`trsm`/`syrk` (`herk`)
-# per front through the dense interface. Regime A gets its fused kernels in T11.
+# synchronization except the final read of the reduced `info`. Regime A runs
+# first, one fused subtree kernel launch per budget class
+# (`src/numeric/subtree.jl`); then regime-B groups run the fused per-front kernel
+# (`src/numeric/front.jl`, one launch per group) and regime-C groups the
+# assembly kernels, then `potrf`/`trsm`/`syrk` (`herk`) per front through the
+# dense interface, the `syrk` result packed into the front's block.
 
 "Workgroup size of the per-phase reduction of the front statistics."
 const STATS_WORKGROUP = 256
@@ -65,9 +67,8 @@ function _check_numeric(N::Numeric{T}, S::Symbolic, nzval::AbstractVector) where
     length(N.factor) == S.layout.factor_len && length(N.stack) == S.layout.stack_len &&
         length(N.info) == nsupernodes(S) + 1 ||
         throw(InvalidValueError("the numeric storage was not allocated for this analysis"))
-    nsubtrees(S.schedule) == 0 ||
-        throw(NotSupportedError("regime-A subtrees need the fused subtree kernels (T11); analyse with " *
-                                "`subtree_budgets = Int[]`"))
+    length(N.work) == S.layout.work_len ||
+        throw(InvalidValueError("the numeric storage was not allocated for this analysis"))
     backend = KernelAbstractions.get_backend(N.factor)
     for x in (nzval, S.amap, N.info)
         typeof(KernelAbstractions.get_backend(x)) == typeof(backend) ||
@@ -89,14 +90,16 @@ end
 # regime-C dense kernels of front `s` (assembled panel + contribution block), `p` from `_front_impls`
 function _factor_front_c!(N::Numeric{T}, S::Symbolic, s::Int, p::NamedTuple) where {T}
     L, sc = S.layout, S.schedule
-    _factor_panel_c!(N.factor, N.stack, N.info, s, L.panel_ptr[s], sc.rows[s], sc.width[s], L.cb_ptr[s], p)
+    _factor_panel_c!(N.factor, N.stack, N.work, N.info, s, L.panel_ptr[s], sc.rows[s], sc.width[s], L.cb_ptr[s], p)
     return nothing
 end
 
-# `potrf`/`trsm`/`syrk` (`herk`) on the `f×w` panel at `factor[p0]` and the `m×m` contribution
-# block at `stack[c0]` (`c0 = 0`: none), status into `info[s]` (also used by bench/front_bins.jl)
-function _factor_panel_c!(factor::AbstractVector{T}, stack::AbstractVector{T}, info::AbstractVector{Int32}, s::Int,
-                          p0::Int, f::Int, w::Int, c0::Int, p::NamedTuple) where {T}
+# `potrf`/`trsm`/`syrk` (`herk`) on the `f×w` panel at `factor[p0]`; the `syrk` result goes to the
+# `m×m` workspace `work[1:m^2]` and is added to the packed contribution block at `stack[c0]`
+# (`c0 = 0`: none); status into `info[s]` (also used by bench/front_bins.jl)
+function _factor_panel_c!(factor::AbstractVector{T}, stack::AbstractVector{T}, work::AbstractVector{T},
+                          info::AbstractVector{Int32}, s::Int, p0::Int, f::Int, w::Int, c0::Int,
+                          p::NamedTuple) where {T}
     m = f - w
     P = reshape(view(factor, p0:(p0 + f * w - 1)), f, w)
     F11 = view(P, 1:w, 1:w)
@@ -105,8 +108,9 @@ function _factor_panel_c!(factor::AbstractVector{T}, stack::AbstractVector{T}, i
     F21 = view(P, (w + 1):f, 1:w)
     _trsm_impl!(p.trsm, 'R', 'L', 'C', 'N', one(T), F11, F21)
     c0 > 0 || return nothing                                  # no parent: nothing to update
-    C = reshape(view(stack, c0:(c0 + m * m - 1)), m, m)
-    _herk_impl!(p.herk, 'L', C, F21, -one(real(T)), one(real(T)))
+    C = reshape(view(work, 1:(m * m)), m, m)
+    _herk_impl!(p.herk, 'L', C, F21, -one(real(T)), zero(real(T)))
+    pack_add!(stack, c0, work, m)
     return nothing
 end
 
@@ -117,29 +121,36 @@ Multifrontal Cholesky `P A Pᵀ = L Lᴴ` on the device: `nzval` are the stored
 values of A (same pattern, view and index base as the analysis) on the backend
 of `numeric`, and `symbolic` has its maps on that backend
 (`adapt(backend, symbolic, INT)`). For every launch group of the schedule,
-in order: a regime-B group (width class `W ≤ 64`) is one
+in order: a regime-A group (budget class) is one [`factorize_subtrees!`](@ref)
+launch (one workgroup per subtree: its fronts assembled, factored and
+extend-added in local memory, panels and the root's contribution block written
+to global memory); a regime-B group (width class `W ≤ 64`) is one
 [`factorize_fronts_b!`](@ref) launch (fused assembly, `F11` Cholesky in local
 memory, `trsm`, `syrk`/`herk` into the front's contribution block); a regime-C
 group is one launch each of [`zero_fronts!`](@ref), [`scatter_A!`](@ref) and
 [`extend_add!`](@ref) over its fronts, then per front [`potrf_info!`](@ref),
-[`trsm!`](@ref) and [`herk!`](@ref)/[`syrk!`](@ref) on its panel and
-contribution block through the dense interface (`impl` is passed on: `:auto`,
+[`trsm!`](@ref) and [`herk!`](@ref)/[`syrk!`](@ref) (into the workspace, then
+[`pack_add!`](@ref) into its packed contribution block) through the dense
+interface (`impl` is passed on: `:auto`,
 `:generic`, `:vendor`, `:ka`, resolved once per call; `:auto` means `:ka` when
 the analysis used `factorization_alg = "algo1"`, no vendor calls). Then
 [`cholesky_stats!`](@ref) and one read of the reduced status.
 
 Returns `info = 0` on success, else the original column of the smallest
 non-positive pivot of the factor (as [`ref_factorize!`](@ref)); fronts above a
-failed one hold garbage. Structure `"SPD"` (real) or `"HPD"`; the analysis must
-have no regime-A subtrees (`subtree_budgets = Int[]`) until T11. Nothing is
+failed one hold garbage. Structure `"SPD"` (real) or `"HPD"`. Nothing is
 allocated on the device; the panels are bitwise reproducible for a fixed
-`impl` and backend (regime B is deterministic by construction).
+`impl` and backend (regimes A and B are deterministic by construction).
 """
 function factorize!(N::Numeric{T}, S::Symbolic, nzval::AbstractVector; impl::Symbol = :auto) where {T}
     _check_numeric(N, S, nzval)
     p = _front_impls(N, S, impl)
     plan = N.plan
     nodes = S.schedule.group_nodes
+    for k in eachindex(plan.sub_first)
+        a, b = plan.sub_first[k], plan.sub_last[k]
+        factorize_subtrees!(N, S, nzval, a, b - a + 1, plan.sub_local[k])
+    end
     for k in eachindex(plan.group_first)
         a, b = plan.group_first[k], plan.group_last[k]
         W = plan.group_width[k]

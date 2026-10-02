@@ -4,8 +4,10 @@
 # (`nodes[first:(first + count - 1)]`, the step's range of `group_nodes`) and
 # writes only into that front (owner-pull): no atomics, and every destination
 # receives its contributions in a fixed order, so the result is bitwise
-# reproducible. On the KA CPU backend, values derived from the group index are
-# recomputed in every segment between barriers (see `src/dense/fallback/common.jl`).
+# reproducible. Contribution blocks on the update stack are packed lower
+# triangles (`_packed`, `m(m+1)/2` entries). On the KA CPU backend, values
+# derived from the group index are recomputed in every segment between barriers
+# (see `src/dense/fallback/common.jl`).
 
 "Workgroup size of the assembly kernels."
 const ASSEMBLY_WORKGROUP = 256
@@ -20,7 +22,7 @@ const ASSEMBLY_WORKGROUP = 256
         c = cb_ptr[s]
         if c > 0
             m = front_nrows[s] - front_ncols[s]
-            for q in (c + li - 1):WG:(c + m * m - 1)
+            for q in (c + li - 1):WG:(c + m * (m + 1) ÷ 2 - 1)
                 stack[q] = z
             end
         end
@@ -106,8 +108,8 @@ function scatter_A!(N::Numeric, S::Symbolic, nzval::AbstractVector, first::Integ
     return N
 end
 
-# add the lower triangle of the contribution block of the `k`-th child of front `s`
-# (if any) to the panel and contribution block of `s` (work item `li` of `WG`)
+# add the packed contribution block of the `k`-th child of front `s` (if any) to
+# the panel and the packed contribution block of `s` (work item `li` of `WG`)
 @inline function _extend_add_child!(factor, stack, s, k, li, front_ptr, front_nrows, front_ncols, cb_ptr,
                                     child_ptr, child_list, relind_ptr, relind, ::Val{WG}) where {WG}
     @inbounds begin
@@ -129,12 +131,12 @@ end
                     if ii >= jj                         # lower triangle of the block
                         ri = relind[r0 + ii]
                         rj = relind[r0 + jj]
-                        v = stack[cb + q]
+                        v = stack[cb + _packed(ii, jj, mc) - 1]
                         if rj <= wp
                             d = pp + (rj - 1) * fp + ri - 1
                             factor[d] += v
                         else
-                            d = cp + (rj - wp - 1) * mp + ri - wp - 1
+                            d = cp + _packed(ri - wp, rj - wp, mp) - 1
                             stack[d] += v
                         end
                     end
@@ -163,9 +165,9 @@ end
     extend_add!(numeric, symbolic, first, count, maxchild) -> numeric
 
 Owner-pull extend-add: the workgroup of each front `s` of
-`symbolic.group_nodes[first:(first + count - 1)]` adds the lower triangles of
-its children's contribution blocks (update stack, `cb_ptr`) to its panel and
-its own contribution block through `relind`, children in `child_list` order
+`symbolic.group_nodes[first:(first + count - 1)]` adds its children's packed
+contribution blocks (update stack, `cb_ptr`) to its panel and its own packed
+contribution block through `relind`, children in `child_list` order
 (`maxchild` ≥ the largest child count of these fronts). No atomics;
 deterministic. Asynchronous.
 """
@@ -176,4 +178,30 @@ function extend_add!(N::Numeric, S::Symbolic, first::Integer, count::Integer, ma
     kernel!(N.factor, N.stack, S.group_nodes, Int(first), S.front_ptr, S.front_nrows, S.front_ncols, S.cb_ptr,
             S.child_ptr, S.child_list, S.relind_ptr, S.relind, Int(maxchild), Val(WG); ndrange = WG * count)
     return N
+end
+
+@kernel function _pack_add_kernel!(stack, c0, work, m)
+    q = @index(Global, Linear)
+    @inbounds if q <= m * m
+        j = (q - 1) ÷ m + 1
+        i = q - (j - 1) * m
+        if i >= j
+            stack[c0 + _packed(i, j, m) - 1] += work[q]
+        end
+    end
+end
+
+"""
+    pack_add!(stack, c0, work, m) -> stack
+
+Add the lower triangle of the column-major `m×m` matrix `work[1:m^2]` to the
+packed contribution block `stack[c0:(c0 + m(m+1)/2 - 1)]` (the regime-C step
+after the vendor `syrk`/`herk` into the workspace). One launch, one work item
+per entry. Asynchronous.
+"""
+function pack_add!(stack::AbstractVector, c0::Integer, work::AbstractVector, m::Integer)
+    m > 0 || return stack
+    kernel! = _pack_add_kernel!(KernelAbstractions.get_backend(stack), ASSEMBLY_WORKGROUP)
+    kernel!(stack, Int(c0), work, Int(m); ndrange = m * m)
+    return stack
 end

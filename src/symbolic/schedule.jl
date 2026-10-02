@@ -2,9 +2,10 @@
 # split into the three regimes of the numeric phase and turned into a fixed
 # sequence of launch groups.
 #
-# * Regime A: whole leaf subtrees whose serial multifrontal stack (fronts and
-#   contribution blocks, in the subtree's processing order) fits a local-memory
-#   budget; one workgroup per subtree, one launch per budget class.
+# * Regime A: whole leaf subtrees whose serial multifrontal stack (packed
+#   lower-triangular fronts and contribution blocks, in the subtree's processing
+#   order) fits the local memory of a budget class; one workgroup per subtree,
+#   one launch per budget class.
 # * Regime B: the remaining fronts with `w ≤ regime_c_width` and
 #   `f ≤ regime_c_rows`, binned by (width class, row class); one launch per
 #   (level, chunk, bin).
@@ -25,6 +26,61 @@ fused per-front level kernels, vendor dense calls on large fronts (PLAN §2.2).
 const REGIME_A = Int8(1)
 const REGIME_B = Int8(2)
 const REGIME_C = Int8(3)
+
+"Largest front width with a fused regime-B kernel; wider bins (raised `regime_c_width`) take the regime-C path."
+const REGIME_B_MAX_WIDTH = 64
+
+"`@localmem` sizes (bytes) of the regime-A kernel instances; a budget uses the largest one it holds."
+const SUBTREE_LOCAL_SIZES = (8192, 16384, 32768, 49152, 65536)
+
+"Bytes of a regime-A kernel's local memory kept for its control words and pivot (not for fronts)."
+const SUBTREE_LOCAL_RESERVE = 256
+
+"""
+    subtree_local_bytes(budget) -> Int
+
+`@localmem` bytes of the regime-A kernel of a budget class: the largest of
+`SUBTREE_LOCAL_SIZES` (8, 16, 32, 48, 64 KiB) that is `≤ budget`, `0` below
+8 KiB. The size is a `Val` parameter of the kernel, so a short list of
+instances serves every budget.
+"""
+subtree_local_bytes(budget::Integer) = foldl((acc, b) -> b <= budget ? b : acc, SUBTREE_LOCAL_SIZES; init = 0)
+
+"""
+    subtree_capacity(budget, elsize) -> Int
+
+Entries of `elsize` bytes a regime-A subtree may keep in local memory under
+`budget`: [`subtree_local_bytes`](@ref) minus `SUBTREE_LOCAL_RESERVE`, divided
+by `elsize` (`0` when the budget is too small).
+"""
+subtree_capacity(budget::Integer, elsize::Integer) =
+    max(subtree_local_bytes(budget) - SUBTREE_LOCAL_RESERVE, 0) ÷ Int(elsize)
+
+"""
+    packed_length(m) -> Int
+
+Entries of the packed lower triangle of an `m×m` matrix, `m(m+1)/2`: the
+storage of a contribution block on the update stack and of a regime-A front in
+local memory (column-major packed, see `_packed`).
+"""
+packed_length(m::Integer) = Int(m) * (Int(m) + 1) ÷ 2
+
+# position (1-based) of (i, j), i ≥ j, in the column-major packed lower triangle of an m×m matrix:
+# column j starts after (j - 1)(2m - j + 2)/2 entries
+@inline _packed(i, j, m) = (j - 1) * (2 * m - j + 2) ÷ 2 + i - j + 1
+
+"""
+    takes_c_path(schedule, s) -> Bool
+
+Whether supernode `s` runs on the regime-C path of the numeric phase (vendor
+or KA dense calls per front): regime C, or a regime-B bin wider than
+`REGIME_B_MAX_WIDTH` (no fused kernel).
+"""
+function takes_c_path(sc, s::Integer)
+    sc.regime[s] == REGIME_C && return true
+    sc.regime[s] == REGIME_B || return false
+    return sc.wclasses[(sc.bin[s] - 1) ÷ length(sc.fclasses) + 1] > REGIME_B_MAX_WIDTH
+end
 
 """
     ScheduleGroup
@@ -64,8 +120,9 @@ Regime assignment and launch order of the supernodes of a
 * regime A subtrees: `subtree[s]` (`0` outside A), `subtree_ptr`/`subtree_nodes`
   (the nodes of subtree `t`, in processing order: a postorder whose children are
   visited by decreasing `peak - cb`, which minimizes the stack), `subtree_root`,
-  `subtree_peak` (bytes of the serial stack), `subtree_class` (index of the
-  smallest budget of `budgets` that holds the peak);
+  `subtree_peak` (bytes of the serial stack of packed fronts and contribution
+  blocks), `subtree_class` (index of the smallest budget of `budgets` whose
+  [`subtree_capacity`](@ref) holds the peak);
 * `groups` and `group_nodes`: the launch groups in execution order (regime A
   classes first, then step by step: B bins in increasing bin id, then C);
 * `wclasses`, `fclasses`, `budgets`, `regime_c_width`, `regime_c_rows`,
@@ -179,16 +236,17 @@ the supernodes of `sp`, with byte budgets for the element type `T`:
 1. regime C: fronts with `w > opts.regime_c_width` or `f > opts.regime_c_rows`
    (every non-A front with `factorization_alg = "algo2"`);
 2. regime A: a front is eligible when it is not C, its children are eligible
-   and its subtree's serial stack peak (full `f×f` fronts plus the `m×m`
-   contribution blocks waiting for their parent, `m = f - w`) fits the largest
-   of `opts.subtree_budgets`; the maximal eligible subtrees are the regime-A
+   and its subtree's serial stack peak (packed lower-triangular `f×f` fronts
+   plus the packed `m×m` contribution blocks waiting for their parent,
+   `m = f - w`) fits the [`subtree_capacity`](@ref) of the largest of
+   `opts.subtree_budgets`; the maximal eligible subtrees are the regime-A
    subtrees, each with the smallest budget class that holds it (empty
    `subtree_budgets` disables regime A);
 3. regime B: the rest, binned by the smallest width class in `8, 16, 32, 64, …`
    `≥ w` and row class in `64, 128, 256, 512, …` `≥ f` (up to the regime-C
    thresholds);
 4. schedule levels of the B/C fronts, split into chunks whose produced
-   contribution-block bytes stay `≤ opts.memory_budget` (a single front larger
+   (packed) contribution-block bytes stay `≤ opts.memory_budget` (a single front larger
    than the budget gets its own chunk; a negative budget means no chunking).
 """
 function build_schedule(sp::SupernodePartition, opts::Options = Options(), ::Type{T} = Float64) where {T}
@@ -196,11 +254,12 @@ function build_schedule(sp::SupernodePartition, opts::Options = Options(), ::Typ
     elsize = sizeof(T)
     cw, cr = opts.regime_c_width, opts.regime_c_rows
     budgets = sort(opts.subtree_budgets)
-    maxbudget = isempty(budgets) ? 0 : budgets[end]
+    capacity = [subtree_capacity(b, elsize) for b in budgets]
+    maxcap = isempty(budgets) ? 0 : maximum(capacity)
     alg = opts.factorization_alg
     width = [snwidth(sp, s) for s in 1:ns]
     rows = [sp.rowptr[s + 1] - sp.rowptr[s] for s in 1:ns]
-    cb = [(rows[s] - width[s])^2 for s in 1:ns]
+    cb = [packed_length(rows[s] - width[s]) for s in 1:ns]
     children = [Int[] for _ in 1:ns]
     for s in 1:ns
         sp.snparent[s] != 0 && push!(children[sp.snparent[s]], s)
@@ -219,8 +278,8 @@ function build_schedule(sp::SupernodePartition, opts::Options = Options(), ::Typ
             pk = max(pk, acc + peak[c])
             acc += cb[c]
         end
-        peak[s] = max(pk, acc + rows[s]^2)
-        eligible[s] = !big[s] && all(c -> eligible[c], kids) && peak[s] * elsize <= maxbudget
+        peak[s] = max(pk, acc + packed_length(rows[s]))
+        eligible[s] = !big[s] && all(c -> eligible[c], kids) && peak[s] <= maxcap
     end
     regime = fill(REGIME_B, ns)
     subtree = zeros(Int, ns)
@@ -249,9 +308,8 @@ function build_schedule(sp::SupernodePartition, opts::Options = Options(), ::Typ
             end
         end
         push!(subtree_ptr, length(subtree_nodes) + 1)
-        bytes = peak[s] * elsize
-        push!(subtree_peak, bytes)
-        push!(subtree_class, findfirst(>=(bytes), budgets))
+        push!(subtree_peak, peak[s] * elsize)
+        push!(subtree_class, findfirst(>=(peak[s]), capacity))
     end
     for s in 1:ns
         regime[s] == REGIME_A && continue

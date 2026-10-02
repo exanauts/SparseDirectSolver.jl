@@ -1398,7 +1398,7 @@ obtained on this machine (CUDSS.jl is in `../CUDSS.jl`).
 
 ---
 
-## T11 — Regime A: fused subtree-per-workgroup kernels   `[ ]`
+## T11 — Regime A: fused subtree-per-workgroup kernels   `[!]`
 
 **Reads**: PLAN §2.2 (regime A), §2.3 step 5, §2.7.
 
@@ -1433,6 +1433,114 @@ the new values; close #48 in this task's PR.
   smaller than with regime A disabled; both give the same solution.
 * Report: factorization time on the T04 generated matrices (CUDA) with
   A+B+C vs B+C vs C only.
+
+### Report
+
+- Status: [!] (done on the CPU backend; the CUDA timing table owed by the task could not be measured, no GPU in the
+  implementing session; CUDA from CI)
+- What was built (internal, nothing exported):
+  - **Packed contribution blocks (owner note, issue #48)**, every producer and consumer in one change: a block is
+    the column-major packed lower triangle of the `m×m` block, `m(m+1)/2` entries, `(i, j)` at
+    `_packed(i, j, m) = (j-1)(2m-j+2)/2 + i-j+1` (moved to `src/symbolic/schedule.jl`, with `packed_length(m)`).
+    `build_layout` (`cb_len`), `build_schedule` (chunk bytes and the regime-A peak), `zero_fronts!`, the owner-pull
+    `extend_add!` (packed reads and packed parent block), the regime-B kernel (packed SYRK output) and the regime-C
+    path: `syrk`/`herk` with `β = 0` into a new workspace `Numeric.work` (`Layout.work_len` = largest `m²` of a
+    front on the regime-C path with a block on the stack, `takes_c_path`), then the new KA kernel
+    `pack_add!(stack, c0, work, m)` adds its lower triangle into the packed block (the one extra launch per C front).
+    The CPU reference keeps host matrices (it does not mirror the stack), so it is unchanged.
+  - `src/numeric/subtree.jl`: `subtree_cholesky_kernel!` (`Val(NE)` local entries, `Val(WG)`, `SUBTREE_WORKGROUP =
+    128`): one 1-D workgroup per subtree of a budget class; postorder loop over its supernodes with the serial stack
+    in `@localmem`: zero the packed `f×f` front, scatter A (`amap`, same duplicate-run summation as T09), extend-add
+    the children's packed blocks from local memory (`child_list` order, one barrier per child), unblocked
+    right-looking Cholesky of the first `w` columns of the whole packed front (leaves L11, L21 and the Schur
+    complement in the trailing triangle, which *is* the packed `m×m` block), write the `f×w` panel (zero strict
+    upper part) and `info[v]`; the subtree root copies its block to the update stack (already packed), any other
+    node moves it down to `local_cb[v]` in rounds of at most the move distance (overlap-safe). Per-node values and
+    trip counts sit in a small `@localmem` control array written by work item 1 before a barrier, so loops with
+    barriers have workgroup-uniform trip counts that the KA CPU backend can evaluate (it runs loop headers outside
+    its work-item loops), and no launch-wide maxima are needed. No atomics; deterministic.
+    `factorize_subtrees!(numeric, symbolic, nzval, first, count, local_bytes)`; the local size becomes a `Val`
+    through explicit branches (`Base.Cartesian.@nif`, no dynamic dispatch, no allocation).
+  - Schedule/layout: `SUBTREE_LOCAL_SIZES = (8, 16, 32, 48, 64 KiB)`, `subtree_local_bytes(budget)` (largest size
+    `≤ budget`), `subtree_capacity(budget, elsize)` (minus `SUBTREE_LOCAL_RESERVE = 256` B for the control words and
+    pivot); the regime-A peak is now counted in packed fronts and blocks against that capacity.
+    `subtree_local_layout` (in `build_layout`): `Layout.local_front`, `local_cb`, `local_len` (checked against
+    `subtree_peak`); `Symbolic` gets the device maps `local_front`, `local_cb`; `NumericPlan` gets the regime-A
+    groups `sub_first/sub_last/sub_local`; `factorize!` runs them first and no longer raises `NotSupportedError` for
+    analyses with subtrees. `memory_estimates`: slot 1 includes the workspace, slot 12 is the kernel's local size.
+  - `bench/regimes.jl` (+ README row): `factorize!` time on the generated T04 matrices with A+B+C, B+C, C only.
+  - Tests: `test/test_numeric_cholesky_a.jl` (new); `pack_lower`/`unpack_lower` in `test/utils.jl`,
+    `numeric_alloc_budget` counts the `pack_add!` launches and the regime-A `@localmem`.
+- Tests: `SDS_TEST_GPU=0 julia --project=. -e 'using Pkg; Pkg.test()'` (Julia 1.13.1, ubuntu-latest, CPU):
+  45796 pass / 0 fail / 0 broken (5 min 11 s). Under CI's flags (`coverage = true`, `--check-bounds=yes`) test_numeric_cholesky_a + _b + _c: 2960 pass / 0 fail. Julia 1.10 not run locally (CI). test_numeric_cholesky_a: 835 pass / 0 fail (106 s). Covered per backend and `T ∈ ELTYPES`: the
+  plan's regime-A groups (one per class in use, before B/C, every subtree once, local size holds `local_len`,
+  estimate slot 12); the T09/T10 correctness suite with regimes A+B+C (`laplacian2d(40,40)` with small budgets and
+  C thresholds, Int32/Int64 maps; `laplacian2d(40,40)` all in one subtree; `random_spd(500,0.01)`,
+  `laplacian3d(10,10,10)` with the default budgets): panels within `100·eps·max|L|` of the reference, equal
+  `stats`, `extract_L`, `relres ≤ tol(T)` (`nrhs` 1, 5), bitwise determinism; four budget settings (8 KiB only,
+  64 KiB, odd budgets `[8192, 20000, 2^20]`, `"algo2"` with A) give the reference factor; `laplacian2d(100,100)`
+  AMD with and without regime A: same solution, `3·nlaunches(A) ≤ nlaunches(no A)` (Float32 14 vs 80, Float64 and
+  ComplexF32 20 vs 80; see deviations for ComplexF64), local moves with more than one round occur; views ×
+  index bases give `==` panels, refactorization and back, allocation budget; `info == j` with the failing front
+  in a subtree (4 analyses, negative and zero pivot, local `info` and `npos`), pivot failing after elimination.
+  T07 schedule tests check the packed peak against `subtree_capacity` and the local layout; the "update stack vs
+  factor (issue #48)" bounds are lowered to the packed values (see measurements).
+  CUDA/AMDGPU: pending CI on the PR.
+- Measurements:
+  - Update stack / factor (AMD, `"S"`, Float64), T07 testset: `kkt_matrix(3000,1000)` 3.0 (was 5.6–6.2),
+    `random_spd(2000,0.002)` 2.89 (was 6.1–6.5), `laplacian2d(100,100)` 0.24 (was 0.61; also fewer blocks on the
+    stack since the packed regime-A peak admits larger subtrees). Bounds now 3.5, 3.5, 0.5.
+  - `nlaunches` `laplacian2d(100,100)` AMD (Float64): 20 with regime A (35 subtrees), 80 without (was 33 vs 80
+    with full `f×f`/`m×m` local accounting before the packed peak).
+  - **CUDA table (A+B+C vs B+C vs C only on the T04 matrices): not measured** (no GPU here). The owner should run
+    `julia --project=bench bench/regimes.jl --backend=cuda` (and `--T=Float32`). KA CPU backend table (1 thread,
+    Float64, `:auto`, median of 3), which only shows launch counts and correctness: the CPU backend runs work items
+    serially, so fused kernels lose to per-front host LAPACK there:
+
+    ```text
+    matrix     regimes  fronts A/B/C     subtrees  launches  factorize! ms  max rel. diff to A+B+C
+    lap2d_300  A+B+C    13300/309/22       387        117        475          0
+    lap2d_300  B+C      0/13609/22           0        161        402          3.1e-15
+    lap2d_300  C only   0/0/13631            0      40931        244          5.4e-15
+    lap3d_40   A+B+C    9566/821/135      1675        466       3524          0
+    lap3d_40   B+C      0/10387/135          0        492       2815          1.8e-16
+    lap3d_40   C only   0/0/10522            0      31593       2765          5.4e-16
+    ```
+
+  - `@allocated factorize!` (second call, CPU, Julia 1.13): 64 B with regime A active.
+- Deviations from PLAN.md / this task:
+  - Regime-A fronts live in local memory as packed lower triangles too (not only the blocks), so the regime-A
+    peak model of the T07 schedule changed from `f² + Σm²` to `f(f+1)/2 + Σm(m+1)/2` entries, measured against
+    `subtree_capacity` (local size minus a 256 B reserve) instead of the raw budget. Budgets are mapped to five
+    kernel instances (8–64 KiB, `subtree_local_bytes`) because the local size must be a `Val` and every branch of the
+    dispatch compiles on the first launch (16 sizes cost ~10 s of compilation per element/index type); a budget
+    below 8 KiB disables its class. The T07 tests were adapted to the packed model (peak simulation, class bounds,
+    `cb_len`, the arrow example's numbers), not loosened.
+  - The front is factored in local memory as a whole (right-looking over the first `w` columns, the Schur
+    complement falls out); no separate TRSM/SYRK as in regime B.
+  - `nlaunches ≥ 3×` on `laplacian2d(100,100)` holds for 4- and 8-byte element types (schedule built for `T`); with
+    ComplexF64 the byte budgets hold half the fronts per subtree: 35 vs 80 (2.3×). The test asserts `3·nA ≤ n0`
+    for the other types and `nA < n0` for 16-byte ones.
+  - The regime-C pack step needs a workspace buffer (`Numeric.work`, largest `m²` of a C-path front), counted in
+    `memory_estimates` slot 1. `Numeric`, `Layout`, `Symbolic` and `NumericPlan` gained fields (PLAN §3.2).
+  - Test adaptations required by the format change: the T10 synthetic `front_cholesky!` test packs/unpacks the
+    stack (its "upper triangle untouched" assertion has no packed counterpart); the T09 test that regime-A analyses
+    raise `NotSupportedError` now asserts they factor (`info == 0`), as the T09 Report asked of T11.
+- Open issues / follow-ups:
+  - CUDA timings of `bench/regimes.jl` and `bench/front_bins.jl` are owed; regime thresholds and budgets stay at the
+    T07 defaults until then.
+  - The 48 KiB default budget fits CUDA's static shared-memory limit (local size + control words ≤ 48 KiB) but not
+    Metal's 32 KiB: T23 must cap `subtree_budgets` per backend.
+  - Extend-add (global and local) and the regime-B SYRK still iterate the full `m×m` square of a block and skip the
+    upper half (half the work items idle); a packed index → (i, j) map would remove that (T25).
+  - Regime-A workgroups of one launch run very different subtree sizes; the launch lasts as long as the largest
+    subtree (on `lap3d_40`, 1675 subtrees). A split of large classes or a size-sorted order is a T25 item.
+  - PR #54 (`build_layout` offline placement) touches the same function; it will need a rebase on the packed
+    `cb_len` (one line).
+- Suggested plan changes:
+  - PLAN §2.3 step 5: regime-A budgets are compared with the packed serial stack (fronts too) minus a small
+    reserve, and map to a fixed list of kernel local sizes.
+  - PLAN §2.3 step 8 / §3.2: the regime-C workspace (largest `m²`) and the extra `local_front`/`local_cb` maps.
 
 ---
 
