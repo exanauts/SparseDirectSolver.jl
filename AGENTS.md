@@ -156,6 +156,12 @@ julia --project=. -e 'using Pkg; Pkg.instantiate()'
 
 # benchmarks (separate environment, needs CUDSS.jl for the cuDSS baseline)
 julia --project=bench bench/cudss_baseline.jl
+
+# cuDSS vs SparseDirectSolver.jl comparison, run by hand (one solver per process),
+# then render bench/comparison/comparison.{md,png}
+julia --project=bench bench/compare.jl --solver=cudss
+julia --project=bench bench/compare.jl --solver=sds --backend=cuda
+julia --project=bench/report bench/compare_report.jl
 ```
 
 `SDS_TEST_GPU` and `SDS_TEST_ONLY` are implemented in `test/runtests.jl` (T01),

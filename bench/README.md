@@ -13,6 +13,9 @@ Baselines every later milestone is measured against (PLAN.md §5 M0, §7). The
 | `regimes.jl` | `factorize!` time on the generated matrices with regimes A+B+C (default), B+C (`subtree_budgets = []`) and C only (`factorization_alg = "algo2"`), with fronts per regime and launch counts; package environment: `julia --project=. bench/regimes.jl [--backend=cuda] [--T=Float64] [--only=lap2d_300,lap3d_40]` |
 | `report.jl` | prints the CSV files as Markdown tables |
 | `dump_madnlp_kkt.jl` | dumps MadNLP K2 and condensed KKT matrices of pglib-opf cases |
+| `features.jl` | module `BenchFeatures`: the comparison features, one per planned capability in TASKS.md order (`cholesky_f64` … `mixed_precision`), with structure, element type, matrix selector and parameters; `task_status` reads the task's marker in TASKS.md |
+| `compare.jl` | cuDSS vs SparseDirectSolver.jl per feature × matrix with BenchmarkTools; one solver per run (`--solver=cudss` or `--solver=sds`), results merged into `bench/comparison/<solver>.csv` |
+| `compare_report.jl` | renders `bench/comparison/comparison.md` (overview + one table per feature) and `comparison.png` (SDS/cuDSS ratio per feature and phase); environment `bench/report/` (CairoMakie) |
 | `pivot_pairs.jl` | 2×2 pivot pairs of the `S` analysis (issue #66): `pivot_pairs` = `none`/`default`/`all` on the K2 dumps and the KKT generators, with nnz(L), zero/perturbed/2×2 pivots, max abs L and factor error of the CPU reference LDLᵀ; package environment: `julia --project=. bench/pivot_pairs.jl [--only=case118,...] [--generators=false]` |
 
 ## Commands
@@ -37,6 +40,60 @@ julia --project=bench bench/report.jl bench/results/cudss_baseline.csv
 julia --project=bench/kkt -e 'using Pkg; Pkg.add(["MadNLP", "ExaModels", "ExaModelsPower"])'
 julia --project=bench/kkt bench/dump_madnlp_kkt.jl pglib_opf_case118_ieee pglib_opf_case1354_pegase --iters=1,10,20
 ```
+
+## cuDSS vs SparseDirectSolver.jl comparison
+
+`bench/comparison/` is committed (unlike `bench/results/`): the two CSVs, the
+Markdown table and the plot are the record of where the package stands against
+cuDSS. Rerun it by hand after a task lands:
+
+```bash
+julia --project=bench -e 'using Pkg; Pkg.instantiate()'          # once
+julia --project=bench/report -e 'using Pkg; Pkg.instantiate()'   # once
+
+julia --project=bench bench/compare.jl --solver=cudss              # cuDSS side, all features
+julia --project=bench bench/compare.jl --solver=sds --backend=cuda # SparseDirectSolver.jl side
+julia --project=bench/report bench/compare_report.jl              # comparison.md + comparison.png
+
+# rerun one feature after its task lands (other rows of the CSV are kept)
+julia --project=bench bench/compare.jl --solver=sds --features=ldlt
+```
+
+* **Features.** Every capability planned in TASKS.md is a row of the overview
+  from the start. The SDS run skips a feature until its task is marked done
+  (`[x]`/`[!]`) in TASKS.md, so its cells stay blank; `--force` runs it anyway
+  and records the error. The gate is the task marker, not an error, because
+  some parameters (`hybrid_memory_mode`, `ir_n_steps`) are accepted and
+  ignored before their task. The cuDSS side runs every feature with a cuDSS
+  counterpart, so its column is filled before the SDS one.
+* **Two processes.** CUDSS.jl and the package's CUDA extension define the same
+  `cholesky(::CuSparseMatrixCSR)` methods, so one run loads one solver. The SDS
+  run uses only the handle layer (`DirectSolver`, `setparam!`, `execute!`,
+  `getparam`) and loads Metis for the default AMD/ND ordering choice. The bench
+  environment gets SparseDirectSolver from `..` through `[sources]`.
+* **Timing.** BenchmarkTools, `evals = 1`, 5 samples per phase (`--samples`).
+  The `setup` of each sample builds a fresh solver, runs the phases the timed
+  one depends on and, on a GPU, keeps the device busy for 0.2 s: otherwise the
+  GPU drops to a low-clock power state during the host-side setup and the timed
+  phase starts slow (lap2d_300 factorization varied between 6 and 19 ms; with
+  the spin it is a stable 5.9 ms, against 6.05 ms in the T04 baseline). The
+  report shows medians; the CSV also keeps the minima. Before the trials, one
+  run compiles and gives `info`, nnz(L) and the residual, and a second run is
+  timed; if its factorization takes longer than `--single-run-above` (5 s),
+  its times are recorded instead of a trial (`samples` = 1 in the CSV, listed
+  under the feature's table). This keeps slow rows, such as the T15 LDLᵀ on
+  the larger matrices, from costing twenty factorizations each. The CSV is
+  rewritten after every row, so an interrupted run keeps what it measured.
+* **Synthetic inputs.** `ubatch8` builds 8 value sets on one pattern by scaling
+  the diagonal of member k by 1 + 0.01(k−1). `schur` takes the last
+  min(64, n/10) rows as the Schur block and times `solve_fwd_schur` as the
+  solve (no residual). `nubatch` batches all selected condensed dumps into one
+  row. The SDS calls for uniform batches assume `(n, nbatch)` right-hand sides
+  and the non-uniform batch assumes `BatchedDirectSolver` (PLAN §3); adjust
+  `compare.jl` when T17/T22 fix the API.
+* **Adding a feature.** One `Feature(...)` entry in `features.jl` (task id,
+  structure, matrix selector, parameters); `compare.jl` handles the kinds
+  `:single`, `:ubatch`, `:nubatch` and `:schur`.
 
 ## What is measured
 
