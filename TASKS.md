@@ -2272,7 +2272,7 @@ repeat it once T21 has landed. The bar is cuDSS with `"matching_alg" =
 
 ---
 
-## T17 — Uniform batch (v1 cut line)   `[ ]`
+## T17 — Uniform batch (v1 cut line)   `[!]`
 
 **Reads**: PLAN §1.6, §3.5, §1.3 (`ubatch_*`), §1.4 (`ubatch_mask`);
 `../CUDSS.jl/docs/src/uniform_batch.md`, `test/test_uniform_batch_cudss.jl`.
@@ -2302,6 +2302,79 @@ repeat it once T21 has landed. The bar is cuDSS with `"matching_alg" =
 
 **This completes v1 (PLAN M0–M6).** The owner re-evaluates the plan before the
 tasks below are refined.
+
+### Report
+
+- Status: [!] (done on the KA CPU backend; CUDA from CI; deviations below)
+- What was built:
+  - `src/numeric/batch.jl` (new): `BatchMap` (active members, `nact`, `nbatch`, the launch's `first`, `nrhs` per
+    member; Adapt-able, `members = nothing` for single-matrix helper launches), member decoding of the flattened
+    group index (`_bm_node`/`_bm_slot`/`_bm_cmember`/`_bm_ucol`), member views (`_mview` member-major,
+    `_iview` interleaved), `MemberPanels` (the panel pointers of member `k`, passed to the kernels in place of
+    `front_ptr`), `panel_offset`, `active_members` (`ubatch_index` 0-based ∩ `ubatch_mask`), `member_runs!`.
+  - Layout (PLAN §3.5): factor panels interleaved per front (the `nb` panels of supernode `s` contiguous, so a
+    regime-C front of a run of consecutive members is one `f×w×count` strided batch); `info` interleaved per
+    entry (batched `potrf` statuses contiguous); `d`, `piv`, `pivot_kind`, update stack, regime-C workspace,
+    `stats`, `totals`, `aux`, `nzval` and the right-hand sides member after member. `nb = 1` is exactly the old
+    layout and the old code paths (regime C, solve dense path).
+  - `Numeric` gains `members` (device `Int32`) and `nbatch`; `NumericPlan` gains `members_host`, `nact`, `runs`,
+    `vendor_ptrs`. `allocate_numeric(S, T, backend; nbatch)`, `set_members!`, `batch_map`, `member_info!`,
+    `member_numeric` (host single-member copy), `panel(S, N, s, k)`, `pivot_totals(N, k)`.
+  - Every numeric kernel (zero/scatter/extend-add, `pack_add`, fused regime-B Cholesky, regime-A Cholesky, both
+    LDLᵀ kernels, `cholesky_stats`, `reduce_stats`, `abs_max`) and every solve kernel (permute/unpermute,
+    forward/backward sweeps, pivot order, diagonal, residual, residual norms, add-correction, `"diag"`) takes the
+    batch index as one more grid dimension, flattened into the 1-D ndrange (as the right-hand sides already were;
+    2-D ndranges allocate on the KA CPU backend). The `BatchMap` replaces the `first` argument, so no kernel goes
+    over the 32-argument specialization limit; the launches stay allocation-free (CPU budgets unchanged).
+  - Regime C with `nb > 1`: per run of consecutive active members, strided-batched `potrf` (`potrf_batched_info!`,
+    new in the dense interface: vendor or KA `ka_potrf!`), `trsm_strided_batched!`, `gemm_strided_batched!`
+    (`F21 F21ᴴ` into `count` workspace blocks) and a batched `pack_add!` (forces the herk real diagonal);
+    `impl = :generic` falls back to the single-matrix calls per member. Vendor `potrf`/`trsm` run on member pointer
+    arrays built once at allocation (`vendor_batch_pointers`, `vendor_potrf_batched_ptrs!`,
+    `vendor_trsm_batched_ptrs!`, new vendor functions; CUDA extension implements them, the existing allocating
+    `vendor_*_batched!` now delegate to them). Solve regime C: strided-batched `gemm`; `trsm` batched on the KA
+    path, member by member on the vendor path (see deviations).
+  - `DirectSolver`: `nbatch` deduced from `length(nzval) ÷ nnz` or an `nnz × nbatch` matrix; `ubatch_size` must be
+    0 or equal (`InvalidValueError`); `info` is a per-member vector (`getparam` returns `Int` for `nb = 1`, a vector
+    otherwise; `setparam!` accepts either); `npivots`, `inertia`, `pivot_stats` per member; `"diag"` = members'
+    diagonals one after the other; `ubatch_index`/`ubatch_mask` restrict factorization and solve phases (inactive
+    members' factors, `info` and solution columns untouched). Right-hand sides: strided vectors, `n × (nrhs nb)`
+    matrices, `n × nrhs × nb` arrays, `MatrixDescriptor(T, n[, nrhs]; nbatch)` (`update!` now also accepts the
+    `n × (ncols nbatch)` matrix of a batched descriptor, as `CudssMatrix(T, n; nbatch)` + `CuMatrix` in CUDSS.jl).
+    Refinement per member (residual with each member's values). LinearAlgebra layer: auto-detection through
+    `DirectSolver`, `ldiv!`/`\` on 3-D arrays, `check` reports the info vector; `logabsdet` of a batch raises
+    `NotSupportedError`.
+  - Tests: `test/test_ubatch.jl` (new), `test/ported/cudss_uniform_batch.jl` (new: LDLᴴ and Cholesky parts of
+    CUDSS.jl's `test_uniform_batch_cudss.jl`, both APIs, strided/non-strided, views L/U/F; LU skipped, T19);
+    shared helpers `batch_members` (test/matrices.jl), `batch_csr`, `batch_relres` (test/utils.jl), `api_csr`,
+    `api_batch_matrix` (test/backends.jl).
+- Tests: `SDS_TEST_GPU=0 julia --project=. -e 'using Pkg; Pkg.test()'` (CPU): 62074 pass, 0 fail, 1 broken (the
+  T16 `@test_broken`), ≈ 14 min; the counts combine the full run (62050 pass, 24 failures of one wrong test
+  assertion in `test_ubatch`, member 1 of a fresh `batch_members` draw is `A` itself) and the rerun of
+  `test_ubatch` after fixing that assertion (1092 pass) — `test_ported`, `test_solve`, `test_refinement` were
+  rerun on the final code as well (9655 pass, 1 broken). `test_ubatch` alone: 1092 pass. CUDA/AMDGPU: pending
+  CI on the PR (the CUDA pointer-array bindings are untested locally).
+- Measurements: KA CPU backend, 1 thread, `laplacian2d(40, 40)` (`n = 1600`), 64 members: batched
+  refactorization 209 ms / solve 36 ms vs 64 single solvers 212 ms / 39 ms — the same arithmetic, as expected on
+  the CPU; the batch's gain is the launch count on GPUs (one launch per group for all members instead of 64).
+- Deviations from PLAN.md / this task:
+  - Solve phase, regime C: cuBLAS has no strided `trsm`, and pointer arrays of `Y` depend on `nrhs` (would be a
+    device allocation per solve), so the vendor path solves `trsm` member by member (the `gemm` stays strided
+    batched; the KA path is batched). The numeric phase uses the prebuilt pointer arrays as asked.
+  - Row-major (`transposed`) right-hand sides of a batch raise `NotSupportedError`; `logabsdet` of a batch too.
+  - The 2×2 pivot pairs of `"S"`/`"H"` (T14 analysis, value based) are computed from the first member's values.
+  - `test/test_api.jl`: three assertions that encoded "not implemented until T17" (`DirectSolver` on batched
+    values, a 3-D right-hand side, `ubatch_size = 2`) now assert the implemented behaviour (a solved batch,
+    `DimensionMismatch` for 4 columns against 1, `InvalidValueError` for a size mismatch).
+- Open issues / follow-ups:
+  - The CUDA bindings `vendor_batch_pointers`/`vendor_*_batched_ptrs!` and the batched regime C on CUDA are
+    exercised only by CI. T23 (AMDGPU/oneAPI/Metal) needs the same three bindings, or falls back to the
+    allocating batched calls / KA (handled: a missing binding leaves `vendor_ptrs` empty).
+  - The GitHub App token expired before the last push: the final commits are local and published by the
+    workflow's "Publish the branch" step.
+- Suggested plan changes:
+  - PLAN §3.5: record the layout choice (panels interleaved per front, `info` interleaved, the rest member-major)
+    and the solve-phase vendor `trsm` per member.
 
 ---
 
