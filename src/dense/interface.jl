@@ -124,8 +124,12 @@ function gemm!(C::AbstractMatrix, A::AbstractMatrix, B::AbstractMatrix, α = tru
                transA = 'N', transB = 'N', impl::Symbol = :auto)
     tA, tB = _trans_char(transA), _trans_char(transB)
     _check_gemm_dims(C, A, B, tA, tB)
+    return _gemm_impl!(select_impl(:gemm, C, impl), tA, tB, α, A, B, β, C)
+end
+
+# `gemm!` with an already resolved implementation `p` (no capability lookup)
+function _gemm_impl!(p::Symbol, tA::Char, tB::Char, α, A::AbstractMatrix, B::AbstractMatrix, β, C::AbstractMatrix)
     T = eltype(C)
-    p = select_impl(:gemm, C, impl)
     if p === :vendor
         vendor_gemm!(tA, tB, T(α), A, B, T(β), C)
     elseif p === :generic

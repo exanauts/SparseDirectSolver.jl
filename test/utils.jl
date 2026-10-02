@@ -246,3 +246,58 @@ function unpack_lower(v::AbstractVector{T}, m::Integer) where {T}
     end
     return C
 end
+
+# ---------------------------------------------------------------------------
+# solve phase (T12)
+
+"""
+    variant_tol(T)
+
+Relative distance allowed between the atomic and the deterministic forward
+sweep, and between a multi-RHS solve and column-by-column solves:
+`10·eps(real(T))` of `‖x‖` (TASKS.md T12).
+"""
+variant_tol(::Type{T}) where {T} = 10 * eps(real(T))
+
+"""
+    solve_setup(backend, A, INT = Int32; opts, nrhs = 5) -> (S, Sd, Nd, ws)
+
+[`numeric_setup`](@ref) of the SPD/HPD matrix `A` (lower triangle) followed
+by the device factorization (asserted to succeed) and a solve workspace for
+`nrhs` right-hand sides on `backend` (T12).
+"""
+function solve_setup(backend, A::SparseMatrixCSC{T}, ::Type{INT} = Int32; opts = Options(),
+                     nrhs::Integer = 5) where {T, INT}
+    S, _, _, Sd, Nd, nz = numeric_setup(backend, A, INT; opts)
+    SparseDirectSolver.factorize!(Nd, Sd, nz) == 0 || error("solve_setup: the factorization failed")
+    return S, Sd, Nd, SparseDirectSolver.allocate_solve(Sd, T, backend, nrhs)
+end
+
+"""
+    device_solve(backend, ws, Sd, Nd, b; kwargs...) -> host solution
+
+Copy `b` to `backend`, run `sweep_solve!` with `kwargs` and return the solution
+on the host.
+"""
+function device_solve(backend, ws, Sd, Nd, b::AbstractArray; kwargs...)
+    bd = to_device(backend, b)
+    return to_host(SparseDirectSolver.sweep_solve!(similar(bd), ws, Sd, Nd, bd; kwargs...))
+end
+
+"""
+    solve_alloc_budget(S, ws) -> Int
+
+[`ka_cpu_alloc_budget`](@ref) for one `sweep_solve!` with the plan of `ws`
+on the CPU backend: two permutation launches, a forward and a backward launch
+per kernel launch of the plan, and per regime-C-path front up to three dense
+calls or kernels each way plus one pull launch per dense step; `@localmem` of
+the control array (`_SV_CTL` indices) per launch.
+"""
+function solve_alloc_budget(S, ws)
+    plan = ws.plan
+    launches = 2
+    for k in eachindex(plan.kind)
+        launches += plan.kind[k] == SparseDirectSolver.SOLVE_DENSE ? 6 * (plan.last[k] - plan.first[k] + 1) + 1 : 2
+    end
+    return ka_cpu_alloc_budget(launches, launches * SparseDirectSolver._SV_CTL * sizeof(Int64))
+end
