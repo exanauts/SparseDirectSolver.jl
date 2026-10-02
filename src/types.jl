@@ -188,6 +188,17 @@ FGMRES with the factorization as preconditioner.
 end
 
 """
+    PivotPairsMode
+
+`pivot_pairs` values (beyond cuDSS): `"default"` (2×2 pivot candidate pairs in
+the analysis of `"S"`/`"H"` matrices, see [`pivot_pairs`](@ref)) and `"none"`.
+"""
+@enum PivotPairsMode::Int32 begin
+    PIVOT_PAIRS_DEFAULT = 0
+    PIVOT_PAIRS_NONE = 1
+end
+
+"""
     enum_spellings(E) -> Tuple{Vararg{Pair}}
 
 The CUDSS.jl spellings of every instance of the enum type `E`, as
@@ -276,6 +287,8 @@ enum_spellings(::Type{ScheduleKind}) = (
 
 enum_spellings(::Type{IRMode}) = ("ir" => IR_PLAIN, "fgmres" => IR_FGMRES)
 
+enum_spellings(::Type{PivotPairsMode}) = ("default" => PIVOT_PAIRS_DEFAULT, "none" => PIVOT_PAIRS_NONE)
+
 """
     StringEnum
 
@@ -283,7 +296,7 @@ Union of the enums spelled with strings (`convert(E, ::AbstractString)`, `conver
 """
 const StringEnum = Union{
     Structure, Phase, ReorderingAlg, FactorizationAlg, SolveAlg, MatchingAlg,
-    PivotEpsilonAlg, ScheduleKind, IRMode,
+    PivotEpsilonAlg, ScheduleKind, IRMode, PivotPairsMode,
 }
 
 """
@@ -313,6 +326,7 @@ enum_description(::Type{MatchingAlg}) = "matching algorithm"
 enum_description(::Type{PivotEpsilonAlg}) = "pivot epsilon algorithm"
 enum_description(::Type{ScheduleKind}) = "schedule"
 enum_description(::Type{IRMode}) = "refinement mode"
+enum_description(::Type{PivotPairsMode}) = "pivot pairs mode"
 
 function _unknown_spelling(::Type{E}, x) where {E}
     expected = join((repr(first(p)) for p in enum_spellings(E)), ", ")

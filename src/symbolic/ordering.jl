@@ -47,7 +47,11 @@ Result of [`compute_ordering`](@ref):
 * `stats::NamedTuple`: `nnz_L`, `flops`, `nlevels`, `cost` of the chosen
   ordering, `candidates::Vector{OrderingCandidate}` (every ordering evaluated,
   the chosen one included), `auto::Bool` (whether the automatic choice ran) and
-  `nd_available::Bool`.
+  `nd_available::Bool`;
+* `pairs::Vector{Tuple{Int,Int}}`: the 2×2 pivot candidate pairs `(partner,
+  candidate)` the ordering was computed with (empty for no pair): `perm` puts
+  each candidate right after its partner, and the symbolic factorization runs on
+  [`factor_pattern`](@ref)`(P, ordering)`.
 """
 struct Ordering
     perm::Vector{Int}
@@ -55,11 +59,13 @@ struct Ordering
     alg_used::Symbol
     stats::@NamedTuple{nnz_L::Int, flops::Float64, nlevels::Int, cost::Float64,
                        candidates::Vector{OrderingCandidate}, auto::Bool, nd_available::Bool}
+    pairs::Vector{Tuple{Int, Int}}
 end
 
 Base.show(io::IO, o::Ordering) =
     print(io, "Ordering($(o.alg_used), n = $(length(o.perm)), nnz_L = $(o.stats.nnz_L), ",
-          "flops = $(o.stats.flops), nlevels = $(o.stats.nlevels))")
+          "flops = $(o.stats.flops), nlevels = $(o.stats.nlevels)",
+          isempty(o.pairs) ? "" : ", npairs = $(length(o.pairs))", ")")
 
 _flop_factor(::Type{T}) where {T} = T <: Complex ? 4.0 : 1.0
 
@@ -124,7 +130,7 @@ function _requested_alg(opts::Options)
 end
 
 """
-    compute_ordering(P::SymmetricPattern, opts::Options; T = Float64, alg = nothing) -> Ordering
+    compute_ordering(P::SymmetricPattern, opts::Options; T = Float64, alg = nothing, pairs = []) -> Ordering
 
 Fill-reducing ordering of the pattern `P` (PLAN §2.3 step 2):
 
@@ -144,23 +150,45 @@ Fill-reducing ordering of the pattern `P` (PLAN §2.3 step 2):
 The keyword `alg` (`:natural`, `:amd`, `:mmd`, `:nd`, `:auto`) overrides
 `reordering_alg` (MMD has no cuDSS spelling); `T` scales the flop counts in
 `stats` (complex: `4×`) and does not change the choice.
+
+2×2 pivot pairs (`"S"`/`"H"`, issue #64). `pairs` lists disjoint `(partner,
+candidate)` pairs, from [`pivot_pairs`](@ref) in the analysis when
+[`pairs_enabled`](@ref) (rows with a zero or negligible diagonal matched to a
+neighbour). AMD, MMD and ND then order the graph compressed by the pairs
+([`compressed_pattern`](@ref): a pair is one vertex with the union adjacency),
+and the order is expanded with each partner right before its candidate
+([`expand_permutation`](@ref)). Every ordering is evaluated, and the factor is
+built, on [`pair_pattern`](@ref), where both columns of a pair have the union
+structure, so the pair lies in one fundamental supernode (never split by
+[`amalgamate`](@ref)) and in-front Bunch–Kaufman can take it as a 2×2 pivot. With `user_perm` (and with the natural ordering) the
+pairs are not applied, the user owns the order: `ordering.pairs` is empty.
+Without pairs the result is the one of the plain ordering, bitwise.
 """
 function compute_ordering(P::SymmetricPattern, opts::Options; T::Type = Float64,
-                          alg::Union{Nothing, Symbol} = nothing)
+                          alg::Union{Nothing, Symbol} = nothing, pairs = Tuple{Int, Int}[])
     requested = alg === nothing ? _requested_alg(opts) : alg
     candidates = OrderingCandidate[]
+    used_pairs = (requested === :user || requested === :natural) ? Tuple{Int, Int}[] :
+                 Vector{Tuple{Int, Int}}(pairs)
+    if isempty(used_pairs)
+        Q, order_on = P, a -> _ordering_perm(P, a, opts)
+    else
+        Pc, gptr, members = compressed_pattern(P, used_pairs)
+        Q = pair_pattern(P, used_pairs)
+        order_on = a -> expand_permutation(_ordering_perm(Pc, a, opts), gptr, members)
+    end
     if requested === :user
         opts.user_perm === nothing && throw(InvalidValueError("alg = :user needs opts.user_perm"))
         perms = [:user => _validate_user_perm(opts.user_perm, P.n)]
     elseif requested === :auto
         algs = nd_available() ? (:amd, :nd) : (:amd,)
-        perms = [a => _ordering_perm(P, a, opts) for a in algs]
+        perms = [a => order_on(a) for a in algs]
     else
-        perms = [requested => _ordering_perm(P, requested, opts)]
+        perms = [requested => order_on(requested)]
     end
     best = 0
     for (k, (a, perm)) in enumerate(perms)
-        e = evaluate_ordering(P, perm; T)
+        e = evaluate_ordering(Q, perm; T)
         push!(candidates, (alg = a, nnz_L = e.nnz_L, flops = e.flops, nlevels = e.nlevels, cost = e.cost))
         (best == 0 || e.cost < candidates[best].cost) && (best = k)
     end
@@ -168,5 +196,5 @@ function compute_ordering(P::SymmetricPattern, opts::Options; T::Type = Float64,
     c = candidates[best]
     stats = (nnz_L = c.nnz_L, flops = c.flops, nlevels = c.nlevels, cost = c.cost,
              candidates = candidates, auto = requested === :auto, nd_available = nd_available())
-    return Ordering(perm, invperm(perm), alg_used, stats)
+    return Ordering(perm, invperm(perm), alg_used, stats, used_pairs)
 end

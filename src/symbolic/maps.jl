@@ -230,18 +230,23 @@ end
     symbolic_analysis(A::CSR, structure, view = 'F'; opts = Options(), T = eltype(A)) -> Symbolic{Int, Vector{Int}}
 
 The whole host analysis of PLAN §2.3: [`SymmetricPattern`](@ref),
-[`compute_ordering`](@ref), [`supernode_partition`](@ref),
-[`build_schedule`](@ref) for element type `T`, [`build_layout`](@ref) and the
-maps of [`Symbolic`](@ref). Only `A.rowptr`/`A.colval` are read (copied to the
-host once).
+[`compute_ordering`](@ref) (with the 2×2 pivot pairs of
+[`pivot_pairs`](@ref) for `"S"`/`"H"`), [`supernode_partition`](@ref) on
+[`factor_pattern`](@ref), [`build_schedule`](@ref) for element type `T`,
+[`build_layout`](@ref) and the maps of [`Symbolic`](@ref). `A.rowptr`/`A.colval`
+are copied to the host once; `A.nzval` too when pairs are looked for
+([`pairs_enabled`](@ref)), and only then.
 """
 function symbolic_analysis(A::CSR, structure, view = VIEW_FULL; opts::Options = Options(), T::Type = eltype(A))
     A.nrows == A.ncols || throw(InvalidValueError("the matrix must be square, got $(A.nrows) × $(A.ncols)"))
     rowptr = Array(A.rowptr)
     colval = Array(A.colval)
     P = SymmetricPattern(rowptr, colval, A.nrows, structure; view, index = A.index)
-    ord = compute_ordering(P, opts; T)
-    sp = supernode_partition(P, ord.perm, opts)
+    pairs = pairs_enabled(structure, opts) ?
+            pivot_pairs(P, rowptr, colval, Array(A.nzval), A.nrows, structure; view, index = A.index) :
+            Tuple{Int, Int}[]
+    ord = compute_ordering(P, opts; T, pairs)
+    sp = supernode_partition(factor_pattern(P, ord), ord.perm, opts)
     sc = build_schedule(sp, opts, T)
     layout = build_layout(sp, sc)
     return Symbolic(sp, sc, layout, rowptr, colval, A.nrows, structure; view, index = A.index)

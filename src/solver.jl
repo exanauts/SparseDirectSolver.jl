@@ -293,7 +293,11 @@ function _reorder!(solver::DirectSolver{T}) where {T}
     solver.host_colval = Array(A.colval)
     P = SymmetricPattern(solver.host_rowptr, solver.host_colval, A.nrows, solver.structure;
                          view = _stored_view(solver), index = A.index)
-    solver.ordering = compute_ordering(P, solver.options; T)
+    # 2×2 pivot pairs ("S"/"H"): the only host copy of the values, at analysis
+    pairs = pairs_enabled(solver.structure, solver.options) ?
+            pivot_pairs(P, solver.host_rowptr, solver.host_colval, Array(A.nzval), A.nrows, solver.structure;
+                        view = _stored_view(solver), index = A.index) : Tuple{Int, Int}[]
+    solver.ordering = compute_ordering(P, solver.options; T, pairs)
     solver.host_symbolic = solver.symbolic = solver.numeric = solver.workspace = nothing
     solver.stage = STAGE_REORDERED
     return solver
@@ -308,7 +312,7 @@ function _symbolic!(solver::DirectSolver{T, INT}) where {T, INT}
     ord = solver.ordering
     P = SymmetricPattern(solver.host_rowptr, solver.host_colval, A.nrows, solver.structure;
                          view = _stored_view(solver), index = A.index)
-    sp = supernode_partition(P, ord.perm, opts)
+    sp = supernode_partition(factor_pattern(P, ord), ord.perm, opts)
     sc = build_schedule(sp, opts, T)
     layout = build_layout(sp, sc)
     Sh = Symbolic(sp, sc, layout, solver.host_rowptr, solver.host_colval, A.nrows, solver.structure;
