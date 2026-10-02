@@ -14,7 +14,9 @@
 #
 # User arrays come in the layouts of `src/solve/permute.jl` (vector, matrix,
 # strided vector, row-major when transposed); the residual `R` is a column-major
-# `n × nrhs` device matrix in the original numbering.
+# `n × nrhs` device matrix in the original numbering. Uniform batch: `R` holds
+# the compact columns of the active members (as the solve workspace), each
+# residual uses its member's values (`nzval` member after member).
 
 "Workgroup size of the residual-norm reduction (one workgroup per right-hand side)."
 const REFINE_WORKGROUP = 256
@@ -105,35 +107,41 @@ function _grow_refinement(W::RefinementWorkspace{T, R, VI, MT, VR}, nrhs::Intege
     return RefinementWorkspace{T, R, VI, MT, VR}(W.rowptr, W.colval, W.src, Rm, Bc, norms, zeros(R, 2 * nrhs))
 end
 
-@kernel function _residual_kernel!(R, rowptr, colval, src, nzval, X, B, n, nrhs, ::Val{XT}, ::Val{BT},
+# compact column r (user column `_bm_ucol(bm, r)` of the `nrhs` user columns, values of member
+# `_bm_cmember(bm, r)`)
+@kernel function _residual_kernel!(R, rowptr, colval, src, nzval_all, X, B, n, nrhs, ncols, bm, ::Val{XT}, ::Val{BT},
                                    ::Val{CJ}) where {XT, BT, CJ}
     q = @index(Global, Linear)
     i = (q - 1) % n + 1
     r = (q - 1) ÷ n + 1
-    @inbounds if r <= nrhs
+    @inbounds if r <= ncols
+        nzval = _mview(nzval_all, _bm_cmember(bm, r), bm.nbatch)
+        u = _bm_ucol(bm, r)
         acc = zero(eltype(R))
         for c in Int(rowptr[i]):(Int(rowptr[i + 1]) - 1)
             s = Int(src[c])
             v = nzval[abs(s)]
             v = xor(s < 0, CJ) ? conj(v) : v
-            acc += v * _rhs_get(X, Int(colval[c]), r, n, nrhs, Val(XT))
+            acc += v * _rhs_get(X, Int(colval[c]), u, n, nrhs, Val(XT))
         end
-        R[i, r] = _rhs_get(B, i, r, n, nrhs, Val(BT)) - acc
+        R[i, r] = _rhs_get(B, i, u, n, nrhs, Val(BT)) - acc
     end
 end
 
-@kernel function _residual_norms_kernel!(norms, R, B, n, nrhs, ::Val{BT}, ::Val{WG}, ::Val{LOG2WG}) where {BT, WG, LOG2WG}
+@kernel function _residual_norms_kernel!(norms, R, B, n, nrhs, bm, ::Val{BT}, ::Val{WG},
+                                         ::Val{LOG2WG}) where {BT, WG, LOG2WG}
     @uniform RT = eltype(norms)
     li = @index(Local, Linear)
     r = @index(Group, Linear)
     nr = @localmem RT (WG,)
     nb = @localmem RT (WG,)
     @inbounds begin
+        u = _bm_ucol(bm, r)
         sr = zero(RT)
         sb = zero(RT)
         for i in li:WG:n
             sr += abs2(R[i, r])
-            sb += abs2(_rhs_get(B, i, r, n, nrhs, Val(BT)))
+            sb += abs2(_rhs_get(B, i, u, n, nrhs, Val(BT)))
         end
         nr[li] = sr
         nb[li] = sb
@@ -155,14 +163,15 @@ end
     end
 end
 
-@kernel function _add_correction_kernel!(X, Y, perm, n, nrhs, ::Val{TR}, ::Val{CJ}) where {TR, CJ}
+@kernel function _add_correction_kernel!(X, Y, perm, n, nrhs, ncols, bm, ::Val{TR}, ::Val{CJ}) where {TR, CJ}
     q = @index(Global, Linear)
     k = (q - 1) % n + 1
     r = (q - 1) ÷ n + 1
-    @inbounds if r <= nrhs
+    @inbounds if r <= ncols
         i = Int(perm[k])
+        u = _bm_ucol(bm, r)
         y = Y[k, r]
-        _rhs_set!(X, _rhs_get(X, i, r, n, nrhs, Val(TR)) + (CJ ? conj(y) : y), i, r, n, nrhs, Val(TR))
+        _rhs_set!(X, _rhs_get(X, i, u, n, nrhs, Val(TR)) + (CJ ? conj(y) : y), i, u, n, nrhs, Val(TR))
     end
 end
 
@@ -175,48 +184,64 @@ end
     end
 end
 
+# the batch map of `nrhs` user columns: given, or every column in order
+_user_map(bm::BatchMap, nrhs) = bm
+_user_map(::Nothing, nrhs) = single_batch(; nrhs)
+
 """
-    residual!(W, nzval, X, B; nrhs, transposed = false, b_transposed = transposed, conjugate = false) -> W.R
+    residual!(W, nzval, X, B; nrhs, transposed = false, b_transposed = transposed, conjugate = false,
+              bm = nothing) -> W.R
 
 `W.R[:, 1:nrhs] = B - M X` (`conj(M)` when `conjugate`) with the full matrix
 `M` of the map of `W` and the user values `nzval`; `X`, `B` in the layouts of
-[`rhs_count`](@ref) (row-major when `transposed`/`b_transposed`). One launch,
+[`rhs_count`](@ref) (row-major when `transposed`/`b_transposed`) with `nrhs`
+right-hand sides. Uniform batch ([`BatchMap`](@ref) `bm`): `nzval` holds the
+values of the `bm.nbatch` members, and the residuals of the active members go
+to the compact columns `1:(bm.nrhs bm.nact)` of `W.R`. One launch,
 one work item per (row, right-hand side), gather-based (no atomics).
 Asynchronous.
 """
 function residual!(W::RefinementWorkspace, nzval::AbstractVector, X::AbstractVecOrMat, B::AbstractVecOrMat;
                    nrhs::Integer, transposed::Bool = false, b_transposed::Bool = transposed,
-                   conjugate::Bool = false)
+                   conjugate::Bool = false, bm::Union{Nothing, BatchMap} = nothing)
     n = size(W.R, 1)
-    n * nrhs > 0 || return W.R
+    bm = _user_map(bm, nrhs)
+    ncols = bm.nrhs * bm.nact
+    n * ncols > 0 || return W.R
     kernel! = _residual_kernel!(KernelAbstractions.get_backend(W.R), PERMUTE_WORKGROUP)
     _with_flags(transposed, b_transposed) do xt, bt
         if conjugate
-            kernel!(W.R, W.rowptr, W.colval, W.src, nzval, X, B, n, Int(nrhs), xt, bt, Val(true); ndrange = n * Int(nrhs))
+            kernel!(W.R, W.rowptr, W.colval, W.src, nzval, X, B, n, Int(nrhs), ncols, bm, xt, bt, Val(true);
+                    ndrange = n * ncols)
         else
-            kernel!(W.R, W.rowptr, W.colval, W.src, nzval, X, B, n, Int(nrhs), xt, bt, Val(false); ndrange = n * Int(nrhs))
+            kernel!(W.R, W.rowptr, W.colval, W.src, nzval, X, B, n, Int(nrhs), ncols, bm, xt, bt, Val(false);
+                    ndrange = n * ncols)
         end
     end
     return W.R
 end
 
 """
-    residual_norms!(W, B; nrhs, transposed = false) -> W.norms_host
+    residual_norms!(W, B; nrhs, transposed = false, bm = nothing) -> W.norms_host
 
-`‖W.R[:, k]‖₂²` and `‖B[:, k]‖₂²` for `k = 1:nrhs` reduced on the device (one
-workgroup per right-hand side, `@localmem` tree reduction) into `W.norms`, then
-copied to `W.norms_host` (one host synchronization).
+`‖W.R[:, k]‖₂²` and `‖B[:, k]‖₂²` for the compact columns `k` (`1:nrhs`, or
+the active members' columns of the [`BatchMap`](@ref) `bm`) reduced on the
+device (one workgroup per right-hand side, `@localmem` tree reduction) into
+`W.norms`, then copied to `W.norms_host` (one host synchronization).
 """
-function residual_norms!(W::RefinementWorkspace, B::AbstractVecOrMat; nrhs::Integer, transposed::Bool = false)
+function residual_norms!(W::RefinementWorkspace, B::AbstractVecOrMat; nrhs::Integer, transposed::Bool = false,
+                         bm::Union{Nothing, BatchMap} = nothing)
     n = size(W.R, 1)
+    bm = _user_map(bm, nrhs)
+    ncols = bm.nrhs * bm.nact
     WG = REFINE_WORKGROUP
     kernel! = _residual_norms_kernel!(KernelAbstractions.get_backend(W.R), WG)
     if transposed
-        kernel!(W.norms, W.R, B, n, Int(nrhs), Val(true), Val(WG), Val(_ilog2(WG)); ndrange = WG * Int(nrhs))
+        kernel!(W.norms, W.R, B, n, Int(nrhs), bm, Val(true), Val(WG), Val(_ilog2(WG)); ndrange = WG * ncols)
     else
-        kernel!(W.norms, W.R, B, n, Int(nrhs), Val(false), Val(WG), Val(_ilog2(WG)); ndrange = WG * Int(nrhs))
+        kernel!(W.norms, W.R, B, n, Int(nrhs), bm, Val(false), Val(WG), Val(_ilog2(WG)); ndrange = WG * ncols)
     end
-    copyto!(W.norms_host, 1, W.norms, 1, 2 * Int(nrhs))
+    copyto!(W.norms_host, 1, W.norms, 1, 2 * ncols)
     return W.norms_host
 end
 
@@ -249,19 +274,23 @@ function copy_rhs!(C::AbstractMatrix, B::AbstractVecOrMat; nrhs::Integer, transp
 end
 
 """
-    add_correction!(X, Y, perm; nrhs, transposed = false, conjugate = false) -> X
+    add_correction!(X, Y, perm; nrhs, transposed = false, conjugate = false, bm = nothing) -> X
 
 `X[perm[k], r] += Y[k, r]` (`conj(Y[k, r])` when `conjugate`): the solution of
 the correction system, in factor order in the workspace `Y`, added to the user
-array `X`. One launch, conflict-free (`perm` is a permutation).
+array `X` of `nrhs` right-hand sides (uniform batch: the compact columns of `Y`
+to the active members' columns of `X`, [`BatchMap`](@ref) `bm`). One launch,
+conflict-free (`perm` is a permutation).
 """
 function add_correction!(X::AbstractVecOrMat, Y::AbstractMatrix, perm::AbstractVector; nrhs::Integer,
-                         transposed::Bool = false, conjugate::Bool = false)
+                         transposed::Bool = false, conjugate::Bool = false, bm::Union{Nothing, BatchMap} = nothing)
     n = length(perm)
-    n * nrhs > 0 || return X
+    bm = _user_map(bm, nrhs)
+    ncols = bm.nrhs * bm.nact
+    n * ncols > 0 || return X
     kernel! = _add_correction_kernel!(KernelAbstractions.get_backend(Y), PERMUTE_WORKGROUP)
     _with_flags(transposed, conjugate) do tr, cj
-        kernel!(X, Y, perm, n, Int(nrhs), tr, cj; ndrange = n * Int(nrhs))
+        kernel!(X, Y, perm, n, Int(nrhs), ncols, bm, tr, cj; ndrange = n * ncols)
     end
     return X
 end
@@ -290,17 +319,21 @@ function refine!(X::AbstractVecOrMat, B::AbstractVecOrMat, W::RefinementWorkspac
                  b_transposed::Bool = transposed, conjugate::Bool = false, deterministic::Bool = false,
                  interrupt::Union{Nothing, Threads.Atomic{Bool}} = nothing,
                  progress::Base.RefValue{Int} = Ref(0))
-    nrhs = rhs_count(X, S.n; transposed)
-    max_rhs(W) >= nrhs && max_rhs(ws) >= nrhs ||
-        throw(DimensionMismatch("the refinement workspace holds $(max_rhs(W)) right-hand sides, need $nrhs"))
+    nu = rhs_count(X, S.n; transposed)                        # user columns: nrhs per member × nbatch
+    nu % N.nbatch == 0 || throw(DimensionMismatch("$nu right-hand sides for a batch of $(N.nbatch) members"))
+    nrhs = nu ÷ N.nbatch
+    ncols = _ncols(N, nrhs)
+    max_rhs(W) >= ncols && max_rhs(ws) >= ncols ||
+        throw(DimensionMismatch("the refinement workspace holds $(max_rhs(W)) right-hand sides, need $ncols"))
+    bm = batch_map(N; nrhs)
     steps = 0
     progress[] = 0
     for _ in 1:nsteps
         _poll_interrupt(interrupt)
-        residual!(W, nzval, X, B; nrhs, transposed, b_transposed, conjugate)
+        residual!(W, nzval, X, B; nrhs = nu, transposed, b_transposed, conjugate, bm)
         if tol > 0
-            norms = residual_norms!(W, B; nrhs, transposed = b_transposed)
-            rel = _max_relative_residual(norms, nrhs)
+            norms = residual_norms!(W, B; nrhs = nu, transposed = b_transposed, bm)
+            rel = _max_relative_residual(norms, ncols)
             _log(LOG_DEBUG, () -> "refinement: step $steps, relative residual $rel")
             rel <= tol && break
         end
@@ -308,7 +341,7 @@ function refine!(X::AbstractVecOrMat, B::AbstractVecOrMat, W::RefinementWorkspac
         forward_sweep!(ws, S, N; nrhs, deterministic)
         diagonal_sweep!(ws, S, N; nrhs)
         backward_sweep!(ws, S, N; nrhs)
-        add_correction!(X, ws.Y, S.perm; nrhs, transposed, conjugate)
+        add_correction!(X, ws.Y, S.perm; nrhs = nu, transposed, conjugate, bm)
         steps += 1
         progress[] = steps
     end

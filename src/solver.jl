@@ -60,13 +60,27 @@ right-hand side and the solution (as for `solve_mode`, see
 [`solve_conjugated`](@ref)).
 
 Implemented at this point: structures `"SPD"` (real `T`), `"HPD"`, `"S"`
-(LDLᵀ; complex symmetric for complex `T`) and `"H"` (LDLᴴ), a single matrix
-(no uniform batch), the phases `"reordering"`, `"symbolic_factorization"`,
+(LDLᵀ; complex symmetric for complex `T`) and `"H"` (LDLᴴ), single matrices
+and uniform batches (see below), the phases `"reordering"`, `"symbolic_factorization"`,
 `"analysis"`, `"factorization"`, `"refactorization"`, `"solve"`,
 `"solve_fwd_perm"`, `"solve_fwd"`, `"solve_diag"`, `"solve_bwd"`,
 `"solve_bwd_perm"` and `"solve_refinement"` ([`execute!`](@ref)). Structure
 `"G"` and the Schur phases raise [`NotSupportedError`](@ref) when they are
 executed.
+
+Uniform batch (PLAN §1.6, §3.5, ≅ CUDSS.jl's uniform batch): `nbatch`
+matrices with the pattern of `rowptr`/`colval` and values `nzval`, either a
+vector of `nbatch · nnz` entries (member after member) or an `nnz × nbatch`
+matrix; `nbatch` is deduced from the values (`length(nzval) ÷ length(colval)`),
+and `"ubatch_size"` must be `0` (deduced) or equal to it. One analysis serves
+every member; each member has its own factor, `"info"`, `"inertia"`,
+`"npivots"` and `"pivot_stats"` (vectors over the members). Right-hand sides
+and solutions hold `nrhs` columns per member, member after member: a strided
+vector of `n · nrhs · nbatch` entries, an `n × (nrhs · nbatch)` matrix, an
+`n × nrhs × nbatch` array or a [`MatrixDescriptor`](@ref) with `nbatch`.
+`"ubatch_index"` (0-based member, `-1` = all) and `"ubatch_mask"` (one 0/1
+flag per member) restrict the factorization and solve phases to a subset of
+the members: the other members' factors and solutions are left untouched.
 
 Fields: `A` (the current [`CSR`](@ref), re-pointed by [`update!`](@ref)),
 `structure`, `view` (as given), `options` ([`Options`](@ref), set through
@@ -88,7 +102,7 @@ mutable struct DirectSolver{T, INT, M <: CSR{T, INT}, B <: KernelAbstractions.Ba
     backend::B
     nbatch::Int
     fresh_factorization::Bool
-    info::Int
+    info::Vector{Int}
     stage::Int
     host_rowptr::Vector{INT}
     host_colval::Vector{INT}
@@ -126,13 +140,12 @@ function DirectSolver(A::CSR{T, INT}, structure, view; index = A.index) where {T
         A = CSR(A.rowptr, A.colval, A.nzval, A.nrows, A.ncols; index = base, transposed = A.transposed)
     end
     nb = nbatch(A)
-    nb == 1 || throw(NotSupportedError("uniform batches (nbatch = $nb) are not implemented yet (T17)"))
     backend = KernelAbstractions.get_backend(A)
     SY, NU, WS = _symbolic_type(backend, INT), _numeric_type(backend, T), _workspace_type(backend, T)
     RF = _refinement_type(backend, T, INT)
     return DirectSolver{T, INT, typeof(A), typeof(backend), SY, NU, WS, RF}(
-        A, s, v, Options(), backend, nb, true, 0, STAGE_NONE, INT[], INT[], nothing, nothing, nothing, nothing,
-        nothing, nothing, -1)
+        A, s, v, Options(), backend, nb, true, zeros(Int, nb), STAGE_NONE, INT[], INT[], nothing, nothing, nothing,
+        nothing, nothing, nothing, -1)
 end
 
 function DirectSolver(rowptr::AbstractVector{<:Integer}, colval::AbstractVector{<:Integer}, nzval::AbstractVecOrMat,
@@ -152,11 +165,12 @@ function Base.show(io::IO, solver::DirectSolver{T, INT}) where {T, INT}
     print(io, "DirectSolver{", T, ", ", INT, "}(n = ", size(solver, 1), ", nnz = ", nnz(solver.A), ", structure = \"",
           convert(String, solver.structure), "\", view = '", convert(Char, solver.view), "', backend = ",
           nameof(typeof(solver.backend)), ", ", _STAGE_NAMES[solver.stage + 1])
+    solver.nbatch > 1 && print(io, ", nbatch = ", solver.nbatch)
     if solver.host_symbolic !== nothing
         print(io, ", ", nsupernodes(solver.host_symbolic), " supernodes, nnz(L) = ",
               solver.host_symbolic.partition.nnz_L)
     end
-    solver.stage == STAGE_FACTORIZED && print(io, ", info = ", solver.info)
+    solver.stage == STAGE_FACTORIZED && print(io, ", info = ", _info_value(solver))
     print(io, ")")
     return nothing
 end
@@ -305,7 +319,9 @@ function _check_analysis_supported(solver::DirectSolver{T}) where {T}
     T <: Complex && s == STRUCTURE_SPD &&
         throw(InvalidValueError("a complex positive definite matrix needs structure \"HPD\""))
     opts = solver.options
-    opts.ubatch_size > 1 && throw(NotSupportedError("uniform batches (ubatch_size > 1) are not implemented yet (T17)"))
+    opts.ubatch_size == 0 || opts.ubatch_size == solver.nbatch ||
+        throw(InvalidValueError("ubatch_size = $(opts.ubatch_size), but the matrix values hold $(solver.nbatch) " *
+                                "batch member(s) (length(nzval) ÷ nnz)"))
     opts.matching_alg == MATCHING_NONE ||
         throw(NotSupportedError("matching_alg = \"$(convert(String, opts.matching_alg))\" is not implemented yet (T21)"))
     opts.schur_mode == 0 || throw(NotSupportedError("schur_mode = 1 is not implemented yet (T20)"))
@@ -326,8 +342,8 @@ function _reorder!(solver::DirectSolver{T}) where {T}
     solver.host_colval = Array(A.colval)
     P = SymmetricPattern(solver.host_rowptr, solver.host_colval, A.nrows, solver.structure;
                          view = _stored_view(solver), index = A.index)
-    # 2×2 pivot pairs ("S"/"H"): the only host copy of the values, at analysis
-    pp = analysis_pairs(P, solver.host_rowptr, solver.host_colval, A.nzval, A.nrows, solver.structure,
+    # 2×2 pivot pairs ("S"/"H"): the only host copy of the values, at analysis (of the first batch member)
+    pp = analysis_pairs(P, solver.host_rowptr, solver.host_colval, _first_member(A), A.nrows, solver.structure,
                         solver.options; view = _stored_view(solver), index = A.index)
     solver.ordering = compute_ordering(P, solver.options; T, pp.pairs, pp.candidates)
     solver.host_symbolic = solver.symbolic = solver.numeric = solver.workspace = solver.refinement = nothing
@@ -335,6 +351,10 @@ function _reorder!(solver::DirectSolver{T}) where {T}
     _log(LOG_INFO, () -> "reordering: n = $(A.nrows), nnz = $(nnz(A)), $(_elapsed(tic))")
     return solver
 end
+
+# the values of the first batch member (all of them for a single matrix)
+_first_member(A::CSR) = nbatch(A) == 1 ? A.nzval : A.nzval isa AbstractMatrix ? view(A.nzval, :, 1) :
+                        view(A.nzval, 1:nnz(A))
 
 function _symbolic!(solver::DirectSolver{T, INT}) where {T, INT}
     solver.stage >= STAGE_REORDERED ||
@@ -352,16 +372,16 @@ function _symbolic!(solver::DirectSolver{T, INT}) where {T, INT}
     layout = build_layout(sp, sc)
     Sh = Symbolic(sp, sc, layout, solver.host_rowptr, solver.host_colval, A.nrows, solver.structure;
                   view = _stored_view(solver), index = A.index)
-    nrhs = solver.workspace === nothing ? 1 : max_rhs(solver.workspace)
+    nrhs = solver.workspace === nothing ? solver.nbatch : max_rhs(solver.workspace)
     Sd = adapt(solver.backend, Sh, INT)
     solver.host_symbolic = Sh
     solver.symbolic = Sd
-    solver.numeric = allocate_numeric(Sd, T, solver.backend)
+    solver.numeric = allocate_numeric(Sd, T, solver.backend; nbatch = solver.nbatch)
     solver.workspace = allocate_solve(Sd, T, solver.backend, nrhs)
     solver.refinement = nothing
     solver.stage = STAGE_ANALYZED
     solver.fresh_factorization = true
-    solver.info = 0
+    fill!(solver.info, 0)
     _log(LOG_INFO, () -> "symbolic_factorization: $(nsupernodes(Sh)) supernodes, nnz(L) = $(sp.nnz_L), " *
                          "flops = $(sp.flops), $(_elapsed(tic))")
     return solver
@@ -372,25 +392,49 @@ function _factorize!(solver::DirectSolver, p::Phase)
     solver.stage >= STAGE_ANALYZED || throw(_phase_error(name, "needs \"analysis\""))
     p == PHASE_REFACTORIZATION && solver.stage < STAGE_FACTORIZED &&
         throw(_phase_error(name, "needs a previous \"factorization\""))
-    p == PHASE_REFACTORIZATION && (solver.info = 0)
+    N, S = solver.numeric, solver.symbolic
+    _set_members!(solver)
+    if p == PHASE_REFACTORIZATION
+        for j in 1:N.plan.nact[]
+            solver.info[N.plan.members_host[j]] = 0
+        end
+    end
     tic = time_ns()
     try
-        solver.info = _numeric_phase!(solver.numeric, solver.symbolic, solver.A.nzval, solver.options)
+        _numeric_phase!(N, S, solver.A.nzval, solver.options)
     catch err
         if err isa InterruptedError
             # the panels are partly overwritten: back to "analyzed", a "factorization" must follow
             solver.stage = STAGE_ANALYZED
             solver.fresh_factorization = true
-            solver.info = 0
+            fill!(solver.info, 0)
             _log(LOG_INFO, () -> "$name: interrupted")
         end
         rethrow()
     end
+    member_info!(solver.info, N, S)
     solver.stage = STAGE_FACTORIZED
     p == PHASE_FACTORIZATION && (solver.fresh_factorization = false)
-    _log(LOG_INFO, () -> "$name: info = $(solver.info), $(_elapsed(tic)) (launches, asynchronous)")
+    _log(LOG_INFO, () -> "$name: info = $(_info_value(solver)), $(_elapsed(tic)) (launches, asynchronous)")
     return solver
 end
+
+# the members the next numeric or solve phase processes (`ubatch_index`, `ubatch_mask`)
+function _set_members!(solver::DirectSolver)
+    opts = solver.options
+    nb = solver.nbatch
+    if opts.ubatch_index == -1 && opts.ubatch_mask === nothing
+        N = solver.numeric
+        N.plan.nact[] == nb || set_members!(N, 1:nb)
+        return N
+    end
+    members = active_members(nb, opts.ubatch_index, opts.ubatch_mask)
+    isempty(members) && throw(InvalidValueError("ubatch_index and ubatch_mask select no batch member"))
+    return set_members!(solver.numeric, members)
+end
+
+# the "info" data parameter: an `Int` for a single matrix, a vector over the members of a batch
+_info_value(solver::DirectSolver) = solver.nbatch == 1 ? solver.info[1] : copy(solver.info)
 
 _elapsed(tic) = string(round((time_ns() - tic) / 1.0e6; digits = 3), " ms")
 
@@ -398,16 +442,22 @@ _elapsed(tic) = string(round((time_ns() - tic) / 1.0e6; digits = 3), " ms")
 _numeric_phase!(N::Numeric, S::Symbolic, nzval::AbstractVector, opts::Options) = factorize!(N, S, nzval; opts)
 _numeric_phase!(N::Numeric, S::Symbolic, nzval::AbstractMatrix, opts::Options) = factorize!(N, S, vec(nzval); opts)
 
-# user data of a right-hand side / solution: (array, transposed)
+# user data of a right-hand side / solution: (array, transposed); an `n × nrhs × nbatch` array is the
+# `n × (nrhs nbatch)` matrix with the same memory (uniform batch)
 _rhs_data(X::AbstractVecOrMat) = (X, false)
 function _rhs_data(X::MatrixDescriptor)
     X.data === nothing && throw(InvalidValueError("MatrixDescriptor has no data; call update! first"))
-    X.nbatch == 1 || throw(NotSupportedError("batched right-hand sides are not implemented yet (T17)"))
-    X.data isa AbstractVecOrMat || throw(NotSupportedError("3-D right-hand sides are not implemented yet (T17)"))
-    return (X.data, X.transposed)
+    X.nbatch == 1 || !X.transposed ||
+        throw(NotSupportedError("row-major (transposed) right-hand sides of a uniform batch are not supported"))
+    return (_rhs_matrix(X.data), X.transposed)
 end
-_rhs_data(X::AbstractArray) = throw(NotSupportedError("$(ndims(X))-D right-hand sides are not implemented yet (T17)"))
-_rhs_data(X) = throw(InvalidValueError("the solve phases need a vector, a matrix or a MatrixDescriptor, got $(typeof(X))"))
+_rhs_data(X::AbstractArray{<:Any, 3}) = (_rhs_matrix(X), false)
+_rhs_data(X::AbstractArray) = throw(InvalidValueError("$(ndims(X))-D right-hand sides are not supported"))
+_rhs_data(X) = throw(InvalidValueError("the solve phases need a vector, a matrix, an n × nrhs × nbatch array or a " *
+                                       "MatrixDescriptor, got $(typeof(X))"))
+
+_rhs_matrix(X::AbstractVecOrMat) = X
+_rhs_matrix(X::AbstractArray{<:Any, 3}) = reshape(X, size(X, 1), size(X, 2) * size(X, 3))
 
 function _check_rhs_backend(solver::DirectSolver, X, name)
     typeof(KernelAbstractions.get_backend(X)) == typeof(solver.backend) ||
@@ -463,31 +513,39 @@ function _solve_phase!(solver::DirectSolver, p::Phase, X::AbstractVecOrMat, B::A
     S, N = solver.symbolic, solver.numeric
     opts = solver.options
     n = S.n
-    nrhs = rhs_count(B, n; transposed)
-    rhs_count(X, n; transposed) == nrhs ||
-        throw(DimensionMismatch("X has $(rhs_count(X, n; transposed)) right-hand sides, B has $nrhs"))
-    ws = _workspace!(solver, nrhs)
+    nu = rhs_count(B, n; transposed)                   # user columns: nrhs per member × nbatch
+    rhs_count(X, n; transposed) == nu ||
+        throw(DimensionMismatch("X has $(rhs_count(X, n; transposed)) right-hand sides, B has $nu"))
+    nb = solver.nbatch
+    nb == 1 || !transposed ||
+        throw(NotSupportedError("row-major (transposed) right-hand sides of a uniform batch are not supported"))
+    nu % nb == 0 ||
+        throw(DimensionMismatch("$nu right-hand side columns do not split over the $nb members of the batch"))
+    nrhs = nu ÷ nb
+    _set_members!(solver)
+    ws = _workspace!(solver, nu)
+    bm = batch_map(N; nrhs)
     det = opts.deterministic_mode == 1
     cj = solve_conjugated(solver.structure, eltype(ws), solver.A.transposed, opts.solve_mode)
     refine = opts.ir_n_steps > 0 && (p == PHASE_SOLVE || p == PHASE_SOLVE_REFINEMENT)
     if p == PHASE_SOLVE_REFINEMENT && refine && Base.mightalias(X, B)
         throw(InvalidValueError("\"solve_refinement\" needs the original right-hand side: X and B must not alias"))
     end
-    W = refine ? _refinement!(solver, nrhs) : nothing
+    W = refine ? _refinement!(solver, nu) : nothing
     if p == PHASE_SOLVE
         Bs, bt = B, transposed
         if refine && Base.mightalias(X, B)     # the solve overwrites B: keep a copy for the residual
-            copy_rhs!(W.Bc, B; nrhs, transposed)
+            copy_rhs!(W.Bc, B; nrhs = nu, transposed)
             Bs, bt = W.Bc, false
         end
-        permute_rhs!(ws.Y, B, S.perm; transposed, conjugate = cj)
+        permute_rhs!(ws.Y, B, S.perm; transposed, conjugate = cj, bm)
         forward_sweep!(ws, S, N; nrhs, deterministic = det)
         diagonal_sweep!(ws, S, N; nrhs)
         backward_sweep!(ws, S, N; nrhs)
-        unpermute_solution!(X, ws.Y, S.perm; transposed, conjugate = cj)
+        unpermute_solution!(X, ws.Y, S.perm; transposed, conjugate = cj, bm)
         refine ? _refine_phase!(solver, W, ws, X, Bs, transposed, bt, cj, det) : (solver.ir_steps = 0)
     elseif p == PHASE_SOLVE_FWD_PERM
-        permute_rhs!(ws.Y, B, S.perm; transposed, conjugate = cj)
+        permute_rhs!(ws.Y, B, S.perm; transposed, conjugate = cj, bm)
     elseif p == PHASE_SOLVE_FWD
         forward_sweep!(ws, S, N; nrhs, deterministic = det)
     elseif p == PHASE_SOLVE_DIAG
@@ -495,7 +553,7 @@ function _solve_phase!(solver::DirectSolver, p::Phase, X::AbstractVecOrMat, B::A
     elseif p == PHASE_SOLVE_BWD
         backward_sweep!(ws, S, N; nrhs)
     elseif p == PHASE_SOLVE_BWD_PERM
-        unpermute_solution!(X, ws.Y, S.perm; transposed, conjugate = cj)
+        unpermute_solution!(X, ws.Y, S.perm; transposed, conjugate = cj, bm)
     else  # PHASE_SOLVE_REFINEMENT
         refine ? _refine_phase!(solver, W, ws, X, B, transposed, transposed, cj, det) : (solver.ir_steps = 0)
     end
@@ -570,7 +628,6 @@ function _output_task(name)
     name in ("perm_matching", "scale_row", "scale_col") && return "T21"
     name in ("schur_shape", "schur_matrix") && return "T20"
     name == "nd_partition_tree" && return "T24"
-    name == "ubatch_mask" && return "T17"
     return "M12"   # hybrid_device_memory_min
 end
 
@@ -580,7 +637,12 @@ end
 Set a configuration or user-input data parameter of `solver` (≅ `cudss_set`):
 everything [`setparam!`](@ref)`(::Options, …)` accepts, stored in
 `solver.options` and used by the next phase that reads it, plus the data
-parameter `"info"` (an integer; CUDSS.jl resets it before a refactorization).
+parameter `"info"` (an integer, or for a uniform batch an integer for every
+member or a vector of `nbatch` integers; CUDSS.jl resets it before a
+refactorization). Uniform batch: `"ubatch_size"` (`0` or the batch size),
+`"ubatch_index"` (0-based member, `-1` = all) and `"ubatch_mask"` (`nbatch`
+flags 0/1, or `nothing`) select the members of the next phases; the index and
+the mask are checked against the batch size when a phase runs.
 `"pivot_sign"` (PLAN §1.7: a vector of `n` entries in `(-1, 0, 1)`, host or
 device, or `nothing`) is checked against the size of the matrix; the next
 `"factorization"`/`"refactorization"` copies it to the device. Setting
@@ -592,9 +654,16 @@ which replaces cuDSS's set-buffer-then-get protocol.
 """
 function setparam!(solver::DirectSolver, name::AbstractString, value)
     if name == "info"
-        (value isa Integer && !(value isa Bool)) ||
-            throw(InvalidValueError("invalid value $(repr(value)) for parameter \"info\"; expected an integer"))
-        solver.info = Int(value)
+        if value isa AbstractVector && solver.nbatch > 1
+            length(value) == solver.nbatch && all(x -> x isa Integer && !(x isa Bool), value) ||
+                throw(InvalidValueError("invalid value $(repr(value)) for parameter \"info\"; expected " *
+                                        "$(solver.nbatch) integers"))
+            solver.info .= value
+        else
+            (value isa Integer && !(value isa Bool)) ||
+                throw(InvalidValueError("invalid value $(repr(value)) for parameter \"info\"; expected an integer"))
+            fill!(solver.info, Int(value))
+        end
     elseif name == "schur_matrix"
         throw(NotSupportedError("the data parameter \"schur_matrix\" is not implemented yet (T20)"))
     elseif name == "pivot_sign" && value !== nothing && length(value) != size(solver, 1)
@@ -623,6 +692,7 @@ The data parameters computed by the solver:
 | name | value | available after |
 | --- | --- | --- |
 | `"info"` | `Int`: `0`, or the original column (1-based) of the first non-positive pivot | always |
+| `"ubatch_mask"` | the `"ubatch_mask"` set (or `nothing`) | always |
 | `"ir_n_steps"` | `Int`: refinement steps performed by the last `"solve"`/`"solve_refinement"` (≤ the configured `ir_n_steps`, fewer when `ir_tol` stopped early); the configured value before the first solve and after `setparam!(solver, "ir_n_steps", k)` | always |
 | `"lu_nnz"` | `Int64`: nonzeros of `L` (diagonal included, amalgamation zeros excluded) | analysis |
 | `"flops"` | `Float64`: factorization flops of the stored panels | analysis |
@@ -635,6 +705,11 @@ The data parameters computed by the solver:
 | `"inertia"` | `Tuple{INT, INT}`: `(npos, nneg)` of D (after perturbation, so the inertia of `A + E`; read it with `"npivots"`); `(0, 0)` for complex symmetric `"S"`; Cholesky: `(number of positive pivots, 0)` | factorization |
 | `"pivot_stats"` | `NamedTuple` `(npos, nneg, nzero, nperturbed, n2x2)` of `Int64` (PLAN §1.7) | factorization |
 
+Uniform batch (`nbatch > 1`): `"info"`, `"npivots"`, `"inertia"` and
+`"pivot_stats"` are vectors with one entry per batch member, `"diag"` is the
+`n · nbatch` vector of the members' diagonals one after the other; the
+analysis outputs are shared by the members.
+
 The pivot statistics are reduced on the device ([`reduce_stats!`](@ref)) and
 copied to the host when read (one synchronization). The reordering
 permutation after `"reordering"` alone is the ordering algorithm's; `"symbolic_factorization"` composes it with the supernodal
@@ -645,7 +720,7 @@ one before the phase that computes it raises [`FactorizationError`](@ref).
 """
 function getparam(solver::DirectSolver, name::AbstractString)
     spec = parameter_spec(name)
-    name == "info" && return solver.info
+    name == "info" && return _info_value(solver)
     name == "ir_n_steps" && solver.ir_steps >= 0 && return solver.ir_steps
     spec.status === :output || spec.status === :solver || return getparam(solver.options, name)
     name in SOLVER_OUTPUTS ||
@@ -698,40 +773,52 @@ function getparam!(buffer::AbstractVector, solver::DirectSolver, name::AbstractS
     return buffer
 end
 
-@kernel function _factor_diag_kernel!(d, factor, super_ptr, front_ptr, front_nrows, ns)
-    s = @index(Global, Linear)
-    @inbounds if s <= ns
+# work item (s, member k of nb): the diagonal of the panel of supernode s of member k into d[(k - 1) n + …]
+@kernel function _factor_diag_kernel!(d, factor, super_ptr, front_ptr, front_nrows, ns, nb)
+    q = @index(Global, Linear)
+    s = (q - 1) % ns + 1
+    k = (q - 1) ÷ ns + 1
+    @inbounds if k <= nb
+        dk = _mview(d, k, nb)
         c0 = Int(super_ptr[s])
         w = Int(super_ptr[s + 1]) - c0
         f = Int(front_nrows[s])
-        p0 = Int(front_ptr[s])
+        p0 = Int(member_panels(front_ptr, k, nb)[s])
         for j in 0:(w - 1)
-            d[c0 + j] = factor[p0 + j * f + j]
+            dk[c0 + j] = factor[p0 + j * f + j]
         end
     end
 end
 
-# npivots / inertia / pivot_stats from the statistics reduced on the device (Cholesky: reduced on demand)
+# npivots / inertia / pivot_stats from the statistics reduced on the device (Cholesky: reduced on demand),
+# per member for a batch
 function _pivot_output(solver::DirectSolver{T, INT}, name) where {T, INT}
     S, N = solver.symbolic, solver.numeric
-    _is_ldlt_structure(S.structure) || reduce_stats!(N, S)
-    st = pivot_totals(N)
-    name == "npivots" && return INT(st.nperturbed)
-    name == "inertia" && return (INT(st.npos), INT(st.nneg))
-    return st
+    if !_is_ldlt_structure(S.structure)
+        _set_members!(solver)
+        reduce_stats!(N, S)
+    end
+    totals = Array(N.totals)
+    out(st) = name == "npivots" ? INT(st.nperturbed) : name == "inertia" ? (INT(st.npos), INT(st.nneg)) : st
+    solver.nbatch == 1 && return out(pivot_totals(totals, 1, 1))
+    return [out(pivot_totals(totals, solver.nbatch, k)) for k in 1:solver.nbatch]
 end
 
-# diagonal of L (Cholesky) or D (LDLᵀ/LDLᴴ) in factor order, on the solver's backend
-# (Cholesky: one launch, one work item per supernode)
+# diagonal of L (Cholesky) or D (LDLᵀ/LDLᴴ) in factor order, on the solver's backend, the members of a batch one
+# after the other (Cholesky: one launch, one work item per (supernode, member))
 function _factor_diag(solver::DirectSolver{T}) where {T}
     S, N = solver.symbolic, solver.numeric
-    d = KernelAbstractions.zeros(solver.backend, T, S.n)
+    n, nb = S.n, solver.nbatch
+    d = KernelAbstractions.zeros(solver.backend, T, n * nb)
     if _is_ldlt_structure(S.structure)
-        copyto!(d, 1, N.d, 1, S.n)
+        for k in 1:nb
+            copyto!(d, (k - 1) * n + 1, N.d, (k - 1) * 2n + 1, n)
+        end
         return d
     end
     ns = nsupernodes(S)
     ns > 0 || return d
-    _factor_diag_kernel!(solver.backend, 64)(d, N.factor, S.super_ptr, S.front_ptr, S.front_nrows, ns; ndrange = ns)
+    _factor_diag_kernel!(solver.backend, 64)(d, N.factor, S.super_ptr, S.front_ptr, S.front_nrows, ns, nb;
+                                             ndrange = ns * nb)
     return d
 end

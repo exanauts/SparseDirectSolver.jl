@@ -228,12 +228,13 @@ end
 end
 
 """
-    subtree_cholesky_kernel!(backend, WG)(factor, stack, info, nzval, amap, amap_ptr, amap_src, trees, first,
+    subtree_cholesky_kernel!(backend, WG)(factor, stack, info, nzval, amap, amap_ptr, amap_src, trees, bm,
                                           subtree_ptr, subtree_nodes, front_ptr, front_nrows, front_ncols, cb_ptr,
                                           local_front, local_cb, child_ptr, child_list, relind_ptr, relind,
-                                          Val(NE), Val(WG); ndrange = WG * count)
+                                          Val(NE), Val(WG); ndrange = WG * count * bm.nact)
 
-Fused regime-A kernel: workgroup `g` takes subtree `t = trees[first + g - 1]`
+Fused regime-A kernel: workgroup `G` takes subtree `t = trees[bm.first + g - 1]`
+of batch member `k` (`g`, `k` from the [`BatchMap`](@ref) `bm`)
 and processes its supernodes `subtree_nodes[subtree_ptr[t]:(subtree_ptr[t+1]-1)]`
 in order with the serial stack of packed fronts and contribution blocks in a
 `@localmem` buffer of `NE` entries (offsets `local_front`, `local_cb`): zero,
@@ -242,7 +243,7 @@ scatter A, extend-add the children, factor the front's first `w` columns
 move the contribution block down, or, for the subtree root (`cb_ptr > 0`),
 write it to the update stack (packed lower triangle).
 """
-@kernel function subtree_cholesky_kernel!(factor, stack, info, nzval, amap, amap_ptr, amap_src, trees, first,
+@kernel function subtree_cholesky_kernel!(factor, stack, info, nzval, amap, amap_ptr, amap_src, trees, bm,
                                           subtree_ptr, subtree_nodes, front_ptr, front_nrows, front_ncols, cb_ptr,
                                           local_front, local_cb, child_ptr, child_list, relind_ptr, relind,
                                           ::Val{NE}, ::Val{WG}) where {NE, WG}
@@ -250,12 +251,12 @@ write it to the update stack (packed lower triangle).
     @uniform RT = real(eltype(factor))
     @uniform IT = eltype(subtree_nodes)
     li = @index(Local, Linear)
-    g = @index(Group, Linear)
+    G = @index(Group, Linear)
     buf = @localmem TT (NE,)
     ctl = @localmem IT (_ST_CTL,)
     piv = @localmem RT (1,)
     if li == 1
-        @inbounds t = trees[first + g - 1]
+        @inbounds t = trees[bm.first + _bm_node(bm, G) - 1]
         @inbounds ctl[_ST_FIRST] = subtree_ptr[t]
         @inbounds ctl[_ST_COUNT] = subtree_ptr[t + 1] - subtree_ptr[t]
     end
@@ -267,7 +268,8 @@ write it to the update stack (packed lower triangle).
         @synchronize
         _subtree_zero!(buf, ctl, li, Val(WG))
         @synchronize
-        _subtree_scatter!(buf, ctl, nzval, amap, amap_ptr, amap_src, front_ptr, li, Val(WG))
+        _subtree_scatter!(buf, ctl, _mview(nzval, _bm_gmember(bm, G), bm.nbatch), amap, amap_ptr, amap_src, front_ptr,
+                          li, Val(WG))
         @synchronize
         for kc in 1:ctl[_ST_NCHILD]
             _subtree_extend_add!(buf, ctl, kc, child_ptr, child_list, front_nrows, front_ncols, local_cb, relind_ptr,
@@ -280,7 +282,9 @@ write it to the update stack (packed lower triangle).
             _subtree_chol_scale!(buf, ctl, piv, j, li, Val(WG))
             @synchronize
         end
-        _subtree_write!(factor, stack, info, buf, ctl, front_ptr, cb_ptr, li, Val(WG))
+        mb = _bm_gmember(bm, G)
+        _subtree_write!(factor, _mview(stack, mb, bm.nbatch), _iview(info, mb, bm.nbatch), buf, ctl,
+                        member_panels(front_ptr, mb, bm.nbatch), cb_ptr, li, Val(WG))
         @synchronize
         for r in 1:ctl[_ST_ROUNDS]
             _subtree_move!(buf, ctl, r, li, Val(WG))
@@ -291,11 +295,12 @@ end
 
 function _launch_subtrees!(N::Numeric{T}, S::Symbolic, nzval, first, count, ::Val{LB}, ::Val{WG}) where {T, LB, WG}
     _ilog2(WG)
+    bm = batch_map(N; first)
     kernel! = subtree_cholesky_kernel!(KernelAbstractions.get_backend(N.factor), WG)
-    kernel!(N.factor, N.stack, N.info, nzval, S.amap, S.amap_ptr, S.amap_src, S.group_nodes, Int(first),
+    kernel!(N.factor, N.stack, N.info, nzval, S.amap, S.amap_ptr, S.amap_src, S.group_nodes, bm,
             S.subtree_ptr, S.subtree_nodes, S.front_ptr, S.front_nrows, S.front_ncols, S.cb_ptr, S.local_front,
             S.local_cb, S.child_ptr, S.child_list, S.relind_ptr, S.relind,
-            Val((LB - SUBTREE_LOCAL_RESERVE) ÷ sizeof(T)), Val(WG); ndrange = WG * count)
+            Val((LB - SUBTREE_LOCAL_RESERVE) ÷ sizeof(T)), Val(WG); ndrange = WG * count * bm.nact)
     return nothing
 end
 
@@ -312,8 +317,8 @@ end
 
 Regime-A launch: assemble and factor the `count` subtrees
 `symbolic.group_nodes[first:(first + count - 1)]` (subtree ids of one budget
-class) with one [`subtree_cholesky_kernel!`](@ref) launch, one workgroup per
-subtree, `local_bytes` ([`subtree_local_bytes`](@ref) of the class) of local
+class) of every active batch member with one [`subtree_cholesky_kernel!`](@ref)
+launch, one workgroup per (subtree, member), `local_bytes` ([`subtree_local_bytes`](@ref) of the class) of local
 memory per workgroup. Panels and statuses of every supernode of the subtrees
 are written, and each subtree root's contribution block goes to the update
 stack. Asynchronous.

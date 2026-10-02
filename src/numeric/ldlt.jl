@@ -512,12 +512,13 @@ end
 
 """
     front_ldlt_kernel!(backend, WG)(factor, stack, info, stats, d, piv, pivot_kind, psign, perm, aux, nzval, amap,
-                                    amap_ptr, amap_src, nodes, first, super_ptr, front_ptr, front_nrows,
+                                    amap_ptr, amap_src, nodes, bm, super_ptr, front_ptr, front_nrows,
                                     front_ncols, cb_ptr, child_ptr, child_list, relind_ptr, relind, maxchild, prm,
-                                    Val(WG); ndrange = WG * count)
+                                    Val(WG); ndrange = WG * count * bm.nact)
 
-LDLᵀ/LDLᴴ kernel of regimes B and C: workgroup `g` takes front
-`s = nodes[first + g - 1]`, zeroes and assembles it (A through the `amap`, then
+LDLᵀ/LDLᴴ kernel of regimes B and C: workgroup `G` takes front
+`s = nodes[bm.first + g - 1]` of batch member `k` (`g`, `k` from the
+[`BatchMap`](@ref) `bm`; the per-member arrays are the member's), zeroes and assembles it (A through the `amap`, then
 the `maxchild` children's packed contribution blocks in `child_list` order),
 factors its `w` fully-summed columns in place in the panel with in-block
 Bunch–Kaufman pivoting, threshold acceptance and perturbation (`prm`, a
@@ -527,42 +528,52 @@ statistics, updates its packed contribution block on the update stack
 (`cb_ptr[s] > 0`) with `F₂₂ − (L₂₁ D) L₂₁ᴴ` and leaves a unit-lower panel.
 """
 @kernel function front_ldlt_kernel!(factor, stack, info, stats, d, piv, pivot_kind, psign, perm, aux, nzval, amap,
-                                    amap_ptr, amap_src, nodes, first, super_ptr, front_ptr, front_nrows, front_ncols,
+                                    amap_ptr, amap_src, nodes, bm, super_ptr, front_ptr, front_nrows, front_ncols,
                                     cb_ptr, child_ptr, child_list, relind_ptr, relind, maxchild,
                                     prm::_LDLTDevice{R, HERM}, ::Val{WG}) where {R, HERM, WG}
     @uniform TT = eltype(factor)
     @uniform IT = eltype(front_ptr)
     li = @index(Local, Linear)
-    g = @index(Group, Linear)
+    G = @index(Group, Linear)
     ctl = @localmem IT (_LT_CTL,)
     pv = @localmem TT (4,)
     if li == 1
-        @inbounds s = nodes[first + g - 1]
-        _lt_front_setup!(ctl, s, super_ptr, front_ptr, front_nrows, front_ncols)
+        @inbounds s = nodes[bm.first + _bm_node(bm, G) - 1]
+        _lt_front_setup!(ctl, s, super_ptr, member_panels(front_ptr, _bm_gmember(bm, G), bm.nbatch), front_nrows,
+                         front_ncols)
     end
     @synchronize
-    @inbounds s = nodes[first + g - 1]
-    _zero_front!(factor, stack, s, li, front_ptr, front_nrows, front_ncols, cb_ptr, Val(WG))
-    _lt_init_piv!(piv, ctl, li, Val(WG))
+    @inbounds s = nodes[bm.first + _bm_node(bm, G) - 1]
+    k = _bm_gmember(bm, G)
+    nb = bm.nbatch
+    _zero_front!(factor, _mview(stack, k, nb), s, li, member_panels(front_ptr, k, nb), front_nrows, front_ncols,
+                 cb_ptr, Val(WG))
+    _lt_init_piv!(_mview(piv, k, nb), ctl, li, Val(WG))
     @synchronize
-    @inbounds s = nodes[first + g - 1]
-    _scatter_front!(factor, nzval, amap, amap_ptr, amap_src, s, li, Val(WG))
+    @inbounds s = nodes[bm.first + _bm_node(bm, G) - 1]
+    k = _bm_gmember(bm, G)
+    _scatter_front!(factor, _mview(nzval, k, bm.nbatch), amap, amap_ptr, amap_src, s,
+                    _member_shift(front_ptr, s, k, bm.nbatch), li, Val(WG))
     @synchronize
-    for k in 1:maxchild
-        @inbounds s = nodes[first + g - 1]
-        _extend_add_child!(factor, stack, s, k, li, front_ptr, front_nrows, front_ncols, cb_ptr, child_ptr,
-                           child_list, relind_ptr, relind, Val(WG))
+    for kc in 1:maxchild
+        @inbounds s = nodes[bm.first + _bm_node(bm, G) - 1]
+        k = _bm_gmember(bm, G)
+        _extend_add_child!(factor, _mview(stack, k, bm.nbatch), s, kc, li, member_panels(front_ptr, k, bm.nbatch),
+                           front_nrows, front_ncols, cb_ptr, child_ptr, child_list, relind_ptr, relind, Val(WG))
         @synchronize
     end
     for it in 1:ctl[_ST_W]
         if li == 1
-            _lt_choose!(factor, ctl, aux, prm, Val(false), Val(HERM))
+            _lt_choose!(factor, ctl, _mview(aux, _bm_gmember(bm, G), bm.nbatch), prm, Val(false), Val(HERM))
         end
         @synchronize
-        _lt_swap!(factor, ctl, piv, li, Val(WG), Val(false), Val(HERM))
+        _lt_swap!(factor, ctl, _mview(piv, _bm_gmember(bm, G), bm.nbatch), li, Val(WG), Val(false), Val(HERM))
         @synchronize
         if li == 1
-            _lt_pivot!(factor, ctl, pv, d, pivot_kind, piv, psign, perm, aux, prm, Val(false), Val(HERM))
+            k = _bm_gmember(bm, G)
+            nb = bm.nbatch
+            _lt_pivot!(factor, ctl, pv, _mview(d, k, nb), _mview(pivot_kind, k, nb), _mview(piv, k, nb), psign, perm,
+                       _mview(aux, k, nb), prm, Val(false), Val(HERM))
         end
         @synchronize
         _lt_update!(factor, ctl, pv, li, Val(WG), Val(false), Val(HERM))
@@ -570,10 +581,13 @@ statistics, updates its packed contribution block on the update stack
         _lt_scale!(factor, ctl, pv, li, Val(WG), Val(false))
         @synchronize
     end
-    @inbounds s = nodes[first + g - 1]
+    @inbounds s = nodes[bm.first + _bm_node(bm, G) - 1]
     @inbounds coff = Int(cb_ptr[s]) - 1
-    _lt_cb_update!(factor, ctl, stack, coff, d, pivot_kind, li, Val(WG), Val(false), Val(HERM))
-    _lt_front_finish!(factor, stats, info, ctl, li, Val(WG))
+    k = _bm_gmember(bm, G)
+    nb = bm.nbatch
+    _lt_cb_update!(factor, ctl, _mview(stack, k, nb), coff, _mview(d, k, nb), _mview(pivot_kind, k, nb), li, Val(WG),
+                   Val(false), Val(HERM))
+    _lt_front_finish!(factor, _mview(stats, k, nb), _iview(info, k, nb), ctl, li, Val(WG))
 end
 
 # ---------------------------------------------------------------------------
@@ -612,12 +626,13 @@ end
 
 """
     subtree_ldlt_kernel!(backend, WG)(factor, stack, info, stats, d, piv, pivot_kind, psign, perm, aux, nzval, amap,
-                                      amap_ptr, amap_src, trees, first, subtree_ptr, subtree_nodes, super_ptr,
+                                      amap_ptr, amap_src, trees, bm, subtree_ptr, subtree_nodes, super_ptr,
                                       front_ptr, front_nrows, front_ncols, cb_ptr, local_front, local_cb, child_ptr,
-                                      child_list, relind_ptr, relind, prm, Val(NE), Val(WG); ndrange = WG * count)
+                                      child_list, relind_ptr, relind, prm, Val(NE), Val(WG);
+                                      ndrange = WG * count * bm.nact)
 
-LDLᵀ/LDLᴴ kernel of regime A: workgroup `g` takes subtree
-`t = trees[first + g - 1]` and processes its supernodes in order with the
+LDLᵀ/LDLᴴ kernel of regime A: workgroup `G` takes subtree
+`t = trees[bm.first + g - 1]` of batch member `k` and processes its supernodes in order with the
 serial stack of packed fronts and contribution blocks in a `@localmem` buffer
 of `NE` entries (as [`subtree_cholesky_kernel!`](@ref)): zero, scatter A,
 extend-add the children, factor the front's first `w` columns with the pivoted
@@ -627,19 +642,19 @@ statistics, then move the block down or (subtree root) write it to the update
 stack.
 """
 @kernel function subtree_ldlt_kernel!(factor, stack, info, stats, d, piv, pivot_kind, psign, perm, aux, nzval, amap,
-                                      amap_ptr, amap_src, trees, first, subtree_ptr, subtree_nodes, super_ptr,
+                                      amap_ptr, amap_src, trees, bm, subtree_ptr, subtree_nodes, super_ptr,
                                       front_ptr, front_nrows, front_ncols, cb_ptr, local_front, local_cb, child_ptr,
                                       child_list, relind_ptr, relind, prm::_LDLTDevice{R, HERM}, ::Val{NE},
                                       ::Val{WG}) where {R, HERM, NE, WG}
     @uniform TT = eltype(factor)
     @uniform IT = eltype(subtree_nodes)
     li = @index(Local, Linear)
-    g = @index(Group, Linear)
+    G = @index(Group, Linear)
     buf = @localmem TT (NE,)
     ctl = @localmem IT (_LT_CTL,)
     pv = @localmem TT (4,)
     if li == 1
-        @inbounds t = trees[first + g - 1]
+        @inbounds t = trees[bm.first + _bm_node(bm, G) - 1]
         @inbounds ctl[_ST_FIRST] = subtree_ptr[t]
         @inbounds ctl[_ST_COUNT] = subtree_ptr[t + 1] - subtree_ptr[t]
     end
@@ -651,9 +666,10 @@ stack.
         end
         @synchronize
         _subtree_zero!(buf, ctl, li, Val(WG))
-        _lt_init_piv!(piv, ctl, li, Val(WG))
+        _lt_init_piv!(_mview(piv, _bm_gmember(bm, G), bm.nbatch), ctl, li, Val(WG))
         @synchronize
-        _subtree_scatter!(buf, ctl, nzval, amap, amap_ptr, amap_src, front_ptr, li, Val(WG))
+        _subtree_scatter!(buf, ctl, _mview(nzval, _bm_gmember(bm, G), bm.nbatch), amap, amap_ptr, amap_src, front_ptr,
+                          li, Val(WG))
         @synchronize
         for kc in 1:ctl[_ST_NCHILD]
             _subtree_extend_add!(buf, ctl, kc, child_ptr, child_list, front_nrows, front_ncols, local_cb, relind_ptr,
@@ -662,13 +678,16 @@ stack.
         end
         for it in 1:ctl[_ST_W]
             if li == 1
-                _lt_choose!(buf, ctl, aux, prm, Val(true), Val(HERM))
+                _lt_choose!(buf, ctl, _mview(aux, _bm_gmember(bm, G), bm.nbatch), prm, Val(true), Val(HERM))
             end
             @synchronize
-            _lt_swap!(buf, ctl, piv, li, Val(WG), Val(true), Val(HERM))
+            _lt_swap!(buf, ctl, _mview(piv, _bm_gmember(bm, G), bm.nbatch), li, Val(WG), Val(true), Val(HERM))
             @synchronize
             if li == 1
-                _lt_pivot!(buf, ctl, pv, d, pivot_kind, piv, psign, perm, aux, prm, Val(true), Val(HERM))
+                mb = _bm_gmember(bm, G)
+                nb = bm.nbatch
+                _lt_pivot!(buf, ctl, pv, _mview(d, mb, nb), _mview(pivot_kind, mb, nb), _mview(piv, mb, nb), psign,
+                           perm, _mview(aux, mb, nb), prm, Val(true), Val(HERM))
             end
             @synchronize
             _lt_update!(buf, ctl, pv, li, Val(WG), Val(true), Val(HERM))
@@ -676,9 +695,14 @@ stack.
             _lt_scale!(buf, ctl, pv, li, Val(WG), Val(true))
             @synchronize
         end
-        _lt_cb_update!(buf, ctl, buf, _lt_local_cb_offset(ctl), d, pivot_kind, li, Val(WG), Val(true), Val(HERM))
+        mb = _bm_gmember(bm, G)
+        _lt_cb_update!(buf, ctl, buf, _lt_local_cb_offset(ctl), _mview(d, mb, bm.nbatch),
+                       _mview(pivot_kind, mb, bm.nbatch), li, Val(WG), Val(true), Val(HERM))
         @synchronize
-        _lt_subtree_write!(factor, stack, info, stats, buf, ctl, front_ptr, cb_ptr, li, Val(WG))
+        mb = _bm_gmember(bm, G)
+        nb = bm.nbatch
+        _lt_subtree_write!(factor, _mview(stack, mb, nb), _iview(info, mb, nb), _mview(stats, mb, nb), buf, ctl,
+                           member_panels(front_ptr, mb, nb), cb_ptr, li, Val(WG))
         @synchronize
         for r in 1:ctl[_ST_ROUNDS]
             _subtree_move!(buf, ctl, r, li, Val(WG))
@@ -690,14 +714,16 @@ end
 # ---------------------------------------------------------------------------
 # reductions
 
-@kernel function _abs_max_kernel!(aux, nzval, nnz, ::Val{WG}, ::Val{LOG2WG}) where {WG, LOG2WG}
+@kernel function _abs_max_kernel!(aux, nzval, nnz, bm, ::Val{WG}, ::Val{LOG2WG}) where {WG, LOG2WG}
     @uniform RT = real(eltype(aux))
     li = @index(Local, Linear)
+    G = @index(Group, Linear)
     best = @localmem RT (WG,)
     @inbounds begin
+        nz = _mview(nzval, _bm_gmember(bm, G), bm.nbatch)
         m = zero(RT)
         for p in li:WG:nnz
-            m = max(m, RT(abs(nzval[p])))
+            m = max(m, RT(abs(nz[p])))
         end
         best[li] = m
     end
@@ -712,33 +738,40 @@ end
         @synchronize
     end
     if li == 1
-        @inbounds aux[1] = eltype(aux)(best[1])
+        @inbounds aux[_bm_gmember(bm, G)] = eltype(aux)(best[1])
     end
 end
 
 """
-    abs_max!(aux, nzval) -> aux
+    abs_max!(aux, nzval[, bm]) -> aux
 
-`aux[1] = max |nzval[p]|` (one workgroup, `@localmem` tree reduction; the
-scale of `pivot_epsilon_alg = "algo1"`). Asynchronous.
+`aux[k] = max |nzval of member k|` for the active members `k` of the
+[`BatchMap`](@ref) `bm` (default: a single matrix, `aux[1]`), one workgroup per
+member, `@localmem` tree reduction; the scale of `pivot_epsilon_alg = "algo1"`.
+Asynchronous.
 """
-function abs_max!(aux::AbstractVector, nzval::AbstractVector)
+function abs_max!(aux::AbstractVector, nzval::AbstractVector, bm::BatchMap = single_batch())
     WG = STATS_WORKGROUP
-    _abs_max_kernel!(KernelAbstractions.get_backend(aux), WG)(aux, nzval, length(nzval), Val(WG), Val(_ilog2(WG));
-                                                             ndrange = WG)
+    _abs_max_kernel!(KernelAbstractions.get_backend(aux), WG)(aux, nzval, length(nzval) ÷ bm.nbatch, bm, Val(WG),
+                                                             Val(_ilog2(WG)); ndrange = WG * bm.nact)
     return aux
 end
 
-@kernel function _reduce_stats_kernel!(totals, stats, ns, ::Val{WG}, ::Val{NF}, ::Val{LOG2WG}) where {WG, NF, LOG2WG}
+@kernel function _reduce_stats_kernel!(totals, stats, ns, bm, ::Val{WG}, ::Val{NF},
+                                       ::Val{LOG2WG}) where {WG, NF, LOG2WG}
     li = @index(Local, Linear)
+    G = @index(Group, Linear)
     acc = @localmem Int64 (WG * NF,)
-    @inbounds for q in 1:NF
-        a = Int64(0)
-        for s in li:WG:ns
-            x = stats[(s - 1) * NF + q]
-            a += q == NF ? Int64(x != 0) : x
+    @inbounds begin
+        st = _mview(stats, _bm_gmember(bm, G), bm.nbatch)
+        for q in 1:NF
+            a = Int64(0)
+            for s in li:WG:ns
+                x = st[(s - 1) * NF + q]
+                a += q == NF ? Int64(x != 0) : x
+            end
+            acc[(q - 1) * WG + li] = a
         end
-        acc[(q - 1) * WG + li] = a
     end
     @synchronize
     for lev in 1:LOG2WG
@@ -753,7 +786,7 @@ end
         @synchronize
     end
     if li <= NF
-        @inbounds totals[li] = acc[(li - 1) * WG + 1]
+        @inbounds _mview(totals, _bm_gmember(bm, G), bm.nbatch)[li] = acc[(li - 1) * WG + 1]
     end
 end
 
@@ -762,26 +795,31 @@ end
 
 Sum the per-front statistics `numeric.stats` into `numeric.totals`
 (`npos, nneg, nzero, nperturbed, n2x2`, and the number of fronts with a failed
-pivot): one workgroup, `@localmem` tree reduction, no atomics. Asynchronous;
-[`pivot_totals`](@ref) reads the result.
+pivot) of every active batch member: one workgroup per member, `@localmem`
+tree reduction, no atomics. Asynchronous; [`pivot_totals`](@ref) reads the
+result.
 """
 function reduce_stats!(N::Numeric, S::Symbolic)
     WG = STATS_WORKGROUP
-    _reduce_stats_kernel!(KernelAbstractions.get_backend(N.stats), WG)(N.totals, N.stats, nsupernodes(S), Val(WG),
-                                                                       Val(FRONT_STATS_FIELDS), Val(_ilog2(WG));
-                                                                       ndrange = WG)
+    bm = batch_map(N)
+    _reduce_stats_kernel!(KernelAbstractions.get_backend(N.stats), WG)(N.totals, N.stats, nsupernodes(S), bm,
+                                                                       Val(WG), Val(FRONT_STATS_FIELDS),
+                                                                       Val(_ilog2(WG)); ndrange = WG * bm.nact)
     return N
 end
 
 """
-    pivot_totals(numeric) -> (npos, nneg, nzero, nperturbed, n2x2)
+    pivot_totals(numeric, k = 1) -> (npos, nneg, nzero, nperturbed, n2x2)
 
-The statistics reduced on the device by [`reduce_stats!`](@ref) (one copy of
-`numeric.totals` to the host: a synchronization, done at the phase boundary
-by `getparam`).
+The statistics of batch member `k` reduced on the device by
+[`reduce_stats!`](@ref) (one copy of `numeric.totals` to the host: a
+synchronization, done at the phase boundary by `getparam`).
 """
-function pivot_totals(N::Numeric)
-    t = Array(N.totals)
+pivot_totals(N::Numeric, k::Integer = 1) = pivot_totals(Array(N.totals), N.nbatch, k)
+
+function pivot_totals(totals::Vector{Int64}, nb::Integer, k::Integer)
+    1 <= k <= nb || throw(InvalidValueError("batch member $k outside 1:$nb"))
+    t = view(totals, ((k - 1) * FRONT_STATS_FIELDS + 1):(k * FRONT_STATS_FIELDS))
     return (npos = t[STAT_NPOS], nneg = t[STAT_NNEG], nzero = t[STAT_NZERO], nperturbed = t[STAT_NPERTURBED],
             n2x2 = t[STAT_N2X2])
 end
@@ -790,22 +828,24 @@ end
 # driver
 
 function _launch_front_ldlt!(N::Numeric, S::Symbolic, nzval, first, count, maxchild, prm, ::Val{WG}) where {WG}
+    bm = batch_map(N; first)
     kernel! = front_ldlt_kernel!(KernelAbstractions.get_backend(N.factor), WG)
     kernel!(N.factor, N.stack, N.info, N.stats, N.d, N.piv, N.pivot_kind, N.psign, S.perm, N.aux, nzval, S.amap,
-            S.amap_ptr, S.amap_src, S.group_nodes, Int(first), S.super_ptr, S.front_ptr, S.front_nrows, S.front_ncols,
+            S.amap_ptr, S.amap_src, S.group_nodes, bm, S.super_ptr, S.front_ptr, S.front_nrows, S.front_ncols,
             S.cb_ptr, S.child_ptr, S.child_list, S.relind_ptr, S.relind, Int(maxchild), prm, Val(WG);
-            ndrange = WG * count)
+            ndrange = WG * count * bm.nact)
     return nothing
 end
 
 function _launch_subtrees_ldlt!(N::Numeric{T}, S::Symbolic, nzval, first, count, prm, ::Val{LB},
                                 ::Val{WG}) where {T, LB, WG}
+    bm = batch_map(N; first)
     kernel! = subtree_ldlt_kernel!(KernelAbstractions.get_backend(N.factor), WG)
     kernel!(N.factor, N.stack, N.info, N.stats, N.d, N.piv, N.pivot_kind, N.psign, S.perm, N.aux, nzval, S.amap,
-            S.amap_ptr, S.amap_src, S.group_nodes, Int(first), S.subtree_ptr, S.subtree_nodes, S.super_ptr,
+            S.amap_ptr, S.amap_src, S.group_nodes, bm, S.subtree_ptr, S.subtree_nodes, S.super_ptr,
             S.front_ptr, S.front_nrows, S.front_ncols, S.cb_ptr, S.local_front, S.local_cb, S.child_ptr, S.child_list,
             S.relind_ptr, S.relind, prm, Val((LB - SUBTREE_LOCAL_RESERVE) ÷ sizeof(T)), Val(WG);
-            ndrange = WG * count)
+            ndrange = WG * count * bm.nact)
     return nothing
 end
 
@@ -857,7 +897,7 @@ function factorize_ldlt!(N::Numeric{T}, S::Symbolic, nzval::AbstractVector; opts
             throw(InvalidValueError("pivot_sign has $(length(ps)) entries, the matrix has $(S.n) rows"))
         copyto!(N.psign, ps)
     end
-    prm.scaled && abs_max!(N.aux, nzval)
+    prm.scaled && abs_max!(N.aux, nzval, batch_map(N))
     if herm
         _factorize_ldlt_groups!(N, S, nzval, prm, opts.user_host_interrupt)
     else
