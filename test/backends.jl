@@ -1,14 +1,16 @@
 # Backends under test (TASKS.md "Shared test conventions").
 #
-# The KernelAbstractions CPU backend is always tested. A GPU backend is added
-# when SDS_TEST_GPU != "0", its package is installed in the test environment
-# (CI adds CUDA/AMDGPU to test/Project.toml itself; locally run
+# The KernelAbstractions CPU backend is tested unless SDS_TEST_CPU == "0" (the
+# GPU CI jobs set it: the CPU-only jobs already cover the CPU backend). A GPU
+# backend is added when SDS_TEST_GPU != "0", its package is installed in the test
+# environment (CI adds CUDA/AMDGPU to test/Project.toml itself; locally run
 # `julia --project=test -e 'using Pkg; Pkg.add("CUDA")'` and do not commit it),
-# and the package reports a functional device.
+# and the package reports a functional device. An empty backend list is an error.
 
 using KernelAbstractions
 using SparseArrays
 
+const TEST_CPU = get(ENV, "SDS_TEST_CPU", "1") != "0"
 const TEST_GPU = get(ENV, "SDS_TEST_GPU", "1") != "0"
 
 is_package_installed(name::String) = Base.find_package(name) !== nothing
@@ -32,11 +34,16 @@ const AMDGPU_FUNCTIONAL = AMDGPU_LOADED && AMDGPU.functional()
 """
     BACKENDS
 
-Backends every numeric test loops over: `CPU()` first, then each functional GPU.
+Backends every numeric test loops over: `CPU()` first (unless `SDS_TEST_CPU=0`),
+then each functional GPU.
 """
-const BACKENDS = Any[CPU()]
+const BACKENDS = Any[]
+TEST_CPU && push!(BACKENDS, CPU())
 CUDA_FUNCTIONAL && push!(BACKENDS, CUDABackend())
 AMDGPU_FUNCTIONAL && push!(BACKENDS, ROCBackend())
+isempty(BACKENDS) &&
+    error("no backend to test: SDS_TEST_CPU=0 and no functional GPU backend (SDS_TEST_GPU=$(get(ENV, "SDS_TEST_GPU", "1")), ",
+          "CUDA loaded: $CUDA_LOADED, AMDGPU loaded: $AMDGPU_LOADED)")
 
 """
     backend_name(backend) -> String
@@ -118,6 +125,7 @@ let gpus = String[]
     CUDA_LOADED && !CUDA_FUNCTIONAL && push!(gpus, "CUDA installed but not functional: skipped")
     AMDGPU_LOADED && !AMDGPU_FUNCTIONAL && push!(gpus, "AMDGPU installed but not functional: skipped")
     TEST_GPU || push!(gpus, "GPU backends disabled by SDS_TEST_GPU=0")
+    TEST_CPU || push!(gpus, "CPU backend disabled by SDS_TEST_CPU=0")
     println("Backends under test: ", join(backend_name.(BACKENDS), ", "),
             isempty(gpus) ? "" : "  [" * join(gpus, "; ") * "]")
 end

@@ -1,6 +1,7 @@
 # Test driver. Every `test_*.jl` file in this directory is a test file; run a
-# subset with SDS_TEST_ONLY="test_options,test_aqua" and skip the GPU backends
-# with SDS_TEST_GPU=0 (see backends.jl).
+# subset with SDS_TEST_ONLY="test_options,test_aqua", leave files out with
+# SDS_TEST_SKIP="test_aqua", skip the GPU backends with SDS_TEST_GPU=0 and the
+# CPU backend with SDS_TEST_CPU=0 (see backends.jl).
 
 using Test
 using Random
@@ -20,14 +21,18 @@ include("backends.jl")
 const TEST_FILES = sort!([first(splitext(f)) for f in readdir(@__DIR__)
                           if startswith(f, "test_") && endswith(f, ".jl")])
 
-function selected_test_files()
-    only = strip(get(ENV, "SDS_TEST_ONLY", ""))
-    isempty(only) && return TEST_FILES
-    names = [first(splitext(strip(s))) for s in split(only, ',') if !isempty(strip(s))]
+function test_file_list(var::String)
+    names = [first(splitext(strip(s))) for s in split(get(ENV, var, ""), ',') if !isempty(strip(s))]
     unknown = setdiff(names, TEST_FILES)
     isempty(unknown) ||
-        error("SDS_TEST_ONLY names unknown test files $(unknown); available: $(join(TEST_FILES, ", "))")
+        error("$var names unknown test files $(unknown); available: $(join(TEST_FILES, ", "))")
     return names
+end
+
+function selected_test_files()
+    only = test_file_list("SDS_TEST_ONLY")
+    skip = test_file_list("SDS_TEST_SKIP")
+    return setdiff(isempty(only) ? TEST_FILES : only, skip)
 end
 
 @testset "SparseDirectSolver.jl" begin

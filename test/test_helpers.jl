@@ -2,8 +2,8 @@
 
 @testset "backends" begin
     names = backend_name.(BACKENDS)
-    @test BACKENDS[1] isa CPU
-    @test count(==("CPU"), names) == 1
+    @test (BACKENDS[1] isa CPU) == TEST_CPU
+    @test count(==("CPU"), names) == (TEST_CPU ? 1 : 0)
     cuda_expected = TEST_GPU && CUDA_LOADED && CUDA.functional()
     @test ("CUDA" in names) == cuda_expected
     rocm_expected = TEST_GPU && AMDGPU_LOADED && AMDGPU.functional()
