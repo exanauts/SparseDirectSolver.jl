@@ -1262,7 +1262,7 @@ obtained on this machine (CUDSS.jl is in `../CUDSS.jl`).
 
 ---
 
-## T10 — Regime B: fused per-front kernels, level-batched   `[ ]`
+## T10 — Regime B: fused per-front kernels, level-batched   `[!]`
 
 **Reads**: PLAN §2.2 (regime B), §2.4, §2.7.
 
@@ -1286,6 +1286,115 @@ obtained on this machine (CUDSS.jl is in `../CUDSS.jl`).
   within tolerance.
 * Report: per-bin timing table from `bench/front_bins.jl` on the RTX 4080 and
   the chosen crossover.
+
+### Report
+
+- Status: [!] (done on the CPU backend; the RTX 4080 per-bin table and the crossover could not be measured in
+  this session, no GPU; the regime thresholds stay at the T07 defaults until they are; CUDA from CI)
+- What was built (internal, nothing exported):
+  - `src/numeric/front.jl`: the KA kernel `front_cholesky_kernel!` (`Val(ASM)`, `Val(W)`, `W ∈ REGIME_B_WIDTHS =
+    (8, 16, 32, 64)`, `Val(NL = W(W+1)/2)`, `Val(WG)`, `FRONT_WORKGROUP = 128`): one 1-D workgroup per front of a
+    launch group, fully fused as PLAN §2.4 says (and as `nlaunches` already counted since T07): zero the panel and
+    CB, scatter A, owner-pull extend-add of the children (the T09 assembly code, shared), load the lower triangle
+    of F11 into `@localmem` (packed, so W = 64 ComplexF64 needs 33 KB, under CUDA's 48 KB static limit), unblocked
+    right-looking Cholesky (two barriers per column; the pivot goes through a 1-entry `@localmem`; first
+    non-positive/NaN pivot stops the front as LAPACK `potrf`), write L11 back, TRSM `F21 ← F21 L11⁻ᴴ` one panel
+    row per work item (row tiles of `WG` rows, L11 from local memory), SYRK/HERK `F22 ← F22 − F21 F21ᴴ` into the
+    front's own CB on the update stack (lower triangle, real diagonal as `herk`), `info[s]` = local status.
+    No atomics, every destination written by one work item in a fixed order → deterministic.
+    `factorize_fronts_b!(numeric, symbolic, nzval, first, count, maxchild, W)` (fused launch for a group) and
+    `front_cholesky!(factor, stack, info, nodes, first, count, front_ptr, front_nrows, front_ncols, cb_ptr;
+    width, workgroup)` (dense part only, on assembled fronts; tests and the bench). `W` becomes a `Val` through
+    explicit branches (no dynamic dispatch, no allocation).
+  - `src/numeric/assembly.jl`: the bodies of `zero_fronts!`/`scatter_A!`/`extend_add!` moved into `@inline`
+    device functions (`_zero_front!`, `_scatter_front!`, `_extend_add_child!`) shared with the fused kernel;
+    behaviour unchanged.
+  - `src/numeric/storage.jl`: `NumericPlan` gains per-launch-group arrays (`group_first/last/maxchild/width`,
+    `width = 0` → regime-C path); the step arrays of T09 are kept.
+  - `src/numeric/factorize.jl`: the driver walks the B/C launch groups: a regime-B group is one
+    `factorize_fronts_b!` launch, a regime-C group the T09 path (3 assembly launches + per-front dense calls,
+    factored out as `_factor_panel_c!` so the bench can call it). `factorization_alg = "algo1"`
+    (`schedule.vendor_c = false`) turns `impl = :auto` into `:ka` for the regime-C fronts (PLAN §1.3: no vendor
+    calls); `"algo2"` is regime C everywhere (T07 schedule).
+  - `bench/front_bins.jl` (+ README row): synthetic batches of assembled `(w, f)` fronts per bin corner, fused
+    regime B (one launch) vs per-front regime C through the dense interface (`--impl`, vendor on CUDA), Markdown
+    table and per-width crossover; runs in the package environment, `--backend=cuda` needs CUDA on the load path.
+  - Tests: `test/test_numeric_cholesky_b.jl`; `numeric_setup`, `triangle_view`, `panel_error`,
+    `numeric_alloc_budget` moved/added to `test/utils.jl` (shared by the T09 file);
+    `test/test_numeric_cholesky_c.jl` now analyses with `factorization_alg = "algo2"` so it still covers regime C
+    on every front (otherwise most fronts would now be regime B), and checks that.
+- Tests: `SDS_TEST_GPU=0 julia --project=. -e 'using Pkg; Pkg.test()'` (Julia 1.13.1, ubuntu-latest, CPU):
+  45045 pass / 0 fail / 0 broken (test_numeric_cholesky_b: 1762, 67 s, mostly compilation of 4 width classes ×
+  4 `T` × 2 `INT`). Under CI's flags (`coverage = true`, `--check-bounds=yes`) test_numeric_cholesky_b + _c:
+  2221 pass / 0 fail. Julia 1.10 not run locally (CI). Covered, per backend and `T ∈ ELTYPES`: the plan's groups
+  (B groups have `W ≥ w`, every front once, wider bins with `regime_c_width = 128` fall back to regime C);
+  `front_cholesky!` against host LAPACK `potrf`/`trsm`/`syrk`/`herk` for every width class with `w ∈ {1, W/2+1, W}`
+  and `m ∈ {0, 1, 5, 37}`, with and without a CB (upper triangle untouched, real CB diagonal), a negative pivot
+  giving `info[s] = w`, an unsupported width raising `InvalidValueError`; the T09 correctness suite with regime B
+  active (`laplacian2d(40,40)` Int32/Int64 maps, `random_spd(500,0.01)`, `laplacian3d(10,10,10)`, and the latter
+  with `regime_c_width = 16, regime_c_rows = 128` so B and C mix): panels within `100·eps·max|L|`, equal `stats`,
+  `extract_L`, `relres ≤ tol(T)` with `ref_solve!` (`nrhs` 1, 5), bitwise determinism; views `'U'`/`'F'` × index
+  `'O'`/`'Z'` give `==` panels, refactorization with new values and back, allocation budget (B only and B+C);
+  `info == j` with the failing front in regime B (4 analyses, negative and zero pivot, local `info` and `npos` in
+  `stats`), pivot failing only after elimination; `"algo1"` and `"algo2"` give the same solution
+  (`‖x₁ − x₂‖ ≤ tol(T)‖x₂‖`) and both match the reference panels.
+  CUDA/AMDGPU: pending CI on the PR.
+- Measurements:
+  - **RTX 4080 per-bin table: not measured** (no GPU in the implementing session; CI runs only the tests). The
+    owner should run `julia --project=. bench/front_bins.jl --backend=cuda --T=Float64` (and `--T=Float32`) and
+    set the crossover from it. CPU-backend table (KA CPU backend, 1 thread, Float64, 64 fronts per batch, median of
+    3; regime C = host LAPACK/BLAS per front), which only shows that on the CPU backend the vendor path wins
+    everywhere (the KA CPU backend runs work items serially):
+
+    ```text
+    w  f    B fused ms  C per front ms  C/B     w  f    B fused ms  C per front ms  C/B
+    8  64      1.25        0.17         0.14    32 64      3.83        0.42         0.11
+    8  128     4.27        0.44         0.10    32 128    10.45        1.14         0.11
+    8  256    17.8         3.37         0.19    32 256    97.6         4.52         0.05
+    8  512    86.1         6.47         0.08    32 512   971          10.6          0.01
+    16 64      1.93        0.25         0.13    64 128    31.5         1.88         0.06
+    16 128     5.94        0.70         0.12    64 256   235           7.12         0.03
+    16 256    24.0         3.71         0.15    64 512  2070          15.7          0.01
+    16 512   234           5.90         0.03
+    ```
+
+    max relative difference B vs C ≤ 3.4 eps on every bin.
+  - **Chosen crossover: unchanged T07 thresholds (`regime_c_width = 64`, `regime_c_rows = 512`)**, since no GPU
+    numbers exist yet; they are `Options` fields, so the owner can change them without code changes.
+  - Whole factorization, ubuntu-latest CPU backend, Float64, `subtree_budgets = Int[]`, best of 3, `:auto`:
+
+    ```text
+    matrix            fronts  B/C (default)  launches default / algo2  ref_factorize!  factorize! default / algo2  @allocated
+    lap2d 100²         3333   3332/1           80 / 10036                7.0 ms         26.1 ms / 18.1 ms          64 B
+    lap3d 20³          1346   1336/10          80 /  4057               29.3 ms         81.9 ms / 41.1 ms          64 B
+    random_spd 2000     244   226/18           83 /   677               54.7 ms         82.5 ms / 67.4 ms          64 B
+    ```
+
+    Regime B cuts the launches of a factorization by 8–125×; on the KA CPU backend it is slower than per-front
+    LAPACK (serial work items), the GPU numbers decide. Panels match the reference within 3 eps (B) / bitwise (C).
+- Deviations from PLAN.md / this task:
+  - Assembly is fused into the regime-B kernel (zero, scatter, extend-add, factor, trsm, syrk in one launch per
+    (step, bin)), as PLAN §2.4 and `nlaunches` describe; the task text lists only the dense steps.
+  - F21 is not staged in local memory: the TRSM is one panel row per work item (rows streamed in tiles of `WG`),
+    reading L11 from local memory and the row from global memory; the SYRK reads F21 from global memory (L1/L2).
+    Staging F21/F22 tiles in local memory is a T25 (performance) item once GPU numbers exist.
+  - One workgroup size (128) for every bin, no per-`fclass` variants: fewer kernel instances (compile time) until
+    the bench says otherwise.
+  - Regime-B bins wider than 64 (only possible with a raised `regime_c_width`) take the regime-C path: a packed
+    128-wide ComplexF64 triangle needs 132 KB of local memory.
+  - "algo1": the remaining regime-C fronts (above the thresholds) use the KA dense kernels (`impl = :ka`), the
+    reading of PLAN §1.3 "no vendor calls".
+  - `test/test_numeric_cholesky_c.jl` (T09) now forces `factorization_alg = "algo2"` to keep testing regime C on
+    every front; its helpers moved to `test/utils.jl`. No assertion was removed or loosened.
+- Open issues / follow-ups:
+  - GPU per-bin timings and the crossover are owed (see above); until then the B/C split is the T07 default.
+  - The kernel has `2W` barriers in the factor loop regardless of the front's actual width `w ≤ W` (uniform trip
+    count, needed for the KA CPU backend); bins are tight so this costs at most 2× on the F11 part.
+  - The T09 extend-add still iterates the full `m×m` square of a child CB (half the work items idle), as does the
+    new SYRK loop; a packed triangular index map would halve both.
+- Suggested plan changes:
+  - PLAN §2.4 / §2.2: state that the regime-B kernel fuses the assembly too (it does, and `nlaunches` assumes it).
+  - PLAN §1.3: make explicit that `"algo1"` runs the regime-C fronts on the KA tiled kernels.
 
 ---
 

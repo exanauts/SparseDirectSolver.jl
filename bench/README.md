@@ -9,6 +9,7 @@ Baselines every later milestone is measured against (PLAN.md §5 M0, §7). The
 | `matrices.jl` | module `BenchMatrices`: generated Laplacians (`lap2d_300`: 300×300 grid, n = 90 000; `lap3d_40`: 40³ grid, n = 64 000), SuiteSparse matrices through MatrixDepot (`HB/bcsstk17`, `Boeing/bcsstk38`, `GHS_psdef/apache2`, `Rajat/rajat21`, `TSOPF/TSOPF_RS_b39_c7`), loader for KKT dumps `bench/data/kkt_<case>_<kind>_<iter>.{mtx,jld2}` with `kind ∈ {k2, condensed}` |
 | `harness.jl` | module `BenchHarness`: `time_phases` (median per phase over `nruns` after warm-up), CHOLMOD/UMFPACK CPU reference, CSV writer |
 | `cudss_baseline.jl` | runs every matrix × structure (`SPD` and `S` for symmetric matrices, `G` for unsymmetric ones) and writes `bench/results/<solver>_baseline.csv` |
+| `front_bins.jl` | regime B (fused per-front kernel, one launch per batch) vs regime C (per-front `potrf`/`trsm`/`syrk` through the dense interface) on synthetic batches per size bin; runs in the package environment: `julia --project=. bench/front_bins.jl [--backend=cuda] [--T=Float64] [--nb=256]` (CUDA from an environment on the load path) |
 | `report.jl` | prints the CSV files as Markdown tables |
 | `dump_madnlp_kkt.jl` | dumps MadNLP K2 and condensed KKT matrices of pglib-opf cases |
 

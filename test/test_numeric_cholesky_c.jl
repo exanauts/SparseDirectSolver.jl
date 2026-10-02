@@ -2,42 +2,25 @@
 # front through the regime-C path (dense interface), checked against the T08
 # reference panels.
 
-# every front through the level driver: no regime-A subtrees (T11)
-const NUMERIC_C_OPTS = Options(subtree_budgets = Int[])
+# every front through the level driver: no regime-A subtrees (T11); since T10 the
+# regime-C path on every front needs `factorization_alg = "algo2"` (regime B: test_numeric_cholesky_b)
+const NUMERIC_C_OPTS = Options(subtree_budgets = Int[], factorization_alg = "algo2")
 
 numeric_c_matrices(::Type{T}) where {T} =
     (("laplacian2d(40,40)", laplacian2d(T, 40, 40)), ("random_spd(500,0.01)", random_spd(T, 500, 0.01)),
      ("laplacian3d(10,10,10)", laplacian3d(T, 10, 10, 10)))
 
-numeric_c_triangle(A, view) = view == 'L' ? tril(A) : view == 'U' ? triu(A) : A
-
-# host analysis + reference factor, the analysis adapted to `backend`, device storage and values
-function numeric_c_setup(backend, A::SparseMatrixCSC{T}, ::Type{INT} = Int32; view = 'L', index = 'O',
-                         opts = NUMERIC_C_OPTS) where {T, INT}
-    C = SDS.CSR(numeric_c_triangle(A, view); index)
-    S = SDS.symbolic_analysis(C, spd_structure(T), view; opts)
-    Nr = SDS.allocate_numeric(S, T)
-    info_ref = SDS.ref_factorize!(Nr, S, C.nzval)
-    Sd = SDS.adapt(backend, S, INT)
-    Nd = SDS.allocate_numeric(Sd, T, backend)
-    return S, Nr, info_ref, Sd, Nd, to_device(backend, C.nzval)
-end
-
-# max |L_device - L_ref| / max |L_ref|
-panel_error(Nh, Nr) = maximum(abs, Nh.factor - Nr.factor) / maximum(abs, Nr.factor)
+# shared with T10: `numeric_setup`, `panel_error`, `numeric_alloc_budget` (test/utils.jl)
+numeric_c_setup(backend, A, INT = Int32; opts = NUMERIC_C_OPTS, kw...) = numeric_setup(backend, A, INT; opts, kw...)
 
 numeric_c_allocated(N, S, nz) = @allocated SDS.factorize!(N, S, nz)
-
-# upper bound on the KA launches of one `factorize!` with `impl = :auto` on the CPU backend (3 assembly
-# launches per step, one `ka_chol_check_info!` per front, the statistics) and their `@localmem` bytes
-numeric_c_launches(S) = 3 * S.schedule.nsteps + SDS.nsupernodes(S) + 1
-const NUMERIC_C_LOCALMEM = SDS.STATS_WORKGROUP * sizeof(Int64)
 
 @testset "storage and plan" begin
     A = laplacian2d(Float64, 20, 20)
     S, _, _, _, Nd, _ = numeric_c_setup(CPU(), A)
     @test Nd isa SDS.Numeric{Float64, Vector{Float64}, Vector{Int64}, Vector{Int32}}
     @test length(Nd.info) == SDS.nsupernodes(S) + 1
+    @test all(==(SDS.REGIME_C), S.schedule.regime) && all(==(0), Nd.plan.group_width)
     # the plan covers every front exactly once, step by step
     plan = Nd.plan
     sc = S.schedule
@@ -130,14 +113,15 @@ end
         # no allocation in the numeric phase (the first call compiles) beyond what the KA CPU backend
         # itself allocates per launch on Julia 1.10 and under coverage (`ka_cpu_alloc_budget`)
         numeric_c_allocated(Nd, Sd, nz)
-        @test numeric_c_allocated(Nd, Sd, nz) <= ka_cpu_alloc_budget(numeric_c_launches(S), NUMERIC_C_LOCALMEM)
+        @test numeric_c_allocated(Nd, Sd, nz) <= numeric_alloc_budget(S, T)
     end
 end
 
 @testset "info: first non-positive pivot ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
     n, j = 60, 23
-    for opts in (NUMERIC_C_OPTS, Options(subtree_budgets = Int[], reordering_alg = "algo5"),
-                 Options(subtree_budgets = Int[], use_superpanels = 0))
+    for opts in (NUMERIC_C_OPTS,
+                 Options(subtree_budgets = Int[], factorization_alg = "algo2", reordering_alg = "algo5"),
+                 Options(subtree_budgets = Int[], factorization_alg = "algo2", use_superpanels = 0))
         A = singular_block_matrix(T, n, j; stored_zero = true)
         A[j, j] = 3
         _, Nr, info_ref, Sd, Nd, nz = numeric_c_setup(backend, A; opts)
@@ -157,7 +141,8 @@ end
     end
     # a non-positive pivot that only appears after elimination: [1 2; 2 1] block at columns 3, 4
     A = sparse(T[4 0 0 0; 0 4 0 0; 0 0 1 2; 0 0 2 1])
-    _, _, info_ref, Sd, Nd, nz = numeric_c_setup(backend, A; opts = Options(subtree_budgets = Int[], reordering_alg = "algo5"))
+    opts = Options(subtree_budgets = Int[], factorization_alg = "algo2", reordering_alg = "algo5")
+    _, _, info_ref, Sd, Nd, nz = numeric_c_setup(backend, A; opts)
     @test info_ref == 4
     @test SDS.factorize!(Nd, Sd, nz) == 4
 end
