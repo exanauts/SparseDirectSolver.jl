@@ -37,6 +37,7 @@ silently.
 * [`TASKS.md`](TASKS.md) — implementation tasks and their reports.
 * [`RESEARCH.md`](RESEARCH.md) — background and state of the art.
 * [`bench/README.md`](bench/README.md) — benchmark harness and cuDSS baselines.
+* [`bench/comparison/comparison.md`](bench/comparison/comparison.md) — per-feature performance comparison with cuDSS.
 
 ## Installation
 
