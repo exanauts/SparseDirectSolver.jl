@@ -129,6 +129,30 @@ end
 kkt_matrix(nh::Integer, nj::Integer, δ::Real; kwargs...) = kkt_matrix(Float64, nh, nj, δ; kwargs...)
 
 """
+    kkt_slack_matrix(T, nh, ns, δ; hessian = :indefinite, rng)
+
+MadNLP-style K2 matrix with inequality slacks, `n = nh + 2ns`:
+
+    [H 0 Jᵀ; 0 Σ −I; J −I −δI]
+
+`H` and `J` (`ns × nh`, `ns ≤ nh`, full row rank) as in [`kkt_matrix`](@ref),
+`Σ` diagonal with zeros on the odd slacks (no barrier term) and `1 + rand` on
+the even ones. Zero-diagonal rows are of two kinds: duals (with `δ = 0`) and
+the odd slacks, whose only off-diagonal entry is `−1` to their dual (a
+`[0 −1; −1 0]` 2×2 pivot). Under a fill-reducing ordering many duals get
+updates from earlier columns and are no elimination-tree leaves.
+"""
+function kkt_slack_matrix(::Type{T}, nh::Integer, ns::Integer, δ::Real; hessian::Symbol = :indefinite,
+                          rng::AbstractRNG = Random.default_rng()) where {T}
+    K = kkt_matrix(T, nh, ns, 0.0; hessian, rng)
+    H, J = K[1:nh, 1:nh], K[(nh + 1):(nh + ns), 1:nh]
+    σ = [isodd(i) ? zero(real(T)) : 1 + rand(rng, real(T)) for i in 1:ns]
+    Z = spzeros(T, nh, ns)
+    Is = sparse(one(T) * I, ns, ns)
+    return [H Z J'; Z' spdiagm(0 => T.(σ)) -Is; J -Is sparse(1:ns, 1:ns, fill(T(-δ), ns), ns, ns)]
+end
+
+"""
     kkt_interleaved_perm(nh, nj) -> Vector{Int}
 
 A KKT-aware ordering of `kkt_matrix(T, nh, nj, δ)` (a `user_perm`):

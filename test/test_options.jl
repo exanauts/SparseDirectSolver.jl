@@ -267,7 +267,7 @@ const ENUM_VALUES = (
     SDS.PivotEpsilonAlg => ("default" => 0, "algo1" => 1, "algo2" => 2),
     SDS.ScheduleKind => ("auto" => 0, "subtree+level" => 1, "syncfree" => 2),
     SDS.IRMode => ("ir" => 0, "fgmres" => 1),
-    SDS.PivotPairsMode => ("default" => 0, "none" => 1),
+    SDS.PivotPairsMode => ("default" => 0, "none" => 1, "all" => 2),
 )
 
 @testset "enum spellings: $(nameof(E))" for (E, table) in ENUM_VALUES

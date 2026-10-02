@@ -242,10 +242,8 @@ function symbolic_analysis(A::CSR, structure, view = VIEW_FULL; opts::Options = 
     rowptr = Array(A.rowptr)
     colval = Array(A.colval)
     P = SymmetricPattern(rowptr, colval, A.nrows, structure; view, index = A.index)
-    pairs = pairs_enabled(structure, opts) ?
-            pivot_pairs(P, rowptr, colval, Array(A.nzval), A.nrows, structure; view, index = A.index) :
-            Tuple{Int, Int}[]
-    ord = compute_ordering(P, opts; T, pairs)
+    pp = analysis_pairs(P, rowptr, colval, A.nzval, A.nrows, structure, opts; view, index = A.index)
+    ord = compute_ordering(P, opts; T, pp.pairs, pp.candidates)
     sp = supernode_partition(factor_pattern(P, ord), ord.perm, opts)
     sc = build_schedule(sp, opts, T)
     layout = build_layout(sp, sc)

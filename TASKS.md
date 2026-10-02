@@ -1957,6 +1957,12 @@ whenever `atomic_add` is `false`. Close #36 in this task's PR.
     Fixed by the 2×2 pivot candidate pairs of the analysis (`"pivot_pairs"`, `src/symbolic/pairs.jl`, branch
     `ccr-fc0b464d-gs8e2b`, PR "Pairs: 2×2 pivot candidate pairs in the analysis (#64)"); both deviations above now run
     on the default ordering too.
+    #66: pairing every candidate cost ~2× nnz(L) on MadNLP K2 systems. `pivot_pairs = "default"` now pairs only the
+    candidates whose pivot is structurally zero in the ordering (`zero_pivot_pairs!`, iterated with re-ordering):
+    1.25–1.4× nnz(L) and 29–49 perturbed pivots instead of ~2000 on the case1354 K2 dumps (`bench/pivot_pairs.jl`);
+    `"all"` keeps the #64 behaviour. On `kkt_matrix(300,100,1e-8)` the unpaired duals give max|L| ~1e4 (80 with
+    `"all"`); one ComplexF32 residual check is `broken` for it in `test_reference_ldlt.jl` (refinement, T16). The
+    K2 dumps keep max|L| ~1e15 in every mode (unscaled): #71 (found-by-agent, T21/M13).
   - T15: `D`, `piv` and `pivot_kind` of the device kernels can be compared bitwise against `ref_ldlt!` only if they
     follow the same pivot sequence: the same candidate order, the same tie-breaking (the first maximum), and the
     same acceptance rules (`_choose_pivot`). `getparam("diag")` for LDLᵀ is `d[1:n]` in factor order.
