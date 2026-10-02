@@ -111,7 +111,7 @@ end
     @test SDS.host_numeric(Nd).factor == F0
     if backend isa CPU
         # no allocation in the numeric phase (the first call compiles) beyond what the KA CPU backend
-        # itself allocates per launch on Julia 1.10 and under coverage (`ka_cpu_alloc_budget`)
+        # itself allocates per launch under coverage (`ka_cpu_alloc_budget`)
         numeric_c_allocated(Nd, Sd, nz)
         @test numeric_c_allocated(Nd, Sd, nz) <= numeric_alloc_budget(S, T)
     end

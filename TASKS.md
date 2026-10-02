@@ -12,7 +12,7 @@ so the **Report** block at the end of each task must be filled in honestly.
 2. Work only inside the task's scope. If something in `PLAN.md` turns out to be
    wrong or impractical, do the task the best way you can and write the
    deviation into the Report; do not silently redesign.
-3. Test environment on this machine: Julia 1.13 (package compat `julia = "1.10"`),
+3. Test environment on this machine: Julia 1.13 (package compat `julia = "1.13"`),
    Linux (WSL2), one NVIDIA RTX 4080 (16 GB). **Locally, tests use only the KA
    CPU backend and CUDA.** The exanauts CI runners also run the suite on an AMD
    GPU (`amdgpu` label); oneAPI and Metal are never tested. Their extension
@@ -2152,9 +2152,9 @@ Block-diagonal packing, forest schedule; `test_nonuniform_batch_cudss.jl` ported
 on oneAPI and Metal they are the only path, so they must become
 allocation-free here (preallocated workspace in `Numeric`, static launch
 configurations), asserted with `ka_cpu_alloc_budget` from `test/utils.jl`.
-`:generic` stays the allocating reference path (PLAN §3.9). The Julia 1.10 /
-coverage allowances in that budget are KernelAbstractions 0.9 artefacts and go
-away with KA 0.10.
+`:generic` stays the allocating reference path (PLAN §3.9). The coverage
+allowance in that budget is a KernelAbstractions 0.9 artefact and goes away
+with KA 0.10 (the Julia 1.10 allowance went with the 1.10 support).
 
 **Owner note (issue #60, item 2)**: the regime-A `@localmem` ladder
 `SUBTREE_LOCAL_SIZES` (`src/symbolic/schedule.jl`) is capped at 48 KiB for
