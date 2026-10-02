@@ -29,7 +29,7 @@ _symbolic_type(backend, ::Type{INT}) where {INT} =
     Symbolic{INT, typeof(KernelAbstractions.allocate(backend, INT, 0))}
 _numeric_type(backend, ::Type{T}) where {T} =
     Numeric{T, typeof(KernelAbstractions.allocate(backend, T, 0)), typeof(KernelAbstractions.allocate(backend, Int64, 0)),
-            typeof(KernelAbstractions.allocate(backend, Int32, 0))}
+            typeof(KernelAbstractions.allocate(backend, Int32, 0)), typeof(KernelAbstractions.allocate(backend, Int8, 0))}
 _workspace_type(backend, ::Type{T}) where {T} = SolveWorkspace{T, typeof(KernelAbstractions.allocate(backend, T, 0, 0))}
 
 """

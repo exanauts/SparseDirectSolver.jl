@@ -116,8 +116,11 @@ Solve `A X = B` with the reference factor `P A Pᵀ = L Lᴴ` of
 supernodes in `snpost` order (`trsm` on the diagonal block, `gemm` update of
 the rows below), backward sweep `Lᴴ W = Z` in reverse order, `X[perm, :] = W`.
 `B` and `X` are host vectors or `n × nrhs` matrices (`X === B` is allowed).
+For structures `"S"`/`"H"` this is the LDLᵀ/LDLᴴ solve of
+[`ref_solve_ldlt!`](@ref) with a factor of [`ref_ldlt!`](@ref).
 """
 function ref_solve!(X::AbstractVecOrMat, S::Symbolic, N::Numeric{T, Vector{T}}, B::AbstractVecOrMat) where {T}
+    _is_ldlt_structure(S.structure) && return ref_solve_ldlt!(X, S, N, B)
     n = S.n
     size(B, 1) == n && size(X, 1) == n && size(X, 2) == size(B, 2) ||
         throw(DimensionMismatch("A is $n×$n, X is $(size(X)), B is $(size(B))"))

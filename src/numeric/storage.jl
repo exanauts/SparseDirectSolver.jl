@@ -78,7 +78,8 @@ function NumericPlan(S)
 end
 
 """
-    Numeric{T, VT <: AbstractVector{T}, VS <: AbstractVector{Int64}, VI <: AbstractVector{Int32}}
+    Numeric{T, VT <: AbstractVector{T}, VS <: AbstractVector{Int64}, VI <: AbstractVector{Int32},
+            VK <: AbstractVector{Int8}}
 
 Numeric storage of a factorization (PLAN §3.2), laid out by the
 [`Layout`](@ref) of a [`Symbolic`](@ref):
@@ -87,7 +88,16 @@ Numeric storage of a factorization (PLAN §3.2), laid out by the
   column-major `f×w` block `factor[panel_ptr[s]:(panel_ptr[s+1]-1)]` (leading
   dimension `f`, rows `snrows(s)`, the upper triangle of its diagonal block is
   unused and kept zero);
-* `d` (`layout.d_len = 2n` entries): D of LDLᵀ/LDLᴴ (unused by Cholesky);
+* `d` (`layout.d_len = 2n` entries): D of LDLᵀ/LDLᴴ (unused by Cholesky):
+  `d[k]` is the diagonal of D at factor column `k`, `d[n + k]` the subdiagonal
+  entry `D[k+1, k]` of a 2×2 block starting at `k` (zero otherwise);
+* `piv` (`n` `Int32`, LDLᵀ/LDLᴴ only): the local pivot order, `piv[k]` is the
+  column of `P A Pᵀ` (supernodal numbering before pivoting) eliminated at factor
+  column `k`; pivoting stays inside a supernode, so `piv` permutes each
+  `sncols(s)` (see [`ref_ldlt!`](@ref));
+* `pivot_kind` (`n` `Int8`, LDLᵀ/LDLᴴ only): `PIVOT_KIND_1X1`,
+  `PIVOT_KIND_PERTURBED`, `PIVOT_KIND_2X2_FIRST`, `PIVOT_KIND_2X2_SECOND`
+  (`0`: not factored);
 * `stack` (`layout.stack_len` entries): the update stack of the device path
   (contribution block of `s` at `cb_ptr[s]`, packed lower triangle of the
   `m×m` block, `m(m+1)/2` entries);
@@ -101,15 +111,24 @@ Numeric storage of a factorization (PLAN §3.2), laid out by the
   column, `0` = none) at `ns + 1`;
 * `plan`: the host [`NumericPlan`](@ref).
 """
-struct Numeric{T, VT <: AbstractVector{T}, VS <: AbstractVector{Int64}, VI <: AbstractVector{Int32}}
+struct Numeric{T, VT <: AbstractVector{T}, VS <: AbstractVector{Int64}, VI <: AbstractVector{Int32},
+               VK <: AbstractVector{Int8}}
     factor::VT
     d::VT
     stack::VT
     work::VT
     stats::VS
     info::VI
+    piv::VI
+    pivot_kind::VK
     plan::NumericPlan
 end
+
+# `pivot_kind` codes of LDLᵀ/LDLᴴ factor columns
+const PIVOT_KIND_1X1 = Int8(1)          # 1×1 pivot
+const PIVOT_KIND_2X2_FIRST = Int8(2)    # first column of a 2×2 block
+const PIVOT_KIND_2X2_SECOND = Int8(3)   # second column of a 2×2 block
+const PIVOT_KIND_PERTURBED = Int8(4)    # 1×1 pivot replaced by ±ε
 
 Base.eltype(::Numeric{T}) where {T} = T
 
@@ -121,7 +140,7 @@ Base.show(io::IO, N::Numeric{T, VT}) where {T, VT} =
     allocate_numeric(symbolic, T, backend = CPU()) -> Numeric{T}
 
 Allocate (zero-filled) the factor panels, D, update stack, regime-C workspace, per-front
-statistics and status vector of `symbolic`'s [`Layout`](@ref) for element type
+statistics, status vector, pivot order and pivot kinds of `symbolic`'s [`Layout`](@ref) for element type
 `T` on the KernelAbstractions `backend`, and build its [`NumericPlan`](@ref).
 This is the only allocation of the numeric phase.
 """
@@ -134,6 +153,9 @@ function allocate_numeric(S::Symbolic, ::Type{T}, backend::KernelAbstractions.Ba
     work = KernelAbstractions.zeros(backend, T, L.work_len)
     stats = KernelAbstractions.zeros(backend, Int64, FRONT_STATS_FIELDS * nsupernodes(S))
     info = KernelAbstractions.zeros(backend, Int32, nsupernodes(S) + 1)
-    return Numeric{T, typeof(factor), typeof(stats), typeof(info)}(factor, d, stack, work, stats, info,
-                                                                         NumericPlan(S))
+    piv = KernelAbstractions.zeros(backend, Int32, S.n)
+    pivot_kind = KernelAbstractions.zeros(backend, Int8, S.n)
+    return Numeric{T, typeof(factor), typeof(stats), typeof(info), typeof(pivot_kind)}(factor, d, stack, work, stats,
+                                                                                         info, piv, pivot_kind,
+                                                                                         NumericPlan(S))
 end

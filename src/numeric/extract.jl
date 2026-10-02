@@ -4,15 +4,16 @@
 """
     host_numeric(numeric) -> Numeric{T, Vector{T}}
 
-Host copy of `numeric` (panels, D, update stack, workspace, statistics and status; the
+Host copy of `numeric` (panels, D, update stack, workspace, statistics, status, pivot order and kinds; the
 plan is shared), usable by [`ref_solve!`](@ref) and [`extract_L`](@ref).
 A host `numeric` is returned as is.
 """
-host_numeric(N::Numeric{T, Vector{T}, Vector{Int64}, Vector{Int32}}) where {T} = N
+host_numeric(N::Numeric{T, Vector{T}, Vector{Int64}, Vector{Int32}, Vector{Int8}}) where {T} = N
 function host_numeric(N::Numeric{T}) where {T}
     factor, d, stack, work = Array(N.factor), Array(N.d), Array(N.stack), Array(N.work)
-    stats, info = Array(N.stats), Array(N.info)
-    return Numeric{T, Vector{T}, Vector{Int64}, Vector{Int32}}(factor, d, stack, work, stats, info, N.plan)
+    stats, info, piv, pivot_kind = Array(N.stats), Array(N.info), Array(N.piv), Array(N.pivot_kind)
+    return Numeric{T, Vector{T}, Vector{Int64}, Vector{Int32}, Vector{Int8}}(factor, d, stack, work, stats, info, piv,
+                                                                             pivot_kind, N.plan)
 end
 
 """

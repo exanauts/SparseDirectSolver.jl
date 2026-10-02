@@ -99,16 +99,18 @@ end
 random_symindef(n::Integer, density::Real; kwargs...) = random_symindef(Float64, n, density; kwargs...)
 
 """
-    kkt_matrix(T, nh, nj, δ; hessian = :spd, density_h, density_j, rng)
+    kkt_matrix(T, nh, nj, δ; hessian = :spd, hessian_scale = 1, density_h, density_j, rng)
 
 KKT matrix `[H Jᴴ; J -δI]` of size `nh + nj` (`nj ≤ nh`). `H` is
 `random_spd(T, nh, density_h)` (`hessian = :spd`) or
 `random_symindef(T, nh, density_h)` (`hessian = :indefinite`). `J` has full row
 rank (its first `nj` columns are row diagonally dominant). The `-δI` block is
 always stored, also for `δ = 0`, as in MadNLP's KKT systems. With
-`hessian = :spd` and `δ ≥ 0` the inertia is `(nh, nj, 0)`.
+`hessian = :spd` and `δ ≥ 0` the inertia is `(nh, nj, 0)`. `H` is multiplied
+by `hessian_scale` (a small value makes 1×1 pivots on the primal diagonal
+unacceptable next to `J`, so Bunch–Kaufman needs 2×2 pivots).
 """
-function kkt_matrix(::Type{T}, nh::Integer, nj::Integer, δ::Real; hessian::Symbol = :spd,
+function kkt_matrix(::Type{T}, nh::Integer, nj::Integer, δ::Real; hessian::Symbol = :spd, hessian_scale::Real = 1,
                     density_h::Real = min(1.0, 5 / nh), density_j::Real = min(1.0, 3 / nh),
                     rng::AbstractRNG = Random.default_rng()) where {T}
     nj <= nh || throw(ArgumentError("kkt_matrix needs nj ≤ nh for a full-row-rank J"))
@@ -122,9 +124,20 @@ function kkt_matrix(::Type{T}, nh::Integer, nj::Integer, δ::Real; hessian::Symb
     R = sprand(rng, T, nj, nh, density_j)
     J = R + spdiagm(nj, nh, 0 => T.(_row_abs_sums(R) .+ 1))
     D = sparse(1:nj, 1:nj, fill(T(-δ), nj), nj, nj)
-    return [H J'; J D]
+    return [T(hessian_scale) * H J'; J D]
 end
 kkt_matrix(nh::Integer, nj::Integer, δ::Real; kwargs...) = kkt_matrix(Float64, nh, nj, δ; kwargs...)
+
+"""
+    kkt_interleaved_perm(nh, nj) -> Vector{Int}
+
+A KKT-aware ordering of `kkt_matrix(T, nh, nj, δ)` (a `user_perm`):
+primal `i` followed by its dual `nh + i` for `i ≤ nj` (the dominant entry
+`J[i, i]` couples them), then the remaining primal rows. Each dual row lands in
+the same supernode as its partner, so in-front pivoting can pair them in a 2×2
+block instead of eliminating a (near-)zero dual pivot on its own.
+"""
+kkt_interleaved_perm(nh::Integer, nj::Integer) = vcat([[i, nh + i] for i in 1:nj]..., (nj + 1):nh)
 
 """
     random_general(T, n, density; rng)
