@@ -45,10 +45,10 @@ const CUDSS08_DATA_PARAMETERS = ("ir_n_steps", "ubatch_mask", "flops")
 
 Parameters beyond cuDSS (PLAN §1.7): the data parameters `"pivot_sign"` (input)
 and `"pivot_stats"` (output), and the configuration parameters `"ir_mode"`,
-`"factor_precision"`, `"amalgamation"` and `"schedule"`.
+`"factor_precision"`, `"amalgamation"`, `"schedule"` and `"pivot_pairs"`.
 """
 const EXTRA_PARAMETERS = ("pivot_sign", "pivot_stats", "ir_mode", "factor_precision",
-                          "amalgamation", "schedule")
+                          "amalgamation", "schedule", "pivot_pairs")
 
 """
     default_pivot_epsilon(T) -> Float64
@@ -117,6 +117,7 @@ defaults below. Keyword arguments are applied through [`setparam!`](@ref), so
 | `factor_precision` | `nothing` | factors in the input precision |
 | `amalgamation` | `(max_width = 32, zero_fraction = 0.25, min_width = 8)` | |
 | `schedule` | `SCHEDULE_AUTO` | |
+| `pivot_pairs` | `PIVOT_PAIRS_DEFAULT` | 2×2 pivot candidate pairs in the analysis of `"S"`/`"H"` ([`pivot_pairs`](@ref)) |
 | `regime_c_width` | `64` | fronts wider than this go to regime C (vendor dense calls) |
 | `regime_c_rows` | `512` | fronts with more rows than this go to regime C |
 | `subtree_budgets` | `[16384, 32768, 49152]` | regime A local-memory budgets in bytes; empty disables regime A |
@@ -163,6 +164,7 @@ mutable struct Options
     factor_precision::Union{Nothing, DataType}
     amalgamation::AmalgamationParams
     schedule::ScheduleKind
+    pivot_pairs::PivotPairsMode
     # analysis tuning knobs of the schedule (T07; not parameter strings)
     regime_c_width::Int
     regime_c_rows::Int
@@ -181,7 +183,7 @@ mutable struct Options
             REORDERING_DEFAULT, FACTORIZATION_DEFAULT, SOLVE_DEFAULT, MATCHING_NONE,
             0, 0, 0.0, PIVOT_AUTO, 0.01, nothing, PIVOT_EPSILON_DEFAULT, -1,
             0, 0, 1, 0, 0, 10, 0, -1, 1, 0, 0, -1,
-            IR_PLAIN, nothing, DEFAULT_AMALGAMATION, SCHEDULE_AUTO,
+            IR_PLAIN, nothing, DEFAULT_AMALGAMATION, SCHEDULE_AUTO, PIVOT_PAIRS_DEFAULT,
             64, 512, copy(DEFAULT_SUBTREE_BUDGETS), -1,
             nothing, nothing, nothing, nothing, nothing, nothing,
         )
@@ -299,6 +301,7 @@ const PARAMETER_SPECS = Dict{String, ParameterSpec}(
     "factor_precision" => ParameterSpec(:config, :port, :factor_precision),
     "amalgamation" => ParameterSpec(:config, :port, :amalgamation),
     "schedule" => ParameterSpec(:config, :port, :schedule),
+    "pivot_pairs" => ParameterSpec(:config, :port, :pivot_pairs),
 )
 
 """
@@ -369,7 +372,7 @@ for (field, E) in ((:reordering_alg, ReorderingAlg), (:factorization_alg, Factor
         _parse_algorithm($E, $(String(field)), value)
 end
 
-for (field, E) in ((:schedule, ScheduleKind), (:ir_mode, IRMode))
+for (field, E) in ((:schedule, ScheduleKind), (:ir_mode, IRMode), (:pivot_pairs, PivotPairsMode))
     @eval _parse_option(::Val{$(QuoteNode(field))}, value, _) =
         _parse_string_enum($E, $(String(field)), value)
 end
@@ -509,6 +512,10 @@ Accepted values:
 * `"ir_tol"`, `"pivot_threshold"`, `"pivot_epsilon"`: a finite real `≥ 0`
   (`nothing` resets `"pivot_epsilon"` to [`default_pivot_epsilon`](@ref));
 * `"ir_mode"`: `"ir"` or `"fgmres"`; `"schedule"`: `"auto"`, `"subtree+level"`, `"syncfree"`;
+* `"pivot_pairs"` (beyond cuDSS): `"default"` (for `"S"`/`"H"`, rows with a zero or
+  negligible diagonal are ordered together with a 2×2 pivot partner, see
+  [`pivot_pairs`](@ref)) or `"none"`; ignored for the other structures, with
+  `user_perm` and with the natural ordering;
 * `"factor_precision"`: `Float32`, `Float64` or `nothing`;
 * `"amalgamation"`: a `NamedTuple` with any of `max_width`, `zero_fraction`, `min_width`;
 * `"user_perm"`, `"user_nd_partition_tree"`: an integer vector (host or device), or `nothing`;

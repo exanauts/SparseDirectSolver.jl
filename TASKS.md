@@ -1954,6 +1954,9 @@ whenever `atomic_add` is `false`. Close #36 in this task's PR.
 - Open issues / follow-ups:
   - #64 (found-by-agent): AMD-ordered KKT systems put dual rows in width-1 leaf supernodes; in-front 2×2 pivoting
     cannot help them. This matters for MadNLP's K2 systems with δc = 0 and for T15's tests on the same matrices.
+    Fixed by the 2×2 pivot candidate pairs of the analysis (`"pivot_pairs"`, `src/symbolic/pairs.jl`, branch
+    `ccr-fc0b464d-gs8e2b`, PR "Pairs: 2×2 pivot candidate pairs in the analysis (#64)"); both deviations above now run
+    on the default ordering too.
   - T15: `D`, `piv` and `pivot_kind` of the device kernels can be compared bitwise against `ref_ldlt!` only if they
     follow the same pivot sequence: the same candidate order, the same tie-breaking (the first maximum), and the
     same acceptance rules (`_choose_pivot`). `getparam("diag")` for LDLᵀ is `d[1:n]` in factor order.

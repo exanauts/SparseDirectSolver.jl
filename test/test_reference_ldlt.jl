@@ -1,42 +1,6 @@
 # T14: CPU reference multifrontal LDLᵀ/LDLᴴ (the oracle of T15), host only.
 # Structure "S" for real T, "H" for complex T (sym_structure), plus complex symmetric "S".
 
-ldlt_triangle(A, view) = view == 'L' ? tril(A) : view == 'U' ? triu(A) : A
-
-# analysis + numeric storage + LDLᵀ/LDLᴴ factorization of A given through `view`
-function reference_ldlt(A::SparseMatrixCSC{T}; view = 'L', opts = Options(), structure = sym_structure(T)) where {T}
-    C = SDS.CSR(ldlt_triangle(A, view))
-    S = SDS.symbolic_analysis(C, structure, view; opts)
-    N = SDS.allocate_numeric(S, T, CPU())
-    info = SDS.ref_ldlt!(N, S, C.nzval; opts)
-    return S, N, info, C
-end
-
-# A[p, p] − L D Lᴴ (Lᵀ for complex symmetric), and |L| |D| |L|ᴴ
-function ldlt_residual(A, S, N; herm = true)
-    L, D, p = SDS.extract_ldlt(S, N)
-    Lc = herm ? L' : transpose(L)
-    return A[p, p] - L * D * Lc, abs.(L) * abs.(D) * abs.(L)'
-end
-
-# ‖P A Pᵀ − L D Lᴴ‖_F / ‖A‖_F
-ldlt_error(A, S, N; herm = true) = norm(first(ldlt_residual(A, S, N; herm))) / norm(A)
-
-# the same error relative to ‖|L| |D| |L|ᴴ‖_F (backward error of the factorization with its growth)
-function ldlt_backward_error(A, S, N; herm = true)
-    R, G = ldlt_residual(A, S, N; herm)
-    return norm(R) / norm(G)
-end
-
-ldlt_factor_tol(::Type{T}) where {T} = real(T) == Float64 ? 1.0e-10 : tol(T)
-
-# (npos, nneg) of the eigenvalues (test/utils.jl), requiring no zero eigenvalue
-function eigen_npos_nneg(A)
-    npos, nneg, nzero = eigen_inertia(A)
-    @test nzero == 0
-    return (npos, nneg)
-end
-
 stat_of(N, s, q) = N.stats[(s - 1) * SDS.FRONT_STATS_FIELDS + q]
 
 psign_minus(n, j) = (v = zeros(Int8, n); v[j] = -1; v)
@@ -74,6 +38,7 @@ end
     nh, nj = 300, 100
     cases = [("random_symindef(400,0.01)", random_symindef(T, 400, 0.01), Options()),
              ("kkt(300,100,1e-2)", kkt_matrix(T, nh, nj, 1.0e-2), Options()),
+             ("kkt(300,100,1e-8)", kkt_matrix(T, nh, nj, 1.0e-8), Options()),
              ("kkt(300,100,1e-8) interleaved", kkt_matrix(T, nh, nj, 1.0e-8),
               Options(user_perm = kkt_interleaved_perm(nh, nj))),
              ("kkt(300,100,1e-2) interleaved", kkt_matrix(T, nh, nj, 1.0e-2),
@@ -100,12 +65,12 @@ end
             end
         end
     end
-    # default (AMD) ordering of the δ = 1e-8 KKT matrix: the dual rows are leaves of
-    # the assembly tree, factored alone with pivots -δ (no 2×2 partner in the block),
-    # so L D Lᴴ has growth ~1/δ; the factorization is still backward stable with
-    # respect to |L| |D| |L|ᴴ (and Float32 perturbs those pivots since δ < ε)
+    # without the 2×2 pivot pairs of the analysis (#64), AMD makes the dual rows of the
+    # δ = 1e-8 KKT matrix leaves of the assembly tree, factored alone with pivots -δ, so
+    # L D Lᴴ has growth ~1/δ; the factorization is still backward stable with respect to
+    # |L| |D| |L|ᴴ (and Float32 perturbs those pivots since δ < ε)
     A = kkt_matrix(T, nh, nj, 1.0e-8)
-    S, N, info, _ = reference_ldlt(A)
+    S, N, info, _ = reference_ldlt(A; opts = Options(pivot_pairs = "none"))
     @test info == 0
     @test ldlt_backward_error(A, S, N) <= ldlt_factor_tol(T)
     @test SDS.inertia(N) == (nh, nj)
@@ -116,6 +81,7 @@ end
     cases = [("random_symindef(300,0.02)", random_symindef(T, 300, 0.02), Options()),
              ("random_symindef(250,0.05) natural", random_symindef(T, 250, 0.05), Options(reordering_alg = "algo5")),
              ("kkt(200,100,1e-2)", kkt_matrix(T, nh, nj, 1.0e-2), Options()),
+             ("kkt indefinite H, δ = 0", kkt_matrix(T, nh, nj, 0.0; hessian = :indefinite), Options()),
              ("kkt indefinite H, δ = 0, interleaved", kkt_matrix(T, nh, nj, 0.0; hessian = :indefinite),
               Options(user_perm = kkt_interleaved_perm(nh, nj))),
              ("kkt 1e-3 H, δ = 0, interleaved (2×2)", kkt_matrix(T, nh, nj, 0.0; hessian = :indefinite,
@@ -237,11 +203,11 @@ end
     nh, nj = 300, 100
     for δ in (1.0e-8, 1.0e-2), pt in ('D', 'N')
         A = kkt_matrix(T, nh, nj, δ)
-        # interleaved ordering: no dual pivot is eliminated before its primal partner;
-        # the default ordering is checked for δ = 1e-2 (bounded growth)
+        # interleaved ordering, and the default ordering with the 2×2 pivot pairs of the
+        # analysis (#64; δ = 1e-8 is below the pair tolerance): no dual pivot is
+        # eliminated before its primal partner
         for opts in (Options(pivot_type = pt, user_perm = kkt_interleaved_perm(nh, nj)),
                      Options(pivot_type = pt))
-            δ == 1.0e-8 && opts.user_perm === nothing && continue
             S, N, info, _ = reference_ldlt(A; opts)
             st = SDS.pivot_stats(N)
             @test info == 0 && st.n2x2 == 0 && st.nperturbed == 0
@@ -255,30 +221,16 @@ end
     end
 end
 
-@testset "MadNLP-style inertia correction: $T" for T in ELTYPES
+const MADNLP_ORDERINGS = (("default ordering", Options()),
+                          ("interleaved", Options(user_perm = kkt_interleaved_perm(200, 100))))
+
+@testset "MadNLP-style inertia correction ($label): $T" for T in ELTYPES, (label, opts) in MADNLP_ORDERINGS
     nh, nj = 200, 100
-    # primal regularization δw on an indefinite H, no dual regularization (δ = 0);
-    # the KKT-aware ordering keeps every dual row with its primal partner
+    # primal regularization δw on an indefinite H, no dual regularization (δ = 0); the
+    # 2×2 pivot pairs of the analysis (#64) or the KKT-aware ordering keep every dual row
+    # with its primal partner
     A = kkt_matrix(T, nh, nj, 0.0; hessian = :indefinite)
-    opts = Options(user_perm = kkt_interleaved_perm(nh, nj))
-    C = SDS.CSR(tril(A))
-    S = SDS.symbolic_analysis(C, sym_structure(T), 'L'; opts)
-    N = SDS.allocate_numeric(S, T)
-    dpos = [C.rowptr[i] - 1 + findfirst(==(i), C.colval[C.rowptr[i]:(C.rowptr[i + 1] - 1)]) for i in 1:nh]
-    δw, iterations, done = 0.0, 0, false
-    nz = similar(C.nzval)
-    while iterations < 50
-        iterations += 1
-        nz .= C.nzval
-        nz[dpos] .+= T(δw)
-        SDS.ref_ldlt!(N, S, nz; opts)
-        st = SDS.pivot_stats(N)
-        if SDS.inertia(N) == (nh, nj) && st.nperturbed == 0
-            done = true
-            break
-        end
-        δw = δw == 0 ? 1.0e-4 : 8 * δw
-    end
+    done, iterations, S, N, δw = madnlp_inertia_loop(A, nh, nj, opts)
     @test done && iterations > 1                  # H is indefinite: δw = 0 is rejected
     @test SDS.npivots(N) == 0
     Aw = A + spdiagm(0 => [fill(T(δw), nh); zeros(T, nj)])

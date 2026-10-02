@@ -301,3 +301,61 @@ function solve_alloc_budget(S, ws)
     end
     return ka_cpu_alloc_budget(launches, launches * SparseDirectSolver._SV_CTL * sizeof(Int64))
 end
+
+# --- LDLᵀ/LDLᴴ reference helpers (T14; shared with the 2×2 pivot pair tests of #64) ---
+
+# analysis + numeric storage + LDLᵀ/LDLᴴ factorization of A given through `view`
+function reference_ldlt(A::SparseMatrixCSC{T}; view = 'L', opts = Options(), structure = sym_structure(T)) where {T}
+    C = SparseDirectSolver.CSR(triangle_view(A, view))
+    S = SparseDirectSolver.symbolic_analysis(C, structure, view; opts)
+    N = SparseDirectSolver.allocate_numeric(S, T, CPU())
+    info = SparseDirectSolver.ref_ldlt!(N, S, C.nzval; opts)
+    return S, N, info, C
+end
+
+# A[p, p] − L D Lᴴ (Lᵀ for complex symmetric), and |L| |D| |L|ᴴ
+function ldlt_residual(A, S, N; herm = true)
+    L, D, p = SparseDirectSolver.extract_ldlt(S, N)
+    Lc = herm ? L' : transpose(L)
+    return A[p, p] - L * D * Lc, abs.(L) * abs.(D) * abs.(L)'
+end
+
+# ‖P A Pᵀ − L D Lᴴ‖_F / ‖A‖_F
+ldlt_error(A, S, N; herm = true) = norm(first(ldlt_residual(A, S, N; herm))) / norm(A)
+
+# the same error relative to ‖|L| |D| |L|ᴴ‖_F (backward error of the factorization with its growth)
+function ldlt_backward_error(A, S, N; herm = true)
+    R, G = ldlt_residual(A, S, N; herm)
+    return norm(R) / norm(G)
+end
+
+ldlt_factor_tol(::Type{T}) where {T} = real(T) == Float64 ? 1.0e-10 : tol(T)
+
+# (npos, nneg) of the eigenvalues (test/utils.jl), requiring no zero eigenvalue
+function eigen_npos_nneg(A)
+    npos, nneg, nzero = eigen_inertia(A)
+    @test nzero == 0
+    return (npos, nneg)
+end
+
+# MadNLP-style inertia correction (T14): δw = 0, 1e-4, ×8 … on H's diagonal until inertia == (nh, nj)
+# with no perturbed pivot; returns (done, iterations, S, N, δw)
+function madnlp_inertia_loop(A::SparseMatrixCSC{T}, nh, nj, opts) where {T}
+    C = SparseDirectSolver.CSR(tril(A))
+    S = SparseDirectSolver.symbolic_analysis(C, sym_structure(T), 'L'; opts)
+    N = SparseDirectSolver.allocate_numeric(S, T)
+    dpos = [C.rowptr[i] - 1 + findfirst(==(i), C.colval[C.rowptr[i]:(C.rowptr[i + 1] - 1)]) for i in 1:nh]
+    δw, iterations = 0.0, 0
+    nz = similar(C.nzval)
+    while iterations < 50
+        iterations += 1
+        nz .= C.nzval
+        nz[dpos] .+= T(δw)
+        SparseDirectSolver.ref_ldlt!(N, S, nz; opts)
+        if SparseDirectSolver.inertia(N) == (nh, nj) && SparseDirectSolver.pivot_stats(N).nperturbed == 0
+            return (true, iterations, S, N, δw)
+        end
+        δw = δw == 0 ? 1.0e-4 : 8 * δw
+    end
+    return (false, iterations, S, N, δw)
+end
