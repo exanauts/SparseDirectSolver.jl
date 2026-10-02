@@ -48,7 +48,13 @@ include("symbolic/schedule.jl")
 include("symbolic/layout.jl")
 include("symbolic/maps.jl")
 
-# CPU reference multifrontal factorization (PLAN §7, the oracle)
+# numeric storage, CPU reference multifrontal factorization (PLAN §7, the oracle)
+include("numeric/storage.jl")
 include("reference/cholesky.jl")
+
+# numeric phase on the device (PLAN §2.4)
+include("numeric/assembly.jl")
+include("numeric/factorize.jl")
+include("numeric/extract.jl")
 
 end # module SparseDirectSolver

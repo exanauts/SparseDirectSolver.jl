@@ -5,51 +5,7 @@
 # panels). It is deliberately independent of the dense interface and of the KA
 # kernels it is meant to check. Contribution blocks live in host matrices, not
 # on the update stack of the layout (regime-A blocks have no stack slot).
-
-"""
-    Numeric{T, VT <: AbstractVector{T}, VS <: AbstractVector{Int64}}
-
-Numeric storage of a factorization (PLAN §3.2), laid out by the
-[`Layout`](@ref) of a [`Symbolic`](@ref):
-
-* `factor` (`layout.factor_len` entries): the panel of supernode `s` is the
-  column-major `f×w` block `factor[panel_ptr[s]:(panel_ptr[s+1]-1)]` (leading
-  dimension `f`, rows `snrows(s)`, the upper triangle of its diagonal block is
-  unused and kept zero);
-* `d` (`layout.d_len = 2n` entries): D of LDLᵀ/LDLᴴ (unused by Cholesky);
-* `stack` (`layout.stack_len` entries): the update stack of the device path;
-* `stats` (`FRONT_STATS_FIELDS × ns` `Int64`, column `s` = front `s`):
-  `(npos, nneg, nzero, nperturbed, n2x2, info)`, `info` = the local column of the
-  first failed pivot of the front (`0` = none).
-"""
-struct Numeric{T, VT <: AbstractVector{T}, VS <: AbstractVector{Int64}}
-    factor::VT
-    d::VT
-    stack::VT
-    stats::VS
-end
-
-Base.eltype(::Numeric{T}) where {T} = T
-
-Base.show(io::IO, N::Numeric{T, VT}) where {T, VT} =
-    print(io, "Numeric{", T, ", ", nameof(VT), "}(factor ", length(N.factor), ", D ", length(N.d), ", stack ",
-          length(N.stack), " entries)")
-
-"""
-    allocate_numeric(symbolic, T, backend = CPU()) -> Numeric{T}
-
-Allocate (zero-filled) the factor panels, D, update stack and per-front
-statistics of `symbolic`'s [`Layout`](@ref) for element type `T` on the
-KernelAbstractions `backend`. This is the only allocation of the numeric phase.
-"""
-function allocate_numeric(S::Symbolic, ::Type{T}, backend::KernelAbstractions.Backend = KernelAbstractions.CPU()) where {T}
-    L = S.layout
-    factor = KernelAbstractions.zeros(backend, T, L.factor_len)
-    d = KernelAbstractions.zeros(backend, T, L.d_len)
-    stack = KernelAbstractions.zeros(backend, T, L.stack_len)
-    stats = KernelAbstractions.zeros(backend, Int64, FRONT_STATS_FIELDS * nsupernodes(S))
-    return Numeric{T, typeof(factor), typeof(stats)}(factor, d, stack, stats)
-end
+# `Numeric` and `allocate_numeric` are in `src/numeric/storage.jl`.
 
 _host_vector(x::Vector) = x
 _host_vector(x::AbstractVector) = Array(x)

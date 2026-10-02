@@ -279,3 +279,38 @@ end
     @test_throws InvalidValueError SDS.strided_batch(buf, 0, 3, 2, 8, 2)    # not a multiple of m
     @test_throws InvalidValueError SDS.strided_batch(buf, 10, 3, 2, 9, 4)   # beyond the buffer
 end
+
+# T09: the asynchronous Cholesky of the numeric phase writes its status into a
+# slot of a device vector; the matrix is the diagonal block of a panel view.
+@testset "potrf_info! ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
+    tl = dense_tol(T)
+    for m in (1, 7, 32, 100)
+        S = dense_hpd(T, m)
+        f = m + 5
+        for uplo in ('L', 'U'), impl in SDS.dense_impls(:potrf, backend, T)
+            P = to_panel(backend, vcat(S, randn(T, f - m, m)))
+            F11 = view(P, 1:m, 1:m)
+            info = to_device(backend, fill(Int32(7), 4))
+            @test SDS.potrf_info!(uplo, F11, info, 3; impl) === info
+            @test to_host(info) == Int32[7, 7, 0, 7]
+            Fh = to_host(F11)
+            F = uplo == 'L' ? LowerTriangular(Fh) : UpperTriangular(Fh)'
+            @test norm(F * F' - S) <= tl * norm(F)^2
+            for j in unique((1, cld(m, 2), m))
+                Sj = copy(S)
+                Sj[j, j] = -one(T)
+                X = to_device(backend, Sj)
+                SDS.potrf_info!(uplo, X, info, 2; impl)
+                @test to_host(info) == Int32[7, j, 0, 7]
+            end
+        end
+    end
+    @test_throws DimensionMismatch SDS.potrf_info!('L', to_device(backend, dense_hpd(T, 3)),
+                                                   to_device(backend, zeros(Int32, 2)), 3)
+    # ka_potrf! with an offset into the status vector
+    X = to_device(backend, cat(dense_hpd(T, 5), dense_hpd(T, 5); dims = 3))
+    info = to_device(backend, fill(Int32(7), 4))
+    SDS.ka_potrf!('L', X, info; offset = 2)
+    @test to_host(info) == Int32[7, 7, 0, 0]
+    @test_throws DimensionMismatch SDS.ka_potrf!('L', X, info; offset = 3)
+end

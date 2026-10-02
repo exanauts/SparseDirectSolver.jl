@@ -297,7 +297,7 @@ element type `T` and device indices `INT` (default: the index type of
 | 8 | D (`2n` entries of `T`) |
 | 9 | update stack (`Layout.stack_len` entries of `T`) |
 | 10 | device maps (`INT`) |
-| 11 | per-front statistics (6 `Int64` per supernode) |
+| 11 | per-front statistics (6 `Int64` per supernode) and status (`ns + 1` `Int32`) |
 | 12 | largest regime-A local-memory budget in use (per workgroup) |
 | 13–16 | 0 (reserved) |
 
@@ -311,7 +311,8 @@ function memory_estimates(S::Symbolic{INT0}, ::Type{T}, ::Type{INT} = INT0) wher
     est[8] = Int64(L.d_len) * sizeof(T)
     est[9] = Int64(L.stack_len) * sizeof(T)
     est[10] = device_map_bytes(S, INT)
-    est[11] = Int64(nsupernodes(S)) * FRONT_STATS_FIELDS * sizeof(Int64)
+    est[11] = Int64(nsupernodes(S)) * FRONT_STATS_FIELDS * sizeof(Int64) +
+              Int64(nsupernodes(S) + 1) * sizeof(Int32)
     est[12] = Int64(maximum((sc.budgets[c] for c in sc.subtree_class); init = 0))
     est[1] = est[7] + est[8] + est[10] + est[11]
     est[2] = est[1] + est[9]

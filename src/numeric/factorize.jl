@@ -1,0 +1,140 @@
+# Level driver of the numeric phase (PLAN §2.4, §3.9): a fixed sequence of
+# launches over the steps of the schedule, no allocation, no host
+# synchronization except the final read of the reduced `info`. In this version
+# every front goes through the regime-C path: assembly kernels per step, then
+# `potrf`/`trsm`/`syrk` (`herk`) per front through the dense interface.
+# Regimes B and A get their fused kernels in T10 and T11.
+
+"Workgroup size of the per-phase reduction of the front statistics."
+const STATS_WORKGROUP = 256
+
+@kernel function _cholesky_stats_kernel!(stats, info, super_ptr, front_ncols, ns, ::Val{WG}, ::Val{NF},
+                                         ::Val{LOG2WG}) where {WG, NF, LOG2WG}
+    li = @index(Local, Linear)
+    best = @localmem Int64 (WG,)
+    @inbounds begin
+        m = typemax(Int64)
+        for s in li:WG:ns
+            fi = Int64(info[s])
+            base = (s - 1) * NF
+            stats[base + 1] = fi == 0 ? Int64(front_ncols[s]) : fi - 1
+            for k in 2:(NF - 1)
+                stats[base + k] = 0
+            end
+            stats[base + NF] = fi
+            fi > 0 && (m = min(m, Int64(super_ptr[s]) + fi - 1))
+        end
+        best[li] = m
+    end
+    @synchronize
+    for lev in 1:LOG2WG
+        @inbounds begin
+            h = WG >> lev
+            if li <= h
+                best[li] = min(best[li], best[li + h])
+            end
+        end
+        @synchronize
+    end
+    if li == 1
+        @inbounds info[ns + 1] = best[1] == typemax(Int64) ? Int32(0) : Int32(best[1])
+    end
+end
+
+"""
+    cholesky_stats!(numeric, symbolic) -> numeric
+
+Fill the per-front statistics of a Cholesky factorization from the per-front
+`potrf` status `numeric.info[1:ns]` (`npos` = `w`, or the failed local column
+minus one; `info` = the failed local column) and reduce the smallest failed
+factor column into `numeric.info[ns + 1]` (0 = none). One workgroup, no
+atomics. Asynchronous.
+"""
+function cholesky_stats!(N::Numeric, S::Symbolic)
+    WG = STATS_WORKGROUP
+    kernel! = _cholesky_stats_kernel!(KernelAbstractions.get_backend(N.factor), WG)
+    kernel!(N.stats, N.info, S.super_ptr, S.front_ncols, nsupernodes(S), Val(WG), Val(FRONT_STATS_FIELDS),
+            Val(_ilog2(WG)); ndrange = WG)
+    return N
+end
+
+function _check_numeric(N::Numeric{T}, S::Symbolic, nzval::AbstractVector) where {T}
+    _check_reference_cholesky(S, T)
+    length(nzval) == S.nnz ||
+        throw(InvalidValueError("nzval has $(length(nzval)) entries, the analysis expects $(S.nnz)"))
+    length(N.factor) == S.layout.factor_len && length(N.stack) == S.layout.stack_len &&
+        length(N.info) == nsupernodes(S) + 1 ||
+        throw(InvalidValueError("the numeric storage was not allocated for this analysis"))
+    nsubtrees(S.schedule) == 0 ||
+        throw(NotSupportedError("regime-A subtrees need the fused subtree kernels (T11); analyse with " *
+                                "`subtree_budgets = Int[]`"))
+    backend = KernelAbstractions.get_backend(N.factor)
+    for x in (nzval, S.amap, N.info)
+        typeof(KernelAbstractions.get_backend(x)) == typeof(backend) ||
+            throw(InvalidValueError("nzval, the device maps (adapt the Symbolic) and the numeric storage must " *
+                                    "live on the same backend"))
+    end
+    return nothing
+end
+
+# regime-C dense kernels of front `s` (assembled panel + contribution block)
+function _factor_front_c!(N::Numeric{T}, S::Symbolic, s::Int, impl::Symbol) where {T}
+    L, sc = S.layout, S.schedule
+    f, w = sc.rows[s], sc.width[s]
+    m = f - w
+    p0 = L.panel_ptr[s]
+    P = reshape(view(N.factor, p0:(p0 + f * w - 1)), f, w)
+    F11 = view(P, 1:w, 1:w)
+    potrf_info!('L', F11, N.info, s; impl)
+    m > 0 || return nothing
+    F21 = view(P, (w + 1):f, 1:w)
+    trsm!('R', 'L', 'C', 'N', one(T), F11, F21; impl)
+    c0 = L.cb_ptr[s]
+    c0 > 0 || return nothing                                  # no parent: nothing to update
+    C = reshape(view(N.stack, c0:(c0 + m * m - 1)), m, m)
+    herk!(C, F21, -one(real(T)), one(real(T)); uplo = 'L', impl)
+    return nothing
+end
+
+"""
+    factorize!(numeric, symbolic, nzval; impl = :auto) -> info::Int
+
+Multifrontal Cholesky `P A Pᵀ = L Lᴴ` on the device: `nzval` are the stored
+values of A (same pattern, view and index base as the analysis) on the backend
+of `numeric`, and `symbolic` has its maps on that backend
+(`adapt(backend, symbolic, INT)`). For every step of the schedule: one launch
+each of [`zero_fronts!`](@ref), [`scatter_A!`](@ref) and
+[`extend_add!`](@ref) over the step's fronts, then per front
+[`potrf_info!`](@ref), [`trsm!`](@ref) and [`herk!`](@ref)/[`syrk!`](@ref) on
+its panel and contribution block through the dense interface (`impl` is passed
+on: `:auto`, `:generic`, `:vendor`, `:ka`); every front takes this regime-C
+path. Then [`cholesky_stats!`](@ref) and one read of the reduced status.
+
+Returns `info = 0` on success, else the original column of the smallest
+non-positive pivot of the factor (as [`ref_factorize!`](@ref)); fronts above a
+failed one hold garbage. Structure `"SPD"` (real) or `"HPD"`; the analysis must
+have no regime-A subtrees (`subtree_budgets = Int[]`) until T11. Nothing is
+allocated on the device; the panels are bitwise reproducible for a fixed
+`impl` and backend.
+"""
+function factorize!(N::Numeric{T}, S::Symbolic, nzval::AbstractVector; impl::Symbol = :auto) where {T}
+    _check_numeric(N, S, nzval)
+    plan = N.plan
+    nodes = S.schedule.group_nodes
+    for t in 1:S.schedule.nsteps
+        a, b = plan.step_first[t], plan.step_last[t]
+        b >= a || continue
+        zero_fronts!(N, S, a, b - a + 1)
+        scatter_A!(N, S, nzval, a, b - a + 1)
+        extend_add!(N, S, a, b - a + 1, plan.step_maxchild[t])
+        for q in a:b
+            _factor_front_c!(N, S, nodes[q], impl)
+        end
+    end
+    cholesky_stats!(N, S)
+    copyto!(plan.info_host, 1, N.info, nsupernodes(S) + 1, 1)  # the phase's only host synchronization
+    k = Int(plan.info_host[1])
+    return k == 0 ? 0 : S.partition.perm[k]
+end
+
+factorize!(N::Numeric, S::Symbolic, A::CSR; impl::Symbol = :auto) = factorize!(N, S, vec(A.nzval); impl)

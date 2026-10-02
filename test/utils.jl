@@ -139,3 +139,14 @@ function offdiag_pattern(A::SparseMatrixCSC)
     keep = I .!= J
     return sparse(I[keep], J[keep], trues(count(keep)), size(A)...)
 end
+
+# ---------------------------------------------------------------------------
+# numeric phase (T09)
+
+"""
+    panel_tol(T)
+
+Elementwise tolerance of device panels against the reference panels, relative
+to `max |L|`: `100·eps(real(T))` (TASKS.md T09).
+"""
+panel_tol(::Type{T}) where {T} = 100 * eps(real(T))
