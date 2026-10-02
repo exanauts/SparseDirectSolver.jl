@@ -294,10 +294,9 @@ function _reorder!(solver::DirectSolver{T}) where {T}
     P = SymmetricPattern(solver.host_rowptr, solver.host_colval, A.nrows, solver.structure;
                          view = _stored_view(solver), index = A.index)
     # 2×2 pivot pairs ("S"/"H"): the only host copy of the values, at analysis
-    pairs = pairs_enabled(solver.structure, solver.options) ?
-            pivot_pairs(P, solver.host_rowptr, solver.host_colval, Array(A.nzval), A.nrows, solver.structure;
-                        view = _stored_view(solver), index = A.index) : Tuple{Int, Int}[]
-    solver.ordering = compute_ordering(P, solver.options; T, pairs)
+    pp = analysis_pairs(P, solver.host_rowptr, solver.host_colval, A.nzval, A.nrows, solver.structure,
+                        solver.options; view = _stored_view(solver), index = A.index)
+    solver.ordering = compute_ordering(P, solver.options; T, pp.pairs, pp.candidates)
     solver.host_symbolic = solver.symbolic = solver.numeric = solver.workspace = nothing
     solver.stage = STAGE_REORDERED
     return solver

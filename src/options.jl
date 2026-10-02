@@ -117,7 +117,7 @@ defaults below. Keyword arguments are applied through [`setparam!`](@ref), so
 | `factor_precision` | `nothing` | factors in the input precision |
 | `amalgamation` | `(max_width = 32, zero_fraction = 0.25, min_width = 8)` | |
 | `schedule` | `SCHEDULE_AUTO` | |
-| `pivot_pairs` | `PIVOT_PAIRS_DEFAULT` | 2×2 pivot candidate pairs in the analysis of `"S"`/`"H"` ([`pivot_pairs`](@ref)) |
+| `pivot_pairs` | `PIVOT_PAIRS_DEFAULT` | 2×2 pivot pairs in the analysis of `"S"`/`"H"` (structurally zero pivots; `"all"`: every candidate) |
 | `regime_c_width` | `64` | fronts wider than this go to regime C (vendor dense calls) |
 | `regime_c_rows` | `512` | fronts with more rows than this go to regime C |
 | `subtree_budgets` | `[16384, 32768, 49152]` | regime A local-memory budgets in bytes; empty disables regime A |
@@ -512,10 +512,12 @@ Accepted values:
 * `"ir_tol"`, `"pivot_threshold"`, `"pivot_epsilon"`: a finite real `≥ 0`
   (`nothing` resets `"pivot_epsilon"` to [`default_pivot_epsilon`](@ref));
 * `"ir_mode"`: `"ir"` or `"fgmres"`; `"schedule"`: `"auto"`, `"subtree+level"`, `"syncfree"`;
-* `"pivot_pairs"` (beyond cuDSS): `"default"` (for `"S"`/`"H"`, rows with a zero or
-  negligible diagonal are ordered together with a 2×2 pivot partner, see
-  [`pivot_pairs`](@ref)) or `"none"`; ignored for the other structures, with
-  `user_perm` and with the natural ordering;
+* `"pivot_pairs"` (beyond cuDSS): `"default"` (for `"S"`/`"H"`, a row with a zero
+  or negligible diagonal whose pivot would be structurally zero is ordered
+  together with a 2×2 pivot partner, see [`zero_pivot_pairs!`](@ref)), `"all"`
+  (every such row, see [`pivot_pairs`](@ref); about 2× `nnz(L)` on KKT systems)
+  or `"none"`;
+  ignored for the other structures, with `user_perm` and with the natural ordering;
 * `"factor_precision"`: `Float32`, `Float64` or `nothing`;
 * `"amalgamation"`: a `NamedTuple` with any of `max_width`, `zero_fraction`, `min_width`;
 * `"user_perm"`, `"user_nd_partition_tree"`: an integer vector (host or device), or `nothing`;

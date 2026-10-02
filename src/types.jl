@@ -190,12 +190,15 @@ end
 """
     PivotPairsMode
 
-`pivot_pairs` values (beyond cuDSS): `"default"` (2×2 pivot candidate pairs in
-the analysis of `"S"`/`"H"` matrices, see [`pivot_pairs`](@ref)) and `"none"`.
+`pivot_pairs` values (beyond cuDSS), for the analysis of `"S"`/`"H"` matrices:
+`"default"` (2×2 pivot pairs for the candidates whose pivot is structurally zero
+in the ordering, see [`zero_pivot_pairs!`](@ref)), `"all"` (every candidate paired, see
+[`pivot_pairs`](@ref)) and `"none"`.
 """
 @enum PivotPairsMode::Int32 begin
     PIVOT_PAIRS_DEFAULT = 0
     PIVOT_PAIRS_NONE = 1
+    PIVOT_PAIRS_ALL = 2
 end
 
 """
@@ -287,7 +290,8 @@ enum_spellings(::Type{ScheduleKind}) = (
 
 enum_spellings(::Type{IRMode}) = ("ir" => IR_PLAIN, "fgmres" => IR_FGMRES)
 
-enum_spellings(::Type{PivotPairsMode}) = ("default" => PIVOT_PAIRS_DEFAULT, "none" => PIVOT_PAIRS_NONE)
+enum_spellings(::Type{PivotPairsMode}) =
+    ("default" => PIVOT_PAIRS_DEFAULT, "none" => PIVOT_PAIRS_NONE, "all" => PIVOT_PAIRS_ALL)
 
 """
     StringEnum

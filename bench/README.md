@@ -13,6 +13,7 @@ Baselines every later milestone is measured against (PLAN.md §5 M0, §7). The
 | `regimes.jl` | `factorize!` time on the generated matrices with regimes A+B+C (default), B+C (`subtree_budgets = []`) and C only (`factorization_alg = "algo2"`), with fronts per regime and launch counts; package environment: `julia --project=. bench/regimes.jl [--backend=cuda] [--T=Float64] [--only=lap2d_300,lap3d_40]` |
 | `report.jl` | prints the CSV files as Markdown tables |
 | `dump_madnlp_kkt.jl` | dumps MadNLP K2 and condensed KKT matrices of pglib-opf cases |
+| `pivot_pairs.jl` | 2×2 pivot pairs of the `S` analysis (issue #66): `pivot_pairs` = `none`/`default`/`all` on the K2 dumps and the KKT generators, with nnz(L), zero/perturbed/2×2 pivots, max abs L and factor error of the CPU reference LDLᵀ; package environment: `julia --project=. bench/pivot_pairs.jl [--only=case118,...] [--generators=false]` |
 
 ## Commands
 
