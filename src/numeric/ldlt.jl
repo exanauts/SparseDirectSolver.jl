@@ -809,15 +809,17 @@ function _launch_subtrees_ldlt!(N::Numeric{T}, S::Symbolic, nzval, first, count,
     return nothing
 end
 
-function _factorize_ldlt_groups!(N::Numeric, S::Symbolic, nzval::AbstractVector, prm)
+function _factorize_ldlt_groups!(N::Numeric, S::Symbolic, nzval::AbstractVector, prm, flag)
     plan = N.plan
     for k in eachindex(plan.sub_first)
+        _poll_interrupt(flag)
         a, b = plan.sub_first[k], plan.sub_last[k]
         _with_local_bytes(plan.sub_local[k]) do lb
             _launch_subtrees_ldlt!(N, S, nzval, a, b - a + 1, prm, lb, Val(SUBTREE_WORKGROUP))
         end
     end
     for k in eachindex(plan.group_first)
+        _poll_interrupt(flag)
         a, b = plan.group_first[k], plan.group_last[k]
         _launch_front_ldlt!(N, S, nzval, a, b - a + 1, plan.group_maxchild[k], prm, Val(LDLT_WORKGROUP))
     end
@@ -836,7 +838,8 @@ other than `n` raises [`InvalidValueError`](@ref)). Regime-A groups are one
 [`subtree_ldlt_kernel!`](@ref) launch per budget class; every regime-B and
 regime-C launch group is one [`front_ldlt_kernel!`](@ref) launch (fused
 assembly and factorization, one workgroup per front; no vendor calls, see the
-T15 report); then [`reduce_stats!`](@ref). With `pivot_epsilon_alg = "algo1"`
+T15 report); then [`reduce_stats!`](@ref). `opts.user_host_interrupt` is polled
+before every launch group ([`InterruptedError`](@ref)). With `pivot_epsilon_alg = "algo1"`
 [`abs_max!`](@ref) computes the scale first. Fills `numeric.factor`
 (unit-lower panels), `d`, `piv`, `pivot_kind`, `stats` and `totals`. The
 factorization always completes (`info = 0`); the phase allocates nothing on
@@ -856,9 +859,9 @@ function factorize_ldlt!(N::Numeric{T}, S::Symbolic, nzval::AbstractVector; opts
     end
     prm.scaled && abs_max!(N.aux, nzval)
     if herm
-        _factorize_ldlt_groups!(N, S, nzval, prm)
+        _factorize_ldlt_groups!(N, S, nzval, prm, opts.user_host_interrupt)
     else
-        _factorize_ldlt_groups!(N, S, nzval, _ldlt_device_params(S, T, opts, Val(false)))
+        _factorize_ldlt_groups!(N, S, nzval, _ldlt_device_params(S, T, opts, Val(false)), opts.user_host_interrupt)
     end
     reduce_stats!(N, S)
     return 0

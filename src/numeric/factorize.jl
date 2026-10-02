@@ -145,7 +145,9 @@ the analysis used `factorization_alg = "algo1"`, no vendor calls). Then
 
 Returns `info = 0` on success, else the original column of the smallest
 non-positive pivot of the factor (as [`ref_factorize!`](@ref)); fronts above a
-failed one hold garbage. Structure `"SPD"` (real) or `"HPD"`. Nothing is
+failed one hold garbage. `opts.user_host_interrupt` is polled before every
+launch group (a host read): when set, [`InterruptedError`](@ref) is raised and
+the factor is incomplete. Structure `"SPD"` (real) or `"HPD"`. Nothing is
 allocated on the device; the panels are bitwise reproducible for a fixed
 `impl` and backend (regimes A and B are deterministic by construction).
 """
@@ -156,11 +158,14 @@ function factorize!(N::Numeric{T}, S::Symbolic, nzval::AbstractVector; impl::Sym
     p = _front_impls(N, S, impl)
     plan = N.plan
     nodes = S.schedule.group_nodes
+    flag = opts.user_host_interrupt
     for k in eachindex(plan.sub_first)
+        _poll_interrupt(flag)
         a, b = plan.sub_first[k], plan.sub_last[k]
         factorize_subtrees!(N, S, nzval, a, b - a + 1, plan.sub_local[k])
     end
     for k in eachindex(plan.group_first)
+        _poll_interrupt(flag)
         a, b = plan.group_first[k], plan.group_last[k]
         W = plan.group_width[k]
         if W > 0

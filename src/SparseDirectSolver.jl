@@ -26,6 +26,7 @@ export CSR, csr_of_transpose, to_backend, nbatch, MatrixDescriptor, update!
 export AbstractDirectSolver, DirectSolver, execute!, analyze!, factorize!, refactorize!, solve!, getparam!
 
 include("errors.jl")
+include("logging.jl")
 include("types.jl")
 include("options.jl")
 include("matrix.jl")
@@ -66,9 +67,12 @@ include("numeric/extract.jl")
 # solve phase on the device (PLAN §2.5)
 include("solve/permute.jl")
 include("solve/sweeps.jl")
+include("solve/refinement.jl")
 
 # public API (PLAN §3.1): handle-style layer and LinearAlgebra layer
 include("solver.jl")
 include("generic.jl")
+
+__init__() = _init_log_level()
 
 end # module SparseDirectSolver

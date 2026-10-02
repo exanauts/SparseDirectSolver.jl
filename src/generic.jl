@@ -4,23 +4,34 @@
 # `Symmetric`/`Hermitian` wrappers, as CUDSS.jl does. A `SparseMatrixCSC` is not
 # accepted by `cholesky` (that method belongs to CHOLMOD): wrap it with `CSR(A)`.
 #
-# PLAN §3.1 turns iterative refinement on in this layer (`ir_n_steps = 2` with
-# early exit). Refinement arrives in T16; until then the layer keeps the
-# handle-layer default `ir_n_steps = 0`, and a value set by the user is stored
-# and ignored (the solve warns once).
+# PLAN §3.1 turns iterative refinement on in this layer: the solvers created
+# by `cholesky`/`ldlt` start with `ir_n_steps = 2` (the handle layer keeps the
+# cuDSS default 0); `ir_tol` (default 0: no early exit, no synchronization per
+# step) stops it early when the user sets it. Both stay settable on the solver.
+
+# the defaults of this layer on a new solver
+function _linear_algebra_defaults!(solver::DirectSolver)
+    setparam!(solver, "ir_n_steps", LINEAR_ALGEBRA_IR_STEPS)
+    return solver
+end
+
+"Refinement steps of the solvers created by `cholesky` and `ldlt` (PLAN §3.1; the handle layer uses 0)."
+const LINEAR_ALGEBRA_IR_STEPS = 2
 
 """
     cholesky(A::CSR, NoPivot(); view = 'F', check = false) -> DirectSolver
 
 LLᵀ (real `T`, structure `"SPD"`) or LLᴴ (complex `T`, `"HPD"`) factorization of
 the sparse matrix `A` on its backend: a [`DirectSolver`](@ref) after
-`"analysis"` and `"factorization"` (synchronized). `view` selects the triangle
+`"analysis"` and `"factorization"` (synchronized), with `ir_n_steps = 2`
+steps of iterative refinement in its solves (the handle layer's default is 0;
+change it with [`setparam!`](@ref)). `view` selects the triangle
 of `A` that is read (`'L'`, `'U'`, `'F'`). As in CUDSS.jl a failed
 factorization does not throw unless `check = true` (then
 [`FactorizationError`](@ref)); otherwise check `getparam(solver, "info")`.
 """
 function LinearAlgebra.cholesky(A::CSR{T}, ::NoPivot = NoPivot(); view::Char = 'F', check::Bool = false) where {T}
-    solver = DirectSolver(A, T <: Real ? "SPD" : "HPD", view)
+    solver = _linear_algebra_defaults!(DirectSolver(A, T <: Real ? "SPD" : "HPD", view))
     execute!("analysis", solver, nothing, nothing)
     execute!("factorization", solver, nothing, nothing; asynchronous = false)
     _check_info(solver, check)
@@ -39,13 +50,13 @@ end
 LDLᵀ (real `T`, structure `"S"`) or LDLᴴ (complex `T`, `"H"`) factorization of
 the sparse symmetric/Hermitian matrix `A` on its backend (≅ CUDSS.jl's `ldlt`):
 a [`DirectSolver`](@ref) after `"analysis"` and `"factorization"`
-(synchronized), with in-front Bunch–Kaufman pivoting and static perturbation of
+(synchronized, `ir_n_steps = 2` as [`cholesky`](@ref)), with in-front Bunch–Kaufman pivoting and static perturbation of
 tiny pivots (read `getparam(solver, "npivots")` and `"inertia"`). `view` as in
 [`cholesky`](@ref). The factorization does not fail (`"info"` stays 0), so
 `check` has no effect; it is accepted for symmetry with `cholesky`.
 """
 function LinearAlgebra.ldlt(A::CSR{T}; view::Char = 'F', check::Bool = false) where {T}
-    solver = DirectSolver(A, T <: Real ? "S" : "H", view)
+    solver = _linear_algebra_defaults!(DirectSolver(A, T <: Real ? "S" : "H", view))
     execute!("analysis", solver, nothing, nothing)
     execute!("factorization", solver, nothing, nothing; asynchronous = false)
     _check_info(solver, check)
