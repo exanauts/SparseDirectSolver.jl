@@ -87,6 +87,16 @@ mutable struct DirectSolver{T, INT, M <: CSR{T, INT}, B <: KernelAbstractions.Ba
     symbolic::Union{Nothing, SY}
     numeric::Union{Nothing, NU}
     workspace::Union{Nothing, WS}
+    # explicit parameters only: the default outer constructor would leave SY, NU, WS unbound
+    # (they occur only in `Union{Nothing, …}` fields; Aqua on Julia 1.10)
+    function DirectSolver{T, INT, M, B, SY, NU, WS}(A, structure, view, options, backend, nbatch,
+                                                    fresh_factorization, info, stage, host_rowptr,
+                                                    host_colval, ordering, host_symbolic, symbolic,
+                                                    numeric, workspace) where {T, INT, M, B, SY, NU, WS}
+        return new{T, INT, M, B, SY, NU, WS}(A, structure, view, options, backend, nbatch, fresh_factorization,
+                                             info, stage, host_rowptr, host_colval, ordering, host_symbolic,
+                                             symbolic, numeric, workspace)
+    end
 end
 
 const SOLVER_ELTYPES = Union{Float32, Float64, ComplexF32, ComplexF64}

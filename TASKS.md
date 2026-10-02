@@ -1796,6 +1796,12 @@ whenever `atomic_add` is `false`. Close #36 in this task's PR.
   diagonal written into the solver's `nzval`, `info == 0`, `relres ≤ tol(T)`, iterations 2–20 within
   `numeric_alloc_budget + solve_alloc_budget` on CPU (measured 64 B per iteration on Julia 1.13, all inside the T09
   `factorize!`); on CUDA `CUDA.@allocated == 0` is asserted). CUDA/AMDGPU: pending CI on the PR.
+  CI fix round 1: Aqua's unbound-type-parameter check failed on Julia 1.10 (the default outer constructor of
+  `DirectSolver` left `SY`, `NU`, `WS` unbound; now an explicit inner constructor), and the CUDA loop measured
+  `2 sizeof(T)` device bytes per iteration on Julia 1.10: cuBLAS runs in device pointer mode, so every host scalar
+  α/β became a fresh `CuRefValue` (the two root-front `trsm` of the solve). The CUDA extension now passes cached
+  device constants (0, 1, -1 per context and type) to all cuBLAS calls. CPU suite green again on Julia 1.13.1;
+  `test_aqua` + `test_api` green on Julia 1.10.12 with coverage on (as CI).
 - Measurements: none asked for. Per refactorize+solve iteration of the MadNLP loop on the CPU backend: 64 B host
   allocation (Julia 1.13.1), the same as the bare T09–T11 `factorize!`; the API layer adds nothing.
 - Deviations from PLAN.md / this task:
@@ -1831,6 +1837,10 @@ whenever `atomic_add` is `false`. Close #36 in this task's PR.
     `_check_analysis_supported` refuses `"S"`/`"H"`; both need updating. `"diag"` must return D for LDLᵀ.
   - T16: `solve_diag`/`solve_refinement` phases, `ir_n_steps` (remove the warning), the complex `solve_mode = 1`,
     complex CSC input, `user_host_interrupt`.
+  - On Julia 1.10.12 *without* code coverage, the CPU MadNLP loop allocates a steady 359 KB (Float32) / 485 KB
+    (Float64) of host memory per iteration and fails its budget (41–43 KB); the same happens before the CI fix, and
+    it passes with coverage on (CI's `julia-runtest` default) and on Julia 1.13. CI therefore does not see it; likely a
+    1.10 inference/specialization difference in the KA CPU launches; not investigated in the CI-fix round.
 - Suggested plan changes:
   - PLAN §1.5/§3.1: the `Symmetric`/`Hermitian` wrappers apply to the backend sparse matrix types of the extensions;
     on the CPU backend the generic layer takes `CSR` (no piracy of CHOLMOD's `cholesky`).

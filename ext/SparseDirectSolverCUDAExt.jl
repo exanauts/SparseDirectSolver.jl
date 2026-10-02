@@ -115,14 +115,41 @@ LinearAlgebra.cholesky(A::Hermitian{T, <:CuSparseMatrixCSR{T}}, p::NoPivot = NoP
 const CuBlasT = Union{Float32, Float64, ComplexF32, ComplexF64}
 const CuBlasC = Union{ComplexF32, ComplexF64}
 
+# cuBLAS handles run in device pointer mode: a host scalar α/β becomes a fresh
+# one-element device allocation (`CuRefValue`) on every call. The scalars the
+# solver passes (0, 1, -1) come from a cached device vector per context and type
+# instead, so the numeric and solve phases allocate nothing on the device.
+const _SCALARS = Dict{Tuple{CuContext, DataType}, CuVector}()
+const _SCALARS_LOCK = ReentrantLock()
+
+function _scalar_cache(::Type{T}) where {T}
+    key = (CUDACore.context(), T)
+    return lock(_SCALARS_LOCK) do
+        get!(_SCALARS, key) do
+            c = CuVector{T}(T[0, 1, -1])
+            CUDACore.synchronize()  # once per context and type: the constants are visible on every stream
+            return c
+        end
+    end::CuVector{T}
+end
+
+# α as a cuBLAS scalar argument: a cached device constant, else the host value
+function _blas_scalar(::Type{T}, α) where {T}
+    x = T(α)
+    i = iszero(x) ? 1 : isone(x) ? 2 : x == -one(T) ? 3 : 0
+    return i == 0 ? x : CUDACore.CuRefArray(_scalar_cache(T), i)
+end
+
 SDS.vendor_gemm!(tA::Char, tB::Char, α, A::StridedCuMatrix{T}, B::StridedCuMatrix{T}, β,
-                 C::StridedCuMatrix{T}) where {T <: CuBlasT} = cuBLAS.gemm!(tA, tB, T(α), A, B, T(β), C)
+                 C::StridedCuMatrix{T}) where {T <: CuBlasT} =
+    cuBLAS.gemm!(tA, tB, _blas_scalar(T, α), A, B, _blas_scalar(T, β), C)
 SDS.vendor_syrk!(uplo::Char, α, A::StridedCuMatrix{T}, β, C::StridedCuMatrix{T}) where {T <: CuBlasT} =
-    cuBLAS.syrk!(uplo, 'N', T(α), A, T(β), C)
+    cuBLAS.syrk!(uplo, 'N', _blas_scalar(T, α), A, _blas_scalar(T, β), C)
 SDS.vendor_herk!(uplo::Char, α, A::StridedCuMatrix{T}, β, C::StridedCuMatrix{T}) where {T <: CuBlasC} =
-    cuBLAS.herk!(uplo, 'N', real(T)(α), A, real(T)(β), C)
+    cuBLAS.herk!(uplo, 'N', _blas_scalar(real(T), α), A, _blas_scalar(real(T), β), C)
 SDS.vendor_trsm!(side::Char, uplo::Char, trans::Char, diag::Char, α, A::StridedCuMatrix{T},
-                 B::StridedCuMatrix{T}) where {T <: CuBlasT} = cuBLAS.trsm!(side, uplo, trans, diag, T(α), A, B)
+                 B::StridedCuMatrix{T}) where {T <: CuBlasT} =
+    cuBLAS.trsm!(side, uplo, trans, diag, _blas_scalar(T, α), A, B)
 
 SDS.vendor_potrf!(uplo::Char, A::StridedCuMatrix{<:CuBlasT}) = Int(cuSOLVER.potrf!(uplo, A)[2])
 
@@ -171,7 +198,7 @@ end
 
 SDS.vendor_gemm_strided_batched!(tA::Char, tB::Char, α, A::StridedCuArray{T, 3}, B::StridedCuArray{T, 3}, β,
                                  C::StridedCuArray{T, 3}) where {T <: CuBlasT} =
-    cuBLAS.gemm_strided_batched!(tA, tB, T(α), A, B, T(β), C)
+    cuBLAS.gemm_strided_batched!(tA, tB, _blas_scalar(T, α), A, B, _blas_scalar(T, β), C)
 
 function _check_square_batch(A::AbstractArray{<:Any, 3})
     size(A, 1) == size(A, 2) || throw(DimensionMismatch("batch members are $(size(A, 1))×$(size(A, 2)), not square"))
@@ -197,10 +224,11 @@ for (fname, fname_64, elty) in ((:cublasStrsmBatched, :cublasStrsmBatched_64, :F
         GC.@preserve A B begin
             Aptrs = _batch_pointers(A)
             Bptrs = _batch_pointers(B)
+            a = _blas_scalar($elty, α)
             if cuBLAS.version() >= v"12.0"
-                cuBLAS.$fname_64(cuBLAS.handle(), side, uplo, trans, diag, m, n, $elty(α), Aptrs, lda, Bptrs, ldb, nb)
+                cuBLAS.$fname_64(cuBLAS.handle(), side, uplo, trans, diag, m, n, a, Aptrs, lda, Bptrs, ldb, nb)
             else
-                cuBLAS.$fname(cuBLAS.handle(), side, uplo, trans, diag, m, n, $elty(α), Aptrs, lda, Bptrs, ldb, nb)
+                cuBLAS.$fname(cuBLAS.handle(), side, uplo, trans, diag, m, n, a, Aptrs, lda, Bptrs, ldb, nb)
             end
             CUDACore.unsafe_free!(Aptrs)
             CUDACore.unsafe_free!(Bptrs)
