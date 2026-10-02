@@ -204,8 +204,9 @@ function compute_ordering(P::SymmetricPattern, opts::Options; T::Type = Float64,
     end
     evaluated = OrderingCandidate[]
     best = 0
+    Q = search ? nothing : pair_pattern(P, perms[1][3])   # the fixed pairs are shared by all algorithms
     for (k, (a, perm, prs, _)) in enumerate(perms)
-        e = evaluate_ordering(pair_pattern(P, prs), perm; T)
+        e = evaluate_ordering(search ? pair_pattern(P, prs) : Q, perm; T)
         push!(evaluated, (alg = a, nnz_L = e.nnz_L, flops = e.flops, nlevels = e.nlevels, cost = e.cost))
         (best == 0 || e.cost < evaluated[best].cost) && (best = k)
     end

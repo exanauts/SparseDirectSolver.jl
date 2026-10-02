@@ -241,7 +241,7 @@ end
         @test isempty(none.pairs) && isempty(inter.pairs) && length(all_.pairs) == nj
         @test 0 < length(ord.pairs) <= nj
         @test ord.stats.nnz_L <= 1.05 * all_.stats.nnz_L && all_.stats.nnz_L <= 2.5 * none.stats.nnz_L
-        @test all_.stats.nnz_L <= inter.stats.nnz_L
+        @test ord.stats.nnz_L <= inter.stats.nnz_L && all_.stats.nnz_L <= inter.stats.nnz_L
     end
     # no candidate (Gershgorin-dominant diagonal): no pair, bitwise the same analysis
     A = random_symindef(T, 400, 0.01)

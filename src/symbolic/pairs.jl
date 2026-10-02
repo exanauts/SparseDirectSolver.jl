@@ -193,7 +193,6 @@ function structural_zero_pivots(cands::PairCandidates, P::SymmetricPattern, perm
         mate[a] = b
         mate[b] = a
     end
-    rowm = zeros(Int, n)                          # row r is matched to column rowm[r]
     colm = zeros(Int, n)                          # column j is matched to row colm[j]
     seen = zeros(Int, n)                          # columns visited by the current search (stamp)
     srow = Int[]                                  # DFS stack: row, next position in its adjacency, column taken
@@ -204,12 +203,11 @@ function structural_zero_pivots(cands::PairCandidates, P::SymmetricPattern, perm
         v = perm[k]
         m = mate[v]
         if m != 0 && pos[m] == k - 1              # second column of a pair: the 2×2 block, crosswise
-            rowm[m] = v; colm[v] = m
-            rowm[v] = m; colm[m] = v
+            colm[v] = m; colm[m] = v
             continue
         end
         if !candidate[v] || m != 0                # nonzero diagonal, or the first column of a pair
-            rowm[v] = v; colm[v] = v
+            colm[v] = v
             continue
         end
         # augmenting path from row v to column v through the columns of the prefix (iterative DFS)
@@ -229,7 +227,6 @@ function structural_zero_pivots(cands::PairCandidates, P::SymmetricPattern, perm
             scol[end] = j
             if j == v                             # reached the free column: flip the path
                 for t in eachindex(srow)
-                    rowm[srow[t]] = scol[t]
                     colm[scol[t]] = srow[t]
                 end
                 found = true
@@ -239,7 +236,7 @@ function structural_zero_pivots(cands::PairCandidates, P::SymmetricPattern, perm
         end
         if !found
             push!(out, v)
-            rowm[v] = v; colm[v] = v
+            colm[v] = v
         end
     end
     return out
