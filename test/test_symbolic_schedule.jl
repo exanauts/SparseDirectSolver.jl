@@ -338,14 +338,19 @@ end
     # blocks live in the fullest step, which the level schedule fixes (a serial
     # Liu postorder would need 4.1 on the KKT matrix and the same 4.4 on the
     # random one) and which packed triangular blocks would halve (issue #48).
-    # Bounds are just above the measured values so a regression shows up; print
-    # the values for the Report. The random generators depend on the RNG state
-    # left by the preceding testsets, which differs with the backend list, so
-    # reseed here.
+    # Bounds sit above the measured values so a regression shows up; print the
+    # values for the Report. The random generators depend on the RNG state left
+    # by the preceding testsets, which differs with the backend list, so reseed
+    # here. The sprand stream for a given seed also differs between Julia
+    # versions: on Julia 1.10 the KKT and random SPD ratios are 5.37 and 5.05
+    # and stack_len is 1.09 and 1.19 times the live bound, so the bounds of the
+    # random matrices carry that margin. The Laplacian is RNG-free and keeps
+    # the tight bounds.
     Random.seed!(666)
-    for (name, A, bound) in (("kkt_matrix(3000, 1000)", kkt_matrix(3000, 1000, 1.0e-8), 5.0),
-                             ("random_spd(2000, 0.002)", random_spd(2000, 0.002), 5.0),
-                             ("laplacian2d(100, 100)", laplacian2d(100, 100), 0.7))
+    for (name, A, bound, slack) in
+        (("kkt_matrix(3000, 1000)", kkt_matrix(3000, 1000, 1.0e-8), 5.5, 1.25),
+         ("random_spd(2000, 0.002)", random_spd(2000, 0.002), 5.5, 1.25),
+         ("laplacian2d(100, 100)", laplacian2d(100, 100), 0.7, 1.05))
         S = SDS.symbolic_analysis(SDS.CSR(A), "S", 'L'; opts = Options(reordering_alg = "algo3"))
         L = S.layout
         ratio = L.stack_len / L.factor_len
@@ -357,7 +362,9 @@ end
         println("  update stack / factor on $name (AMD): $(round(ratio; digits = 2)), ",
                 "live bound $(round(maximum(live) / L.factor_len; digits = 2))")
         @test ratio <= bound
-        @test maximum(live) <= L.stack_len <= 1.05 * maximum(live)
+        println("  stack_len / live bound on $name: ",
+                "$(round(L.stack_len / maximum(live); digits = 3))")
+        @test maximum(live) <= L.stack_len <= slack * maximum(live)
         check_schedule(S)
     end
 end
