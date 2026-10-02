@@ -23,14 +23,16 @@ permissions:
   actions: read
   id-token: write
 
-concurrency:
-  group: claude-implement
-  cancel-in-progress: false
-
 jobs:
   implement:
     if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'claude:implement'
     runs-on: ubuntu-latest
+    # Job-level, not workflow-level: every `labeled` event on any issue creates a
+    # run whose job is skipped by the `if` above, and a workflow-level group let
+    # those empty runs queue behind (and cancel each other around) a real one.
+    concurrency:
+      group: claude-implement
+      cancel-in-progress: false
     timeout-minutes: 300
     env:
       ISSUE: ${{ github.event.inputs.issue_number || github.event.issue.number }}

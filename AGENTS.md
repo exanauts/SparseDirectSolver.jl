@@ -94,7 +94,11 @@ reviewing agent must pass. The moving parts:
   in earlier code, a limit hit, a plan problem) becomes an issue with label
   `found-by-agent` using `.github/ISSUE_TEMPLATE/agent-finding.md`, cited in
   the Report. Do not fix it in the task's PR and do not edit `PLAN.md`; the
-  owner decides what becomes a task.
+  owner decides what becomes a task. **Such issues hold the chain**: after a
+  task PR merges, the pipeline starts the next task only when every open
+  `found-by-agent` issue carries the label `triaged` or is closed; otherwise it
+  comments on the next task issue and waits. Labelling the last untriaged issue
+  `triaged` (or closing it) resumes the chain (`claude-triage.yml`).
 * The owner re-evaluates `PLAN.md` and `TASKS.md` between tasks by pausing the
   chain (`CLAUDE_AUTOPILOT=false` or `on-hold` on the next issue), editing on
   `main`, and relabelling.

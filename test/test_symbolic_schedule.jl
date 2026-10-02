@@ -344,23 +344,40 @@ end
 @testset "update stack vs factor (issue #48)" begin
     # Regression guard for the update-stack high-water mark relative to the
     # factor. Keeping wide fundamental supernodes whole (no chain of max_width
-    # panels) brought the KKT ratio from 7.8 to 5.6 (T07 Report); packed
-    # lower-triangular contribution blocks (T11, which closes issue #48) halve
-    # what remains: measured 3.0 (KKT), 2.9 (random SPD) and 0.24 (2-D Laplacian,
-    # also fewer blocks on the stack since the larger regime-A subtrees keep
-    # theirs in local memory), against 5.6-6.2, 6.1-6.5 and 0.61 with full m×m
-    # blocks. Bounds are just above the measured values so a regression shows
-    # up; print the values for the Report.
-    # The random generators depend on the RNG state left by the preceding
-    # testsets, which differs with the backend list, so reseed here.
+    # panels) brought the KKT ratio from 7.8 to 5.6 (T07 Report); placing the
+    # contribution blocks offline over their known lifetimes (best of first fit,
+    # largest first, largest size × lifetime first) removed the fragmentation of
+    # the step-by-step first fit: 6.2 -> 4.5 (KKT) and 6.1 -> 4.5 (random SPD);
+    # packed lower-triangular contribution blocks (T11, which closes issue #48)
+    # halve what remains: measured 3.0 (KKT), 2.9 (random SPD) and 0.24 (2-D
+    # Laplacian, also fewer blocks on the stack since the larger regime-A
+    # subtrees keep theirs in local memory) with the first fit alone. Bounds sit
+    # above the measured values so a regression shows up; print the values for
+    # the Report. The random generators depend on the RNG state left by the
+    # preceding testsets, which differs with the backend list, so reseed here.
+    # The sprand stream for a given seed also differs between Julia versions
+    # (on Julia 1.10 the full-block ratios were 5.37 and 5.05 and stack_len
+    # 1.09 and 1.19 times the live bound), so the bounds of the random matrices
+    # carry that margin. The Laplacian is RNG-free and keeps the tight bounds.
     Random.seed!(666)
-    for (name, A, bound) in (("kkt_matrix(3000, 1000)", kkt_matrix(3000, 1000, 1.0e-8), 3.5),
-                             ("random_spd(2000, 0.002)", random_spd(2000, 0.002), 3.5),
-                             ("laplacian2d(100, 100)", laplacian2d(100, 100), 0.5))
+    for (name, A, bound, slack) in
+        (("kkt_matrix(3000, 1000)", kkt_matrix(3000, 1000, 1.0e-8), 3.5, 1.25),
+         ("random_spd(2000, 0.002)", random_spd(2000, 0.002), 3.5, 1.25),
+         ("laplacian2d(100, 100)", laplacian2d(100, 100), 0.5, 1.05))
         S = SDS.symbolic_analysis(SDS.CSR(A), "S", 'L'; opts = Options(reordering_alg = "algo3"))
-        ratio = S.layout.stack_len / S.layout.factor_len
-        println("  update stack / factor on $name (AMD): $(round(ratio; digits = 2))")
+        L = S.layout
+        ratio = L.stack_len / L.factor_len
+        # entries live in the fullest step: no placement can go below it
+        live = zeros(Int, S.schedule.nsteps + 1)
+        for s in eachindex(L.cb_len), t in L.cb_first[s]:L.cb_last[s]
+            L.cb_len[s] > 0 && (live[t + 1] += L.cb_len[s])
+        end
+        println("  update stack / factor on $name (AMD): $(round(ratio; digits = 2)), ",
+                "live bound $(round(maximum(live) / L.factor_len; digits = 2))")
         @test ratio <= bound
+        println("  stack_len / live bound on $name: ",
+                "$(round(L.stack_len / maximum(live); digits = 3))")
+        @test maximum(live) <= L.stack_len <= slack * maximum(live)
         check_schedule(S)
     end
 end
