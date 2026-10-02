@@ -1551,7 +1551,7 @@ the new values; close #48 in this task's PR.
 
 ---
 
-## T12 — GPU solve sweeps, multiple right-hand sides, permutations   `[ ]`
+## T12 — GPU solve sweeps, multiple right-hand sides, permutations   `[!]`
 
 **Reads**: PLAN §2.5, §3.4.
 
@@ -1584,6 +1584,120 @@ whenever `atomic_add` is `false`. Close #36 in this task's PR.
   deterministic variant is bitwise reproducible on CUDA.
 * Transposed (row-major) RHS layout gives the same solution.
 * Solving with the `(n, nrhs)` matrix equals solving each column separately.
+
+### Report
+
+- Status: [!] (done on the CPU backend; the right-hand-side grid dimension is flattened into a 1-D ndrange, and the
+  deterministic buffers have their own small layout instead of the update stack; CUDA from CI)
+- What was built (internal, nothing exported; T13 wires them to `execute!`/`solve!` and the `"solve_*"` phases):
+  - `src/solve/permute.jl`: `permute_rhs!(Y, B, perm; transposed)` (`Y[k, r] = B[perm[k], r]`) and
+    `unpermute_solution!(X, Y, perm; transposed)`, one launch each, one work item per entry. `B`/`X` can be an `n`
+    vector, an `n × nrhs` matrix, a strided vector of `n·nrhs` entries, or with `transposed = true` row-major data (a
+    column-major `nrhs × n` matrix or its strided vector), the layouts of `MatrixDescriptor`. `rhs_count(B, n;
+    transposed)` reads `nrhs` and checks the shape.
+  - `src/solve/sweeps.jl`:
+    - `SolvePlan` (host, forward order, the backward sweep runs it reversed): one launch over **all** regime-A
+      subtrees (the solve kernels need no local-memory class), then per step one launch over its regime-B fronts
+      and one range of regime-C-path fronts (`takes_c_path`, as in the numeric phase); `maxm` = the largest `m` of a
+      regime-C-path front.
+    - `SolveWorkspace{T, MT}` / `allocate_solve(symbolic, T, backend, nrhs)` (the only allocation of the phase): `Y`
+      (`n × nrhs`, permuted RHS, overwritten by the solution), `U` (`length(rowval) × nrhs`, the deterministic
+      per-front update buffers), `tmp` (`maxm × nrhs`, the regime-C `gemm` result), `atomic` (the `atomic_add`
+      capability, looked up once), the plan; `max_rhs(ws)`, `solve_memory(symbolic, T, nrhs)`. Any `nrhs ≤ max_rhs`
+      can be solved with one workspace.
+    - KA kernels, one 1-D workgroup (`SOLVE_WORKGROUP = 64`) per (front or subtree, right-hand side),
+      `G = g + count·(r − 1)`: `solve_fwd_kernel!` (`Val(SUB)`: a subtree walked in processing order, or one
+      regime-B front; `Val(DET)`): deterministic only, zero the front's buffer in `U` and owner-pull its children's
+      buffers through `relind` in `child_list` order, one barrier per child (rows ≤ `w` go to the front's columns of
+      `Y`, the others to its own buffer); TRSV with `L11` on `Y` (one barrier per column, the division by the diagonal
+      in a final pass); GEMV with `L21` into the front's buffer (deterministic) or straight into `Y` (atomic variant:
+      `Atomix.@atomic` for every regime-B row and for regime-A rows above the subtree root's last column, plain
+      updates for rows that only the subtree's workgroup touches). `solve_bwd_kernel!`: subtrees in reverse
+      processing order; gather of the finished rows below + GEMV with `L21ᴴ` (one work item per column), TRSV with
+      `L11ᴴ`; no atomics. Per-node values in a `@localmem` control array (as the T11 kernel) so loops with barriers
+      have workgroup-uniform trip counts on the KA CPU backend. `_sv_pull_kernel!`, `_sv_scatter_kernel!`,
+      `_sv_gather_kernel!` serve the regime-C path.
+    - Regime-C-path fronts, one at a time per step: forward `trsm(L11)` on `view(Y, cols, 1:nrhs)` and `gemm(L21, ·)`
+      into `tmp` through the dense interface (vendor under `:auto`, `:ka` for `factorization_alg = "algo1"`, `impl`
+      passed on and resolved once per sweep), then one scatter launch (plain `Y[row] -= tmp`: these fronts run
+      sequentially, no atomics needed; deterministic: into the front's buffer); in the deterministic variant one pull
+      launch per step range first. Backward: gather launch into `tmp`, `gemm(L21ᴴ, tmp)`, `trsm(L11ᴴ)`.
+    - Drivers: `forward_sweep!(ws, S, N; nrhs, deterministic, impl)`, `diagonal_sweep!` (identity for Cholesky, the
+      T15 hook), `backward_sweep!(ws, S, N; nrhs, impl)`, `sweep_solve!(X, ws, S, N, B; transposed, deterministic,
+      impl)` (`X === B` allowed). Asynchronous, no host synchronization, no allocation (0 B on the CPU backend, Julia
+      1.13). The deterministic variant runs when `deterministic = true` (T13 maps `deterministic_mode = 1` to it) or
+      when `ws.atomic` is false.
+  - Dense layer: `_gemm_impl!` (gemm with a resolved impl, as `_trsm_impl!`), `gemm!` now calls it.
+  - Tests: `test/test_solve.jl`; `variant_tol`, `solve_setup`, `device_solve`, `solve_alloc_budget` in
+    `test/utils.jl`.
+- **Issue #36 (complex atomics), decision**: the deterministic variant is selected whenever
+  `capabilities(backend, T).atomic_add` is false, i.e. for every complex `T` on every backend; no reinterpreted real
+  view. Reasons: one kernel code path without aliasing a complex array as a real one (which on the CPU backend would
+  need `unsafe_wrap`, and would also break the vendor `trsm`/`gemm` views of `Y`); the deterministic variant does the
+  same work (pull instead of push, one extra pull launch per regime-C step) and is needed anyway. The test asserts
+  `!ws.atomic` for complex `T` and that the requested atomic variant then equals the deterministic one bitwise.
+  (#36 is already closed; nothing left to close.)
+- Tests: `SDS_TEST_GPU=0 julia --project=. -e 'using Pkg; Pkg.test()'` (Julia 1.13.1, ubuntu-latest, CPU): 46356 pass /
+  0 fail / 0 broken (7 min 31 s; test_solve: 554, 73 s). test_solve under CI's flags (`coverage = true`,
+  `--check-bounds=yes`): Julia 1.13.1 554 pass / 0 fail; Julia 1.10.10 556 pass / 0 fail. Covered, per backend and
+  `T ∈ ELTYPES`: plan (one regime-A launch first, one launch per step and kind, every front once, `maxm`), workspace
+  sizes and `solve_memory`; permutation kernels for matrix, transposed matrix, strided vector and transposed strided
+  vector, round trip, shape errors; `relres ≤ tol(T)` for `nrhs ∈ {1, 2, 5}` × {atomic, deterministic} on
+  `laplacian2d(40,40)` (Int32 and Int64 maps), `random_spd(500,0.01)`, `laplacian3d(10,10,10)`, all with regimes A,
+  B and C present (`subtree_budgets = [8192, 16384]`, `regime_c_width = 16`, `regime_c_rows = 128`), and within
+  `tol(T)` of `ref_solve!` on the copied-back factor; forward and backward sweeps separately against triangular
+  solves with `extract_L`, the diagonal hook, `nrhs < max_rhs` leaving the other columns alone; atomic vs
+  deterministic within `10·eps(real(T))·‖x‖` and deterministic bitwise reproducible (all backends); transposed and
+  strided layouts `==` the column-major solution (deterministic) and within `10·eps·‖x‖` (atomic), in place
+  `X === B`; the `(n, 5)` matrix vs the columns one at a time within `10·eps·‖xᵣ‖`, the `n` vector `==` the `n × 1`
+  matrix; errors (too many right-hand sides, mismatched `X`, a workspace of another analysis); default options, no
+  regime A, `"algo1"` (KA dense on the C path) and `"algo2"`; every `impl` available for both `trsm` and `gemm`; no
+  allocation beyond `solve_alloc_budget` on CPU (0 B measured on Julia 1.13). CUDA/AMDGPU: pending CI on the PR.
+  CI fix round 1: CUDA on Julia 1.13 errored (scalar indexing) in "schedules and dense implementations" with
+  `impl = :generic`: the 2-argument `ldiv!(::AbstractTriangular, B)` of Julia ≥ 1.11 calls `istriu` on the L11
+  view of the factor, which GPUArrays only overloads for unwrapped device matrices. `_generic_trsm!` now uses the
+  3-argument `ldiv!(B, M, B)` (same `generic_trimatdiv!` path, no `istriu`); CPU suite still 46356 pass.
+- Measurements (ubuntu-latest KA CPU backend, Float64, default analysis, best of 3, measured while another test run
+  shared the machine, so indicative only; `ref` = `ref_solve!` on the host factor):
+
+  ```text
+  matrix            nrhs  launches (atomic)  ref_solve!  sweep_solve! atomic  deterministic
+  lap2d 100²          1          28           1.9 ms         4.1 ms             5.3 ms
+  lap2d 100²          5          28           2.8 ms        20.5 ms            26.3 ms
+  lap3d 20³           1          80           1.8 ms         3.8 ms             4.3 ms
+  lap3d 20³           5          80           4.4 ms        24.2 ms            27.4 ms
+  random_spd 2000     1         138           1.0 ms         1.5 ms             1.6 ms
+  random_spd 2000     5         138           1.9 ms         5.4 ms             6.1 ms
+  ```
+
+  The KA CPU backend runs work items serially, and the kernels repeat the per-front walk for every right-hand side;
+  the GPU numbers decide. Atomic vs deterministic differ by 0.4–0.7 eps·‖x‖ (Float64), column-by-column vs matrix by
+  ≤ 0.8 eps·‖x‖.
+- Deviations from PLAN.md / this task:
+  - "`nrhs > 1` via a second ndrange dimension": the right-hand side is the second grid dimension of every kernel,
+    but flattened into the 1-D ndrange (`G = g + count·(r − 1)`), because a 2-D ndrange allocates 80 B per launch on
+    the KA CPU backend (Julia 1.13, KA 0.9) and the phase must not allocate; 1-D launches allocate nothing.
+  - "per-front RHS buffers on the update-stack layout": the buffers are not placed on the update stack (whose packed
+    `m(m+1)/2` slots are too small for `m × nrhs` once `nrhs > (m+1)/2`), but at the front's rows of the gather list,
+    `U[rowptr[s] + i − 1, r]` for `i ∈ w+1:f`, so no new map is needed; `U` has `length(rowval)·nrhs` entries
+    (`Σ f_s`, a few times `n`).
+  - Regime-C-path scatter in the atomic variant is a plain update (the fronts of that path run one launch at a time);
+    atomics stay in the fused regime-A/B kernels only.
+  - The solve does not use the regime-A budget classes or regime-B width classes: one solve kernel instance per
+    (`SUB`, `DET`) serves every front (state in global memory, no `@localmem` besides the control words).
+- Open issues / follow-ups:
+  - T13 should keep one `SolveWorkspace` per solver and reallocate it only when `nrhs` grows (the phases
+    `"solve_fwd_perm"`, `"solve_fwd"`, `"solve_bwd"`, `"solve_bwd_perm"` map to `permute_rhs!`, `forward_sweep!`,
+    `backward_sweep!`, `unpermute_solution!`); `deterministic_mode` → `deterministic = true`.
+  - T15 fills `diagonal_sweep!` (D and 2×2 pivots) and needs unit-diagonal TRSVs (`L11` with unit diagonal).
+  - Performance (T25): the backward gather has one work item per column (`w`), the TRSVs one barrier per column,
+    every right-hand side repeats the front walk; staging `L11`/`y` in local memory and processing several
+    right-hand sides per workgroup are the obvious steps once GPU timings exist.
+- Suggested plan changes:
+  - PLAN §2.5: the deterministic forward buffers live at the fronts' gather-list rows (`length(rowval) × nrhs`), not
+    on the update stack; complex `T` always uses the deterministic variant (issue #36).
+  - PLAN §2.7 (KA constraints): 2-D ndranges allocate per launch on the KA CPU backend; allocation-free phases use
+    1-D ndranges with the extra dimension folded into the group index.
 
 ---
 

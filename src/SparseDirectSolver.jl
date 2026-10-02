@@ -59,4 +59,8 @@ include("numeric/subtree.jl")
 include("numeric/factorize.jl")
 include("numeric/extract.jl")
 
+# solve phase on the device (PLAN §2.5)
+include("solve/permute.jl")
+include("solve/sweeps.jl")
+
 end # module SparseDirectSolver
