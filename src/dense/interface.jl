@@ -206,7 +206,9 @@ function _generic_trsm!(side::Char, uplo::Char, trans::Char, diag::Char, α, A, 
     tri = uplo == 'L' ? (diag == 'U' ? UnitLowerTriangular(A) : LowerTriangular(A)) :
           (diag == 'U' ? UnitUpperTriangular(A) : UpperTriangular(A))
     M = _op_wrap(tri, trans)
-    side == 'L' ? ldiv!(M, B) : rdiv!(B, M)
+    # 3-argument ldiv!: the 2-argument form calls `istriu(M)` first on Julia ≥ 1.11, which
+    # scans `A` elementwise (scalar indexing) when `A` is a view of a device array
+    side == 'L' ? ldiv!(B, M, B) : rdiv!(B, M)
     return B
 end
 

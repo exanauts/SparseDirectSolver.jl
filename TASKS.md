@@ -1650,6 +1650,10 @@ whenever `atomic_add` is `false`. Close #36 in this task's PR.
   matrix; errors (too many right-hand sides, mismatched `X`, a workspace of another analysis); default options, no
   regime A, `"algo1"` (KA dense on the C path) and `"algo2"`; every `impl` available for both `trsm` and `gemm`; no
   allocation beyond `solve_alloc_budget` on CPU (0 B measured on Julia 1.13). CUDA/AMDGPU: pending CI on the PR.
+  CI fix round 1: CUDA on Julia 1.13 errored (scalar indexing) in "schedules and dense implementations" with
+  `impl = :generic`: the 2-argument `ldiv!(::AbstractTriangular, B)` of Julia ≥ 1.11 calls `istriu` on the L11
+  view of the factor, which GPUArrays only overloads for unwrapped device matrices. `_generic_trsm!` now uses the
+  3-argument `ldiv!(B, M, B)` (same `generic_trimatdiv!` path, no `istriu`); CPU suite still 46356 pass.
 - Measurements (ubuntu-latest KA CPU backend, Float64, default analysis, best of 3, measured while another test run
   shared the machine, so indicative only; `ref` = `ref_solve!` on the host factor):
 
