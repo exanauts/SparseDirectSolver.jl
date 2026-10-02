@@ -2004,6 +2004,16 @@ whenever `atomic_add` is `false`. Close #36 in this task's PR.
 
 **Reads**: PLAN §1.2, §1.3 (`ir_*`, `solve_mode`), §1.4 (`user_host_interrupt`, `ir_n_steps` data), §2.5.
 
+**Owner note (issue #71)**: the MadNLP K2 dumps in `bench/data` are badly
+scaled and static in-front pivoting cannot bound the growth (`max|L|` 1e14 to
+1e16, factor error up to 3.6 on case1354); cuDSS's default static pivoting
+fails on them too (T04 baseline: relres 7 to 170). Refinement is half of the
+remedy, matching and scaling (T21) the other half. Add to the Report a table of
+`relres` before and after `ir_n_steps ∈ {0, 2, 5}` on the K2 dumps of
+`bench/pivot_pairs.jl` (case118 and case1354, iterations 1, 10, 20), and
+repeat it once T21 has landed. The bar is cuDSS with `"matching_alg" =
+"algo5"` and `"ir_n_steps" = 5`: 3.7e-13 (case118) and 4.6e-11 (case1354).
+
 #### Deliverables
 
 * `src/solve/refinement.jl`: KA CSR SpMV on the full-pattern map (symmetric
@@ -2100,6 +2110,19 @@ weighted matching instead (the 2-cycles of the matching permutation, Duff &
 Pralet 2005) and hand them to `compute_ordering(…; pairs)`; expose the
 tolerance as a tuning parameter next to `amalgamation`. The greedy pairs stay
 the default without matching. Closes #67.
+
+**Owner note (issue #71)**: acceptance measurement on the MadNLP K2 dumps
+(`bench/pivot_pairs.jl`, case118 and case1354 at iterations 1, 10, 20, plus
+the converged case14 iterate `k2_15`): `max|L|`, `‖A[p,p] − LDLᵀ‖_F/‖A‖_F`,
+`nperturbed` and `nnz(L)` with the symmetric matching and scaling on, against
+the unscaled numbers of #71. The bar is cuDSS with `"matching_alg" = "algo5"`
+on the same dumps (T04 baseline): `npivots` 0 (case118) and 14 (case1354),
+relres 5.4e-13 and 7.7e-3 before refinement. On the converged case14 iterate
+almost every row is a pair candidate and the default pairs cost 1.9× `nnz(L)`
+for no gain; the matching-based pairs of #67 must do better there. Decide in
+the Report whether the a posteriori pivoting of M13 (T27) must move before
+the MadNLP integration; the cuDSS evidence says matching is enough. Closes
+#71.
 
 Host MC64-style matching (job 5 first), `perm_matching`, `scale_row/col`,
 composition with the ordering; test: on a badly scaled unsymmetric matrix the
