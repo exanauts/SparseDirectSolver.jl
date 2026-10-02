@@ -263,7 +263,9 @@ end
 Point `desc` at `x` without copying (≅ `cudss_update(matrix, x)`). `x` must hold
 `nrows * ncols * nbatch` entries of type `T`: either as a strided vector, or with
 the descriptor's shape (`(nrows, ncols)`, `(ncols, nrows)` when transposed, plus
-a trailing `nbatch` dimension for 3-D arrays). Anything else throws
+a trailing `nbatch` dimension for 3-D arrays; a uniform batch also accepts the
+`nrows × (ncols nbatch)` matrix with the same memory, e.g. `n × nbatch` for
+`MatrixDescriptor(T, n; nbatch)`, as CUDSS.jl). Anything else throws
 `InvalidValueError`.
 """
 function update!(desc::MatrixDescriptor{T, A}, x::AbstractArray) where {T, A}
@@ -276,7 +278,9 @@ function update!(desc::MatrixDescriptor{T, A}, x::AbstractArray) where {T, A}
     if ndims(x) > 1
         shape = desc.transposed ? (desc.ncols, desc.nrows) : (desc.nrows, desc.ncols)
         expected = ndims(x) == 2 ? shape : (shape..., desc.nbatch)
-        ndims(x) <= 3 && size(x) == expected ||
+        batch_matrix = ndims(x) == 2 && desc.nbatch > 1 && !desc.transposed &&
+                       size(x) == (desc.nrows, desc.ncols * desc.nbatch)
+        ndims(x) <= 3 && (size(x) == expected || batch_matrix) ||
             throw(InvalidValueError("array of size $(size(x)) does not match descriptor shape $expected"))
     end
     desc.data = x

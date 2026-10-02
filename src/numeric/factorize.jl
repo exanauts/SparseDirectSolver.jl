@@ -143,10 +143,22 @@ function _factor_panels_c_batched!(N::Numeric{T}, S::Symbolic, s::Int, j0::Int, 
     P3 = reshape(view(N.factor, (off + 1):(off + f * w * count)), f, w, count)
     F11 = view(P3, 1:w, 1:w, :)
     ioff = (s - 1) * nb + k0 - 1                              # info of front s, member k0 (interleaved)
-    _potrf_batched_impl!(p.bpotrf, F11, N.info, ioff)
+    ptrs = N.plan.vendor_ptrs[s]                              # (F11, F21) member pointers, or nothing
+    if p.bpotrf === :vendor && ptrs !== nothing
+        vendor_potrf_batched_ptrs!('L', w, view(ptrs[1], k0:(k0 + count - 1)), f,
+                                   view(N.info, (ioff + 1):(ioff + count)), count)
+        ka_chol_check_info!(N.info, ioff, F11)
+    else
+        _potrf_batched_impl!(p.bpotrf, F11, N.info, ioff)
+    end
     m > 0 || return nothing
     F21 = view(P3, (w + 1):f, 1:w, :)
-    trsm_strided_batched!('R', 'L', 'C', 'N', one(T), F11, F21; impl = p.btrsm)
+    if p.btrsm === :vendor && ptrs !== nothing
+        vendor_trsm_batched_ptrs!('R', 'L', 'C', 'N', one(T), m, w, view(ptrs[1], k0:(k0 + count - 1)), f,
+                                  view(ptrs[2], k0:(k0 + count - 1)), f, count)
+    else
+        trsm_strided_batched!('R', 'L', 'C', 'N', one(T), F11, F21; impl = p.btrsm)
+    end
     c0 = L.cb_ptr[s]
     c0 > 0 || return nothing                                  # no parent: nothing to update
     C = reshape(view(N.work, 1:(m * m * count)), m, m, count)
@@ -203,7 +215,14 @@ the analysis used `factorization_alg = "algo1"`, no vendor calls). Then
 
 Returns `info = 0` on success, else the original column of the smallest
 non-positive pivot of the factor (as [`ref_factorize!`](@ref)); fronts above a
-failed one hold garbage. `opts.user_host_interrupt` is polled before every
+failed one hold garbage. Uniform batch (`numeric.nbatch > 1`, PLAN §3.5): the
+active members of `numeric` ([`set_members!`](@ref)) are factorized by the same
+launches with the batch index as one more grid dimension (`nzval` holds the
+values of every member, member after member), a regime-C front by
+strided-batched `potrf`/`trsm`/`gemm` over each run of consecutive members
+(vendor `potrf`/`trsm` on the member pointers built at allocation; per member
+with `impl = :generic`); the return value is the first nonzero member `info`
+(see [`member_info!`](@ref) for all of them). `opts.user_host_interrupt` is polled before every
 launch group (a host read): when set, [`InterruptedError`](@ref) is raised and
 the factor is incomplete. Structure `"SPD"` (real) or `"HPD"`. Nothing is
 allocated on the device; the panels are bitwise reproducible for a fixed

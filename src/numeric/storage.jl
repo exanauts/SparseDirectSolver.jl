@@ -24,6 +24,10 @@ buffer of the one `info` read per phase (one entry per batch member).
 Batch state (PLAN §3.5): `members_host[1:nact[]]` are the active members of the
 last phase (mirrored in `numeric.members`), `runs` the starts of their runs of
 consecutive members ([`member_runs!`](@ref), the strided batches of regime C).
+`vendor_ptrs[s]` (regime-C front `s` of a batch on a backend with batched vendor
+`potrf`/`trsm`, else `nothing`): the device vectors of member pointers
+`(F11, F21)` of its `nbatch` panels, built once at allocation
+([`vendor_batch_pointers`](@ref)).
 """
 struct NumericPlan
     step_first::Vector{Int}
@@ -40,6 +44,7 @@ struct NumericPlan
     members_host::Vector{Int32}
     nact::Base.RefValue{Int}
     runs::Vector{Int}
+    vendor_ptrs::Vector{Any}
 end
 
 function NumericPlan(S, nb::Integer = 1)
@@ -81,7 +86,7 @@ function NumericPlan(S, nb::Integer = 1)
         end
     end
     return NumericPlan(first, last, maxchild, gfirst, glast, gmaxchild, gwidth, sfirst, slast, slocal, zeros(Int32, nb),
-                       Int32.(1:nb), Ref(Int(nb)), [1, nb + 1])
+                       Int32.(1:nb), Ref(Int(nb)), [1, nb + 1], Any[nothing for _ in 1:ns])
 end
 
 """
@@ -193,10 +198,34 @@ function allocate_numeric(S::Symbolic{INT}, ::Type{T}, backend::KernelAbstractio
     aux = KernelAbstractions.zeros(backend, T, nb)
     members = KernelAbstractions.allocate(backend, Int32, nb)
     copyto!(members, Int32.(1:nb))
+    plan = NumericPlan(S, nb)
+    nb > 1 && _vendor_batch_pointers!(plan.vendor_ptrs, factor, S, nb)
     return Numeric{T, typeof(factor), typeof(stats), typeof(info), typeof(pivot_kind)}(factor, d, stack, work, stats,
                                                                                          info, piv, pivot_kind, totals,
-                                                                                         psign, aux, NumericPlan(S, nb),
-                                                                                         members, nb)
+                                                                                         psign, aux, plan, members, nb)
+end
+
+# member pointers of the F11 and F21 blocks of the `nb` panels of every regime-C front, when the backend has batched
+# vendor `potrf`/`trsm` (and the analysis uses vendor calls in regime C)
+function _vendor_batch_pointers!(ptrs::Vector{Any}, factor::AbstractVector{T}, S::Symbolic, nb::Int) where {T}
+    sc, L = S.schedule, S.layout
+    _is_ldlt_structure(S.structure) && return ptrs           # LDLᵀ/LDLᴴ: KA kernels in every regime
+    sc.vendor_c || return ptrs
+    caps = capabilities(KernelAbstractions.get_backend(factor), T)
+    caps.vendor_potrf_batched || caps.vendor_trsm_batched || return ptrs
+    for s in 1:nsupernodes(S)
+        takes_c_path(sc, s) || continue
+        f, w = sc.rows[s], sc.width[s]
+        off = panel_offset(L.panel_ptr, s, 1, nb) - 1
+        P = reshape(view(factor, (off + 1):(off + f * w * nb)), f, w, nb)
+        try
+            ptrs[s] = (vendor_batch_pointers(view(P, 1:w, 1:w, :)), vendor_batch_pointers(view(P, (w + 1):f, 1:w, :)))
+        catch err
+            err isa NotSupportedError || rethrow()
+            return ptrs                                       # no pointer binding: the per-call batched calls
+        end
+    end
+    return ptrs
 end
 
 """
