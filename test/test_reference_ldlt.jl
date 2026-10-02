@@ -35,6 +35,9 @@ psign_minus(n, j) = (v = zeros(Int8, n); v[j] = -1; v)
 end
 
 @testset "P A Pᵀ = L D Lᴴ, inertia and solves: $T" for T in ELTYPES
+    # The matrices and right-hand sides otherwise depend on the RNG state left by the preceding
+    # testsets (backend list, test subset): reseed so each T sees one fixed draw.
+    Random.seed!(666)
     nh, nj = 300, 100
     cases = [("random_symindef(400,0.01)", random_symindef(T, 400, 0.01), Options()),
              ("kkt(300,100,1e-2)", kkt_matrix(T, nh, nj, 1.0e-2), Options()),
@@ -59,12 +62,20 @@ end
                 b = nrhs == 1 ? rand(T, size(A, 1)) : rand(T, size(A, 1), nrhs)
                 x = similar(b)
                 @test SDS.ref_solve!(x, S, N, b) === x
-                # Issue #66: pivot_pairs = "default" pairs only the structurally zero dual pivots. The
-                # other duals of this generator meet weak couplings first, so max|L| grows to ~1e4 (80
-                # with "all"): the factor error and inertia hold, but on this draw the ComplexF32
-                # residual is 1.2–1.8× tol(T) (other draws pass). Refinement (T16) is the remedy; the
-                # last case asserts the bound with "all".
-                @test relres(A, x, b) <= tol(T) broken = (name == "kkt(300,100,1e-8)" && T == ComplexF32)
+                if name == "kkt(300,100,1e-8)" && T == ComplexF32
+                    # Issue #66: pivot_pairs = "default" pairs only the structurally zero dual
+                    # pivots. The other duals of this generator meet weak couplings first, so max|L|
+                    # can grow to ~1e4 (80 with "all"); the factor error and inertia hold. The
+                    # ComplexF32 residual is ≤ 0.4 tol(T) on most draws (seeds 1–15) but 1.3–1.8×
+                    # tol(T) on this one with Julia ≥ 1.11's sprand stream (it passes on Julia 1.10),
+                    # so neither @test nor @test_broken holds on every CI version. One refinement
+                    # step (the remedy, T16) must bring it under tol(T); the last case asserts the
+                    # unrefined bound with "all".
+                    x1 = x + SDS.ref_solve!(similar(b), S, N, b - A * x)
+                    @test relres(A, x1, b) <= tol(T)
+                else
+                    @test relres(A, x, b) <= tol(T)
+                end
                 y = copy(b)
                 SDS.ref_solve!(y, S, N, y)
                 @test y == x

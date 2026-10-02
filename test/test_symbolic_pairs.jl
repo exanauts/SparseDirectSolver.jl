@@ -230,6 +230,8 @@ end
     # leaf. On these generators almost every dual pivot is structurally zero, so "default" pairs
     # most of them and costs 1.6–2.2× nnz_L, like "all"; the T14 interleaved user_perm is worse. On
     # MadNLP K2 systems "default" costs 1.3–1.4× and "all" ~2× (issue #66, bench/pivot_pairs.jl).
+    # Pairing fewer duals is not monotone in nnz_L under AMD: over 15 seeds "default"/"all" was
+    # 0.96–1.025 (1.012 on Julia 1.10's draw), hence the 5% margin.
     for (nh, nj, A) in ((300, 100, kkt_matrix(T, 300, 100, 1.0e-8)),
                         (200, 100, kkt_matrix(T, 200, 100, 0.0; hessian = :indefinite)))
         _, ord, _ = pairs_ordering(A)
@@ -238,7 +240,7 @@ end
         _, inter, _ = pairs_ordering(A; opts = Options(user_perm = kkt_interleaved_perm(nh, nj)))
         @test isempty(none.pairs) && isempty(inter.pairs) && length(all_.pairs) == nj
         @test 0 < length(ord.pairs) <= nj
-        @test ord.stats.nnz_L <= all_.stats.nnz_L <= 2.5 * none.stats.nnz_L
+        @test ord.stats.nnz_L <= 1.05 * all_.stats.nnz_L && all_.stats.nnz_L <= 2.5 * none.stats.nnz_L
         @test all_.stats.nnz_L <= inter.stats.nnz_L
     end
     # no candidate (Gershgorin-dominant diagonal): no pair, bitwise the same analysis

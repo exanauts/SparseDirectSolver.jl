@@ -1961,7 +1961,10 @@ whenever `atomic_add` is `false`. Close #36 in this task's PR.
     candidates whose pivot is structurally zero in the ordering (`zero_pivot_pairs!`, iterated with re-ordering):
     1.25–1.4× nnz(L) and 29–49 perturbed pivots instead of ~2000 on the case1354 K2 dumps (`bench/pivot_pairs.jl`);
     `"all"` keeps the #64 behaviour. On `kkt_matrix(300,100,1e-8)` the unpaired duals give max|L| ~1e4 (80 with
-    `"all"`); one ComplexF32 residual check is `broken` for it in `test_reference_ldlt.jl` (refinement, T16). The
+    `"all"`); its ComplexF32 residual is 1.3–1.8× tol on the seed-666 draw of Julia ≥ 1.11 (≤ 0.4× on Julia 1.10
+    and on seeds 1–15), so `test_reference_ldlt.jl` asserts tol for that one case after one refinement step (T16)
+    and reseeds the testset. `"default"` is not monotone below `"all"` in nnz(L) (0.96–1.025× over 15 seeds),
+    so `test_symbolic_pairs.jl` bounds it by 1.05× `"all"` (CI round 1: Julia 1.10 gave 1.012×). The
     K2 dumps keep max|L| ~1e15 in every mode (unscaled): #71 (found-by-agent, T21/M13).
   - T15: `D`, `piv` and `pivot_kind` of the device kernels can be compared bitwise against `ref_ldlt!` only if they
     follow the same pivot sequence: the same candidate order, the same tie-breaking (the first maximum), and the
