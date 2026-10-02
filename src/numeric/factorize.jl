@@ -1,9 +1,9 @@
 # Level driver of the numeric phase (PLAN §2.4, §3.9): a fixed sequence of
 # launches over the steps of the schedule, no allocation, no host
-# synchronization except the final read of the reduced `info`. In this version
-# every front goes through the regime-C path: assembly kernels per step, then
-# `potrf`/`trsm`/`syrk` (`herk`) per front through the dense interface.
-# Regimes B and A get their fused kernels in T10 and T11.
+# synchronization except the final read of the reduced `info`. Regime-B groups
+# run the fused per-front kernel (`src/numeric/front.jl`, one launch per group);
+# regime-C groups run the assembly kernels, then `potrf`/`trsm`/`syrk` (`herk`)
+# per front through the dense interface. Regime A gets its fused kernels in T11.
 
 "Workgroup size of the per-phase reduction of the front statistics."
 const STATS_WORKGROUP = 256
@@ -78,8 +78,10 @@ function _check_numeric(N::Numeric{T}, S::Symbolic, nzval::AbstractVector) where
 end
 
 # the dense implementations of the regime-C front kernels, resolved once per phase (backend and `T` are
-# fixed), so the per-front calls do no capability lookup (its lock and closure allocate)
-function _front_impls(N::Numeric{T}, impl::Symbol) where {T}
+# fixed), so the per-front calls do no capability lookup (its lock and closure allocate);
+# `factorization_alg = "algo1"` (no vendor calls) turns `:auto` into the KA kernels
+function _front_impls(N::Numeric{T}, S::Symbolic, impl::Symbol) where {T}
+    impl === :auto && !S.schedule.vendor_c && (impl = :ka)
     return (potrf = select_impl(:potrf, N.factor, impl), trsm = select_impl(:trsm, N.factor, impl),
             herk = select_impl(T <: Real ? :syrk : :herk, N.factor, impl))
 end
@@ -87,18 +89,23 @@ end
 # regime-C dense kernels of front `s` (assembled panel + contribution block), `p` from `_front_impls`
 function _factor_front_c!(N::Numeric{T}, S::Symbolic, s::Int, p::NamedTuple) where {T}
     L, sc = S.layout, S.schedule
-    f, w = sc.rows[s], sc.width[s]
+    _factor_panel_c!(N.factor, N.stack, N.info, s, L.panel_ptr[s], sc.rows[s], sc.width[s], L.cb_ptr[s], p)
+    return nothing
+end
+
+# `potrf`/`trsm`/`syrk` (`herk`) on the `f×w` panel at `factor[p0]` and the `m×m` contribution
+# block at `stack[c0]` (`c0 = 0`: none), status into `info[s]` (also used by bench/front_bins.jl)
+function _factor_panel_c!(factor::AbstractVector{T}, stack::AbstractVector{T}, info::AbstractVector{Int32}, s::Int,
+                          p0::Int, f::Int, w::Int, c0::Int, p::NamedTuple) where {T}
     m = f - w
-    p0 = L.panel_ptr[s]
-    P = reshape(view(N.factor, p0:(p0 + f * w - 1)), f, w)
+    P = reshape(view(factor, p0:(p0 + f * w - 1)), f, w)
     F11 = view(P, 1:w, 1:w)
-    _potrf_info_impl!(p.potrf, 'L', F11, N.info, s)
+    _potrf_info_impl!(p.potrf, 'L', F11, info, s)
     m > 0 || return nothing
     F21 = view(P, (w + 1):f, 1:w)
     _trsm_impl!(p.trsm, 'R', 'L', 'C', 'N', one(T), F11, F21)
-    c0 = L.cb_ptr[s]
     c0 > 0 || return nothing                                  # no parent: nothing to update
-    C = reshape(view(N.stack, c0:(c0 + m * m - 1)), m, m)
+    C = reshape(view(stack, c0:(c0 + m * m - 1)), m, m)
     _herk_impl!(p.herk, 'L', C, F21, -one(real(T)), one(real(T)))
     return nothing
 end
@@ -109,34 +116,42 @@ end
 Multifrontal Cholesky `P A Pᵀ = L Lᴴ` on the device: `nzval` are the stored
 values of A (same pattern, view and index base as the analysis) on the backend
 of `numeric`, and `symbolic` has its maps on that backend
-(`adapt(backend, symbolic, INT)`). For every step of the schedule: one launch
-each of [`zero_fronts!`](@ref), [`scatter_A!`](@ref) and
-[`extend_add!`](@ref) over the step's fronts, then per front
-[`potrf_info!`](@ref), [`trsm!`](@ref) and [`herk!`](@ref)/[`syrk!`](@ref) on
-its panel and contribution block through the dense interface (`impl` is passed
-on: `:auto`, `:generic`, `:vendor`, `:ka`, resolved once per call); every front takes this regime-C
-path. Then [`cholesky_stats!`](@ref) and one read of the reduced status.
+(`adapt(backend, symbolic, INT)`). For every launch group of the schedule,
+in order: a regime-B group (width class `W ≤ 64`) is one
+[`factorize_fronts_b!`](@ref) launch (fused assembly, `F11` Cholesky in local
+memory, `trsm`, `syrk`/`herk` into the front's contribution block); a regime-C
+group is one launch each of [`zero_fronts!`](@ref), [`scatter_A!`](@ref) and
+[`extend_add!`](@ref) over its fronts, then per front [`potrf_info!`](@ref),
+[`trsm!`](@ref) and [`herk!`](@ref)/[`syrk!`](@ref) on its panel and
+contribution block through the dense interface (`impl` is passed on: `:auto`,
+`:generic`, `:vendor`, `:ka`, resolved once per call; `:auto` means `:ka` when
+the analysis used `factorization_alg = "algo1"`, no vendor calls). Then
+[`cholesky_stats!`](@ref) and one read of the reduced status.
 
 Returns `info = 0` on success, else the original column of the smallest
 non-positive pivot of the factor (as [`ref_factorize!`](@ref)); fronts above a
 failed one hold garbage. Structure `"SPD"` (real) or `"HPD"`; the analysis must
 have no regime-A subtrees (`subtree_budgets = Int[]`) until T11. Nothing is
 allocated on the device; the panels are bitwise reproducible for a fixed
-`impl` and backend.
+`impl` and backend (regime B is deterministic by construction).
 """
 function factorize!(N::Numeric{T}, S::Symbolic, nzval::AbstractVector; impl::Symbol = :auto) where {T}
     _check_numeric(N, S, nzval)
-    p = _front_impls(N, impl)
+    p = _front_impls(N, S, impl)
     plan = N.plan
     nodes = S.schedule.group_nodes
-    for t in 1:S.schedule.nsteps
-        a, b = plan.step_first[t], plan.step_last[t]
-        b >= a || continue
-        zero_fronts!(N, S, a, b - a + 1)
-        scatter_A!(N, S, nzval, a, b - a + 1)
-        extend_add!(N, S, a, b - a + 1, plan.step_maxchild[t])
-        for q in a:b
-            _factor_front_c!(N, S, nodes[q], p)
+    for k in eachindex(plan.group_first)
+        a, b = plan.group_first[k], plan.group_last[k]
+        W = plan.group_width[k]
+        if W > 0
+            factorize_fronts_b!(N, S, nzval, a, b - a + 1, plan.group_maxchild[k], W)
+        else
+            zero_fronts!(N, S, a, b - a + 1)
+            scatter_A!(N, S, nzval, a, b - a + 1)
+            extend_add!(N, S, a, b - a + 1, plan.group_maxchild[k])
+            for q in a:b
+                _factor_front_c!(N, S, nodes[q], p)
+            end
         end
     end
     cholesky_stats!(N, S)

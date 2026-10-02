@@ -169,3 +169,54 @@ function ka_cpu_alloc_budget(launches::Integer, localmem_bytes::Integer)
     Base.JLOptions().code_coverage != 0 && (b += localmem_bytes + 64 * launches)
     return b
 end
+
+"""
+    triangle_view(A, view) -> SparseMatrixCSC
+
+The part of `A` stored for matrix view `view` (`'L'`: `tril(A)`, `'U'`: `triu(A)`, `'F'`: `A`).
+"""
+triangle_view(A, view) = view == 'L' ? tril(A) : view == 'U' ? triu(A) : A
+
+"""
+    numeric_setup(backend, A, INT = Int32; view = 'L', index = 'O', opts) -> (S, Nr, info_ref, Sd, Nd, nz)
+
+Host analysis `S` of the `view` triangle of the SPD/HPD matrix `A` (index base
+`index`, options `opts`), its reference factor `Nr` and `info_ref`
+(`ref_factorize!`), the analysis adapted to `backend` with `INT` maps, device
+storage `Nd` and the values `nz` on `backend` (T09, T10).
+"""
+function numeric_setup(backend, A::SparseMatrixCSC{T}, ::Type{INT} = Int32; view = 'L', index = 'O',
+                       opts = Options(subtree_budgets = Int[])) where {T, INT}
+    C = SparseDirectSolver.CSR(triangle_view(A, view); index)
+    S = SparseDirectSolver.symbolic_analysis(C, spd_structure(T), view; opts)
+    Nr = SparseDirectSolver.allocate_numeric(S, T)
+    info_ref = SparseDirectSolver.ref_factorize!(Nr, S, C.nzval)
+    Sd = SparseDirectSolver.adapt(backend, S, INT)
+    Nd = SparseDirectSolver.allocate_numeric(Sd, T, backend)
+    return S, Nr, info_ref, Sd, Nd, to_device(backend, C.nzval)
+end
+
+"""
+    panel_error(Nh, Nr)
+
+`max |L_device - L_ref| / max |L_ref|` of a host copy `Nh` of a device factor
+and the reference factor `Nr`; compare with [`panel_tol`](@ref).
+"""
+panel_error(Nh, Nr) = maximum(abs, Nh.factor - Nr.factor) / maximum(abs, Nr.factor)
+
+"""
+    numeric_alloc_budget(S, T) -> Int
+
+[`ka_cpu_alloc_budget`](@ref) for one `factorize!` of the analysis `S` with
+element type `T` and `impl = :auto` on the CPU backend: at most three
+assembly launches per launch group, one `ka_chol_check_info!` per front and
+the statistics launch; `@localmem` of the statistics kernel plus, per group,
+that of the largest fused regime-B kernel (packed 64×64 triangle, status, pivot).
+"""
+function numeric_alloc_budget(S, ::Type{T}) where {T}
+    ngroups = length(S.schedule.groups)
+    launches = 3 * ngroups + SparseDirectSolver.nsupernodes(S) + 1
+    localmem = SparseDirectSolver.STATS_WORKGROUP * sizeof(Int64) +
+               ngroups * (64 * 65 ÷ 2 * sizeof(T) + sizeof(Int32) + sizeof(real(T)))
+    return ka_cpu_alloc_budget(launches, localmem)
+end

@@ -10,12 +10,9 @@
 "Workgroup size of the assembly kernels."
 const ASSEMBLY_WORKGROUP = 256
 
-@kernel function _zero_fronts_kernel!(factor, stack, nodes, first, front_ptr, front_nrows, front_ncols, cb_ptr,
-                                      ::Val{WG}) where {WG}
-    li = @index(Local, Linear)
-    g = @index(Group, Linear)
+# zero the panel and the update-stack contribution block of front `s` (work item `li` of `WG`)
+@inline function _zero_front!(factor, stack, s, li, front_ptr, front_nrows, front_ncols, cb_ptr, ::Val{WG}) where {WG}
     @inbounds begin
-        s = nodes[first + g - 1]
         z = zero(eltype(factor))
         for q in (front_ptr[s] + li - 1):WG:(front_ptr[s + 1] - 1)
             factor[q] = z
@@ -28,6 +25,15 @@ const ASSEMBLY_WORKGROUP = 256
             end
         end
     end
+    return nothing
+end
+
+@kernel function _zero_fronts_kernel!(factor, stack, nodes, first, front_ptr, front_nrows, front_ncols, cb_ptr,
+                                      ::Val{WG}) where {WG}
+    li = @index(Local, Linear)
+    g = @index(Group, Linear)
+    @inbounds s = nodes[first + g - 1]
+    _zero_front!(factor, stack, s, li, front_ptr, front_nrows, front_ncols, cb_ptr, Val(WG))
 end
 
 """
@@ -49,12 +55,10 @@ end
 # value of nzval entry `x` as added at amap offset `off` (negative: conjugate)
 @inline _amap_value(::Type{T}, x, off) where {T} = off < 0 ? T(conj(x)) : T(x)
 
-@kernel function _scatter_A_kernel!(factor, nzval, amap, amap_ptr, amap_src, nodes, first, ::Val{WG}) where {WG}
-    li = @index(Local, Linear)
-    g = @index(Group, Linear)
+# assemble the values of A into the zeroed panel of front `s` (work item `li` of `WG`)
+@inline function _scatter_front!(factor, nzval, amap, amap_ptr, amap_src, s, li, ::Val{WG}) where {WG}
     @inbounds begin
         T = eltype(factor)
-        s = nodes[first + g - 1]
         a = amap_ptr[s]
         b = amap_ptr[s + 1] - 1
         # the entries of a front are sorted by destination: the work item holding
@@ -75,6 +79,14 @@ end
             end
         end
     end
+    return nothing
+end
+
+@kernel function _scatter_A_kernel!(factor, nzval, amap, amap_ptr, amap_src, nodes, first, ::Val{WG}) where {WG}
+    li = @index(Local, Linear)
+    g = @index(Group, Linear)
+    @inbounds s = nodes[first + g - 1]
+    _scatter_front!(factor, nzval, amap, amap_ptr, amap_src, s, li, Val(WG))
 end
 
 """
@@ -94,6 +106,45 @@ function scatter_A!(N::Numeric, S::Symbolic, nzval::AbstractVector, first::Integ
     return N
 end
 
+# add the lower triangle of the contribution block of the `k`-th child of front `s`
+# (if any) to the panel and contribution block of `s` (work item `li` of `WG`)
+@inline function _extend_add_child!(factor, stack, s, k, li, front_ptr, front_nrows, front_ncols, cb_ptr,
+                                    child_ptr, child_list, relind_ptr, relind, ::Val{WG}) where {WG}
+    @inbounds begin
+        kc = child_ptr[s] + k - 1
+        if kc < child_ptr[s + 1]
+            c = child_list[kc]
+            cb = cb_ptr[c]
+            if cb > 0
+                mc = front_nrows[c] - front_ncols[c]
+                fp = front_nrows[s]
+                wp = front_ncols[s]
+                mp = fp - wp
+                pp = front_ptr[s]
+                cp = cb_ptr[s]
+                r0 = relind_ptr[c] - 1
+                for q in (li - 1):WG:(mc * mc - 1)
+                    jj = q ÷ mc + 1
+                    ii = q - (jj - 1) * mc + 1
+                    if ii >= jj                         # lower triangle of the block
+                        ri = relind[r0 + ii]
+                        rj = relind[r0 + jj]
+                        v = stack[cb + q]
+                        if rj <= wp
+                            d = pp + (rj - 1) * fp + ri - 1
+                            factor[d] += v
+                        else
+                            d = cp + (rj - wp - 1) * mp + ri - wp - 1
+                            stack[d] += v
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return nothing
+end
+
 @kernel function _extend_add_kernel!(factor, stack, nodes, first, front_ptr, front_nrows, front_ncols, cb_ptr,
                                      child_ptr, child_list, relind_ptr, relind, maxchild, ::Val{WG}) where {WG}
     li = @index(Local, Linear)
@@ -101,39 +152,9 @@ end
     # children one after the other (fixed order, a barrier between them): rows
     # of one child go to distinct destinations, rows of two children may not
     for k in 1:maxchild
-        @inbounds begin
-            s = nodes[first + g - 1]
-            kc = child_ptr[s] + k - 1
-            if kc < child_ptr[s + 1]
-                c = child_list[kc]
-                cb = cb_ptr[c]
-                if cb > 0
-                    mc = front_nrows[c] - front_ncols[c]
-                    fp = front_nrows[s]
-                    wp = front_ncols[s]
-                    mp = fp - wp
-                    pp = front_ptr[s]
-                    cp = cb_ptr[s]
-                    r0 = relind_ptr[c] - 1
-                    for q in (li - 1):WG:(mc * mc - 1)
-                        jj = q ÷ mc + 1
-                        ii = q - (jj - 1) * mc + 1
-                        if ii >= jj                         # lower triangle of the block
-                            ri = relind[r0 + ii]
-                            rj = relind[r0 + jj]
-                            v = stack[cb + q]
-                            if rj <= wp
-                                d = pp + (rj - 1) * fp + ri - 1
-                                factor[d] += v
-                            else
-                                d = cp + (rj - wp - 1) * mp + ri - wp - 1
-                                stack[d] += v
-                            end
-                        end
-                    end
-                end
-            end
-        end
+        @inbounds s = nodes[first + g - 1]
+        _extend_add_child!(factor, stack, s, k, li, front_ptr, front_nrows, front_ncols, cb_ptr, child_ptr,
+                           child_list, relind_ptr, relind, Val(WG))
         @synchronize
     end
 end

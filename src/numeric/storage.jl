@@ -10,13 +10,23 @@ Host launch plan of the level driver ([`factorize!`](@ref)), derived from the
 [`Schedule`](@ref) once at allocation: for every step `t` of regimes B/C,
 `step_first[t]:step_last[t]` is its range in `schedule.group_nodes` (empty
 when `step_first[t] > step_last[t]`) and `step_maxchild[t]` the largest number
-of children of one of its fronts (the trip count of the owner-pull extend-add);
-`info_host` is the host staging buffer of the one `info` read per phase.
+of children of one of its fronts (the trip count of the owner-pull extend-add).
+The launch groups of regimes B/C, in execution order: group `k` covers
+`group_first[k]:group_last[k]` of `group_nodes`, its fronts have at most
+`group_maxchild[k]` children, and `group_width[k]` is the width class `W` of
+its fused regime-B kernel ([`factorize_fronts_b!`](@ref)), or `0` when the
+group takes the regime-C path (regime C, or a regime-B bin wider than
+`REGIME_B_MAX_WIDTH`). `info_host` is the host staging buffer of the one
+`info` read per phase.
 """
 struct NumericPlan
     step_first::Vector{Int}
     step_last::Vector{Int}
     step_maxchild::Vector{Int}
+    group_first::Vector{Int}
+    group_last::Vector{Int}
+    group_maxchild::Vector{Int}
+    group_width::Vector{Int}
     info_host::Vector{Int32}
 end
 
@@ -31,8 +41,15 @@ function NumericPlan(S)
     first = ones(Int, sc.nsteps)
     last = zeros(Int, sc.nsteps)
     maxchild = zeros(Int, sc.nsteps)
+    gfirst, glast, gmaxchild, gwidth = Int[], Int[], Int[], Int[]
+    nf = length(sc.fclasses)
     for grp in sc.groups
         grp.regime == REGIME_A && continue
+        W = grp.regime == REGIME_B ? sc.wclasses[(grp.class - 1) ÷ nf + 1] : 0
+        push!(gfirst, grp.first)
+        push!(glast, grp.last)
+        push!(gmaxchild, maximum(q -> nchild[sc.group_nodes[q]], grp.first:grp.last; init = 0))
+        push!(gwidth, W <= REGIME_B_MAX_WIDTH ? W : 0)
         t = grp.step
         if last[t] < first[t]
             first[t] = grp.first
@@ -44,7 +61,7 @@ function NumericPlan(S)
             maxchild[t] = max(maxchild[t], nchild[sc.group_nodes[q]])
         end
     end
-    return NumericPlan(first, last, maxchild, zeros(Int32, 1))
+    return NumericPlan(first, last, maxchild, gfirst, glast, gmaxchild, gwidth, zeros(Int32, 1))
 end
 
 """
