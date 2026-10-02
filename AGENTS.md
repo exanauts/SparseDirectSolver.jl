@@ -144,9 +144,11 @@ reviewing agent must pass. The moving parts:
 # full test suite (CPU backend + CUDA when functional)
 julia --project=. -e 'using Pkg; Pkg.test()'
 
-# CPU only / a subset of test files
+# CPU only / GPU only (as the CUDA CI jobs) / a subset of test files / all but some
 SDS_TEST_GPU=0 julia --project=. -e 'using Pkg; Pkg.test()'
+SDS_TEST_CPU=0 julia --project=. -e 'using Pkg; Pkg.test()'
 SDS_TEST_ONLY="test_symbolic_etree,test_options" julia --project=. -e 'using Pkg; Pkg.test()'
+SDS_TEST_SKIP="test_aqua" julia --project=. -e 'using Pkg; Pkg.test()'
 
 # instantiate / update after editing Project.toml
 julia --project=. -e 'using Pkg; Pkg.instantiate()'
@@ -155,7 +157,11 @@ julia --project=. -e 'using Pkg; Pkg.instantiate()'
 julia --project=bench bench/cudss_baseline.jl
 ```
 
-`SDS_TEST_GPU` and `SDS_TEST_ONLY` are implemented in `test/runtests.jl` (T01).
+`SDS_TEST_GPU` and `SDS_TEST_ONLY` are implemented in `test/runtests.jl` (T01),
+`SDS_TEST_CPU` (in `test/backends.jl`) and `SDS_TEST_SKIP` were added for CI: the
+CUDA jobs run with `SDS_TEST_CPU=0 SDS_TEST_SKIP=test_aqua`, since the CPU-only
+jobs already cover the CPU backend and Aqua. A task's "passes on CPU and CUDA"
+still means the default run (both backends) on the owner's machine.
 
 ## Code conventions
 

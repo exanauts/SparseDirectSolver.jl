@@ -24,7 +24,9 @@ so the **Report** block at the end of each task must be filled in honestly.
 5. Run the full suite with
    `julia --project=. -e 'using Pkg; Pkg.test()'`.
    `SDS_TEST_GPU=0` skips CUDA; `SDS_TEST_ONLY="name1,name2"` restricts to the
-   named test files (both implemented in T01).
+   named test files (both implemented in T01); `SDS_TEST_CPU=0` skips the CPU
+   backend and `SDS_TEST_SKIP="name1,name2"` leaves files out (used by the CUDA
+   CI jobs, which run `SDS_TEST_CPU=0 SDS_TEST_SKIP=test_aqua`).
 6. Every public function gets a docstring. Tests are deterministic
    (`Random.seed!(666)`). Tolerances and matrix generators come from
    `test/utils.jl` and `test/matrices.jl` (T01); do not invent new ones per file.
@@ -47,8 +49,9 @@ so the **Report** block at the end of each task must be filled in honestly.
 
 ## Shared test conventions (created in T01, used everywhere)
 
-* `test/backends.jl`: `BACKENDS = Any[CPU()]`, plus `CUDABackend()` when
-  `CUDA.functional()` and `SDS_TEST_GPU != "0"`. `to_device(backend, x)` maps
+* `test/backends.jl`: `BACKENDS = Any[CPU()]` (unless `SDS_TEST_CPU == "0"`),
+  plus `CUDABackend()` when `CUDA.functional()` and `SDS_TEST_GPU != "0"`; an
+  empty list is an error. `to_device(backend, x)` maps
   `Array`/`SparseMatrixCSC` to the backend (`CuArray`, `CuSparseMatrixCSR`),
   `to_host(x)` maps back. `backend_name(backend)` for testset names.
 * `test/matrices.jl` (all return `SparseMatrixCSC{T,Int}`):
