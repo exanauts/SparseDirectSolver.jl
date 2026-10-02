@@ -1,17 +1,18 @@
 # Port of `cudss_solver()` with `cudss_solver_data_parameters` and
 # `cudss_solver_config_parameters` (CUDSS.jl test/test_cudss.jl): the get/set
-# loop over every data and configuration parameter, restricted to the SPD/HPD
-# structures.
+# loop over every data and configuration parameter.
 #
 # Changes:
-# * structures "SPD" and "HPD" only (real `T`: both; complex `T`: "HPD", and
-#   "SPD" is checked to be rejected at analysis);
+# * structures "S", "H", "SPD" and "HPD" ("G" is T19; complex `T`: "SPD" is
+#   checked to be rejected at analysis); the matrix is SPD/HPD, so `"inertia"`
+#   is `(n, 0)` for real "S" and "H" (complex symmetric "S": `(0, 0)`, no
+#   inertia) and `"diag"` is real positive except for complex "S";
 # * `matching_alg = "algo6"` before the analysis is skipped: matching is T21 and
 #   the analysis raises `NotSupportedError` for it (checked);
 # * cuDSS's set-buffer-then-get protocol for vector data is
 #   `getparam!(buffer, solver, name)`; the matching outputs (`"perm_matching"`,
-#   `"scale_row"`, `"scale_col"`), `"npivots"`, `"inertia"` and
-#   `"hybrid_device_memory_min"` are not implemented yet (`NotSupportedError`);
+#   `"scale_row"`, `"scale_col"`) and `"hybrid_device_memory_min"` are not
+#   implemented yet (`NotSupportedError`);
 # * configuration values that the package does not accept raise errors instead
 #   of being passed to the library: `factorization_alg`/`pivot_epsilon_alg`
 #   `"algo3"`–`"algo5"` and `solve_alg` `"algo2"`–`"algo5"` (`InvalidValueError`,
@@ -26,8 +27,7 @@ const PORTED_ACCEPTED_ALGOS = Dict(
     "pivot_epsilon_alg" => ("default", "algo1", "algo2"),
 )
 
-const PORTED_NOT_IMPLEMENTED_DATA = ("npivots", "inertia", "perm_matching", "scale_row", "scale_col",
-                                     "hybrid_device_memory_min")
+const PORTED_NOT_IMPLEMENTED_DATA = ("perm_matching", "scale_row", "scale_col", "hybrid_device_memory_min")
 
 function ported_solver_data_parameters(backend, solver, structure, n, memory_estimates, buffer_int::Vector{INT},
                                        buffer_R, buffer_T) where {INT}
@@ -54,7 +54,8 @@ function ported_solver_data_parameters(backend, solver, structure, n, memory_est
             end
             if parameter == "diag"
                 getparam!(buffer_T, solver, parameter)
-                @test all(x -> real(x) > 0 && imag(x) == 0, buffer_T)
+                csym = structure == "S" && eltype(buffer_T) <: Complex      # D of a complex symmetric matrix
+                csym || @test all(x -> real(x) > 0 && imag(x) == 0, buffer_T)
             end
             if parameter == "memory_estimates"
                 getparam!(memory_estimates, solver, parameter)
@@ -80,6 +81,9 @@ function ported_solver_data_parameters(backend, solver, structure, n, memory_est
                 parameter ∈ ("perm_reorder_row", "perm_reorder_col") && @test isperm(val)
                 parameter == "diag" && @test length(val) == n
                 parameter == "memory_estimates" && @test length(val) == 16
+                parameter == "npivots" && @test val == 0
+                csym = structure == "S" && eltype(buffer_T) <: Complex
+                parameter == "inertia" && @test val == (csym ? (0, 0) : (n, 0))
             end
         end
     end
@@ -165,7 +169,7 @@ end
                                                                       INT in INTTYPES
     n = 20
     A_cpu = random_spd(T, n, 1.0)
-    @testset "structure = $structure" for structure in (T <: Real ? ("SPD", "HPD") : ("HPD",))
+    @testset "structure = $structure" for structure in (T <: Real ? ("S", "H", "SPD", "HPD") : ("S", "H", "HPD"))
         @testset "view = $view" for view in ('L', 'U', 'F')
             A_gpu = api_matrix(backend, triangle_view(A_cpu, view), INT)
             ported_solver(backend, T, INT, A_gpu, structure, view, n)

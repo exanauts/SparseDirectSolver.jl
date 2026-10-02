@@ -54,12 +54,13 @@ of its transpose with the view flipped (`'L'` ↔ `'U'`); for complex Hermitian
 matrices this needs the conjugated solve of `solve_mode` (T16) and raises
 [`NotSupportedError`](@ref) for now.
 
-Implemented at this point (v0.1): structures `"SPD"` (real `T`) and `"HPD"`, a
-single matrix (no uniform batch), the phases `"reordering"`,
-`"symbolic_factorization"`, `"analysis"`, `"factorization"`,
-`"refactorization"`, `"solve"`, `"solve_fwd_perm"`, `"solve_fwd"`,
-`"solve_bwd"` and `"solve_bwd_perm"` ([`execute!`](@ref)). Other structures and
-phases raise [`NotSupportedError`](@ref) when they are executed.
+Implemented at this point: structures `"SPD"` (real `T`), `"HPD"`, `"S"`
+(LDLᵀ; complex symmetric for complex `T`) and `"H"` (LDLᴴ), a single matrix
+(no uniform batch), the phases `"reordering"`, `"symbolic_factorization"`,
+`"analysis"`, `"factorization"`, `"refactorization"`, `"solve"`,
+`"solve_fwd_perm"`, `"solve_fwd"`, `"solve_diag"`, `"solve_bwd"` and
+`"solve_bwd_perm"` ([`execute!`](@ref)). Structure `"G"` and the other phases
+raise [`NotSupportedError`](@ref) when they are executed.
 
 Fields: `A` (the current [`CSR`](@ref), re-pointed by [`update!`](@ref)),
 `structure`, `view` (as given), `options` ([`Options`](@ref), set through
@@ -221,13 +222,16 @@ Execute `phase` on `solver` (≅ `cudss(phase, solver, x, b)`), PLAN §1.2:
   allocates the numeric storage and the solve workspace (needs `"reordering"`);
 * `"analysis"`: both;
 * `"factorization"`: numeric factorization with the current values of the
-  matrix (needs the analysis); sets `"info"` (`0` or the original column of the
-  first non-positive pivot) and clears `fresh_factorization`;
+  matrix (needs the analysis); sets `"info"` (`0` or, for `"SPD"`/`"HPD"`, the
+  original column of the first non-positive pivot; LDLᵀ/LDLᴴ perturbs tiny
+  pivots instead and always reports `0`, see `"npivots"`) and clears
+  `fresh_factorization`;
 * `"refactorization"`: the same with the analysis and storage reused, `"info"`
   reset first (needs a previous `"factorization"`);
 * `"solve"`: `X = A⁻¹ B`; the sub-phases `"solve_fwd_perm"` (permute `B` into the
-  workspace), `"solve_fwd"` (forward sweep), `"solve_bwd"` (backward sweep) and
-  `"solve_bwd_perm"` (inverse permutation into `X`) do the same in four calls
+  workspace), `"solve_fwd"` (forward sweep), `"solve_diag"` (`D⁻¹` of LDLᵀ/LDLᴴ,
+  the identity for Cholesky), `"solve_bwd"` (backward sweep) and
+  `"solve_bwd_perm"` (inverse permutation into `X`) do the same in five calls
   with the same `X`, `B`.
 
 `X` and `B` are only read by the solve phases (pass anything, e.g. `nothing`,
@@ -236,10 +240,10 @@ to the others): vectors, `n × nrhs` matrices, strided vectors or
 backend; `X === B` is allowed. A failed factorization does not throw (as in
 cuDSS): check `getparam(solver, "info")`; solving with it gives garbage.
 
-`"solve_diag"`, `"solve_refinement"`, `"solve_fwd_schur"` and
-`"solve_bwd_schur"` raise [`NotSupportedError`](@ref) until their task (T16,
-T20); unknown phase strings raise `ArgumentError`. Executing a phase before
-the phases it depends on raises [`FactorizationError`](@ref).
+`"solve_refinement"`, `"solve_fwd_schur"` and `"solve_bwd_schur"` raise
+[`NotSupportedError`](@ref) until their task (T16, T20); unknown phase
+strings raise `ArgumentError`. Executing a phase before the phases it depends
+on raises [`FactorizationError`](@ref).
 With `asynchronous = false` the backend is synchronized before returning
 (`KernelAbstractions.synchronize`).
 """
@@ -254,12 +258,12 @@ function execute!(phase::AbstractString, solver::DirectSolver, X, B; asynchronou
         _symbolic!(solver)
     elseif p == PHASE_FACTORIZATION || p == PHASE_REFACTORIZATION
         _factorize!(solver, p)
-    elseif p == PHASE_SOLVE || p == PHASE_SOLVE_FWD_PERM || p == PHASE_SOLVE_FWD || p == PHASE_SOLVE_BWD ||
-           p == PHASE_SOLVE_BWD_PERM
+    elseif p == PHASE_SOLVE || p == PHASE_SOLVE_FWD_PERM || p == PHASE_SOLVE_FWD || p == PHASE_SOLVE_DIAG ||
+           p == PHASE_SOLVE_BWD || p == PHASE_SOLVE_BWD_PERM
         _solve!(solver, p, X, B)
     else
         throw(NotSupportedError("phase \"$phase\" is not implemented yet " *
-                                "($(p == PHASE_SOLVE_DIAG || p == PHASE_SOLVE_REFINEMENT ? "T16" : "T20"))"))
+                                "($(p == PHASE_SOLVE_REFINEMENT ? "T16" : "T20"))"))
     end
     asynchronous || KernelAbstractions.synchronize(solver.backend)
     return nothing
@@ -268,10 +272,10 @@ end
 # options that no phase implements yet: refuse them instead of silently ignoring them
 function _check_analysis_supported(solver::DirectSolver{T}) where {T}
     s = solver.structure
-    (s == STRUCTURE_SPD || s == STRUCTURE_HPD) ||
-        throw(NotSupportedError("structure \"$(convert(String, s))\" is not implemented yet (LDLᵀ/LDLᴴ: T14/T15, " *
-                                "LU: T19); use \"SPD\" or \"HPD\""))
-    T <: Complex && s != STRUCTURE_HPD &&
+    s == STRUCTURE_GENERAL &&
+        throw(NotSupportedError("structure \"G\" (LU) is not implemented yet (T19); use \"S\", \"H\", \"SPD\" or " *
+                                "\"HPD\""))
+    T <: Complex && s == STRUCTURE_SPD &&
         throw(InvalidValueError("a complex positive definite matrix needs structure \"HPD\""))
     opts = solver.options
     opts.ubatch_size > 1 && throw(NotSupportedError("uniform batches (ubatch_size > 1) are not implemented yet (T17)"))
@@ -334,15 +338,15 @@ function _factorize!(solver::DirectSolver, p::Phase)
     p == PHASE_REFACTORIZATION && solver.stage < STAGE_FACTORIZED &&
         throw(_phase_error(name, "needs a previous \"factorization\""))
     p == PHASE_REFACTORIZATION && (solver.info = 0)
-    solver.info = _numeric_phase!(solver.numeric, solver.symbolic, solver.A.nzval)
+    solver.info = _numeric_phase!(solver.numeric, solver.symbolic, solver.A.nzval, solver.options)
     solver.stage = STAGE_FACTORIZED
     p == PHASE_FACTORIZATION && (solver.fresh_factorization = false)
     return solver
 end
 
 # function barrier: concrete storage types for the numeric phase
-_numeric_phase!(N::Numeric, S::Symbolic, nzval::AbstractVector) = factorize!(N, S, nzval)
-_numeric_phase!(N::Numeric, S::Symbolic, nzval::AbstractMatrix) = factorize!(N, S, vec(nzval))
+_numeric_phase!(N::Numeric, S::Symbolic, nzval::AbstractVector, opts::Options) = factorize!(N, S, nzval; opts)
+_numeric_phase!(N::Numeric, S::Symbolic, nzval::AbstractMatrix, opts::Options) = factorize!(N, S, vec(nzval); opts)
 
 # user data of a right-hand side / solution: (array, transposed)
 _rhs_data(X::AbstractVecOrMat) = (X, false)
@@ -411,6 +415,8 @@ function _solve_phase!(solver::DirectSolver, p::Phase, X::AbstractVecOrMat, B::A
         permute_rhs!(ws.Y, B, S.perm; transposed)
     elseif p == PHASE_SOLVE_FWD
         forward_sweep!(ws, S, N; nrhs, deterministic = det)
+    elseif p == PHASE_SOLVE_DIAG
+        diagonal_sweep!(ws, S, N; nrhs)
     elseif p == PHASE_SOLVE_BWD
         backward_sweep!(ws, S, N; nrhs)
     else  # PHASE_SOLVE_BWD_PERM
@@ -462,13 +468,12 @@ end
 # ---------------------------------------------------------------------------
 # parameters
 
-# data parameters the v0.1 solver computes (PLAN §1.4)
+# data parameters the solver computes (PLAN §1.4, §1.7)
 const SOLVER_OUTPUTS = ("lu_nnz", "flops", "nsuperpanels", "memory_estimates", "perm_reorder_row",
-                        "perm_reorder_col", "perm_row", "perm_col", "diag")
+                        "perm_reorder_col", "perm_row", "perm_col", "diag", "npivots", "inertia", "pivot_stats")
 
 # task that provides the other computed data parameters
 function _output_task(name)
-    name in ("npivots", "inertia", "pivot_stats") && return "T14/T15"
     name in ("perm_matching", "scale_row", "scale_col") && return "T21"
     name in ("schur_shape", "schur_matrix") && return "T20"
     name == "nd_partition_tree" && return "T24"
@@ -483,6 +488,9 @@ Set a configuration or user-input data parameter of `solver` (≅ `cudss_set`):
 everything [`setparam!`](@ref)`(::Options, …)` accepts, stored in
 `solver.options` and used by the next phase that reads it, plus the data
 parameter `"info"` (an integer; CUDSS.jl resets it before a refactorization).
+`"pivot_sign"` (PLAN §1.7: a vector of `n` entries in `(-1, 0, 1)`, host or
+device, or `nothing`) is checked against the size of the matrix; the next
+`"factorization"`/`"refactorization"` copies it to the device.
 Computed data parameters (`"lu_nnz"`, `"diag"`, `"perm_row"`, …) cannot be set
 (`ArgumentError`): read them with [`getparam`](@ref) or [`getparam!`](@ref),
 which replaces cuDSS's set-buffer-then-get protocol.
@@ -494,6 +502,8 @@ function setparam!(solver::DirectSolver, name::AbstractString, value)
         solver.info = Int(value)
     elseif name == "schur_matrix"
         throw(NotSupportedError("the data parameter \"schur_matrix\" is not implemented yet (T20)"))
+    elseif name == "pivot_sign" && value !== nothing && length(value) != size(solver, 1)
+        throw(InvalidValueError("pivot_sign has $(length(value)) entries, the matrix has $(size(solver, 1)) rows"))
     else
         setparam!(solver.options, name, value)
     end
@@ -523,13 +533,17 @@ The data parameters computed by the solver:
 | `"memory_estimates"` | `Vector{Int64}` (16 entries, see [`memory_estimates`](@ref)) | analysis |
 | `"perm_reorder_row"`, `"perm_reorder_col"` | `Vector{Int}`: the fill-reducing permutation, 1-based (`perm[k]` = original index of the `k`-th pivot) | reordering |
 | `"perm_row"`, `"perm_col"` | `Vector{Int}`: the final permutation of the factor (= the reordering for Cholesky) | analysis |
-| `"diag"` | vector of `T` on the solver's backend: the diagonal of `L` in factor order | factorization |
+| `"diag"` | vector of `T` on the solver's backend: the diagonal of `L` (Cholesky) or of `D` (LDLᵀ/LDLᴴ; for a 2×2 block its two diagonal entries) in factor order | factorization |
+| `"npivots"` | `INT`: perturbed pivots (LDLᵀ/LDLᴴ; `0` for Cholesky) | factorization |
+| `"inertia"` | `Tuple{INT, INT}`: `(npos, nneg)` of D (after perturbation, so the inertia of `A + E`; read it with `"npivots"`); `(0, 0)` for complex symmetric `"S"`; Cholesky: `(number of positive pivots, 0)` | factorization |
+| `"pivot_stats"` | `NamedTuple` `(npos, nneg, nzero, nperturbed, n2x2)` of `Int64` (PLAN §1.7) | factorization |
 
-The reordering permutation after `"reordering"` alone is the ordering
-algorithm's; `"symbolic_factorization"` composes it with the supernodal
+The pivot statistics are reduced on the device ([`reduce_stats!`](@ref)) and
+copied to the host when read (one synchronization). The reordering
+permutation after `"reordering"` alone is the ordering algorithm's; `"symbolic_factorization"` composes it with the supernodal
 renumbering, and from then on both permutations are the one the factor uses.
-Data parameters of later tasks (`"npivots"`, `"inertia"`, `"perm_matching"`,
-`"scale_row"`, `"schur_shape"`, …) raise [`NotSupportedError`](@ref); reading
+Data parameters of later tasks (`"perm_matching"`, `"scale_row"`,
+`"schur_shape"`, …) raise [`NotSupportedError`](@ref); reading
 one before the phase that computes it raises [`FactorizationError`](@ref).
 """
 function getparam(solver::DirectSolver, name::AbstractString)
@@ -546,6 +560,10 @@ function getparam(solver::DirectSolver, name::AbstractString)
     if name == "diag"
         _need_stage(solver, STAGE_FACTORIZED, name)
         return _factor_diag(solver)
+    end
+    if name in ("npivots", "inertia", "pivot_stats")
+        _need_stage(solver, STAGE_FACTORIZED, name)
+        return _pivot_output(solver, name)
     end
     _need_stage(solver, STAGE_ANALYZED, name)
     Sh = solver.host_symbolic
@@ -595,10 +613,25 @@ end
     end
 end
 
-# diagonal of L in factor order, on the solver's backend (one launch, one work item per supernode)
+# npivots / inertia / pivot_stats from the statistics reduced on the device (Cholesky: reduced on demand)
+function _pivot_output(solver::DirectSolver{T, INT}, name) where {T, INT}
+    S, N = solver.symbolic, solver.numeric
+    _is_ldlt_structure(S.structure) || reduce_stats!(N, S)
+    st = pivot_totals(N)
+    name == "npivots" && return INT(st.nperturbed)
+    name == "inertia" && return (INT(st.npos), INT(st.nneg))
+    return st
+end
+
+# diagonal of L (Cholesky) or D (LDLᵀ/LDLᴴ) in factor order, on the solver's backend
+# (Cholesky: one launch, one work item per supernode)
 function _factor_diag(solver::DirectSolver{T}) where {T}
     S, N = solver.symbolic, solver.numeric
     d = KernelAbstractions.zeros(solver.backend, T, S.n)
+    if _is_ldlt_structure(S.structure)
+        copyto!(d, 1, N.d, 1, S.n)
+        return d
+    end
     ns = nsupernodes(S)
     ns > 0 || return d
     _factor_diag_kernel!(solver.backend, 64)(d, N.factor, S.super_ptr, S.front_ptr, S.front_nrows, ns; ndrange = ns)

@@ -122,9 +122,11 @@ end
     # unknown phase strings: ArgumentError; phases of later tasks: NotSupportedError
     @test thrown(() -> execute!("solving", solver, x, b)) isa ArgumentError
     @test thrown(() -> execute!("Solve", solver, x, b)) isa ArgumentError
-    for phase in ("solve_diag", "solve_refinement", "solve_fwd_schur", "solve_bwd_schur")
+    for phase in ("solve_refinement", "solve_fwd_schur", "solve_bwd_schur")
         @test thrown(() -> execute!(phase, solver, x, b)) isa NotSupportedError
     end
+    # "solve_diag" (T15) is the identity for Cholesky
+    @test execute!("solve_diag", solver, x, b) === nothing
     # a new analysis resets the factorization
     execute!("analysis", solver, x, b)
     @test solver.fresh_factorization
@@ -149,7 +151,7 @@ end
     setparam!(solver, "solve_alg", "algo1")
     @test thrown(() -> execute!("solve", solver, x, b)) isa NotSupportedError
     setparam!(solver, "solve_alg", "default")
-    s3 = DirectSolver(api_matrix(backend, tril(A)), sym_structure(T), 'L')
+    s3 = DirectSolver(api_matrix(backend, A), "G", 'F')      # LU: T19
     @test thrown(() -> execute!("analysis", s3, x, b)) isa NotSupportedError
     if T <: Complex
         s4 = DirectSolver(api_matrix(backend, tril(A)), "SPD", 'L')
@@ -210,10 +212,14 @@ end
     for name in ("lu_nnz", "perm_row", "diag", "nsuperpanels", "memory_estimates")
         @test thrown(() -> setparam!(solver, name, 1)) isa ArgumentError
     end
-    for name in ("npivots", "inertia", "perm_matching", "scale_row", "scale_col", "schur_shape", "schur_matrix",
-                 "nd_partition_tree", "hybrid_device_memory_min", "pivot_stats")
+    for name in ("perm_matching", "scale_row", "scale_col", "schur_shape", "schur_matrix", "nd_partition_tree",
+                 "hybrid_device_memory_min")
         @test thrown(() -> getparam(solver, name)) isa NotSupportedError
     end
+    # pivot statistics of a successful Cholesky factorization (T15)
+    @test getparam(solver, "inertia") == (n, 0) && getparam(solver, "inertia") isa Tuple{INT, INT}
+    @test getparam(solver, "npivots") == 0 && getparam(solver, "npivots") isa INT
+    @test getparam(solver, "pivot_stats") == (npos = n, nneg = 0, nzero = 0, nperturbed = 0, n2x2 = 0)
     @test thrown(() -> getparam(solver, "no_such_parameter")) isa ArgumentError
     @test thrown(() -> setparam!(solver, "no_such_parameter", 1)) isa ArgumentError
     # configuration parameters go to the solver's options

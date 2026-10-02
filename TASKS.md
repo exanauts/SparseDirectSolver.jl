@@ -1983,7 +1983,7 @@ whenever `atomic_add` is `false`. Close #36 in this task's PR.
 
 ---
 
-## T15 — GPU LDLᵀ/LDLᴴ in regimes A/B/C, diagonal solve, statistics   `[ ]`
+## T15 — GPU LDLᵀ/LDLᴴ in regimes A/B/C, diagonal solve, statistics   `[!]`
 
 **Reads**: PLAN §2.4, §3.3, §2.6 (sytrf), §1.4.
 
@@ -2009,6 +2009,131 @@ whenever `atomic_add` is `false`. Close #36 in this task's PR.
 * Determinism on CUDA (bitwise `D` and panels).
 * MadNLP-style loop from T14 on the GPU; the ported CUDSS.jl symmetric tests
   pass for `T ∈ ELTYPES`.
+
+### Report
+
+- Status: [!] (done on the CPU backend; regime C runs the KA kernel for `"S"` too, no vendor `sytrf`, see deviations;
+  CUDA from CI)
+- What was built:
+  - `src/numeric/ldlt.jl` (new): the T14 in-front factorization as KA kernels, pivot for pivot.
+    `front_ldlt_kernel!` (regimes B and C): one workgroup (`LDLT_WORKGROUP = 128`) per front of a launch group,
+    fused zero/scatter/owner-pull extend-add (the T09 device functions), then the pivoted factorization of the
+    `w` fully-summed columns in place in the panel, then `F₂₂ ← F₂₂ − (L₂₁D)L₂₁ᴴ` into the front's packed block on
+    the update stack (`W = L₂₁D` formed on the fly from `d`/`pivot_kind`, 2×2 blocks included), unit diagonal.
+    `subtree_ldlt_kernel!` (regime A): the T11 subtree walk with packed fronts and blocks in `@localmem`, the same
+    pivot steps on the packed front, the block update in place in the trailing triangle. Per pivot step (a loop of
+    `w` iterations with a uniform trip count; a 2×2 pivot leaves the last ones idle): work item 1 chooses the pivot
+    (`_lt_choose` = the reference's `_choose_pivot`, `_accept_1x1`, `_accept_2x2`, `_best_1x1` on the lower
+    triangle), the workgroup swaps rows/columns (LAPACK-style symmetric interchange of the lower triangle), work
+    item 1 stores D (perturbation `±ε` with the `pivot_sign` of the original row, `psign[perm[piv[g]]]`), the pivot
+    kinds and the counts, the workgroup applies the rank-1/rank-2 update to the remaining fully-summed columns, then
+    scales the pivot columns into L. Pivot choice, control words and per-front counts live in `@localmem` and go
+    to `numeric.stats`. No atomics, deterministic. `_LDLTDevice{R, H}` carries `pivot_type`, `pivot_threshold`,
+    `pivot_epsilon` and the scaled flag (`H`: Hermitian/real vs complex symmetric as a type parameter).
+    `factorize_ldlt!(numeric, symbolic, nzval; opts)` (copies `pivot_sign` to `numeric.psign`, `abs_max!` for
+    `pivot_epsilon_alg = "algo1"`, one launch per regime-A class and per B/C launch group, `reduce_stats!`; returns 0,
+    no host synchronization), `reduce_stats!` (one workgroup, `@localmem` tree reduction of the per-front statistics
+    into `numeric.totals`), `pivot_totals` (reads them), `abs_max!`. `factorize!(N, S, nzval; impl, opts)`
+    dispatches to it for `"S"`/`"H"`.
+  - `Numeric` gains `totals` (6 `Int64`), `psign` (`n` `Int8`) and `aux` (one `T`: `max|aᵢⱼ|`); `allocate_numeric`,
+    `host_numeric`, `memory_estimates` slot 11 updated. `ref_ldlt!` fills `totals` too.
+  - `src/solve/sweeps.jl`: the forward kernel reorders a front's slice of `Y` by its local pivot order before its
+    TRSV, the backward kernel restores it after its TRSV (`Val(LDL)`; scratch: rows `1:w` of the front's
+    gather-list buffer in `U`, unused before), as `ref_solve_ldlt!` does; `Val(CONJ) = false` solves with `Lᵀ` for
+    complex symmetric `"S"`; the regime-C path gets a pivot-order kernel each way and `'T'` dense calls for complex
+    `"S"`. The unit diagonal is stored, so the TRSVs divide by 1 (exact) and need no change. `diagonal_sweep!` is
+    one launch (1×1 and 2×2 blocks of D); identity for Cholesky.
+  - API (`src/solver.jl`, `src/generic.jl`, CUDA extension): structures `"S"` (complex: complex symmetric) and
+    `"H"` accepted (`"G"` refused, T19); `execute!("solve_diag", …)`; `getparam` for `"npivots"` (`INT`), `"inertia"`
+    (`Tuple{INT, INT}`, as CUDSS.jl), `"pivot_stats"` (NamedTuple) from the device totals (Cholesky: reduced on
+    demand, `(npos, 0)`), `"diag"` = `d[1:n]` for LDLᵀ; `setparam!(solver, "pivot_sign", v)` checks the length
+    (host or device vector), the next factorization copies it to the device; `ldlt(A::CSR; view, check)`,
+    `ldlt!(solver, A)`, `logabsdet` for LDLᵀ/LDLᴴ (`det D`, 2×2 blocks, sign ±1 or complex); CUDA extension:
+    `ldlt(::CuSparseMatrixCSR)` and its `Symmetric`/`Hermitian` wrappers.
+  - Tests: `test/test_numeric_ldlt.jl` (new); `test/ported/cudss_execution.jl` and `cudss_generic.jl` gain the
+    "Symmetric -- Hermitian" parts; `cudss_solver.jl` runs `"S"`/`"H"` too and checks `"npivots"`/`"inertia"`;
+    helpers `ldlt_setup`, `d_error`, `ldlt_alloc_budget`, `madnlp_inertia_loop_device` in `test/utils.jl`,
+    `solve_alloc_budget(…; ldlt)`; `MADNLP_ORDERINGS` moved from `test_reference_ldlt.jl` to `test/matrices.jl`.
+- Tests: `SDS_TEST_GPU=0 julia --project=. -e 'using Pkg; Pkg.test()'` (Julia 1.13.1, ubuntu-latest, CPU):
+  59877 pass / 0 fail / 0 broken (11 min 54 s); test_numeric_ldlt 1822 pass (31 s in the suite, ~6 min
+  standalone, mostly compilation), test_ported 8104 pass. Under CI's flags (`coverage = true`, `--check-bounds=yes`)
+  test_numeric_ldlt + test_api: 3768 pass / 0 fail. Julia 1.10 not run locally (CI). Covered, per backend and `T ∈ ELTYPES`
+  (`"S"` real, `"H"` complex):
+  - Device factor vs `ref_ldlt!` on the T14 matrices (`random_symindef(400,0.01)`, `kkt(300,100,1e-2)`,
+    `kkt(300,100,1e-8)` default and interleaved ordering, `random_symindef(300,0.02)`, indefinite-H KKT δ = 0,
+    the 2×2 case `hessian_scale = 1e-3` interleaved, complex symmetric for complex `T`), each under three analyses
+    (default, regimes A+B+C with small budgets and C thresholds, C only): `piv == `, `pivot_kind ==`, `stats ==`,
+    totals `==`, D and panels within `panel_tol(T)` (100 eps) of the reference; inertia equals the eigenvalue
+    signs on the `n ≤ 300` cases; `relres ≤ tol(T)` for `nrhs ∈ {1, 5}`, atomic and deterministic sweeps
+    (`kkt(300,100,1e-8)` ComplexF32 after one refinement step, as in T14 / #66).
+  - Regime-A groups with Int64 maps; views `'U'`/`'F'` give `==` factors.
+  - `singular_block_matrix` (structurally zero and stored zero, both `pivot_sign` signs) under the default analysis
+    and with the zero pivot in a regime-C root front (`"algo2"`; asserted `snparent == 0`, `takes_c_path`): D,
+    `piv`, kinds `==` the reference, perturbed entry `±ε` exactly at row `j`, inertia, consistent-RHS relres ≤ 1e-6;
+    `pivot_epsilon`, scaled `"algo1"` (device `max|a|`), `'N'`, `'D'`; wrong `pivot_sign` length.
+  - `'D'`/`'N'` on quasi-definite KKT (no 2×2, no perturbation, inertia `(nh, nj)`, `'N'` no interchange).
+  - Determinism: refactorization with new values and back gives `==` factor, D, `piv`; deterministic solves `==`;
+    no allocation beyond the budgets in `factorize!` (64 B measured) and the solve (0 B) on the CPU backend.
+  - Sweeps one at a time (permute, forward, diagonal, backward) `==` the solve, against `extract_ldlt`'s `L` and
+    `D`; every dense implementation on the regime-C path.
+  - MadNLP-style inertia loop through the handle layer (`DirectSolver`, `nzval` rewritten, `"refactorization"`,
+    `getparam("inertia")`, `"npivots"`) for the three T14 orderings: same iterations and `δw` as the reference loop,
+    final solve `relres ≤ tol(T)`.
+  - Public API for `INT ∈ INTTYPES`: phases, `npivots`/`inertia`/`pivot_stats` (types, values against the
+    reference, phase-order errors), `diag`, `getparam!`, the five sub-phases `==` `"solve"`, `logabsdet` against the
+    dense one (also complex symmetric), `pivot_sign` set through the solver (length error, device vector, perturbed
+    sign and inertia), `ldlt(::CSR)`.
+  - Ported: `cudss_execution` "Symmetric -- Hermitian" (views F/L/U × pivoting C/R/N, refactorization after a
+    diagonal shift), `cudss_generic` `ldlt`/`ldlt!`/`ldiv!`/`\`, `cudss_solver` for `"S"`/`"H"`; `T ∈ ELTYPES`,
+    `INT ∈ INTTYPES`.
+  - CUDA/AMDGPU: pending CI on the PR.
+- Measurements (ubuntu-latest KA CPU backend, Float64, best of 3; device = `factorize!` on the CPU backend, so only
+  launch counts and equality are meaningful, the GPU numbers are owed):
+
+  ```text
+  matrix                         fronts A/B/C  launches  ref_ldlt!   device    ref_solve!  sweep_solve!  same piv
+  random_symindef(2000,0.002)     194/33/23       34      159 ms     292 ms     0.72 ms     1.45 ms      yes
+  kkt(3000,1000,1e-8)             151/80/35       31    12.9 s      13.5 s      6.0 ms      6.8 ms       yes
+  kkt(3000,1000,1e-8), C only       0/0/302       37     2.06 s      7.7 s      5.4 ms      5.8 ms       yes
+  laplacian2d(100,100) - 3I       3305/27/1       20     13.3 ms    31.8 ms     2.1 ms      5.3 ms       yes
+  ```
+
+  The 13 s of the KKT case are the reference's `_best_1x1` fallback scan (`O(w²f)` per front) on fronts with
+  unpaired dual rows, inherited by the device kernel (#75). `@allocated factorize!` (LDLᵀ, second call): 64 B.
+- Deviations from PLAN.md / this task:
+  - **No vendor `sytrf` for regime C.** Regime-B and regime-C groups both run the fused KA `front_ldlt_kernel!`
+    (one workgroup per front), for `"S"` as for `"H"`. LAPACK/cuSOLVER `sytrf` factors `F₁₁` alone with its own
+    Bunch–Kaufman sequence (no `pivot_threshold` against the rows of `F₂₁`, its own tie-breaking, blocked updates),
+    so `D`/`pivot_kind` would not equal the reference, which this task's first test requires, and the "post-check
+    and KA redo" needs a copy of the assembled block (`sytrf` overwrites it). The large-front performance (vendor
+    BLAS-3 for `L₂₁` and the contribution block, or `sytrf` with a documented different sequence) is follow-up #75
+    (T25).
+  - Regime B keeps the panel in global memory (pivot decisions, control words and counts in `@localmem`), the
+    pivot search is serial on work item 1 (the reference's logic verbatim); both are T25 items (#75).
+  - Bunch–Kaufman `α` is now `real(T)(α)` in the reference too (was a Float64 constant, so Float32 comparisons ran
+    in Float64): the device kernels need the same arithmetic, and Metal has no Float64.
+  - `getparam(solver, "inertia")` for SPD/HPD returns `(positive pivots, 0)` and `"npivots"` 0 (not specified).
+  - `Numeric` gains three more fields (`totals`, `psign`, `aux`; PLAN §3.2).
+  - The first regime-A kernel had 34 arguments; its KA CPU launch was not specialized (dynamic dispatch, ~400 B per
+    workgroup). The Hermitian flag is now a type parameter of the pivot parameters and `n` comes from
+    `length(perm)`, so the kernel has 32 arguments and allocates nothing (32 is what was verified, not the exact
+    limit).
+  - Test adaptations required by the new features: `test_api.jl` no longer expects `"S"`/`"H"` (now `"G"`),
+    `"solve_diag"`, `"npivots"`, `"inertia"`, `"pivot_stats"` to raise `NotSupportedError`, and asserts their values
+    instead; `cudss_solver.jl` likewise. No assertion was loosened.
+- Open issues / follow-ups:
+  - #75 (found-by-agent): serial pivot search with the `O(w²f)` fallback scan, one workgroup per regime-C front, no
+    vendor `sytrf`, `F₁₁` not in local memory (T25).
+  - On a GPU, the pivot sequence can differ from the CPU reference if FMA contraction changes the rounding of a
+    near-tie in the pivot tests; the equality tests use well-separated generators, CI will tell.
+  - T16: `"solve_diag"` exists now; the complex `solve_mode` and refinement remain. `ir_n_steps` still warns.
+- Suggested plan changes:
+  - PLAN §2.4 / §3.3: regime C of `"S"` uses the KA in-front kernel (same pivot sequence as the oracle); vendor
+    calls only for the BLAS-3 parts (`L₂₁`, contribution block), or `sytrf` when equality with the reference is
+    not required.
+  - PLAN §3.2: `Numeric` also holds `totals`, `psign`, `aux`.
+  - PLAN §2.7: KA CPU launches with many arguments (34 here) are not specialized and allocate; keep kernels at
+    ≤ 32 arguments.
 
 ---
 

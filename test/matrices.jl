@@ -163,6 +163,11 @@ block instead of eliminating a (near-)zero dual pivot on its own.
 """
 kkt_interleaved_perm(nh::Integer, nj::Integer) = vcat([[i, nh + i] for i in 1:nj]..., (nj + 1):nh)
 
+# orderings of the MadNLP-style loops on kkt_matrix(T, 200, 100, 0; hessian = :indefinite) (T14, T15)
+const MADNLP_ORDERINGS = (("default ordering", Options()),
+                          ("default ordering, pivot_pairs = all", Options(pivot_pairs = "all")),
+                          ("interleaved", Options(user_perm = kkt_interleaved_perm(200, 100))))
+
 """
     random_general(T, n, density; rng)
 

@@ -106,6 +106,12 @@ Numeric storage of a factorization (PLAN §3.2), laid out by the
 * `stats` (`FRONT_STATS_FIELDS × ns` `Int64`, column `s` = front `s`):
   `(npos, nneg, nzero, nperturbed, n2x2, info)`, `info` = the local column of the
   first failed pivot of the front (`0` = none);
+* `totals` (`FRONT_STATS_FIELDS` `Int64`): the sums of `stats` over the fronts
+  ([`reduce_stats!`](@ref); `info` field: number of failed fronts);
+* `psign` (`n` `Int8`, LDLᵀ/LDLᴴ): the `pivot_sign` request per original row
+  (`0` = none), copied from the options at every factorization;
+* `aux` (1 entry): `max |aᵢⱼ|` of the values of the last LDLᵀ/LDLᴴ
+  factorization with `pivot_epsilon_alg = "algo1"` (scaled perturbation);
 * `info` (`ns + 1` `Int32`): device status of the numeric phase, the
   `potrf` info of front `s` at `s`, the reduced result (smallest failed factor
   column, `0` = none) at `ns + 1`;
@@ -121,6 +127,9 @@ struct Numeric{T, VT <: AbstractVector{T}, VS <: AbstractVector{Int64}, VI <: Ab
     info::VI
     piv::VI
     pivot_kind::VK
+    totals::VS
+    psign::VK
+    aux::VT
     plan::NumericPlan
 end
 
@@ -140,7 +149,7 @@ Base.show(io::IO, N::Numeric{T, VT}) where {T, VT} =
     allocate_numeric(symbolic, T, backend = CPU()) -> Numeric{T}
 
 Allocate (zero-filled) the factor panels, D, update stack, regime-C workspace, per-front
-statistics, status vector, pivot order and pivot kinds of `symbolic`'s [`Layout`](@ref) for element type
+statistics and their totals, status vector, pivot order, pivot kinds, pivot sign requests and `aux` of `symbolic`'s [`Layout`](@ref) for element type
 `T` on the KernelAbstractions `backend`, and build its [`NumericPlan`](@ref).
 This is the only allocation of the numeric phase.
 """
@@ -155,7 +164,10 @@ function allocate_numeric(S::Symbolic, ::Type{T}, backend::KernelAbstractions.Ba
     info = KernelAbstractions.zeros(backend, Int32, nsupernodes(S) + 1)
     piv = KernelAbstractions.zeros(backend, Int32, S.n)
     pivot_kind = KernelAbstractions.zeros(backend, Int8, S.n)
+    totals = KernelAbstractions.zeros(backend, Int64, FRONT_STATS_FIELDS)
+    psign = KernelAbstractions.zeros(backend, Int8, S.n)
+    aux = KernelAbstractions.zeros(backend, T, 1)
     return Numeric{T, typeof(factor), typeof(stats), typeof(info), typeof(pivot_kind)}(factor, d, stack, work, stats,
-                                                                                         info, piv, pivot_kind,
-                                                                                         NumericPlan(S))
+                                                                                         info, piv, pivot_kind, totals,
+                                                                                         psign, aux, NumericPlan(S))
 end

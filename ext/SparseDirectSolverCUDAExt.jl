@@ -109,6 +109,19 @@ LinearAlgebra.cholesky(A::Symmetric{T, <:CuSparseMatrixCSR{T}}, p::NoPivot = NoP
 LinearAlgebra.cholesky(A::Hermitian{T, <:CuSparseMatrixCSR{T}}, p::NoPivot = NoPivot(); check::Bool = false) where {T} =
     cholesky(CSR(A.data), p; view = A.uplo, check)
 
+"""
+    ldlt(A::CuSparseMatrixCSR; view = 'F', check = false) -> DirectSolver
+    ldlt(Symmetric(A::CuSparseMatrixCSR)) / ldlt(Hermitian(A::CuSparseMatrixCSR))
+
+LDLᵀ/LDLᴴ factorization of `A` on the GPU (≅ CUDSS.jl's `ldlt`); the wrappers
+pass their `uplo` as the view. See `ldlt(::CSR)`.
+"""
+LinearAlgebra.ldlt(A::CuSparseMatrixCSR; view::Char = 'F', check::Bool = false) = ldlt(CSR(A); view, check)
+LinearAlgebra.ldlt(A::Symmetric{T, <:CuSparseMatrixCSR{T}}; check::Bool = false) where {T <: Real} =
+    ldlt(CSR(A.data); view = A.uplo, check)
+LinearAlgebra.ldlt(A::Hermitian{T, <:CuSparseMatrixCSR{T}}; check::Bool = false) where {T} =
+    ldlt(CSR(A.data); view = A.uplo, check)
+
 # ---------------------------------------------------------------------------
 # vendor dense bindings (see `src/dense/vendor.jl` for the contracts)
 
