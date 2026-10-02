@@ -52,6 +52,7 @@ include("symbolic/maps.jl")
 # numeric storage, CPU reference multifrontal factorization (PLAN §7, the oracle)
 include("numeric/storage.jl")
 include("reference/cholesky.jl")
+include("reference/ldlt.jl")
 
 # numeric phase on the device (PLAN §2.4)
 include("numeric/assembly.jl")

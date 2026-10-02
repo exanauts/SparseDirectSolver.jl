@@ -1848,7 +1848,7 @@ whenever `atomic_add` is `false`. Close #36 in this task's PR.
 
 ---
 
-## T14 — CPU reference LDLᵀ/LDLᴴ: in-front Bunch–Kaufman, perturbation, sign policy, inertia   `[ ]`
+## T14 — CPU reference LDLᵀ/LDLᴴ: in-front Bunch–Kaufman, perturbation, sign policy, inertia   `[!]`
 
 **Reads**: PLAN §3.3, §1.7 (`pivot_sign`, `pivot_stats`); RESEARCH section 4 (pivoting, inertia).
 
@@ -1879,6 +1879,92 @@ whenever `atomic_add` is `false`. Close #36 in this task's PR.
 * MadNLP-style inertia correction: starting from `δ = 0` on an indefinite
   `H`, increase a primal regularization until `inertia == (nh, nj)`; the
   loop terminates and the final factorization has `nperturbed == 0`.
+
+### Report
+
+- Status: [!] (done on the CPU backend; one test runs on a different ordering than the task names, see deviations)
+- What was built (internal like the rest of the oracle, nothing exported):
+  - `src/reference/ldlt.jl`: `ref_ldlt!(numeric, symbolic, nzval | CSR; opts = Options()) -> info` (structures `"S"`
+    and `"H"`; real, complex Hermitian and complex symmetric `T`). Assembly and extend-add are the Cholesky oracle's.
+    Each front is symmetrized on its fully-summed columns, then `_ldlt_front!` factors columns `1:w` right-looking,
+    with pivot choice inside the block, and `F₂₂ ← F₂₂ − (L₂₁ D) L₂₁ᴴ` runs once per front (`W = L₂₁·D`, PLAN §2.4).
+    Pivoting (`_choose_pivot`): `'B'` (also `'A'` and `'L'`) is Bunch–Kaufman, `α = (1+√17)/8`, on the remaining
+    block. The choice is accepted when it is not tiny and passes `pivot_threshold` against the whole remaining front
+    column (for 2×2 pivots, through `|D⁻¹|`). Otherwise the best acceptable 1×1 of the block is taken, then the BK
+    choice if it is not tiny, then the current column, perturbed. `'D'` takes 1×1 pivots only and `'N'` does no
+    search. Perturbation: `|d| < ε` → `d ← sign·ε`, with `ε` = `pivot_epsilon` (default `default_pivot_epsilon`),
+    `× max|aᵢⱼ|` for `pivot_epsilon_alg = "algo1"`; `sign` = `pivot_sign[original row]` if nonzero, else `sign(d)`
+    (`+1` for 0, `d/|d|` for complex symmetric). `ref_solve_ldlt!` does the forward sweep (local pivot order applied
+    to the supernode's slice, unit `trsm`), the 1×1/2×2 diagonal step, then the backward sweep (`ᴴ`, or `ᵀ` for
+    complex symmetric) and undoes the order. `ref_solve!` dispatches to it for `"S"`/`"H"`. Also
+    `extract_ldlt(symbolic, numeric) -> (L, D, p)` with `A[p,p] ≈ L D Lᴴ`, and `pivot_stats(numeric) -> (npos, nneg,
+    nzero, nperturbed, n2x2)`, `inertia(numeric) -> (npos, nneg)`, `npivots(numeric)` (per-front `stats` summed on
+    the host). `BUNCH_KAUFMAN_ALPHA`.
+  - `Numeric` (`src/numeric/storage.jl`) gains `piv::VI` (`n` `Int32`: the column of `P A Pᵀ` eliminated at factor
+    column `k`) and `pivot_kind::VK` (`n` `Int8`: `PIVOT_KIND_1X1/2X2_FIRST/2X2_SECOND/PERTURBED`), plus a fifth type
+    parameter. `allocate_numeric`, `host_numeric`, the solver's `_numeric_type` and `memory_estimates` slot 11 are
+    updated. D storage follows the existing layout: `d[k]` is the diagonal, `d[n+k]` the subdiagonal of a 2×2 block.
+  - `test/test_reference_ldlt.jl`; `test/matrices.jl`: `kkt_matrix(…; hessian_scale)` (scales H; the default 1 is
+    unchanged) and `kkt_interleaved_perm(nh, nj)` (a `user_perm` putting dual `nh+i` after primal `i`).
+- Tests: `SDS_TEST_GPU=0 julia --project=. -e 'using Pkg; Pkg.test()'` (Julia 1.13.1, ubuntu-latest, CPU): 52726 pass / 0 fail / 0 broken (8 min 40 s);
+  test_reference_ldlt: 676 pass (~55 s). All for `T ∈ ELTYPES` (`"S"` real, `"H"` complex). Covered:
+  - Storage invariants: `piv` permutes each supernode's columns, unit-diagonal `L`, `'A'`/`'L'` ≡ `'B'`; invalid
+    structure, size and `pivot_sign` length are rejected; `ref_factorize!` still refuses `"S"`.
+  - `‖A[p,p] − LDLᴴ‖_F/‖A‖_F ≤ 1e-10` (Float64; `tol(T)` for Float32) plus `relres ≤ tol(T)` for `nrhs ∈ {1,5}`
+    and in place, on `random_symindef(400,0.01)`, `kkt(300,100,1e-2)`, and `kkt(300,100,δ)` with
+    `δ ∈ {1e-8, 1e-2}` under the interleaved ordering. Under the default ordering, `kkt(300,100,1e-8)` passes the
+    backward-error bound against `‖|L||D||L|ᴴ‖` and has exact inertia.
+  - Inertia equals the eigenvalue signs (`nperturbed == 0`) on six `n ≤ 300` cases, including indefinite-H KKT
+    with δ = 0 and two cases with 2×2 pivots (`hessian_scale = 1e-3`, ~100 2×2 blocks, interleaved over 16–29
+    fronts and as a single front).
+  - Views `'L'`/`'U'`/`'F'` give `==` factors; refactorization with new values, then back to the old ones, is `==`.
+  - Complex symmetric `"S"` with 1×1 and 2×2 pivots.
+  - `singular_block_matrix` (structurally zero and stored-zero pivot): `nperturbed, npivots, nzero ≥ 1`, the
+    perturbed entry is row `j` with exactly `±ε` as requested by `pivot_sign` (both signs) and the inertia follows,
+    consistent-RHS `relres ≤ 1e-6`; default sign `+1`, custom `pivot_epsilon`, scaled `"algo1"`, `'N'`/`'D'`.
+  - `'D'`/`'N'` on quasi-definite KKT (δ ∈ {1e-8, 1e-2}): all 1×1, `n2x2 == nperturbed == 0`, exact inertia, factor
+    and residual bounds; `'N'` makes no interchange.
+  - MadNLP-style loop on `kkt(200,100,0; hessian = :indefinite)`: `δw = 0, 1e-4, ×8 …` on H's diagonal (written into
+    `nzval`), refactorized on one analysis, until `inertia == (nh, nj)` with `nperturbed == 0`. It ends after a few
+    steps (δw ≈ 26, H's Gershgorin bound); the final solve passes `relres ≤ tol(T)`.
+  - CUDA/AMDGPU: pending CI on the PR (the new tests are host-only; the `Numeric` change touches the device path).
+- Measurements (Float64, default analysis, `ref_ldlt!`): `random_symindef(400,0.01)` error 1.9e-16, inertia
+  (200,200) exact, no 2×2 needed (Gershgorin-dominant diagonal). With `kkt(300,100,1e-8)` under AMD, the error
+  relative to `‖A‖` is 2.2e-10 and relres 2.6e-8. Under the interleaved ordering it is ~3e-16. With
+  `kkt(200,100,0; indefinite)` under AMD, 61 zero pivots are perturbed (error 8e-4).
+- Deviations from PLAN.md / this task:
+  - The `≤ 1e-10` test of `kkt_matrix(300, 100, 1e-8)` runs with a KKT-aware `user_perm` (interleaved primal/dual)
+    instead of the default ordering. Under AMD, every dual row is a width-1 leaf supernode, so in-block BK can
+    never pair it and its pivot `-δ` gives growth `1/δ` (2.2e-10 relative to `‖A‖`). That case is asserted with
+    the backward-error measure `‖A[p,p] − LDLᴴ‖/‖|L||D||L|ᴴ‖ ≤ 1e-10` and exact inertia. Issue #64. For the same
+    reason, the MadNLP loop with δ = 0 uses the interleaved ordering: under AMD the zero dual pivots are always
+    perturbed, so `nperturbed == 0` would be unreachable.
+  - `Numeric` gets two fields, `piv` and `pivot_kind`, and a fifth type parameter (PLAN §3.2 lists two). `piv` is
+    needed because Bunch–Kaufman interchanges columns inside a supernode. Panel rows below the diagonal block keep
+    the pre-pivoting numbering, and the solve applies each supernode's local order (LAPACK `sytrs` style), so the
+    symbolic structure and the maps are unchanged.
+  - `ref_factorize!` stays Cholesky-only (its T08 test requires it to refuse `"S"`); LDLᵀ is `ref_ldlt!`.
+    `ref_solve!` serves both.
+  - Definitions not fixed by the plan: `nzero` counts pivots that were exactly zero before perturbation.
+    `npos`/`nneg` count D after perturbation, so they give the inertia of `A + E` (PLAN §1.4). `pivot_kind`
+    distinguishes perturbed 1×1 pivots. `'L'` (local block) is treated as Bunch–Kaufman inside the block.
+    `pivot_epsilon_alg` `"default"` is static. Complex symmetric `"S"` reports `npos = nneg = 0`.
+  - The threshold test uses the whole remaining front column, rows outside the fully-summed block included, since
+    the entries of `L₂₁` need the bound too. BK candidates come from the block only.
+- Open issues / follow-ups:
+  - #64 (found-by-agent): AMD-ordered KKT systems put dual rows in width-1 leaf supernodes; in-front 2×2 pivoting
+    cannot help them. This matters for MadNLP's K2 systems with δc = 0 and for T15's tests on the same matrices.
+  - T15: `D`, `piv` and `pivot_kind` of the device kernels can be compared bitwise against `ref_ldlt!` only if they
+    follow the same pivot sequence: the same candidate order, the same tie-breaking (the first maximum), and the
+    same acceptance rules (`_choose_pivot`). `getparam("diag")` for LDLᵀ is `d[1:n]` in factor order.
+  - With static perturbation, a zero pivot whose column is *not* zero (a zero diagonal with no partner in its
+    block) is replaced by ±1e-13 and wrecks the factor (growth 1e13, compounding). Refinement cannot recover from
+    that, which is one more argument for #64.
+- Suggested plan changes:
+  - PLAN §3.2: `Numeric` also holds `piv` (local pivot order) and `pivot_kind`.
+  - PLAN §3.3: for `"S"`/`"H"`, the analysis should keep zero- or small-diagonal rows in the same supernode as a 2×2
+    partner (compressed-graph ordering or matching-based pairs); otherwise in-block BK cannot handle KKT systems
+    (#64).
 
 ---
 
