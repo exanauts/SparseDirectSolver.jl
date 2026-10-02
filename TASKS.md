@@ -2092,6 +2092,15 @@ Constrained ordering, unfactorized root front, `schur_shape`, dense and CSR
 
 ### T21 — Matching and scaling   `[ ]`
 
+**Owner note (issue #67)**: the 2×2 pivot pairs of #64 (`src/symbolic/pairs.jl`,
+`pivot_pairs`) use a fixed candidate tolerance `PIVOT_PAIR_TOLERANCE = 1e-6`
+and a greedy, value-weighted matching on the candidates' neighbours. Here,
+when `matching_alg ≠ "default"`, derive the pairs from the symmetric
+weighted matching instead (the 2-cycles of the matching permutation, Duff &
+Pralet 2005) and hand them to `compute_ordering(…; pairs)`; expose the
+tolerance as a tuning parameter next to `amalgamation`. The greedy pairs stay
+the default without matching. Closes #67.
+
 Host MC64-style matching (job 5 first), `perm_matching`, `scale_row/col`,
 composition with the ordering; test: on a badly scaled unsymmetric matrix the
 LU with matching has `nperturbed == 0` where the LU without has `> 0`;
@@ -2111,6 +2120,17 @@ configurations), asserted with `ka_cpu_alloc_budget` from `test/utils.jl`.
 `:generic` stays the allocating reference path (PLAN §3.9). The Julia 1.10 /
 coverage allowances in that budget are KernelAbstractions 0.9 artefacts and go
 away with KA 0.10.
+
+**Owner note (issue #60, item 2)**: the regime-A `@localmem` ladder
+`SUBTREE_LOCAL_SIZES` (`src/symbolic/schedule.jl`) is capped at 48 KiB for
+every backend. Static local memory differs per backend (Metal 32 KiB, AMDGPU
+LDS 64 KiB; the CUDA CI runner compiled and ran a 64 KiB instance in run
+36956560314). Add a capability `max_local_bytes(backend)` in
+`src/dense/capabilities.jl` and the extensions, use it in the analysis to cap
+`subtree_budgets` and to select the ladder, and raise a clear
+`InvalidValueError` for a budget above the cap. Item 1 of #60 (the CUDA
+timing table of T11) is measured by the owner separately; #60 closes when both
+are done.
 
 Written by analogy with the CUDA extension (sparse adapters, vendor dense
 bindings, capability probes). Test on this machine: a temporary environment
