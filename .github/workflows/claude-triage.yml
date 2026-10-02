@@ -9,6 +9,10 @@ name: Claude triage
 on:
   issues:
     types: [labeled, closed]
+  # Dispatched by the pipeline after it merges a PR that is not a task PR: such a
+  # merge closes issues with `github.token`, whose events never trigger this
+  # workflow, so #66's close by #72 left T15 unstarted.
+  workflow_dispatch:
 
 permissions:
   issues: write
@@ -18,9 +22,10 @@ permissions:
 jobs:
   resume:
     if: >-
-      contains(github.event.issue.labels.*.name, 'found-by-agent') &&
-      (github.event.action == 'closed' || github.event.label.name == 'triaged') &&
-      vars.CLAUDE_AUTOPILOT != 'false'
+      vars.CLAUDE_AUTOPILOT != 'false' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (contains(github.event.issue.labels.*.name, 'found-by-agent') &&
+        (github.event.action == 'closed' || github.event.label.name == 'triaged')))
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}

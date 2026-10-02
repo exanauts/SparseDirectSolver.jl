@@ -2180,6 +2180,22 @@ partition and `nnz_L`.
 
 ### T25 — Performance pass   `[ ]`
 
+**Owner note (issue #75)**: the device LDLᵀ of T15 follows the reference
+pivot for pivot and pays for it in three places that are deliverables here:
+(1) the pivot search runs on one work item (`_lt_choose`, `O(w·f)` per
+column when the Bunch–Kaufman choice fails the threshold and `_best_1x1`
+scans the block): parallel reductions for the column maxima, `λ`/`σ` and the
+`_best_1x1` scan, and a cheaper fallback, in the reference too; (2) regime-C
+fronts run the fused KA kernel with one workgroup each and no vendor call
+(the task's `sytrf` path was dropped by owner decision, since `sytrf` picks
+its own pivot order on `F₁₁` and the reference equality test must hold): KA
+in-front pivoting of `F₁₁` keeping the reference sequence, then vendor
+`trsm`/`gemm` for `L₂₁` and the contribution block; (3) regime B keeps `F₁₁`
+in global memory: stage it in `@localmem` as the Cholesky kernel does.
+Baseline: `kkt_matrix(Float64, 3000, 1000, 1e-8)`, default analysis, 13.5 s
+device / 12.9 s reference on the KA CPU backend (T15 report); the Report
+gives the same numbers after, plus CUDA. Closes #75.
+
 Partitioned-inverse solve (`solve_alg = "algo1"`), CUDA sync-free forward
 sweep behind a capability check, CUDA graph capture of refactorize+solve,
 level merging, amalgamation/bin tuning; tests: all previous suites unchanged;
