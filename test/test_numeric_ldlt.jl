@@ -93,7 +93,11 @@ end
         S, Nr, Sd, Nd, nz = ldlt_setup(backend, A; opts)
         @test SDS.factorize!(Nd, Sd, nz; opts) == 0
         Nh = SDS.host_numeric(Nd)
-        @test Nh.pivot_kind == Nr.pivot_kind && Nh.piv == Nr.piv && Nh.d == Nr.d
+        # the same pivot sequence; D to rounding (the device may contract to FMA), perturbed pivots exactly
+        @test Nh.pivot_kind == Nr.pivot_kind && Nh.piv == Nr.piv
+        @test d_error(Nh, Nr) <= panel_tol(T)
+        pert = Nr.pivot_kind .== SDS.PIVOT_KIND_PERTURBED
+        @test Nh.d[1:n][pert] == Nr.d[1:n][pert]
         st = SDS.pivot_totals(Nd)
         @test st.nperturbed >= 1 && st.nzero >= 1
         k = findfirst(==(SDS.PIVOT_KIND_PERTURBED), Nh.pivot_kind)
@@ -119,7 +123,10 @@ end
         S, Nr, Sd, Nd, nz = ldlt_setup(backend, A; opts)
         SDS.factorize!(Nd, Sd, nz; opts)
         Nh = SDS.host_numeric(Nd)
-        @test Nh.pivot_kind == Nr.pivot_kind && Nh.piv == Nr.piv && Nh.d == Nr.d
+        @test Nh.pivot_kind == Nr.pivot_kind && Nh.piv == Nr.piv
+        @test d_error(Nh, Nr) <= panel_tol(T)
+        pert = Nr.pivot_kind .== SDS.PIVOT_KIND_PERTURBED
+        @test Nh.d[1:n][pert] == Nr.d[1:n][pert]
         @test SDS.pivot_totals(Nd).nperturbed == 1
     end
     # pivot_sign of the wrong length

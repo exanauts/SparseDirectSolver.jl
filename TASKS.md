@@ -2068,8 +2068,8 @@ whenever `atomic_add` is `false`. Close #36 in this task's PR.
     (`kkt(300,100,1e-8)` ComplexF32 after one refinement step, as in T14 / #66).
   - Regime-A groups with Int64 maps; views `'U'`/`'F'` give `==` factors.
   - `singular_block_matrix` (structurally zero and stored zero, both `pivot_sign` signs) under the default analysis
-    and with the zero pivot in a regime-C root front (`"algo2"`; asserted `snparent == 0`, `takes_c_path`): D,
-    `piv`, kinds `==` the reference, perturbed entry `±ε` exactly at row `j`, inertia, consistent-RHS relres ≤ 1e-6;
+    and with the zero pivot in a regime-C root front (`"algo2"`; asserted `snparent == 0`, `takes_c_path`):
+    `piv`, kinds `==` the reference, D within `panel_tol(T)`, perturbed D entries `==` the reference, perturbed entry `±ε` exactly at row `j`, inertia, consistent-RHS relres ≤ 1e-6;
     `pivot_epsilon`, scaled `"algo1"` (device `max|a|`), `'N'`, `'D'`; wrong `pivot_sign` length.
   - `'D'`/`'N'` on quasi-definite KKT (no 2×2, no perturbation, inertia `(nh, nj)`, `'N'` no interchange).
   - Determinism: refactorization with new values and back gives `==` factor, D, `piv`; deterministic solves `==`;
@@ -2086,7 +2086,11 @@ whenever `atomic_add` is `false`. Close #36 in this task's PR.
   - Ported: `cudss_execution` "Symmetric -- Hermitian" (views F/L/U × pivoting C/R/N, refactorization after a
     diagonal shift), `cudss_generic` `ldlt`/`ldlt!`/`ldiv!`/`\`, `cudss_solver` for `"S"`/`"H"`; `T ∈ ELTYPES`,
     `INT ∈ INTTYPES`.
-  - CUDA/AMDGPU: pending CI on the PR.
+  - CUDA/AMDGPU: pending CI on the PR. CI fix round 1: the first CUDA run failed 12 checks in "perturbation and
+    pivot_sign (CUDA, Float32)", which compared the whole of D bitwise with the host reference; nvcc contracts the
+    Float32 Schur updates to FMA, so the non-perturbed pivots differ by rounding. These checks now compare D within
+    `panel_tol(T)` like every other device-vs-reference test, and the perturbed entries (the subject of the test)
+    still bitwise. CPU after the fix: 59973 pass / 0 fail / 0 broken.
 - Measurements (ubuntu-latest KA CPU backend, Float64, best of 3; device = `factorize!` on the CPU backend, so only
   launch counts and equality are meaningful, the GPU numbers are owed):
 
