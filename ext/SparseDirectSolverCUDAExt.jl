@@ -3,7 +3,8 @@ module SparseDirectSolverCUDAExt
 # CUDA support: CSR adapters (T02) and the vendor dense bindings of the dense
 # layer (T03, PLAN §2.6): cuBLAS gemm/syrk/herk/trsm/strided-batched gemm/
 # batched trsm, cuSOLVER potrf (also with a device info)/getrf/sytrf/potrfBatched,
-# cuBLAS getrfBatched.
+# cuBLAS getrfBatched; the batched trsm/potrf also on member pointers built once
+# (uniform batch, T17).
 
 using SparseDirectSolver
 using SparseDirectSolver: CSR, DirectSolver, INDEX_ONE, INDEX_ZERO, InvalidValueError
@@ -225,24 +226,36 @@ function _batch_pointers(A::StridedCuArray{T, 3}) where {T}
     return CuArray([base + (i - 1) * s for i in 1:size(A, 3)])
 end
 
+# built once per regime-C front of a uniform batch (T17): the numeric phase then allocates nothing
+SDS.vendor_batch_pointers(A::StridedCuArray{T, 3}) where {T <: CuBlasT} = _batch_pointers(A)
+
 for (fname, fname_64, elty) in ((:cublasStrsmBatched, :cublasStrsmBatched_64, :Float32),
                                 (:cublasDtrsmBatched, :cublasDtrsmBatched_64, :Float64),
                                 (:cublasCtrsmBatched, :cublasCtrsmBatched_64, :ComplexF32),
                                 (:cublasZtrsmBatched, :cublasZtrsmBatched_64, :ComplexF64))
+    @eval function SDS.vendor_trsm_batched_ptrs!(side::Char, uplo::Char, trans::Char, diag::Char, α, m::Integer,
+                                                 n::Integer, Aptrs::StridedCuArray{CuPtr{$elty}, 1}, lda::Integer,
+                                                 Bptrs::StridedCuArray{CuPtr{$elty}, 1}, ldb::Integer, count::Integer)
+        count == 0 && return Bptrs
+        a = _blas_scalar($elty, α)
+        if cuBLAS.version() >= v"12.0"
+            cuBLAS.$fname_64(cuBLAS.handle(), side, uplo, trans, diag, m, n, a, Aptrs, max(1, lda), Bptrs, max(1, ldb),
+                             count)
+        else
+            cuBLAS.$fname(cuBLAS.handle(), side, uplo, trans, diag, m, n, a, Aptrs, max(1, lda), Bptrs, max(1, ldb),
+                          count)
+        end
+        return Bptrs
+    end
     @eval function SDS.vendor_trsm_batched!(side::Char, uplo::Char, trans::Char, diag::Char, α,
                                             A::StridedCuArray{$elty, 3}, B::StridedCuArray{$elty, 3})
         m, n, nb = size(B)
         nb == 0 && return B
-        lda, ldb = max(1, stride(A, 2)), max(1, stride(B, 2))
         GC.@preserve A B begin
             Aptrs = _batch_pointers(A)
             Bptrs = _batch_pointers(B)
-            a = _blas_scalar($elty, α)
-            if cuBLAS.version() >= v"12.0"
-                cuBLAS.$fname_64(cuBLAS.handle(), side, uplo, trans, diag, m, n, a, Aptrs, lda, Bptrs, ldb, nb)
-            else
-                cuBLAS.$fname(cuBLAS.handle(), side, uplo, trans, diag, m, n, a, Aptrs, lda, Bptrs, ldb, nb)
-            end
+            SDS.vendor_trsm_batched_ptrs!(side, uplo, trans, diag, α, m, n, Aptrs, stride(A, 2), Bptrs, stride(B, 2),
+                                          nb)
             CUDACore.unsafe_free!(Aptrs)
             CUDACore.unsafe_free!(Bptrs)
         end
@@ -252,13 +265,19 @@ end
 
 for (fname, elty) in ((:cusolverDnSpotrfBatched, :Float32), (:cusolverDnDpotrfBatched, :Float64),
                       (:cusolverDnCpotrfBatched, :ComplexF32), (:cusolverDnZpotrfBatched, :ComplexF64))
+    @eval function SDS.vendor_potrf_batched_ptrs!(uplo::Char, n::Integer, Aptrs::StridedCuArray{CuPtr{$elty}, 1},
+                                                  lda::Integer, info::StridedCuArray{Cint, 1}, count::Integer)
+        count == 0 && return info
+        cuSOLVER.$fname(cuSOLVER.dense_handle(), uplo, n, Aptrs, max(1, lda), info, count)
+        return info
+    end
     @eval function SDS.vendor_potrf_batched!(uplo::Char, A::StridedCuArray{$elty, 3}, info::CuVector{Cint})
         n = _check_square_batch(A)
         nb = size(A, 3)
         nb == 0 && return info
         GC.@preserve A begin
             Aptrs = _batch_pointers(A)
-            cuSOLVER.$fname(cuSOLVER.dense_handle(), uplo, n, Aptrs, max(1, stride(A, 2)), info, nb)
+            SDS.vendor_potrf_batched_ptrs!(uplo, n, Aptrs, stride(A, 2), info, nb)
             CUDACore.unsafe_free!(Aptrs)
         end
         return info

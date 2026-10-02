@@ -301,6 +301,24 @@ function ubatch_example(::Type{T}) where {T}
     return (A = A, rowptr = rowptr, colval = colval, nzval = nzval, b = b, Λ = Λ, n = 3, nbatch = 3)
 end
 
+"""
+    batch_members(A, nb; rng) -> Vector{SparseMatrixCSC}
+
+`nb` matrices with the sparsity pattern of `A` (a uniform batch, T17): member
+1 is `A`, member `k > 1` is the congruence `Dₖ A Dₖ` with a random positive
+diagonal `Dₖ` (entries in `[1/2, 2]`), so every member keeps the structure of
+`A` (SPD/HPD, symmetric or Hermitian indefinite with the inertia of `A`,
+complex symmetric).
+"""
+function batch_members(A::SparseMatrixCSC{T}, nb::Integer; rng::AbstractRNG = Random.default_rng()) where {T}
+    members = [copy(A)]
+    for _ in 2:nb
+        D = Diagonal(real(T)(0.5) .+ real(T)(1.5) .* rand(rng, real(T), size(A, 1)))
+        push!(members, sparse(D * A * D))
+    end
+    return members
+end
+
 # ---------------------------------------------------------------------------
 # dense generators (T03)
 

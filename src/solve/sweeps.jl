@@ -436,8 +436,8 @@ its local pivot order `piv`; TRSV with `L11` on its columns of `Y`; GEMV with
     for k in 1:ctl[_SV_COUNT]
         if li == 1
             v = _sv_node(ctl, k, list, subtree_nodes, Val(SUB), Val(false))
-            _sv_setup!(ctl, v, super_ptr, rowptr, member_panels(front_ptr, _bm_cmember(bm, _sv_rhs(G, count)), bm.nbatch),
-                       front_nrows, front_ncols, child_ptr)
+            P = member_panels(front_ptr, _bm_cmember(bm, _sv_rhs(G, count)), bm.nbatch)
+            _sv_setup!(ctl, v, super_ptr, rowptr, P, front_nrows, front_ncols, child_ptr)
         end
         @synchronize
         if DET
@@ -492,8 +492,8 @@ order before the front's local pivoting.
     for k in 1:ctl[_SV_COUNT]
         if li == 1
             v = _sv_node(ctl, k, list, subtree_nodes, Val(SUB), Val(true))
-            _sv_setup!(ctl, v, super_ptr, rowptr, member_panels(front_ptr, _bm_cmember(bm, _sv_rhs(G, count)), bm.nbatch),
-                       front_nrows, front_ncols, child_ptr)
+            P = member_panels(front_ptr, _bm_cmember(bm, _sv_rhs(G, count)), bm.nbatch)
+            _sv_setup!(ctl, v, super_ptr, rowptr, P, front_nrows, front_ncols, child_ptr)
         end
         @synchronize
         _sv_bwd_gather!(Y, factor, rowval, ctl, _sv_rhs(G, count), li, Val(WG), Val(CONJ))
@@ -706,35 +706,40 @@ function _piv_dense!(ws::SolveWorkspace, S::Symbolic, N::Numeric, s::Int, nrhs::
     return nothing
 end
 
-# the blocks L11, L21 of the panels of front `s` of the `count` consecutive batch members starting at member slot
-# `j0`, the front's rows of their columns of Y and the m rows of their columns of tmp: matrices for one member
-# (the single-matrix layout, `count = 1`), `×count` strided batches otherwise
-function _dense_front(ws::SolveWorkspace, S::Symbolic, N::Numeric, s::Int, nrhs::Int, j0::Int, count::Int)
+# the blocks L11, L21 of the panel of front `s` of the batch member in slot `j`, the front's rows of the member's
+# columns of Y and the m rows of its columns of tmp (the single-matrix path)
+function _dense_front(ws::SolveWorkspace, S::Symbolic, N::Numeric, s::Int, nrhs::Int, j::Int)
     sc = S.schedule
     f, w = sc.rows[s], sc.width[s]
     m = f - w
-    nb = N.nbatch
-    p0 = panel_offset(S.layout.panel_ptr, s, N.plan.members_host[j0], nb)
+    p0 = panel_offset(S.layout.panel_ptr, s, N.plan.members_host[j], N.nbatch)
+    c0 = S.partition.super_ptr[s]
+    cols = ((j - 1) * nrhs + 1):(j * nrhs)
+    P = reshape(view(N.factor, p0:(p0 + f * w - 1)), f, w)
+    return view(P, 1:w, 1:w), view(P, (w + 1):f, 1:w), view(ws.Y, c0:(c0 + w - 1), cols), view(ws.tmp, 1:m, cols)
+end
+
+# the same for the `count` consecutive members in the slots `j0:(j0 + count - 1)`, as `×count` strided batches
+function _dense_front_batch(ws::SolveWorkspace, S::Symbolic, N::Numeric, s::Int, nrhs::Int, j0::Int, count::Int)
+    sc = S.schedule
+    f, w = sc.rows[s], sc.width[s]
+    m = f - w
+    p0 = panel_offset(S.layout.panel_ptr, s, N.plan.members_host[j0], N.nbatch)
     c0 = S.partition.super_ptr[s]
     cols = ((j0 - 1) * nrhs + 1):((j0 + count - 1) * nrhs)
-    if count == 1
-        P = reshape(view(N.factor, p0:(p0 + f * w - 1)), f, w)
-        return f, w, view(P, 1:w, 1:w), view(P, (w + 1):f, 1:w), view(ws.Y, c0:(c0 + w - 1), cols),
-               view(ws.tmp, 1:m, cols)
-    end
     P = reshape(view(N.factor, p0:(p0 + f * w * count - 1)), f, w, count)
     Y3 = reshape(view(ws.Y, :, cols), size(ws.Y, 1), nrhs, count)
     T3 = reshape(view(ws.tmp, :, cols), size(ws.tmp, 1), nrhs, count)
-    return f, w, view(P, 1:w, 1:w, :), view(P, (w + 1):f, 1:w, :), view(Y3, c0:(c0 + w - 1), :, :),
-           view(T3, 1:m, :, :)
+    return view(P, 1:w, 1:w, :), view(P, (w + 1):f, 1:w, :), view(Y3, c0:(c0 + w - 1), :, :), view(T3, 1:m, :, :)
 end
 
 # the dense calls of front `s` for each run of consecutive active members: one strided-batched call per run, or
-# (single matrix, `impl = :generic`) one call per member; `forward` selects `_dense_fwd!` or `_dense_bwd!`
+# (single matrix, `impl = :generic`) one call per member
 function _dense_runs!(ws::SolveWorkspace, S::Symbolic, N::Numeric, s::Int, nrhs::Int, p::NamedTuple, forward::Bool,
                       tr::Char)
+    m = S.schedule.rows[s] - S.schedule.width[s]
     if N.nbatch == 1
-        _dense_call!(ws, S, N, s, nrhs, 1, 1, p, forward, tr, false)
+        _dense_call!(p, forward, tr, m, _dense_front(ws, S, N, s, nrhs, 1)...)
         return nothing
     end
     runs = N.plan.runs
@@ -742,33 +747,47 @@ function _dense_runs!(ws::SolveWorkspace, S::Symbolic, N::Numeric, s::Int, nrhs:
         j0, j1 = runs[r], runs[r + 1] - 1
         if p.btrsm === :none
             for j in j0:j1
-                _dense_call!(ws, S, N, s, nrhs, j, 1, p, forward, tr, false)
+                _dense_call!(p, forward, tr, m, _dense_front(ws, S, N, s, nrhs, j)...)
             end
         else
-            _dense_call!(ws, S, N, s, nrhs, j0, j1 - j0 + 1, p, forward, tr, true)
+            _dense_call_batch!(p, forward, tr, m, _dense_front_batch(ws, S, N, s, nrhs, j0, j1 - j0 + 1)...)
         end
     end
     return nothing
 end
 
-function _dense_call!(ws::SolveWorkspace{T}, S::Symbolic, N::Numeric, s::Int, nrhs::Int, j0::Int, count::Int,
-                      p::NamedTuple, forward::Bool, tr::Char, batched::Bool) where {T}
-    f, w, L11, L21, Yc, Tm = _dense_front(ws, S, N, s, nrhs, j0, batched ? count : 1)
-    m = f - w
+function _dense_call!(p::NamedTuple, forward::Bool, tr::Char, m::Int, L11::AbstractMatrix{T}, L21, Yc, Tm) where {T}
     if forward
-        if batched
-            trsm_strided_batched!('L', 'L', 'N', 'N', one(T), L11, Yc; impl = p.btrsm)
-            m > 0 && gemm_strided_batched!(Tm, L21, Yc, one(T), zero(T); impl = p.bgemm)
-        else
-            _trsm_impl!(p.trsm, 'L', 'L', 'N', 'N', one(T), L11, Yc)
-            m > 0 && _gemm_impl!(p.gemm, 'N', 'N', one(T), L21, Yc, zero(T), Tm)
-        end
-    elseif batched
-        m > 0 && gemm_strided_batched!(Yc, L21, Tm, -one(T), one(T); transA = tr, impl = p.bgemm)
-        trsm_strided_batched!('L', 'L', tr, 'N', one(T), L11, Yc; impl = p.btrsm)
+        _trsm_impl!(p.trsm, 'L', 'L', 'N', 'N', one(T), L11, Yc)
+        m > 0 && _gemm_impl!(p.gemm, 'N', 'N', one(T), L21, Yc, zero(T), Tm)
     else
         m > 0 && _gemm_impl!(p.gemm, tr, 'N', -one(T), L21, Tm, one(T), Yc)
         _trsm_impl!(p.trsm, 'L', 'L', tr, 'N', one(T), L11, Yc)
+    end
+    return nothing
+end
+
+function _dense_call_batch!(p::NamedTuple, forward::Bool, tr::Char, m::Int, L11::AbstractArray{T, 3}, L21, Yc,
+                            Tm) where {T}
+    if forward
+        _trsm_batched!(p, 'N', L11, Yc)
+        m > 0 && gemm_strided_batched!(Tm, L21, Yc, one(T), zero(T); impl = p.bgemm)
+    else
+        m > 0 && gemm_strided_batched!(Yc, L21, Tm, -one(T), one(T); transA = tr, impl = p.bgemm)
+        _trsm_batched!(p, tr, L11, Yc)
+    end
+    return nothing
+end
+
+# the strided-batched trsm of the solve: the vendor's pointer-array trsm would need member pointers of `Y` per call
+# (a device allocation), so the vendor path solves member by member
+function _trsm_batched!(p::NamedTuple, tr::Char, L11::AbstractArray{T, 3}, Yc::AbstractArray{T, 3}) where {T}
+    if p.btrsm === :vendor
+        for b in axes(Yc, 3)
+            _trsm_impl!(p.trsm, 'L', 'L', tr, 'N', one(T), view(L11, :, :, b), view(Yc, :, :, b))
+        end
+    else
+        trsm_strided_batched!('L', 'L', tr, 'N', one(T), L11, Yc; impl = p.btrsm)
     end
     return nothing
 end

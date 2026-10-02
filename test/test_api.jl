@@ -53,8 +53,14 @@ end
     @test thrown(() -> DirectSolver(C, s, 'X')) isa InvalidValueError
     @test thrown(() -> DirectSolver(C, s, 'L'; index = 'Q')) isa InvalidValueError
     @test thrown(() -> DirectSolver(CSR(C.rowptr, C.colval, C.nzval, 60, 61), s, 'L')) isa InvalidValueError
+    # values of two members: a uniform batch (T17, test_ubatch.jl)
     batch = CSR(C.rowptr, C.colval, to_device(backend, repeat(Array(C.nzval), 2)), 60, 60)
-    @test thrown(() -> DirectSolver(batch, s, 'L')) isa NotSupportedError
+    sb = DirectSolver(batch, s, 'L')
+    @test sb.nbatch == 2
+    execute!("analysis", sb, nothing, nothing)
+    execute!("factorization", sb, nothing, nothing)
+    bb = rand(T, 60, 2)
+    @test maximum(batch_relres([A, A], api_solve(backend, sb, bb), bb)) <= tol(T)
 end
 
 @testset "phases ($(backend_name(backend)), $T, $INT)" for backend in BACKENDS, T in ELTYPES, INT in INTTYPES
@@ -137,18 +143,23 @@ end
     @test thrown(() -> execute!("solve", solver, nothing, b)) isa InvalidValueError
     @test thrown(() -> execute!("solve", solver, x, to_device(backend, rand(T, 41)))) isa DimensionMismatch
     @test thrown(() -> execute!("solve", solver, x, to_device(backend, rand(T, 40, 2)))) isa DimensionMismatch
-    @test thrown(() -> execute!("solve", solver, x, to_device(backend, rand(T, 40, 2, 2)))) isa NotSupportedError
+    # an n × nrhs × nbatch array is a uniform-batch layout (T17): 4 columns for X's 1
+    @test thrown(() -> execute!("solve", solver, x, to_device(backend, rand(T, 40, 2, 2)))) isa DimensionMismatch
     other = T <: Complex ? ComplexF64 === T ? ComplexF32 : ComplexF64 : Float64 === T ? Float32 : Float64
     bo = to_device(backend, rand(other, 40))
     @test thrown(() -> execute!("solve", solver, bo, bo)) isa InvalidValueError
     backend isa CPU ||
         @test thrown(() -> execute!("solve", solver, rand(T, 40), rand(T, 40))) isa InvalidValueError
     # options and structures that are not implemented yet
-    for (name, value) in (("matching_alg", "algo1"), ("schur_mode", 1), ("ubatch_size", 2), ("schedule", "syncfree"))
+    for (name, value) in (("matching_alg", "algo1"), ("schur_mode", 1), ("schedule", "syncfree"))
         s2 = DirectSolver(api_matrix(backend, tril(A)), spd_structure(T), 'L')
         setparam!(s2, name, value)
         @test thrown(() -> execute!("analysis", s2, x, b)) isa NotSupportedError
     end
+    # uniform batches since T17: ubatch_size must match the batch size of the values (1 here)
+    s2 = DirectSolver(api_matrix(backend, tril(A)), spd_structure(T), 'L')
+    setparam!(s2, "ubatch_size", 2)
+    @test thrown(() -> execute!("analysis", s2, x, b)) isa InvalidValueError
     setparam!(solver, "solve_alg", "algo1")
     @test thrown(() -> execute!("solve", solver, x, b)) isa NotSupportedError
     setparam!(solver, "solve_alg", "default")
