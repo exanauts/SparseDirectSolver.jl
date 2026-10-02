@@ -265,7 +265,8 @@ is polled at the start of the analysis phases, between the launch groups of the
 factorization and between refinement steps: when set, the phase raises
 [`InterruptedError`](@ref). An interrupted factorization leaves the solver
 analyzed (the next phase must be `"factorization"`); an interrupted refinement
-leaves the last completed iterate in `X`.
+leaves the last completed iterate in `X` and reports the steps completed in
+`"ir_n_steps"`.
 
 `"solve_fwd_schur"` and `"solve_bwd_schur"` raise [`NotSupportedError`](@ref)
 until their task (T20); unknown phase strings raise `ArgumentError`. Executing
@@ -379,6 +380,7 @@ function _factorize!(solver::DirectSolver, p::Phase)
         if err isa InterruptedError
             # the panels are partly overwritten: back to "analyzed", a "factorization" must follow
             solver.stage = STAGE_ANALYZED
+            solver.fresh_factorization = true
             solver.info = 0
             _log(LOG_INFO, () -> "$name: interrupted")
         end
@@ -503,11 +505,15 @@ end
 function _refine_phase!(solver::DirectSolver, W::RefinementWorkspace, ws::SolveWorkspace, X, B, xt::Bool, bt::Bool,
                         cj::Bool, det::Bool)
     opts = solver.options
-    solver.ir_steps = 0
-    steps = refine!(X, B, W, ws, solver.symbolic, solver.numeric, vec(solver.A.nzval); nsteps = opts.ir_n_steps,
-                    tol = opts.ir_tol, transposed = xt, b_transposed = bt, conjugate = cj, deterministic = det,
-                    interrupt = opts.user_host_interrupt)
-    solver.ir_steps = steps
+    done = Ref(0)   # the corrections applied, also when the refinement is interrupted
+    try
+        refine!(X, B, W, ws, solver.symbolic, solver.numeric, vec(solver.A.nzval); nsteps = opts.ir_n_steps,
+                tol = opts.ir_tol, transposed = xt, b_transposed = bt, conjugate = cj, deterministic = det,
+                interrupt = opts.user_host_interrupt, progress = done)
+    finally
+        solver.ir_steps = done[]
+    end
+    steps = done[]
     _log(LOG_INFO, () -> "solve_refinement: $steps of $(opts.ir_n_steps) steps")
     return nothing
 end

@@ -22,6 +22,20 @@ function ir_solve(backend, solver, b; steps = nothing, tol = nothing)
     return to_host(xd)
 end
 
+# a logger that sets `flag` when the refinement logs the residual after `step` corrections (an interrupt
+# raised between two refinement steps, deterministically)
+struct InterruptAtStepLogger <: Base.CoreLogging.AbstractLogger
+    flag::Threads.Atomic{Bool}
+    step::Int
+end
+Base.CoreLogging.min_enabled_level(::InterruptAtStepLogger) = Base.CoreLogging.Debug
+Base.CoreLogging.shouldlog(::InterruptAtStepLogger, args...) = true
+Base.CoreLogging.catch_exceptions(::InterruptAtStepLogger) = false
+function Base.CoreLogging.handle_message(L::InterruptAtStepLogger, level, message, args...; kwargs...)
+    startswith(string(message), "refinement: step $(L.step),") && (L.flag[] = true)
+    return nothing
+end
+
 const SOLVE_SUBPHASES = ("solve_fwd_perm", "solve_fwd", "solve_diag", "solve_bwd", "solve_bwd_perm", "solve_refinement")
 
 @testset "refinement on a badly scaled SPD matrix ($(backend_name(backend)))" for backend in BACKENDS
@@ -99,6 +113,22 @@ end
             @test reshape(to_host(xs), n, nrhs) == x
         end
         @test SDS.max_rhs(solver.refinement) >= 3
+        # a row-major strided vector with fewer right-hand sides than the workspace, ir_tol > 0:
+        # the norm reduction indexes B with the solve's nrhs, not the workspace capacity
+        b2 = rand(T, n, 2)
+        Bd = MatrixDescriptor(T, n, 2; transposed = true)
+        update!(Bd, to_device(backend, vec(permutedims(b2))))
+        Xd = MatrixDescriptor(T, n, 2; transposed = true)
+        update!(Xd, similar(Bd.data))
+        setparam!(solver, "ir_tol", 1.0e-30)
+        execute!("solve", solver, Xd, Bd; asynchronous = false)
+        x2 = permutedims(reshape(to_host(Xd.data), 2, n))
+        @test relres(A, x2, b2) <= tol(T)
+        W = solver.refinement
+        SDS.residual!(W, vec(solver.A.nzval), Xd.data, Bd.data; nrhs = 2, transposed = true)
+        nh = SDS.residual_norms!(W, Bd.data; nrhs = 2, transposed = true)
+        @test [nh[2], nh[4]] ≈ [sum(abs2, b2[:, 1]), sum(abs2, b2[:, 2])]
+        setparam!(solver, "ir_tol", 0.0)
         # "solve_refinement" with ir_n_steps = 0 is a no-op
         setparam!(solver, "ir_n_steps", 0)
         b = rand(T, n)
@@ -203,6 +233,23 @@ end
         flag[] = false
         factorize!(solver)
         refactorize!(solver)
+        # the LinearAlgebra layer recovers too: cholesky!/ldlt! pick "factorization" again
+        flag[] = true
+        @test thrown(() -> refactorize!(solver)) isa InterruptedError
+        @test solver.fresh_factorization
+        flag[] = false
+        structure == spd_structure(T) ? cholesky!(solver, api_matrix(backend, tril(M), Int32)) :
+            ldlt!(solver, api_matrix(backend, tril(M), Int32))
+        @test !solver.fresh_factorization
+        @test relres(M, ir_solve(backend, solver, b), b) <= tol(T)
+        # an interrupt after two refinement steps: X holds that iterate, ir_n_steps reports 2
+        setparam!(solver, "ir_n_steps", 5)
+        setparam!(solver, "ir_tol", 1.0e-30)
+        @test Base.CoreLogging.with_logger(() -> thrown(() -> ir_solve(backend, solver, b)),
+                                           InterruptAtStepLogger(flag, 1)) isa InterruptedError
+        @test getparam(solver, "ir_n_steps") == 2
+        flag[] = false
+        setparam!(solver, "ir_tol", 0.0)
         # refinement polls the flag between steps
         setparam!(solver, "ir_n_steps", 2)
         flag[] = true

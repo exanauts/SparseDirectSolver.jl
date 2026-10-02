@@ -122,13 +122,12 @@ end
     end
 end
 
-@kernel function _residual_norms_kernel!(norms, R, B, n, ::Val{BT}, ::Val{WG}, ::Val{LOG2WG}) where {BT, WG, LOG2WG}
+@kernel function _residual_norms_kernel!(norms, R, B, n, nrhs, ::Val{BT}, ::Val{WG}, ::Val{LOG2WG}) where {BT, WG, LOG2WG}
     @uniform RT = eltype(norms)
     li = @index(Local, Linear)
     r = @index(Group, Linear)
     nr = @localmem RT (WG,)
     nb = @localmem RT (WG,)
-    nrhs = size(R, 2)
     @inbounds begin
         sr = zero(RT)
         sb = zero(RT)
@@ -213,9 +212,9 @@ function residual_norms!(W::RefinementWorkspace, B::AbstractVecOrMat; nrhs::Inte
     WG = REFINE_WORKGROUP
     kernel! = _residual_norms_kernel!(KernelAbstractions.get_backend(W.R), WG)
     if transposed
-        kernel!(W.norms, W.R, B, n, Val(true), Val(WG), Val(_ilog2(WG)); ndrange = WG * Int(nrhs))
+        kernel!(W.norms, W.R, B, n, Int(nrhs), Val(true), Val(WG), Val(_ilog2(WG)); ndrange = WG * Int(nrhs))
     else
-        kernel!(W.norms, W.R, B, n, Val(false), Val(WG), Val(_ilog2(WG)); ndrange = WG * Int(nrhs))
+        kernel!(W.norms, W.R, B, n, Int(nrhs), Val(false), Val(WG), Val(_ilog2(WG)); ndrange = WG * Int(nrhs))
     end
     copyto!(W.norms_host, 1, W.norms, 1, 2 * Int(nrhs))
     return W.norms_host
@@ -270,7 +269,7 @@ end
 """
     refine!(X, B, W, ws, symbolic, numeric, nzval; nsteps, tol = 0, transposed = false,
             b_transposed = transposed, conjugate = false, deterministic = false,
-            interrupt = nothing) -> steps
+            interrupt = nothing, progress = Ref(0)) -> steps
 
 Plain iterative refinement of the solution `X` of `op(A) X = B` (`op(A) = M`,
 or `conj(M)` when `conjugate`), at most `nsteps` steps of
@@ -283,16 +282,19 @@ with the factor in `numeric`, the solve workspace `ws` and the refinement
 workspace `W`. `tol = 0` (the default of `ir_tol`) never stops early and never
 synchronizes. `interrupt` (a `Threads.Atomic{Bool}` or `nothing`) is polled
 before every step ([`InterruptedError`](@ref); `X` then holds the last
-completed iterate). Returns the number of corrections applied.
+completed iterate). Returns the number of corrections applied, which is also
+kept in `progress[]` after every step (so it survives an interrupt).
 """
 function refine!(X::AbstractVecOrMat, B::AbstractVecOrMat, W::RefinementWorkspace, ws::SolveWorkspace, S::Symbolic,
                  N::Numeric, nzval::AbstractVector; nsteps::Integer, tol::Real = 0, transposed::Bool = false,
                  b_transposed::Bool = transposed, conjugate::Bool = false, deterministic::Bool = false,
-                 interrupt::Union{Nothing, Threads.Atomic{Bool}} = nothing)
+                 interrupt::Union{Nothing, Threads.Atomic{Bool}} = nothing,
+                 progress::Base.RefValue{Int} = Ref(0))
     nrhs = rhs_count(X, S.n; transposed)
     max_rhs(W) >= nrhs && max_rhs(ws) >= nrhs ||
         throw(DimensionMismatch("the refinement workspace holds $(max_rhs(W)) right-hand sides, need $nrhs"))
     steps = 0
+    progress[] = 0
     for _ in 1:nsteps
         _poll_interrupt(interrupt)
         residual!(W, nzval, X, B; nrhs, transposed, b_transposed, conjugate)
@@ -308,6 +310,7 @@ function refine!(X::AbstractVecOrMat, B::AbstractVecOrMat, W::RefinementWorkspac
         backward_sweep!(ws, S, N; nrhs)
         add_correction!(X, ws.Y, S.perm; nrhs, transposed, conjugate)
         steps += 1
+        progress[] = steps
     end
     return steps
 end

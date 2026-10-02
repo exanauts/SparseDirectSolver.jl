@@ -2208,8 +2208,10 @@ repeat it once T21 has landed. The bar is cuDSS with `"matching_alg" =
     `ir_mode = "fgmres"` raises `NotSupportedError` (T18).
   - `user_host_interrupt`: polled (host read, no sync) before every launch group of `factorize!`/`factorize_ldlt!`,
     at the start of `"reordering"`/`"symbolic_factorization"` and before every refinement step. An interrupted
-    factorization/refactorization sets the solver back to "analyzed" (solve and `"refactorization"` then raise
-    `FactorizationError`; `"factorization"` works once the flag is cleared).
+    factorization/refactorization sets the solver back to "analyzed" and resets `fresh_factorization` (solve and
+    `"refactorization"` then raise `FactorizationError`; `"factorization"`, and `cholesky!`/`ldlt!`, work once the
+    flag is cleared). An interrupted refinement leaves the last completed iterate in `X` and reports the completed
+    steps in `"ir_n_steps"` (`refine!(…; progress)`, review round 1).
   - `src/logging.jl` (new): `SDS_LOG_LEVEL` (`0`/`none`, `1`/`info`, `2`/`debug`, read in `__init__`),
     `SparseDirectSolver.set_log_level!` (unexported). Phase summaries (reordering, symbolic factorization,
     factorization with host wall time of the launches, refinement steps) as `@info` at level ≥ 1, per-step
@@ -2219,8 +2221,8 @@ repeat it once T21 has landed. The bar is cuDSS with `"matching_alg" =
     `bench/refinement.jl` (new): the relres table below.
   - `test/test_api.jl`: the assertions that `"solve_refinement"`, complex `solve_mode = 1`, complex Hermitian CSC
     input raise `NotSupportedError` and that `ir_n_steps` warns are replaced by assertions of the results.
-- Tests: `SDS_TEST_GPU=0 SDS_TEST_ONLY=test_refinement`: 453 pass, 1 broken (CPU). Full
-  `SDS_TEST_GPU=0 julia --project=. -e 'using Pkg; Pkg.test()'`: 60433 pass, 0 fail, 1 broken (the one above), 11.5 min. CUDA/AMDGPU: pending CI on the PR.
+- Tests (after review round 1): `SDS_TEST_GPU=0 SDS_TEST_ONLY=test_refinement`: 517 pass, 1 broken (CPU). Full
+  `SDS_TEST_GPU=0 julia --project=. -e 'using Pkg; Pkg.test()'`: 60490 pass, 0 fail, 1 broken (the one above), 13.8 min. CUDA/AMDGPU: pending CI on the PR.
 - Measurements: relres `‖b − Ax‖/‖b‖`, `b = A·1`, handle layer `"S"`, view `'L'`, default pivoting, KA CPU
   backend, after `ir_n_steps` steps (`bench/refinement.jl`; dumps generated in this session with
   `bench/dump_madnlp_kkt.jl`, MadNLP/ExaModelsPower current releases):
@@ -2256,7 +2258,6 @@ repeat it once T21 has landed. The bar is cuDSS with `"matching_alg" =
     that refines, not at analysis, so the handle layer with `ir_n_steps = 0` (MadNLP) pays nothing.
   - The interrupt is polled between launch groups, not per level inside a group, and not inside the solve sweeps.
 - Open issues / follow-ups:
-  - An interrupted refinement leaves the last completed iterate in `X` but reports `"ir_n_steps" = 0`.
   - `"solve_refinement"` and the residual read the solver's current values: `update!` without a refactorization
     refines towards the new matrix (tested), which MadNLP could use to skip refactorizations.
 - Suggested plan changes:
