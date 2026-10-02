@@ -10,6 +10,7 @@ Baselines every later milestone is measured against (PLAN.md §5 M0, §7). The
 | `harness.jl` | module `BenchHarness`: `time_phases` (median per phase over `nruns` after warm-up), CHOLMOD/UMFPACK CPU reference, CSV writer |
 | `cudss_baseline.jl` | runs every matrix × structure (`SPD` and `S` for symmetric matrices, `G` for unsymmetric ones) and writes `bench/results/<solver>_baseline.csv` |
 | `front_bins.jl` | regime B (fused per-front kernel, one launch per batch) vs regime C (per-front `potrf`/`trsm`/`syrk` through the dense interface) on synthetic batches per size bin; runs in the package environment: `julia --project=. bench/front_bins.jl [--backend=cuda] [--T=Float64] [--nb=256]` (CUDA from an environment on the load path) |
+| `regimes.jl` | `factorize!` time on the generated matrices with regimes A+B+C (default), B+C (`subtree_budgets = []`) and C only (`factorization_alg = "algo2"`), with fronts per regime and launch counts; package environment: `julia --project=. bench/regimes.jl [--backend=cuda] [--T=Float64] [--only=lap2d_300,lap3d_40]` |
 | `report.jl` | prints the CSV files as Markdown tables |
 | `dump_madnlp_kkt.jl` | dumps MadNLP K2 and condensed KKT matrices of pglib-opf cases |
 

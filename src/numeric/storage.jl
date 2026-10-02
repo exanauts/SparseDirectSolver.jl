@@ -16,8 +16,11 @@ The launch groups of regimes B/C, in execution order: group `k` covers
 `group_maxchild[k]` children, and `group_width[k]` is the width class `W` of
 its fused regime-B kernel ([`factorize_fronts_b!`](@ref)), or `0` when the
 group takes the regime-C path (regime C, or a regime-B bin wider than
-`REGIME_B_MAX_WIDTH`). `info_host` is the host staging buffer of the one
-`info` read per phase.
+`REGIME_B_MAX_WIDTH`). The regime-A launch groups (one per budget class, run
+first): group `k` covers the subtree ids `sub_first[k]:sub_last[k]` of
+`group_nodes` and its kernel has `sub_local[k]` bytes of local memory
+([`subtree_local_bytes`](@ref) of its budget). `info_host` is the host staging
+buffer of the one `info` read per phase.
 """
 struct NumericPlan
     step_first::Vector{Int}
@@ -27,6 +30,9 @@ struct NumericPlan
     group_last::Vector{Int}
     group_maxchild::Vector{Int}
     group_width::Vector{Int}
+    sub_first::Vector{Int}
+    sub_last::Vector{Int}
+    sub_local::Vector{Int}
     info_host::Vector{Int32}
 end
 
@@ -42,9 +48,16 @@ function NumericPlan(S)
     last = zeros(Int, sc.nsteps)
     maxchild = zeros(Int, sc.nsteps)
     gfirst, glast, gmaxchild, gwidth = Int[], Int[], Int[], Int[]
+    sfirst, slast, slocal = Int[], Int[], Int[]
     nf = length(sc.fclasses)
     for grp in sc.groups
-        grp.regime == REGIME_A && continue
+        if grp.regime == REGIME_A
+            isempty(gfirst) || throw(InvalidValueError("schedule: regime-A groups must come first"))
+            push!(sfirst, grp.first)
+            push!(slast, grp.last)
+            push!(slocal, subtree_local_bytes(sc.budgets[grp.class]))
+            continue
+        end
         W = grp.regime == REGIME_B ? sc.wclasses[(grp.class - 1) ÷ nf + 1] : 0
         push!(gfirst, grp.first)
         push!(glast, grp.last)
@@ -61,7 +74,7 @@ function NumericPlan(S)
             maxchild[t] = max(maxchild[t], nchild[sc.group_nodes[q]])
         end
     end
-    return NumericPlan(first, last, maxchild, gfirst, glast, gmaxchild, gwidth, zeros(Int32, 1))
+    return NumericPlan(first, last, maxchild, gfirst, glast, gmaxchild, gwidth, sfirst, slast, slocal, zeros(Int32, 1))
 end
 
 """
@@ -76,7 +89,10 @@ Numeric storage of a factorization (PLAN §3.2), laid out by the
   unused and kept zero);
 * `d` (`layout.d_len = 2n` entries): D of LDLᵀ/LDLᴴ (unused by Cholesky);
 * `stack` (`layout.stack_len` entries): the update stack of the device path
-  (contribution block of `s` at `cb_ptr[s]`, `m×m`, leading dimension `m`);
+  (contribution block of `s` at `cb_ptr[s]`, packed lower triangle of the
+  `m×m` block, `m(m+1)/2` entries);
+* `work` (`layout.work_len` entries): the full `m×m` `syrk`/`herk` result of a
+  regime-C front before it is packed into its block;
 * `stats` (`FRONT_STATS_FIELDS × ns` `Int64`, column `s` = front `s`):
   `(npos, nneg, nzero, nperturbed, n2x2, info)`, `info` = the local column of the
   first failed pivot of the front (`0` = none);
@@ -89,6 +105,7 @@ struct Numeric{T, VT <: AbstractVector{T}, VS <: AbstractVector{Int64}, VI <: Ab
     factor::VT
     d::VT
     stack::VT
+    work::VT
     stats::VS
     info::VI
     plan::NumericPlan
@@ -103,7 +120,7 @@ Base.show(io::IO, N::Numeric{T, VT}) where {T, VT} =
 """
     allocate_numeric(symbolic, T, backend = CPU()) -> Numeric{T}
 
-Allocate (zero-filled) the factor panels, D, update stack, per-front
+Allocate (zero-filled) the factor panels, D, update stack, regime-C workspace, per-front
 statistics and status vector of `symbolic`'s [`Layout`](@ref) for element type
 `T` on the KernelAbstractions `backend`, and build its [`NumericPlan`](@ref).
 This is the only allocation of the numeric phase.
@@ -114,7 +131,9 @@ function allocate_numeric(S::Symbolic, ::Type{T}, backend::KernelAbstractions.Ba
     factor = KernelAbstractions.zeros(backend, T, L.factor_len)
     d = KernelAbstractions.zeros(backend, T, L.d_len)
     stack = KernelAbstractions.zeros(backend, T, L.stack_len)
+    work = KernelAbstractions.zeros(backend, T, L.work_len)
     stats = KernelAbstractions.zeros(backend, Int64, FRONT_STATS_FIELDS * nsupernodes(S))
     info = KernelAbstractions.zeros(backend, Int32, nsupernodes(S) + 1)
-    return Numeric{T, typeof(factor), typeof(stats), typeof(info)}(factor, d, stack, stats, info, NumericPlan(S))
+    return Numeric{T, typeof(factor), typeof(stats), typeof(info)}(factor, d, stack, work, stats, info,
+                                                                         NumericPlan(S))
 end

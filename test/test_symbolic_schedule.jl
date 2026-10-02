@@ -1,17 +1,18 @@
 # T07: schedule (levels, regimes, bins, chunks), static layout, device maps.
 
 # Serial multifrontal stack of a regime-A subtree processed in `nodes` order (bytes):
-# children's blocks are on top of the stack when their parent is assembled.
+# children's blocks are on top of the stack when their parent is assembled; fronts
+# and contribution blocks are packed lower triangles (T11).
 function simulated_subtree_peak(sc::SDS.Schedule, sp::SDS.SupernodePartition, nodes)
     stack = Tuple{Int, Int}[]               # (node, contribution-block entries)
     peak = 0
     for v in nodes
         kids = count(t -> sp.snparent[t[1]] == v, stack)
         live = sum(last, stack; init = 0)
-        peak = max(peak, live + sc.rows[v]^2)
+        peak = max(peak, live + SDS.packed_length(sc.rows[v]))
         all(t -> sp.snparent[t[1]] == v, stack[(end - kids + 1):end]) || return -1   # not a stack order
         resize!(stack, length(stack) - kids)
-        push!(stack, (v, (sc.rows[v] - sc.width[v])^2))
+        push!(stack, (v, SDS.packed_length(sc.rows[v] - sc.width[v])))
     end
     return peak * sc.elsize
 end
@@ -72,8 +73,21 @@ function check_schedule(S::SDS.Symbolic)
         nodes = sc.subtree_nodes[sc.subtree_ptr[t]:(sc.subtree_ptr[t + 1] - 1)]
         ok &= nodes[end] == sc.subtree_root[t] && all(v -> sc.subtree[v] == t, nodes)
         ok &= simulated_subtree_peak(sc, sp, nodes) == sc.subtree_peak[t]
-        ok &= sc.subtree_peak[t] <= sc.budgets[sc.subtree_class[t]]
-        ok &= sc.subtree_class[t] == 1 || sc.subtree_peak[t] > sc.budgets[sc.subtree_class[t] - 1]
+        cap(c) = SDS.subtree_capacity(sc.budgets[c], sc.elsize) * sc.elsize
+        ok &= sc.subtree_peak[t] <= cap(sc.subtree_class[t]) <= sc.budgets[sc.subtree_class[t]]
+        ok &= sc.subtree_class[t] == 1 || sc.subtree_peak[t] > cap(sc.subtree_class[t] - 1)
+        # local layout: every front inside the peak, contribution blocks below their parent's front
+        ok &= L.local_len[t] * sc.elsize == sc.subtree_peak[t]
+        for v in nodes
+            ok &= 1 <= L.local_front[v] && L.local_front[v] + SDS.packed_length(sc.rows[v]) - 1 <= L.local_len[t]
+            p = sp.snparent[v]
+            if v == sc.subtree_root[t]
+                ok &= L.local_cb[v] == 0
+            else
+                ok &= L.local_cb[v] + SDS.packed_length(sc.rows[v] - sc.width[v]) <= L.local_front[p]
+                ok &= L.local_cb[v] <= L.local_front[v]
+            end
+        end
     end
     @test ok
     @test count(==(SDS.REGIME_A), sc.regime) == length(sc.subtree_nodes)
@@ -82,7 +96,7 @@ function check_schedule(S::SDS.Symbolic)
         ok = true
         for t in 1:sc.nsteps
             fronts = [s for s in 1:ns if sc.step[s] == t]
-            bytes = sum(s -> (sc.rows[s] - sc.width[s])^2 * sc.elsize, fronts; init = 0)
+            bytes = sum(s -> SDS.packed_length(sc.rows[s] - sc.width[s]) * sc.elsize, fronts; init = 0)
             ok &= bytes <= sc.memory_budget || length(fronts) == 1
         end
         @test ok
@@ -111,7 +125,7 @@ function check_schedule(S::SDS.Symbolic)
         m = sc.rows[s] - sc.width[s]
         needs = p != 0 && m > 0 && (sc.regime[s] != SDS.REGIME_A || sc.subtree_root[sc.subtree[s]] == s)
         ok &= (L.cb_len[s] > 0) == needs && (L.cb_ptr[s] > 0) == needs
-        needs && (ok &= L.cb_len[s] == m^2 && L.cb_first[s] == sc.step[s] && L.cb_last[s] == sc.step[p])
+        needs && (ok &= L.cb_len[s] == m * (m + 1) ÷ 2 && L.cb_first[s] == sc.step[s] && L.cb_last[s] == sc.step[p])
     end
     @test ok
     @test S.cb_ptr == L.cb_ptr
@@ -201,7 +215,7 @@ end
     @test sc.level == [1, 1, 1, 1, 2]
     @test all(==(SDS.REGIME_A), sc.regime)                       # everything fits 16 KiB
     @test SDS.nsubtrees(sc) == 1 && sc.subtree_root == [5]
-    @test sc.subtree_peak == [(4 + 4 + 4 + 9) * 8]                # three 2×2 blocks waiting + 3×3 front
+    @test sc.subtree_peak == [(3 + 3 + 3 + 6) * 8]                # three packed 2×2 blocks waiting + packed 3×3 front
     @test SDS.nlaunches(sc) == 1
     @test S.layout.stack_len == 0
     check_schedule(S)
@@ -213,14 +227,14 @@ end
     @test sc0.slevel == [1, 1, 1, 1, 2]
     @test SDS.nlaunches(sc0) == 2
     @test S0.relind == [1, 2, 1, 2, 1, 2, 1, 2]
-    @test S0.layout.cb_len == [4, 4, 4, 4, 0]
-    @test S0.layout.stack_len == 16
+    @test S0.layout.cb_len == [3, 3, 3, 3, 0]                    # packed 2×2 lower triangles
+    @test S0.layout.stack_len == 12
     check_schedule(S0)
     # vendor everywhere: five C fronts (four with a contribution block)
     S2 = SDS.symbolic_analysis(SDS.CSR(A), "SPD", 'L'; opts = Options(reordering_alg = "algo5", use_superpanels = 0,
                                                                       subtree_budgets = Int[], factorization_alg = "algo2"))
     @test all(==(SDS.REGIME_C), S2.schedule.regime)
-    @test SDS.nlaunches(S2.schedule) == (1 + 4 * 3) + (1 + 1)
+    @test SDS.nlaunches(S2.schedule) == (1 + 4 * 4) + (1 + 1)   # potrf, trsm, syrk, pack_add!
     check_schedule(S2)
     # "G" maps are not implemented yet
     @test thrown(() -> SDS.symbolic_analysis(SDS.CSR(A), "G", 'F')) isa NotSupportedError
@@ -333,24 +347,23 @@ end
     # panels) brought the KKT ratio from 7.8 to 5.6 (T07 Report); placing the
     # contribution blocks offline over their known lifetimes (best of first fit,
     # largest first, largest size × lifetime first) removed the fragmentation of
-    # the step-by-step first fit: 6.2 -> 4.5 (KKT) and 6.1 -> 4.5 (random SPD) on
-    # an RTX 4080 / CPU run. The rest is live data: the sum of the contribution
-    # blocks live in the fullest step, which the level schedule fixes (a serial
-    # Liu postorder would need 4.1 on the KKT matrix and the same 4.4 on the
-    # random one) and which packed triangular blocks would halve (issue #48).
-    # Bounds sit above the measured values so a regression shows up; print the
-    # values for the Report. The random generators depend on the RNG state left
-    # by the preceding testsets, which differs with the backend list, so reseed
-    # here. The sprand stream for a given seed also differs between Julia
-    # versions: on Julia 1.10 the KKT and random SPD ratios are 5.37 and 5.05
-    # and stack_len is 1.09 and 1.19 times the live bound, so the bounds of the
-    # random matrices carry that margin. The Laplacian is RNG-free and keeps
-    # the tight bounds.
+    # the step-by-step first fit: 6.2 -> 4.5 (KKT) and 6.1 -> 4.5 (random SPD);
+    # packed lower-triangular contribution blocks (T11, which closes issue #48)
+    # halve what remains: measured 3.0 (KKT), 2.9 (random SPD) and 0.24 (2-D
+    # Laplacian, also fewer blocks on the stack since the larger regime-A
+    # subtrees keep theirs in local memory) with the first fit alone. Bounds sit
+    # above the measured values so a regression shows up; print the values for
+    # the Report. The random generators depend on the RNG state left by the
+    # preceding testsets, which differs with the backend list, so reseed here.
+    # The sprand stream for a given seed also differs between Julia versions
+    # (on Julia 1.10 the full-block ratios were 5.37 and 5.05 and stack_len
+    # 1.09 and 1.19 times the live bound), so the bounds of the random matrices
+    # carry that margin. The Laplacian is RNG-free and keeps the tight bounds.
     Random.seed!(666)
     for (name, A, bound, slack) in
-        (("kkt_matrix(3000, 1000)", kkt_matrix(3000, 1000, 1.0e-8), 5.5, 1.25),
-         ("random_spd(2000, 0.002)", random_spd(2000, 0.002), 5.5, 1.25),
-         ("laplacian2d(100, 100)", laplacian2d(100, 100), 0.7, 1.05))
+        (("kkt_matrix(3000, 1000)", kkt_matrix(3000, 1000, 1.0e-8), 3.5, 1.25),
+         ("random_spd(2000, 0.002)", random_spd(2000, 0.002), 3.5, 1.25),
+         ("laplacian2d(100, 100)", laplacian2d(100, 100), 0.5, 1.05))
         S = SDS.symbolic_analysis(SDS.CSR(A), "S", 'L'; opts = Options(reordering_alg = "algo3"))
         L = S.layout
         ratio = L.stack_len / L.factor_len

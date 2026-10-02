@@ -5,22 +5,16 @@
 # width class `W`), factors it unblocked (right-looking, two barriers per
 # column), writes L11 back, solves F21 ← F21 L11⁻ᴴ one panel row per work item
 # (row tiles of `WG` rows streamed from the panel, L11 read from local memory),
-# and updates its own contribution block F22 ← F22 − F21 F21ᴴ (lower triangle)
-# on the update stack. Every front writes only its own panel and contribution
+# and updates its own contribution block F22 ← F22 − F21 F21ᴴ (packed lower
+# triangle) on the update stack. Every front writes only its own panel and contribution
 # block: no atomics, deterministic. The status of the front (`potrf` info: the
 # first non-positive pivot, local column) goes to `info[s]`.
 
 "Width classes with a fused regime-B kernel (`@localmem` holds the packed `W×W` lower triangle)."
 const REGIME_B_WIDTHS = (8, 16, 32, 64)
 
-"Largest front width with a fused regime-B kernel; wider bins (raised `regime_c_width`) take the regime-C path."
-const REGIME_B_MAX_WIDTH = 64
-
 "Workgroup size of the fused regime-B kernel."
 const FRONT_WORKGROUP = 128
-
-# position of (i, j), i ≥ j, in the packed column-major lower triangle of a W×W matrix
-@inline _packed(i, j, W) = (j - 1) * (2 * W - j + 2) ÷ 2 + i - j + 1
 
 # load the lower triangle of F11 of front `s` into local memory, reset the status
 @inline function _front_load!(L11, st, factor, s, li, front_ptr, front_nrows, front_ncols, ::Val{W},
@@ -111,7 +105,7 @@ end
     return nothing
 end
 
-# F22 ← F22 − F21 F21ᴴ on the lower triangle of the contribution block (real diagonal, as herk)
+# F22 ← F22 − F21 F21ᴴ on the packed contribution block (real diagonal, as herk)
 @inline function _front_syrk!(factor, stack, st, s, li, front_ptr, front_nrows, front_ncols, cb_ptr,
                               ::Val{WG}) where {WG}
     @inbounds begin
@@ -130,7 +124,7 @@ end
                     for k in 1:w
                         acc += factor[p0 + (k - 1) * f + ii] * conj(factor[p0 + (k - 1) * f + jj])
                     end
-                    d = c0 + q
+                    d = c0 + _packed(ii, jj, m) - 1
                     stack[d] = ii == jj ? T(real(stack[d]) - real(acc)) : stack[d] - acc
                 end
             end
@@ -150,7 +144,7 @@ Fused regime-B kernel: workgroup `g` takes front `s = nodes[first + g - 1]`
 `amap`, then the `maxchild` children's contribution blocks in `child_list`
 order), then factors `F11 = L11 L11ᴴ` in `@localmem` (`NL = W(W+1)/2`
 entries), solves `F21 ← F21 L11⁻ᴴ`, updates its contribution block on the
-update stack (`cb_ptr[s] > 0`) and sets `info[s]` (0, or the local column of
+update stack (`cb_ptr[s] > 0`, packed lower triangle) and sets `info[s]` (0, or the local column of
 the first non-positive pivot; the front is then left partially factored).
 Without `ASM` the panels and contribution blocks must already be assembled.
 """
@@ -248,9 +242,9 @@ Dense part of the regime-B kernel on already assembled fronts (benchmarks and
 tests): for each front `s = nodes[first + k - 1]`, `k = 1:count`, with panel
 `factor[front_ptr[s]:(front_ptr[s + 1] - 1)]` (`f×w`, `f = front_nrows[s]`,
 `w = front_ncols[s] ≤ width`, `width ∈ $(REGIME_B_WIDTHS)`) and contribution
-block `stack[cb_ptr[s]:(cb_ptr[s] + m^2 - 1)]` (`m = f - w`, skipped when
-`cb_ptr[s] == 0`): `F11 = L11 L11ᴴ`, `F21 ← F21 L11⁻ᴴ`,
-`F22 ← F22 − F21 F21ᴴ` (lower triangle), `info[s]` = status. Asynchronous.
+block `stack[cb_ptr[s]:(cb_ptr[s] + m(m+1)/2 - 1)]` (`m = f - w`, packed lower
+triangle, skipped when `cb_ptr[s] == 0`): `F11 = L11 L11ᴴ`, `F21 ← F21 L11⁻ᴴ`,
+`F22 ← F22 − F21 F21ᴴ`, `info[s]` = status. Asynchronous.
 """
 function front_cholesky!(factor::AbstractVector, stack::AbstractVector, info::AbstractVector{Int32},
                          nodes::AbstractVector, first::Integer, count::Integer, front_ptr::AbstractVector,

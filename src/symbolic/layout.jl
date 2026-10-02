@@ -7,16 +7,26 @@
 #   upper triangle of its diagonal block is stored but unused;
 # * D buffer (length `2n`): the diagonal of D for column `j` at `j`, the
 #   subdiagonal of a 2×2 pivot starting at column `j` at `n + j`;
-# * update stack: the `m×m` contribution block (`m = f - w`, column-major,
-#   leading dimension `m`) of a B/C front, or of the root of a regime-A subtree,
-#   at `cb_ptr[s]:(cb_ptr[s] + m^2 - 1)`. It lives from the step that produces it
-#   to the step of its parent (both included); contribution blocks live at the
-#   same time never overlap. All lifetimes are known here, so the offsets come
-#   from the best of three placements (issue #48): a step-by-step first fit, and
-#   two offline placements that put each block at the lowest offset clear of the
-#   blocks already placed with an overlapping lifetime, largest blocks first and
-#   largest size × lifetime first. Contribution blocks inside a regime-A subtree
-#   stay in local memory (`cb_ptr = 0`), as do those of roots of the tree (`m = 0`).
+# * update stack: the contribution block (`m = f - w`) of a B/C front, or of the
+#   root of a regime-A subtree, as the packed lower triangle of the `m×m` block
+#   (column-major packed, `m(m+1)/2` entries, column `j` from offset
+#   `(j-1)(2m-j+2)/2`, see `_packed`) at `cb_ptr[s]:(cb_ptr[s] + m(m+1)/2 - 1)`.
+#   It lives from the step that produces it to the step of its parent (both
+#   included); contribution blocks live at the same time never overlap. All
+#   lifetimes are known here, so the offsets come from the best of three
+#   placements (issue #48): a step-by-step first fit, and two offline placements
+#   that put each block at the lowest offset clear of the blocks already placed
+#   with an overlapping lifetime, largest blocks first and largest size ×
+#   lifetime first. Contribution blocks inside a regime-A subtree stay in local
+#   memory (`cb_ptr = 0`), as do those of roots of the tree (`m = 0`);
+# * regime-C workspace: the full `m×m` result of the vendor `syrk`/`herk` of a
+#   front on the regime-C path, packed and added to its block afterwards; one
+#   buffer of the largest such `m^2`;
+# * local memory of a regime-A subtree (per workgroup): the serial stack of the
+#   subtree in processing order. The front of `v` (packed `f×f` lower triangle)
+#   is placed on top of its children's contribution blocks; once factored, its
+#   trailing `m×m` triangle (which is the packed contribution block) moves down
+#   to where the first child's block started.
 
 """
     Layout
@@ -32,7 +42,13 @@ offsets, 1-based:
   it has none there); `cb_first`, `cb_last`: the steps it lives in (step 0 is
   regime A, see [`Schedule`](@ref));
 * `step_top[t + 1]`: last update-stack entry in use during step `t`
-  (`t = 0:nsteps`); `stack_len = maximum(step_top)` is the high-water mark.
+  (`t = 0:nsteps`); `stack_len = maximum(step_top)` is the high-water mark;
+* `work_len`: entries of the regime-C `syrk` workspace (largest `m^2` of a
+  front on the regime-C path, [`takes_c_path`](@ref), with a block on the stack);
+* `local_front`, `local_cb` (regime A, `0` elsewhere): local-memory offset of the
+  packed front of `s` and of its contribution block after the move (`0` for a
+  subtree root, whose block goes to the update stack); `local_len[t]`: entries
+  of the serial stack of subtree `t` (its peak).
 """
 struct Layout
     panel_ptr::Vector{Int}
@@ -45,10 +61,15 @@ struct Layout
     cb_last::Vector{Int}
     step_top::Vector{Int}
     stack_len::Int
+    work_len::Int
+    local_front::Vector{Int}
+    local_cb::Vector{Int}
+    local_len::Vector{Int}
 end
 
 Base.show(io::IO, L::Layout) =
-    print(io, "Layout(factor ", L.factor_len, ", D ", L.d_len, ", update stack ", L.stack_len, " entries)")
+    print(io, "Layout(factor ", L.factor_len, ", D ", L.d_len, ", update stack ", L.stack_len, ", workspace ",
+          L.work_len, " entries)")
 
 # first fit in a sorted free list of (offset, length) holes over an unbounded buffer
 function _first_fit!(free::Vector{Tuple{Int, Int}}, top::Base.RefValue{Int}, len::Int)
@@ -148,11 +169,13 @@ _high_water(cb_ptr, cb_len, ids) = maximum((cb_ptr[s] + cb_len[s] - 1 for s in i
 
 Panel offsets in supernode order, D offsets, and the update-stack offsets of
 the contribution blocks that leave their front through global memory (B/C
-fronts and regime-A subtree roots that have a parent). Blocks whose lifetimes
-`[step(s), step(parent)]` overlap never share entries; the offsets are the
-placement with the lowest high-water mark among a step-by-step first fit and
-two offline placements (lowest free offset, largest blocks first and largest
-size × lifetime first; issue #48).
+fronts and regime-A subtree roots that have a parent; packed lower triangles).
+Blocks whose lifetimes `[step(s), step(parent)]` overlap never share entries;
+the offsets are the placement with the lowest high-water mark among a
+step-by-step first fit and two offline placements (lowest free offset, largest
+blocks first and largest size × lifetime first; issue #48). Also the regime-C
+workspace and the local-memory offsets of the regime-A subtrees
+([`subtree_local_layout`](@ref)).
 """
 function build_layout(sp::SupernodePartition, sc::Schedule)
     ns = nsupernodes(sp)
@@ -174,7 +197,7 @@ function build_layout(sp::SupernodePartition, sc::Schedule)
         m = sc.rows[s] - sc.width[s]
         (p == 0 || m == 0) && continue
         sc.regime[s] == REGIME_A && sc.subtree_root[sc.subtree[s]] != s && continue
-        cb_len[s] = m * m
+        cb_len[s] = packed_length(m)
         cb_first[s] = sc.step[s]
         cb_last[s] = sc.step[p]
         cb_last[s] > cb_first[s] ||
@@ -197,6 +220,58 @@ function build_layout(sp::SupernodePartition, sc::Schedule)
     for s in ids, t in cb_first[s]:cb_last[s]
         step_top[t + 1] = max(step_top[t + 1], cb_ptr[s] + cb_len[s] - 1)
     end
+    work_len = maximum((cb_len[s] > 0 && takes_c_path(sc, s) ? (sc.rows[s] - sc.width[s])^2 : 0 for s in 1:ns);
+                       init = 0)
+    local_front, local_cb, local_len = subtree_local_layout(sp, sc)
     return Layout(panel_ptr, panel_ptr[end] - 1, d_ptr, 2n, cb_ptr, cb_len, cb_first, cb_last, step_top,
-                  maximum(step_top; init = 0))
+                  maximum(step_top; init = 0), work_len, local_front, local_cb, local_len)
+end
+
+"""
+    subtree_local_layout(sp, schedule) -> (local_front, local_cb, local_len)
+
+Local-memory layout (1-based entry offsets) of the regime-A subtrees: a serial
+stack in each subtree's processing order. The packed front of `v`
+(`f(f+1)/2` entries) starts at `local_front[v]`, right above the contribution
+blocks of its children (which are the top of the stack, contiguous); after the
+factorization its packed `m(m+1)/2` contribution block (the trailing triangle
+of the front) moves down to `local_cb[v]`, the start of the first child's
+block, or of the front when it has no children. Subtree roots keep
+`local_cb = 0` (their block goes to the update stack). `local_len[t]` is the
+peak of subtree `t` in entries (`schedule.subtree_peak[t] / elsize`).
+"""
+function subtree_local_layout(sp::SupernodePartition, sc::Schedule)
+    ns = nsupernodes(sp)
+    local_front = zeros(Int, ns)
+    local_cb = zeros(Int, ns)
+    local_len = zeros(Int, nsubtrees(sc))
+    for t in 1:nsubtrees(sc)
+        stack = Int[]                                  # nodes whose blocks are live, bottom to top
+        top = 0                                        # entries in use
+        peak = 0
+        for k in sc.subtree_ptr[t]:(sc.subtree_ptr[t + 1] - 1)
+            v = sc.subtree_nodes[k]
+            base = top
+            while !isempty(stack) && sp.snparent[stack[end]] == v
+                c = pop!(stack)
+                base = local_cb[c] - 1
+            end
+            any(c -> sp.snparent[c] == v, stack) &&
+                throw(InvalidValueError("subtree $t: the children of $v are not on top of the stack"))
+            local_front[v] = top + 1
+            peak = max(peak, top + packed_length(sc.rows[v]))
+            m = sc.rows[v] - sc.width[v]
+            if v == sc.subtree_root[t]
+                top = base
+            else
+                local_cb[v] = base + 1
+                top = base + packed_length(m)
+                push!(stack, v)
+            end
+        end
+        local_len[t] = peak
+        peak * sc.elsize == sc.subtree_peak[t] ||
+            throw(InvalidValueError("subtree $t: local stack peak $(peak * sc.elsize) B, schedule says $(sc.subtree_peak[t]) B"))
+    end
+    return local_front, local_cb, local_len
 end

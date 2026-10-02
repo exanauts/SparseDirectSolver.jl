@@ -49,21 +49,22 @@ else
     error("unknown backend $(OPTS["backend"])")
 end
 
-# a batch of `nb` assembled fronts of shape (w, f): panels, contribution blocks, descriptors
+# a batch of `nb` assembled fronts of shape (w, f): panels, packed contribution blocks, descriptors
 function make_batch(::Type{T}, nb, w, f) where {T}
     m = f - w
+    mp = m * (m + 1) ÷ 2
     factor = zeros(T, nb * f * w)
-    stack = zeros(T, nb * m * m)
+    stack = zeros(T, nb * mp)
     for s in 1:nb
         M = rand(T, f, f)
         F = M * M' + f * I
         p0 = (s - 1) * f * w
         reshape(view(factor, (p0 + 1):(p0 + f * w)), f, w) .= tril(F[:, 1:w])
-        c0 = (s - 1) * m * m
-        reshape(view(stack, (c0 + 1):(c0 + m * m)), m, m) .= tril(F[(w + 1):end, (w + 1):end])
+        c0 = (s - 1) * mp
+        stack[(c0 + 1):(c0 + mp)] .= [F[w + i, w + j] for j in 1:m for i in j:m]
     end
     front_ptr = Int32.(1 .+ (0:nb) .* (f * w))
-    cb_ptr = Int32.(1 .+ (0:(nb - 1)) .* (m * m))
+    cb_ptr = Int32.(1 .+ (0:(nb - 1)) .* mp)
     return (; factor, stack, front_ptr, cb_ptr, nrows = fill(Int32(f), nb), ncols = fill(Int32(w), nb),
             nodes = Int32.(1:nb))
 end
@@ -95,8 +96,9 @@ function bench_bin(::Type{T}, nb, w, f, W, impl, nruns) where {T}
     p = (potrf = SDS.select_impl(:potrf, factor, impl), trsm = SDS.select_impl(:trsm, factor, impl),
          herk = SDS.select_impl(T <: Real ? :syrk : :herk, factor, impl))
     m = f - w
+    work = similar(factor, m * m)
     runc!() = for s in 1:nb
-        SDS._factor_panel_c!(factor, stack, info, s, (s - 1) * f * w + 1, f, w, (s - 1) * m * m + 1, p)
+        SDS._factor_panel_c!(factor, stack, work, info, s, (s - 1) * f * w + 1, f, w, (s - 1) * (m * (m + 1) ÷ 2) + 1, p)
     end
     tc = time_median(runc!, reset!, nruns)
     Fc = Array(factor)
