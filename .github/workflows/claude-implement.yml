@@ -131,7 +131,12 @@ jobs:
                `gh issue create --label found-by-agent --title "..." --body "..."` (fields in
                .github/ISSUE_TEMPLATE/agent-finding.md) and cite it in the Report. Do not fix them silently.
             5. Commit with a message starting with `${{ steps.guard.outputs.task }}: ` (never commit
-               Manifest.toml), then `git push -u origin <branch>`.
+               Manifest.toml), then `git push -u origin <branch>`. Push the branch early as well
+               (right after creating it, and after each green test subset): the GitHub App token
+               of this run expires after one hour, and an early push limits what a late failure
+               loses. If a push or `gh` call fails with 401/403, do not retry and do not print
+               patches into the log: commit locally, finish the Report, and stop; the workflow's
+               "Publish the branch" step pushes your commits and opens the PR with its own token.
             6. Open the pull request:
                `gh pr create --title "${{ steps.guard.outputs.task }}: <summary>" --label claude:pr --milestone "${{ steps.guard.outputs.milestone }}" --body "<body>"`
                following .github/pull_request_template.md. The body must contain the exact line
@@ -149,6 +154,42 @@ jobs:
           name: claude-execution-${{ steps.guard.outputs.task }}-${{ github.run_id }}
           path: ${{ steps.claude.outputs.execution_file }}
           retention-days: 14
+
+      # The Claude App token the action mints lives one hour; a run longer than that
+      # (T15 took 81 min) cannot push or open the PR at the end. This step publishes
+      # whatever Claude committed on its `task/TNN-*` branch. With the fine-grained
+      # PAT `CLAUDE_GH_PAT` (contents, pull requests, issues: write) the push and the
+      # PR trigger CI and the reviewer like Claude's own would; without it the
+      # `github.token` is used, which opens the PR but starts no workflow (the owner
+      # then closes and reopens the PR, or pushes to it, to start CI).
+      - name: Publish the branch if Claude could not
+        if: always() && steps.guard.outputs.go == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.CLAUDE_GH_PAT || github.token }}
+          TASK: ${{ steps.guard.outputs.task }}
+          MILESTONE: ${{ steps.guard.outputs.milestone }}
+          HAS_PAT: ${{ secrets.CLAUDE_GH_PAT != '' }}
+        run: |
+          set -euo pipefail
+          pr=$(gh pr list --state all --limit 100 --json number,headRefName,createdAt \
+            --jq "[.[] | select(.headRefName | startswith(\"task/$TASK-\"))] | sort_by(.createdAt) | last | .number // empty")
+          if [ -n "$pr" ]; then echo "PR #$pr exists for $TASK; nothing to publish."; exit 0; fi
+          branch=$(git for-each-ref --format='%(refname:short)' "refs/heads/task/$TASK-*" | head -1)
+          if [ -z "$branch" ]; then echo "No local task/$TASK-* branch."; exit 0; fi
+          git checkout --quiet "$branch"
+          if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+            git add -u && git commit --quiet -m "$TASK: uncommitted changes at the end of the implementer run"
+          fi
+          if [ "$(git rev-list --count origin/main.."$branch")" = "0" ]; then echo "Branch $branch has no commits."; exit 0; fi
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          git push --quiet -u origin "$branch"
+          subject=$(git log -1 --format=%s "$branch")
+          body=$(printf 'Closes #%s\n\n**Task**: %s — opened by the workflow after the implementer run %s/%s/actions/runs/%s ended without a pull request (the App token had expired). The Report block in TASKS.md and the commit message are the implementer'"'"'s; the body of the PR template is not filled in.\n\n%s\n' \
+            "$ISSUE" "$TASK" "${{ github.server_url }}" "${{ github.repository }}" "${{ github.run_id }}" "$(git log -1 --format=%b "$branch")")
+          gh pr create --title "$subject" --head "$branch" --base main --label claude:pr --milestone "$MILESTONE" --body "$body"
+          if [ "$HAS_PAT" != "true" ]; then
+            gh issue comment "$ISSUE" --body "The implementer's branch was published with the workflow token, so CI and the reviewer did not start on its PR: close and reopen the PR (or push to it) to start them. Set the repository secret \`CLAUDE_GH_PAT\` to avoid this."
+          fi
 
       - name: Check that a pull request was opened
         if: always() && steps.guard.outputs.go == 'true'

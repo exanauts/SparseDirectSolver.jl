@@ -226,7 +226,14 @@ jobs:
         run: |
           set -euo pipefail
           task=$(sed -nE 's/^(T[0-9]{2}):.*/\1/p' <<<"$TITLE")
-          if [ -z "$task" ]; then echo "PR title has no task id; nothing to chain."; exit 0; fi
+          if [ -z "$task" ]; then
+            # Not a task PR (an owner PR closing found-by-agent issues): the issue
+            # closes above were made with github.token and trigger nothing, so run
+            # the triage workflow by hand; it starts the next task if nothing holds it.
+            echo "PR title has no task id; dispatching claude-triage.yml."
+            gh workflow run claude-triage.yml || true
+            exit 0
+          fi
           next=$(printf 'T%02d' $((10#${task#T} + 1)))
           issue=$(gh issue list --state open --label task --limit 100 --json number,title,labels \
             --jq '[.[] | select(.title | startswith("'"$next"' — "))][0]')
