@@ -54,16 +54,16 @@ end
     cols = ["solver", "feature", "task", "matrix", "structure", "n", "nnz", "T", "nrhs", "nbatch",
             "analysis_s", "factorization_s", "refactorization_s", "solve_s",
             "analysis_min_s", "factorization_min_s", "refactorization_min_s", "solve_min_s",
-            "lu_nnz", "flops", "nsuperpanels", "relres", "status", "device", "version", "git_sha", "date"]
-    row(solver, feature, matrix, t, status = "ok") =
+            "lu_nnz", "flops", "nsuperpanels", "relres", "status", "device", "version", "git_sha", "date", "samples"]
+    row(solver, feature, matrix, t, status = "ok"; samples = "5") =
         [solver, feature, "T13", matrix, "SPD", "100", "500", "Float64", "1", "1",
          (status == "ok" ? fill(string(t), 8) : fill("", 8))..., (status == "ok" ? ["1000", "2.0e6", "0", "1.0e-12"] : fill("", 4))...,
-         status, "GPU", "0.8.0", "abc123", "2026-10-02"]
+         status, "GPU", "0.8.0", "abc123", "2026-10-02", samples]
     mktempdir() do dir
         write_rows(path, rows) = open(io -> writedlm(io, [permutedims(cols); permutedims(reduce(hcat, rows))], ','), path, "w")
         write_rows(joinpath(dir, "cudss.csv"), [row("cudss", "cholesky_f64", "a", 0.001), row("cudss", "cholesky_f64", "b", 0.002),
                                                row("cudss", "ldlt", "a", 0.001)])
-        write_rows(joinpath(dir, "sds.csv"), [row("sds", "cholesky_f64", "a", 0.002), row("sds", "cholesky_f64", "b", 0.008),
+        write_rows(joinpath(dir, "sds.csv"), [row("sds", "cholesky_f64", "a", 0.002), row("sds", "cholesky_f64", "b", 0.008; samples = "1"),
                                              row("sds", "cholesky_nrhs16", "a", 0.0, "NotSupportedError: not implemented yet (T99)")])
         c = read_rows(joinpath(dir, "cudss.csv"))
         s = read_rows(joinpath(dir, "sds.csv"))
@@ -83,7 +83,8 @@ end
         @test occursin("| a | 100 | 1 | 2 | 2.00× |", md)            # analysis cuDSS 1 ms, SDS 2 ms
         @test occursin("| a | 100 | 1 |  |  |", md)                  # ldlt: SDS cell blank
         @test occursin("fail", md) && occursin("* SDS on a: NotSupportedError", md)
-        @test occursin("Not run yet.", md)                             # features without rows
+        @test occursin("Not run yet.", md)
+        @test occursin("limit): SDS on b.", md)                       # single-run note                             # features without rows
         @test occursin("cuDSS 0.8.0 on GPU, repository abc123, 2026-10-02.", md)
         @test !occursin("comparison.png", md)
         for f in BF.COMPARE_FEATURES

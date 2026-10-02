@@ -77,7 +77,13 @@ julia --project=bench bench/compare.jl --solver=sds --features=ldlt
   GPU drops to a low-clock power state during the host-side setup and the timed
   phase starts slow (lap2d_300 factorization varied between 6 and 19 ms; with
   the spin it is a stable 5.9 ms, against 6.05 ms in the T04 baseline). The
-  report shows medians; the CSV also keeps the minima.
+  report shows medians; the CSV also keeps the minima. Before the trials, one
+  run compiles and gives `info`, nnz(L) and the residual, and a second run is
+  timed; if its factorization takes longer than `--single-run-above` (5 s),
+  its times are recorded instead of a trial (`samples` = 1 in the CSV, listed
+  under the feature's table). This keeps slow rows, such as the T15 LDLᵀ on
+  the larger matrices, from costing twenty factorizations each. The CSV is
+  rewritten after every row, so an interrupted run keeps what it measured.
 * **Synthetic inputs.** `ubatch8` builds 8 value sets on one pattern by scaling
   the diagonal of member k by 1 + 0.01(k−1). `schur` takes the last
   min(64, n/10) rows as the Schur block and times `solve_fwd_schur` as the

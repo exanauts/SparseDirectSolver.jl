@@ -104,7 +104,7 @@ function render_markdown(io::IO, cudss_rows, sds_rows; features = COMPARE_FEATUR
         foreach(p -> print(io, " $p cuDSS ms | SDS ms | ratio |"), PHASES)
         println(io, " nnz(L) cuDSS | SDS | relres cuDSS | SDS |")
         println(io, "|", repeat(" --- |", 2 + 3 * length(PHASES) + 4))
-        failures = String[]
+        failures, single = String[], String[]
         for m in names
             c, s = find_row(cudss_rows, f, m), find_row(sds_rows, f, m)
             n = c !== nothing ? c["n"] : s["n"]
@@ -114,10 +114,13 @@ function render_markdown(io::IO, cudss_rows, sds_rows; features = COMPARE_FEATUR
                     " | ", fmt_field(s, "relres"), " |")
             for (who, r) in (("cuDSS", c), ("SDS", s))
                 r !== nothing && !ok(r) && push!(failures, "$who on $m: $(r["status"])")
+                ok(r) && get(r, "samples", "") == "1" && push!(single, "$who on $m")
             end
         end
         println(io)
         isempty(failures) || (foreach(x -> println(io, "* ", x), failures); println(io))
+        isempty(single) || println(io, "Single run instead of a BenchmarkTools trial (factorization above the ",
+                                   "`--single-run-above` limit): ", join(single, ", "), ".\n")
     end
     println(io, "## Runs\n")
     for (who, rows) in (("cuDSS", cudss_rows), ("SparseDirectSolver.jl", sds_rows))

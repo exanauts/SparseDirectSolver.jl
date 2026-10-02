@@ -12,6 +12,8 @@
 #   --only=m1,m2        matrix names (default: all harness matrices)
 #   --samples=5         BenchmarkTools samples per phase (after its warm-up sample)
 #   --seconds=60        time budget per phase; sampling stops at whichever limit comes first
+#   --single-run-above=5  if one factorization takes longer (seconds), record the
+#                       times of a single run instead of a BenchmarkTools trial
 #   --no-suitesparse    skip the MatrixDepot matrices
 #   --no-dumps          skip the KKT dumps under bench/data/
 #   --force             run SDS features whose task is not done in TASKS.md (rows record the error)
@@ -19,8 +21,10 @@
 # Each phase is timed on a fresh solver: the `setup` of the benchmark creates the
 # solver and runs the phases it depends on, the timed expression runs the phase
 # and synchronizes the device. On a GPU the setup ends by keeping the device busy
-# for 0.2 s so that it is at full clock (see `spin_device`). One more untimed
-# run gives `info`, the statistics and the residual.
+# for 0.2 s so that it is at full clock (see `spin_device`). A first run of all
+# phases compiles and gives `info`, the statistics and the residual; when the
+# factorization of a second run exceeds --single-run-above, the times of that
+# run are recorded instead of a trial.
 
 using LinearAlgebra
 using SparseArrays
@@ -36,12 +40,12 @@ using .BenchFeatures
 
 function parse_args(args)
     o = Dict{String, String}("solver" => "", "backend" => "cuda", "features" => "", "only" => "",
-                             "samples" => "5", "seconds" => "60", "suitesparse" => "true", "dumps" => "true",
+                             "samples" => "5", "seconds" => "60", "single-run-above" => "5", "suitesparse" => "true", "dumps" => "true",
                              "force" => "false")
     for a in args
         if a in ("--no-suitesparse", "--no-dumps", "--force")
             o[a == "--force" ? "force" : a[6:end]] = a == "--force" ? "true" : "false"
-        elseif (m = match(r"^--(solver|backend|features|only|samples|seconds)=(.*)$", a)) !== nothing
+        elseif (m = match(r"^--(solver|backend|features|only|samples|seconds|single-run-above)=(.*)$", a)) !== nothing
             o[m[1]] = m[2]
         else
             error("unknown argument \"$a\"; see the header of bench/compare.jl")
@@ -210,19 +214,34 @@ function stat(f, s)
 end
 
 """
-    measure(sys; samples, seconds) -> NamedTuple
+    measure(sys; samples, seconds, single_run_above) -> NamedTuple
 
-Timings of the four phases, then one untimed run for `info`, statistics and the residual.
+A first run of all four phases compiles and gives `info`, the statistics and
+the residual. A second run is timed phase by phase; if its factorization took
+longer than `single_run_above` seconds, its times are recorded (`samples = 1`),
+otherwise each phase gets a BenchmarkTools trial (median and minimum).
 """
-function measure(sys; samples, seconds)
-    times = Dict(p => time_phase(sys, p; samples, seconds) for p in PHASES)
+function measure(sys; samples, seconds, single_run_above)
     st = sys.fresh()
     foreach(p -> run_phase(sys, st, p), PHASES)
     sync()
     info = API.get(st[1], "info")
     info == 0 || error("info = $info after the factorization")
-    return (; times, relres = sys.check(solution(st)), lu_nnz = stat(s -> API.get(s, "lu_nnz"), st[1]),
-            flops = stat(API.flops, st[1]), nsuperpanels = stat(s -> API.get(s, "nsuperpanels"), st[1]))
+    stats = (relres = sys.check(solution(st)), lu_nnz = stat(s -> API.get(s, "lu_nnz"), st[1]),
+             flops = stat(API.flops, st[1]), nsuperpanels = stat(s -> API.get(s, "nsuperpanels"), st[1]))
+    st = sys.fresh()
+    once = Dict{String, Float64}()
+    for p in PHASES
+        p == "analysis" || spin_device()
+        t0 = time_ns()
+        run_phase(sys, st, p)
+        sync()
+        once[p] = (time_ns() - t0) / 1e9
+    end
+    single = once["factorization"] > single_run_above
+    times = single ? Dict(p => (once[p], once[p]) for p in PHASES) :
+            Dict(p => time_phase(sys, p; samples, seconds) for p in PHASES)
+    return (; times, samples = single ? 1 : samples, stats...)
 end
 
 # --- CSV ---------------------------------------------------------------------
@@ -230,7 +249,7 @@ end
 const COLUMNS = ["solver", "feature", "task", "matrix", "structure", "n", "nnz", "T", "nrhs", "nbatch",
                  "analysis_s", "factorization_s", "refactorization_s", "solve_s",
                  "analysis_min_s", "factorization_min_s", "refactorization_min_s", "solve_min_s",
-                 "lu_nnz", "flops", "nsuperpanels", "relres", "status", "device", "version", "git_sha", "date"]
+                 "lu_nnz", "flops", "nsuperpanels", "relres", "samples", "status", "device", "version", "git_sha", "date"]
 
 cell(x) = x === missing || x === nothing ? "" : x isa AbstractFloat ? repr(Float64(x)) : string(x)
 clean(msg) = first(strip(replace(msg, r"[,\"\s]+" => " ")), 200)
@@ -255,10 +274,10 @@ function csv_row(f, name, Ms, result, meta)
     head = [SOLVER, f.id, f.task, name, f.structure, string(n), string(nz), string(f.T), string(f.nrhs),
             string(f.kind == :nubatch ? length(Ms) : f.nbatch)]
     if result isa Exception
-        body = vcat(fill("", 12), clean(sprint(showerror, result)))
+        body = vcat(fill("", 13), clean(sprint(showerror, result)))
     else
         body = vcat([cell(result.times[p][1]) for p in PHASES], [cell(result.times[p][2]) for p in PHASES],
-                    cell.([result.lu_nnz, result.flops, result.nsuperpanels, result.relres]), "ok")
+                    [cell(x) for x in (result.lu_nnz, result.flops, result.nsuperpanels, result.relres, result.samples)], "ok")
     end
     return vcat(head, body, meta)
 end
@@ -293,12 +312,14 @@ end
 function main()
     ON_GPU && !CUDA.functional() && error("CUDA is not functional on this machine")
     samples, seconds = parse(Int, OPTS["samples"]), parse(Float64, OPTS["seconds"])
+    single_run_above = parse(Float64, OPTS["single-run-above"])
     ids = filter(!isempty, split(OPTS["features"], ','))
     features = isempty(ids) ? COMPARE_FEATURES : feature.(ids)
     mats = bench_matrices(; suitesparse = OPTS["suitesparse"] == "true", dumps = OPTS["dumps"] == "true")
     only_names = filter(!isempty, split(OPTS["only"], ','))
     isempty(only_names) || filter!(M -> M.name in only_names, mats)
     meta = [device_name(), API.version, git_sha(), string(today())]
+    out = joinpath(@__DIR__, "comparison", "$SOLVER.csv")
     println(SOLVER, " ", API.version, " on ", meta[1], ", samples = ", samples)
 
     rows = Vector{Vector{String}}()
@@ -317,7 +338,7 @@ function main()
             print(rpad(f.id, 18), rpad(name, 42))
             flush(stdout)
             result = try
-                Base.invokelatest(measure, build_system(f, Ms); samples, seconds)
+                Base.invokelatest(measure, build_system(f, Ms); samples, seconds, single_run_above)
             catch err
                 err isa InterruptException && rethrow()
                 err
@@ -326,15 +347,14 @@ function main()
                 println("FAILED: ", first(sprint(showerror, result), 160))
             else
                 println(join(("$p $(round(result.times[p][1] * 1e3; sigdigits = 3)) ms" for p in PHASES), ", "),
-                        ", relres ", result.relres === missing ? "-" : round(result.relres; sigdigits = 2))
+                        ", relres ", result.relres === missing ? "-" : round(result.relres; sigdigits = 2),
+                        result.samples == 1 ? " (single run)" : "")
             end
             push!(rows, csv_row(f, name, Ms, result, meta))
+            merge_csv(out, rows)  # after every row, so an interrupted run keeps what it measured
         end
     end
-    isempty(rows) && return println("nothing to run")
-    out = joinpath(@__DIR__, "comparison", "$SOLVER.csv")
-    merge_csv(out, rows)
-    println("wrote ", out)
+    println(isempty(rows) ? "nothing to run" : "wrote $out")
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__
