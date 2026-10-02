@@ -20,7 +20,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-        julia-version: ['lts', '1']
+        julia-version: ['1']
         julia-arch: [x64]
 
     steps:
@@ -49,7 +49,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-        julia-version: ['lts', '1']
+        julia-version: ['1']
         julia-arch: [x64]
         # 'amdgpu' is disabled until the AMDGPU extension exists (T23); add it
         # back here and to the required checks of the branch ruleset.
