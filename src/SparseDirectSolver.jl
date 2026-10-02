@@ -23,6 +23,7 @@ export SparseDirectSolverError, NotSupportedError, InvalidValueError, Factorizat
 export CONFIG_PARAMETERS, DATA_PARAMETERS, CUDSS08_DATA_PARAMETERS, EXTRA_PARAMETERS
 export Options, setparam!, getparam, default_pivot_epsilon
 export CSR, csr_of_transpose, to_backend, nbatch, MatrixDescriptor, update!
+export AbstractDirectSolver, DirectSolver, execute!, analyze!, factorize!, refactorize!, solve!, getparam!
 
 include("errors.jl")
 include("types.jl")
@@ -62,5 +63,9 @@ include("numeric/extract.jl")
 # solve phase on the device (PLAN §2.5)
 include("solve/permute.jl")
 include("solve/sweeps.jl")
+
+# public API (PLAN §3.1): handle-style layer and LinearAlgebra layer
+include("solver.jl")
+include("generic.jl")
 
 end # module SparseDirectSolver
