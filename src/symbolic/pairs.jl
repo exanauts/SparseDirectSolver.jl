@@ -175,7 +175,8 @@ on its pattern) given that the previous one is; the diagonal of a candidate
 counts as absent. The test runs incrementally: a perfect matching of the prefix
 is kept, a non-candidate is matched to its own diagonal, and a candidate looks
 for an augmenting path from its row to its column through earlier columns
-(`|aᵢⱼ| > 0` edges). A candidate without one is reported and matched to itself,
+(`|aᵢⱼ| > 0` edges, and the diagonal of a non-candidate row that an earlier path
+moved off it). A candidate without one is reported and matched to itself,
 as if a partner fixed it. A pair `(a, c)` with `c` right after `a` is matched
 crosswise (a 2×2 block). An elimination-tree leaf candidate is always reported;
 so is a candidate whose earlier neighbours are all used up by earlier
@@ -216,13 +217,19 @@ function structural_zero_pivots(cands::PairCandidates, P::SymmetricPattern, perm
         found = false
         while !isempty(srow)
             r, p = srow[end], sptr[end]
-            if p >= P.colptr[r + 1]               # row r exhausted: backtrack
+            if p > P.colptr[r + 1]                # row r exhausted: backtrack
                 pop!(srow); pop!(sptr); pop!(scol)
                 continue
             end
             sptr[end] = p + 1
-            j = P.rowval[p]
-            (pos[j] <= k && w[p] > 0 && seen[j] != k) || continue
+            if p == P.colptr[r + 1]               # last slot: the diagonal of a non-candidate row
+                candidate[r] && continue          # (not stored; r may have been displaced from it)
+                j = r
+            else
+                j = P.rowval[p]
+                w[p] > 0 || continue
+            end
+            (pos[j] <= k && seen[j] != k) || continue
             seen[j] = k
             scol[end] = j
             if j == v                             # reached the free column: flip the path

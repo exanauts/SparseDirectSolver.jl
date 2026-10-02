@@ -230,8 +230,8 @@ end
     symbolic_analysis(A::CSR, structure, view = 'F'; opts = Options(), T = eltype(A)) -> Symbolic{Int, Vector{Int}}
 
 The whole host analysis of PLAN §2.3: [`SymmetricPattern`](@ref),
-[`compute_ordering`](@ref) (with the 2×2 pivot pairs of
-[`pivot_pairs`](@ref) for `"S"`/`"H"`), [`supernode_partition`](@ref) on
+[`compute_ordering`](@ref) (with the 2×2 pivot pair candidates or fixed pairs
+of [`analysis_pairs`](@ref) for `"S"`/`"H"`), [`supernode_partition`](@ref) on
 [`factor_pattern`](@ref), [`build_schedule`](@ref) for element type `T`,
 [`build_layout`](@ref) and the maps of [`Symbolic`](@ref). `A.rowptr`/`A.colval`
 are copied to the host once; `A.nzval` too when pairs are looked for

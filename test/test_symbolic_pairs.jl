@@ -102,6 +102,14 @@ end
     cg = SDS.pivot_candidates(PG, CG, "S"; view = 'L')
     @test SDS.etree(PG, [1, 2, 3]) == [2, 3, 0]                             # 3 has a child
     @test SDS.structural_zero_pivots(cg, PG, [1, 2, 3]) == [3]
+    # primal 1 – dual 2 – zero-Σ slack 3: reaching 2 moves 1 off its diagonal (1 → column 2); 3 is
+    # reached through column 2, row 1 and 1's own diagonal (pivots 2, -1/2, 2, none zero)
+    S3 = sparse([1, 2, 3, 2, 3], [1, 2, 3, 1, 2], [2.0, 0.0, 0.0, 1.0, 1.0], 3, 3)
+    CS3 = SDS.CSR(S3)
+    PS3 = SDS.SymmetricPattern(CS3, "S"; view = 'L')
+    cs3 = SDS.pivot_candidates(PS3, CS3, "S"; view = 'L')
+    @test findall(cs3.candidate) == [2, 3]
+    @test isempty(SDS.structural_zero_pivots(cs3, PS3, [1, 2, 3]))
     # a partner must reach u times the row maximum: row 1, (0, 1e-3, 1), skips the weak entry
     B = sparse([1, 2, 3, 2, 3], [1, 2, 3, 1, 1], [0.0, 4.0, 4.0, 1.0e-3, 1.0], 3, 3)
     CB = SDS.CSR(B)

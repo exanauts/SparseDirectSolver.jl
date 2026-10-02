@@ -1965,7 +1965,10 @@ whenever `atomic_add` is `false`. Close #36 in this task's PR.
     and on seeds 1–15), so `test_reference_ldlt.jl` asserts tol for that one case after one refinement step (T16)
     and reseeds the testset. `"default"` is not monotone below `"all"` in nnz(L) (0.96–1.025× over 15 seeds),
     so `test_symbolic_pairs.jl` bounds it by 1.05× `"all"` (CI round 1: Julia 1.10 gave 1.012×). The
-    K2 dumps keep max|L| ~1e15 in every mode (unscaled): #71 (found-by-agent, T21/M13).
+    K2 dumps keep max|L| ~1e15 in every mode (unscaled): #71 (found-by-agent, T21/M13). Review round 2: the
+    augmenting-path test now also uses the diagonal of a non-candidate row displaced by an earlier path (it
+    could report a nonzero pivot as zero, never the reverse); the generator rows of `bench/pivot_pairs.jl` are
+    unchanged, the K2 numbers above predate the fix (fewer pairs possible, not re-measured: no dumps on CI).
   - T15: `D`, `piv` and `pivot_kind` of the device kernels can be compared bitwise against `ref_ldlt!` only if they
     follow the same pivot sequence: the same candidate order, the same tie-breaking (the first maximum), and the
     same acceptance rules (`_choose_pivot`). `getparam("diag")` for LDLᵀ is `d[1:n]` in factor order.
