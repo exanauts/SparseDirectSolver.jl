@@ -9,6 +9,15 @@
 # `n * nrhs` entries (column-major), or, with `transposed = true`, row-major
 # data, i.e. a column-major `nrhs × n` matrix (or the strided vector of one).
 
+# call `f(Val(a), Val(b))` with compile-time flags (a runtime `Val(flag)` would dispatch dynamically)
+@inline function _with_flags(f, a::Bool, b::Bool)
+    if a
+        return b ? f(Val(true), Val(true)) : f(Val(true), Val(false))
+    else
+        return b ? f(Val(false), Val(true)) : f(Val(false), Val(false))
+    end
+end
+
 "Workgroup size of the permutation kernels."
 const PERMUTE_WORKGROUP = 256
 
@@ -45,21 +54,23 @@ function rhs_count(B::AbstractVecOrMat, n::Integer; transposed::Bool = false)
     return nrhs
 end
 
-@kernel function _permute_rhs_kernel!(Y, B, perm, n, nrhs, ::Val{TR}) where {TR}
+@kernel function _permute_rhs_kernel!(Y, B, perm, n, nrhs, ::Val{TR}, ::Val{CJ}) where {TR, CJ}
     q = @index(Global, Linear)
     k = (q - 1) % n + 1
     r = (q - 1) ÷ n + 1
     @inbounds if r <= nrhs
-        Y[k, r] = _rhs_get(B, perm[k], r, n, nrhs, Val(TR))
+        v = _rhs_get(B, perm[k], r, n, nrhs, Val(TR))
+        Y[k, r] = CJ ? conj(v) : v
     end
 end
 
-@kernel function _unpermute_solution_kernel!(X, Y, perm, n, nrhs, ::Val{TR}) where {TR}
+@kernel function _unpermute_solution_kernel!(X, Y, perm, n, nrhs, ::Val{TR}, ::Val{CJ}) where {TR, CJ}
     q = @index(Global, Linear)
     k = (q - 1) % n + 1
     r = (q - 1) ÷ n + 1
     @inbounds if r <= nrhs
-        _rhs_set!(X, Y[k, r], perm[k], r, n, nrhs, Val(TR))
+        v = Y[k, r]
+        _rhs_set!(X, CJ ? conj(v) : v, perm[k], r, n, nrhs, Val(TR))
     end
 end
 
@@ -72,40 +83,39 @@ function _check_permute(Y, B, perm, transposed)
 end
 
 """
-    permute_rhs!(Y, B, perm; transposed = false) -> Y
+    permute_rhs!(Y, B, perm; transposed = false, conjugate = false) -> Y
 
-`Y[k, r] = B[perm[k], r]` for the `nrhs` right-hand sides of the user array
+`Y[k, r] = B[perm[k], r]` (conjugated when `conjugate`, for the solves with
+`conj(A)` of `solve_mode`) for the `nrhs` right-hand sides of the user array
 `B` ([`rhs_count`](@ref): vector, matrix, strided vector; row-major when
 `transposed`) into the first `nrhs` columns of the `n × ≥ nrhs` device matrix
 `Y`. One launch; asynchronous.
 """
-function permute_rhs!(Y::AbstractMatrix, B::AbstractVecOrMat, perm::AbstractVector; transposed::Bool = false)
+function permute_rhs!(Y::AbstractMatrix, B::AbstractVecOrMat, perm::AbstractVector; transposed::Bool = false,
+                      conjugate::Bool = false)
     n, nrhs = _check_permute(Y, B, perm, transposed)
     n * nrhs > 0 || return Y
     kernel! = _permute_rhs_kernel!(KernelAbstractions.get_backend(Y), PERMUTE_WORKGROUP)
-    if transposed
-        kernel!(Y, B, perm, n, nrhs, Val(true); ndrange = n * nrhs)
-    else
-        kernel!(Y, B, perm, n, nrhs, Val(false); ndrange = n * nrhs)
+    _with_flags(transposed, conjugate) do tr, cj
+        kernel!(Y, B, perm, n, nrhs, tr, cj; ndrange = n * nrhs)
     end
     return Y
 end
 
 """
-    unpermute_solution!(X, Y, perm; transposed = false) -> X
+    unpermute_solution!(X, Y, perm; transposed = false, conjugate = false) -> X
 
-`X[perm[k], r] = Y[k, r]`: the inverse of [`permute_rhs!`](@ref), from the
+`X[perm[k], r] = Y[k, r]` (conjugated when `conjugate`): the inverse of [`permute_rhs!`](@ref), from the
 first `nrhs` columns of `Y` into the user array `X` (same layouts). One launch;
 asynchronous.
 """
-function unpermute_solution!(X::AbstractVecOrMat, Y::AbstractMatrix, perm::AbstractVector; transposed::Bool = false)
+function unpermute_solution!(X::AbstractVecOrMat, Y::AbstractMatrix, perm::AbstractVector; transposed::Bool = false,
+                             conjugate::Bool = false)
     n, nrhs = _check_permute(Y, X, perm, transposed)
     n * nrhs > 0 || return X
     kernel! = _unpermute_solution_kernel!(KernelAbstractions.get_backend(Y), PERMUTE_WORKGROUP)
-    if transposed
-        kernel!(X, Y, perm, n, nrhs, Val(true); ndrange = n * nrhs)
-    else
-        kernel!(X, Y, perm, n, nrhs, Val(false); ndrange = n * nrhs)
+    _with_flags(transposed, conjugate) do tr, cj
+        kernel!(X, Y, perm, n, nrhs, tr, cj; ndrange = n * nrhs)
     end
     return X
 end

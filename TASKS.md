@@ -2141,7 +2141,7 @@ whenever `atomic_add` is `false`. Close #36 in this task's PR.
 
 ---
 
-## T16 — Iterative refinement, solve sub-phases, `solve_mode`, interrupt, logging   `[ ]`
+## T16 — Iterative refinement, solve sub-phases, `solve_mode`, interrupt, logging   `[!]`
 
 **Reads**: PLAN §1.2, §1.3 (`ir_*`, `solve_mode`), §1.4 (`user_host_interrupt`, `ir_n_steps` data), §2.5.
 
@@ -2181,6 +2181,94 @@ repeat it once T21 has landed. The bar is cuDSS with `"matching_alg" =
 * `solve_mode = 2` on a complex `"S"` matrix solves `Aᴴ x = b`.
 * Setting the interrupt flag before `factorize!` raises `InterruptedError`;
   clearing it and calling `factorize!` again succeeds.
+
+### Report
+
+- Status: [!] (done on the CPU backend; the "100× on a badly scaled SPD matrix" assertion is `@test_broken`, see
+  deviations; CUDA from CI)
+- What was built:
+  - `src/solve/refinement.jl` (new): `RefinementWorkspace` (device CSR of the full matrix over the contributions
+    of the user's `nzval`, signed source index = conjugated mirror entry for `"H"`/`"HPD"`, built from the existing
+    `full_pattern_map` by `refinement_map`; residual `R`, a copy `Bc` of `B`, column norms on device + host copy),
+    `allocate_refinement`, kernels `residual!` (gather SpMV, one work item per (row, rhs), no atomics),
+    `residual_norms!` (one workgroup per rhs, `@localmem` tree reduction, one host read), `add_correction!`,
+    `copy_rhs!`, the loop `refine!` (poll interrupt → residual → early-exit test only when `ir_tol > 0` → permute,
+    forward/diagonal/backward sweeps → `X += correction`), and `solve_conjugated` (when `op(A)` is `conj(M)`).
+  - `src/solve/permute.jl`: `permute_rhs!`/`unpermute_solution!` take `conjugate`; `_with_flags` turns runtime
+    flags into compile-time `Val`s without dynamic dispatch.
+  - `src/solver.jl`: `DirectSolver` gains the type parameter `RF` and the fields `refinement` (allocated lazily
+    by the first refining solve, reset by a new analysis, grown with `nrhs`) and `ir_steps`.
+    `"solve_refinement"` is a phase; `"solve"` = sweeps + refinement; the six sub-phases compose bitwise to
+    `"solve"`. `"solve"` with `X === B` (aliasing via `Base.mightalias`) copies `B` first;
+    `"solve_refinement"` with aliasing raises `InvalidValueError`. `solve_mode` 0/1/2 for all four structures:
+    `op(A)` is always `M` or `conj(M)` of the stored matrix `M`, solved as `conj(M⁻¹ conj(b))` (conjugating
+    permutations), and the residual uses the conjugated values. This also lifts the T13 restriction on complex
+    Hermitian CSC input (`A = Mᵀ = conj(M)`). `getparam(solver, "ir_n_steps")` = steps performed by the last
+    solve; the configured value before a solve and after `setparam!(solver, "ir_n_steps", k)`.
+    `ir_mode = "fgmres"` raises `NotSupportedError` (T18).
+  - `user_host_interrupt`: polled (host read, no sync) before every launch group of `factorize!`/`factorize_ldlt!`,
+    at the start of `"reordering"`/`"symbolic_factorization"` and before every refinement step. An interrupted
+    factorization/refactorization sets the solver back to "analyzed" and resets `fresh_factorization` (solve and
+    `"refactorization"` then raise `FactorizationError`; `"factorization"`, and `cholesky!`/`ldlt!`, work once the
+    flag is cleared). An interrupted refinement leaves the last completed iterate in `X` and reports the completed
+    steps in `"ir_n_steps"` (`refine!(…; progress)`, review round 1).
+  - `src/logging.jl` (new): `SDS_LOG_LEVEL` (`0`/`none`, `1`/`info`, `2`/`debug`, read in `__init__`),
+    `SparseDirectSolver.set_log_level!` (unexported). Phase summaries (reordering, symbolic factorization,
+    factorization with host wall time of the launches, refinement steps) as `@info` at level ≥ 1, per-step
+    relative residuals at level 2; below the level they are `@debug` records (visible with `JULIA_DEBUG`).
+  - `src/generic.jl`: `cholesky`/`ldlt` set `ir_n_steps = 2` on the solvers they create (handle layer stays 0).
+  - `test/test_refinement.jl` (new), `test/matrices.jl`: `badly_scaled_spd(T, n, density; exponent = 4)`.
+    `bench/refinement.jl` (new): the relres table below.
+  - `test/test_api.jl`: the assertions that `"solve_refinement"`, complex `solve_mode = 1`, complex Hermitian CSC
+    input raise `NotSupportedError` and that `ir_n_steps` warns are replaced by assertions of the results.
+- Tests (after review round 1): `SDS_TEST_GPU=0 SDS_TEST_ONLY=test_refinement`: 517 pass, 1 broken (CPU). Full
+  `SDS_TEST_GPU=0 julia --project=. -e 'using Pkg; Pkg.test()'`: 60490 pass, 0 fail, 1 broken (the one above), 13.8 min. CUDA/AMDGPU: pending CI on the PR.
+  CI round 2 (CUDA H200): the five bitwise `==` checks between solves (X === B, row-major, strided, sub-phases vs
+  `"solve"`) failed for Float64 by last-bit differences: the default atomic forward sweep sums in a run-dependent
+  order on GPUs. Those two testsets now set `deterministic_mode = 1` (the documented reproducible path); test counts
+  unchanged.
+- Measurements: relres `‖b − Ax‖/‖b‖`, `b = A·1`, handle layer `"S"`, view `'L'`, default pivoting, KA CPU
+  backend, after `ir_n_steps` steps (`bench/refinement.jl`; dumps generated in this session with
+  `bench/dump_madnlp_kkt.jl`, MadNLP/ExaModelsPower current releases):
+
+  | K2 dump | n | npivots | ir 0 | ir 2 | ir 5 |
+  | --- | ---: | ---: | ---: | ---: | ---: |
+  | case118 k2_1 | 3150 | 5 | 0.042 | 3.0e-10 | 1.1e-15 |
+  | case118 k2_10 | 3150 | 3 | 2.1e-5 | 3.8e-11 | 3.9e-17 |
+  | case118 k2_20 | 3150 | 3 | 7.1e-7 | 1.5e-13 | 3.8e-18 |
+  | case1354 k2_1 | 33811 | 34 | 0.14 | 6.5e-4 | 7.9e-7 |
+  | case1354 k2_10 | 33811 | 48 | 0.042 | 5.0e-3 | 5.7e-5 |
+  | case1354 k2_20 | 33811 | 32 | 7.3e-3 | 8.5e-5 | 1.6e-7 |
+
+  case118 beats the cuDSS bar (3.7e-13 with matching + 5 steps) without matching; case1354 is still 1e4–1e6 above
+  its bar (4.6e-11) and needs T21's scaling (repeat this table then). On a badly scaled SPD matrix
+  (`badly_scaled_spd(Float64, 300, 0.02)`) one step changes relres by 2×–7× only (3e-16 → 6e-17); on the KKT
+  generator with perturbed pivots (`kkt_matrix(150, 60, 0)`, `pivot_pairs = "none"`) relres goes 1.5e-4 → 2.4e-9
+  → … and `ir_tol = 1e-14` stops after 3 steps. `test_refinement` takes 9 s inside the full run, ~6 min alone
+  (compilation of the kernel variants over 4 element types × structures × flags).
+- Deviations from PLAN.md / this task:
+  - "On a badly row-scaled SPD matrix one refinement step reduces relres by ≥ 100×" cannot be observed: Cholesky
+    is backward stable and invariant under symmetric diagonal scaling (the only scaling that keeps the matrix
+    SPD). Measured on 3 generators × 3 scalings × 5 right-hand-side choices: the unrefined relres is either at
+    rounding level (`b = A x`) or limited by `cond(A)` (random `b`), and one step gains ≤ 7× (once 42×). The SPD
+    assertion is `@test_broken` with that comment; the 100× reduction is asserted on a KKT matrix whose
+    factorization carries static pivot perturbations (the case refinement is meant for, issue #71), together with
+    the `ir_tol`/early-exit/steps-performed checks (also run on the SPD matrix, where they pass).
+  - `ir_tol` is the largest `‖Rₖ‖₂/‖Bₖ‖₂` over the right-hand sides; checking it costs one host synchronization
+    per step, so it runs only when `ir_tol > 0`. The LinearAlgebra layer sets `ir_n_steps = 2` but keeps
+    `ir_tol = 0` (PLAN §3.1 "early exit on ir_tol" is available once the user sets `ir_tol`), so `ldiv!` adds no
+    synchronizations beyond its final one.
+  - The refinement workspace (map ≈ 2·nnz(full) `INT`s plus `2·n·nrhs` values) is allocated by the first solve
+    that refines, not at analysis, so the handle layer with `ir_n_steps = 0` (MadNLP) pays nothing.
+  - The interrupt is polled between launch groups, not per level inside a group, and not inside the solve sweeps.
+- Open issues / follow-ups:
+  - `"solve_refinement"` and the residual read the solver's current values: `update!` without a refactorization
+    refines towards the new matrix (tested), which MadNLP could use to skip refactorizations.
+- Suggested plan changes:
+  - TASKS T16 test 1: phrase the 100× criterion on a factorization with active static perturbation (or with
+    Float32 factors, §3.8), not on a scaled SPD matrix.
+  - PLAN §1.4: document `getparam(solver, "ir_n_steps")` as "steps performed after a solve, configured value
+    otherwise" (one name for config and data in CUDSS.jl).
 
 ---
 

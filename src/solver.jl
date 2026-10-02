@@ -31,9 +31,13 @@ _numeric_type(backend, ::Type{T}) where {T} =
     Numeric{T, typeof(KernelAbstractions.allocate(backend, T, 0)), typeof(KernelAbstractions.allocate(backend, Int64, 0)),
             typeof(KernelAbstractions.allocate(backend, Int32, 0)), typeof(KernelAbstractions.allocate(backend, Int8, 0))}
 _workspace_type(backend, ::Type{T}) where {T} = SolveWorkspace{T, typeof(KernelAbstractions.allocate(backend, T, 0, 0))}
+_refinement_type(backend, ::Type{T}, ::Type{INT}) where {T, INT} =
+    RefinementWorkspace{T, real(T), typeof(KernelAbstractions.allocate(backend, INT, 0)),
+                        typeof(KernelAbstractions.allocate(backend, T, 0, 0)),
+                        typeof(KernelAbstractions.allocate(backend, real(T), 0))}
 
 """
-    DirectSolver{T, INT, M, B, SY, NU, WS} <: AbstractDirectSolver{T, INT}
+    DirectSolver{T, INT, M, B, SY, NU, WS, RF} <: AbstractDirectSolver{T, INT}
 
 Sparse direct solver handle (≅ `CudssSolver`), PLAN §3.1–§3.2.
 
@@ -51,16 +55,18 @@ CSR arrays are wrapped without copies and live on a KernelAbstractions backend
 host CSR arrays once. A CSC matrix (`CuSparseMatrixCSC`, or a [`CSR`](@ref) with
 `transposed = true`, e.g. from [`csr_of_transpose`](@ref)) is read as the CSR
 of its transpose with the view flipped (`'L'` ↔ `'U'`); for complex Hermitian
-matrices this needs the conjugated solve of `solve_mode` (T16) and raises
-[`NotSupportedError`](@ref) for now.
+matrices that transpose is the conjugate, and the solve phases conjugate the
+right-hand side and the solution (as for `solve_mode`, see
+[`solve_conjugated`](@ref)).
 
 Implemented at this point: structures `"SPD"` (real `T`), `"HPD"`, `"S"`
 (LDLᵀ; complex symmetric for complex `T`) and `"H"` (LDLᴴ), a single matrix
 (no uniform batch), the phases `"reordering"`, `"symbolic_factorization"`,
 `"analysis"`, `"factorization"`, `"refactorization"`, `"solve"`,
-`"solve_fwd_perm"`, `"solve_fwd"`, `"solve_diag"`, `"solve_bwd"` and
-`"solve_bwd_perm"` ([`execute!`](@ref)). Structure `"G"` and the other phases
-raise [`NotSupportedError`](@ref) when they are executed.
+`"solve_fwd_perm"`, `"solve_fwd"`, `"solve_diag"`, `"solve_bwd"`,
+`"solve_bwd_perm"` and `"solve_refinement"` ([`execute!`](@ref)). Structure
+`"G"` and the Schur phases raise [`NotSupportedError`](@ref) when they are
+executed.
 
 Fields: `A` (the current [`CSR`](@ref), re-pointed by [`update!`](@ref)),
 `structure`, `view` (as given), `options` ([`Options`](@ref), set through
@@ -68,9 +74,12 @@ Fields: `A` (the current [`CSR`](@ref), re-pointed by [`update!`](@ref)),
 the first `"factorization"` after an analysis; the `LinearAlgebra` layer then
 switches `cholesky!` to `"refactorization"`), `info` (the `"info"` data
 parameter), the analysis (`ordering`, host `host_symbolic`, device `symbolic`),
-the numeric storage `numeric` and the solve `workspace`.
+the numeric storage `numeric`, the solve `workspace`, the refinement storage
+`refinement` (allocated by the first solve that refines) and `ir_steps` (the
+`"ir_n_steps"` data parameter: refinement steps of the last solve, `-1` before
+one).
 """
-mutable struct DirectSolver{T, INT, M <: CSR{T, INT}, B <: KernelAbstractions.Backend, SY, NU, WS} <:
+mutable struct DirectSolver{T, INT, M <: CSR{T, INT}, B <: KernelAbstractions.Backend, SY, NU, WS, RF} <:
                AbstractDirectSolver{T, INT}
     A::M
     structure::Structure
@@ -88,15 +97,18 @@ mutable struct DirectSolver{T, INT, M <: CSR{T, INT}, B <: KernelAbstractions.Ba
     symbolic::Union{Nothing, SY}
     numeric::Union{Nothing, NU}
     workspace::Union{Nothing, WS}
-    # explicit parameters only: the default outer constructor would leave SY, NU, WS unbound
+    refinement::Union{Nothing, RF}
+    ir_steps::Int
+    # explicit parameters only: the default outer constructor would leave SY, NU, WS, RF unbound
     # (they occur only in `Union{Nothing, …}` fields; Aqua on Julia 1.10)
-    function DirectSolver{T, INT, M, B, SY, NU, WS}(A, structure, view, options, backend, nbatch,
-                                                    fresh_factorization, info, stage, host_rowptr,
-                                                    host_colval, ordering, host_symbolic, symbolic,
-                                                    numeric, workspace) where {T, INT, M, B, SY, NU, WS}
-        return new{T, INT, M, B, SY, NU, WS}(A, structure, view, options, backend, nbatch, fresh_factorization,
-                                             info, stage, host_rowptr, host_colval, ordering, host_symbolic,
-                                             symbolic, numeric, workspace)
+    function DirectSolver{T, INT, M, B, SY, NU, WS, RF}(A, structure, view, options, backend, nbatch,
+                                                        fresh_factorization, info, stage, host_rowptr,
+                                                        host_colval, ordering, host_symbolic, symbolic,
+                                                        numeric, workspace, refinement,
+                                                        ir_steps) where {T, INT, M, B, SY, NU, WS, RF}
+        return new{T, INT, M, B, SY, NU, WS, RF}(A, structure, view, options, backend, nbatch, fresh_factorization,
+                                                 info, stage, host_rowptr, host_colval, ordering, host_symbolic,
+                                                 symbolic, numeric, workspace, refinement, ir_steps)
     end
 end
 
@@ -113,17 +125,14 @@ function DirectSolver(A::CSR{T, INT}, structure, view; index = A.index) where {T
     if base != A.index
         A = CSR(A.rowptr, A.colval, A.nzval, A.nrows, A.ncols; index = base, transposed = A.transposed)
     end
-    if A.transposed && T <: Complex && _is_hermitian(s)
-        throw(NotSupportedError("a complex Hermitian matrix given as CSC (the CSR of its transpose) needs the " *
-                                "conjugated solve of solve_mode (T16); pass the CSR arrays instead"))
-    end
     nb = nbatch(A)
     nb == 1 || throw(NotSupportedError("uniform batches (nbatch = $nb) are not implemented yet (T17)"))
     backend = KernelAbstractions.get_backend(A)
     SY, NU, WS = _symbolic_type(backend, INT), _numeric_type(backend, T), _workspace_type(backend, T)
-    return DirectSolver{T, INT, typeof(A), typeof(backend), SY, NU, WS}(
+    RF = _refinement_type(backend, T, INT)
+    return DirectSolver{T, INT, typeof(A), typeof(backend), SY, NU, WS, RF}(
         A, s, v, Options(), backend, nb, true, 0, STAGE_NONE, INT[], INT[], nothing, nothing, nothing, nothing,
-        nothing)
+        nothing, nothing, -1)
 end
 
 function DirectSolver(rowptr::AbstractVector{<:Integer}, colval::AbstractVector{<:Integer}, nzval::AbstractVecOrMat,
@@ -228,24 +237,43 @@ Execute `phase` on `solver` (≅ `cudss(phase, solver, x, b)`), PLAN §1.2:
   `fresh_factorization`;
 * `"refactorization"`: the same with the analysis and storage reused, `"info"`
   reset first (needs a previous `"factorization"`);
-* `"solve"`: `X = A⁻¹ B`; the sub-phases `"solve_fwd_perm"` (permute `B` into the
-  workspace), `"solve_fwd"` (forward sweep), `"solve_diag"` (`D⁻¹` of LDLᵀ/LDLᴴ,
-  the identity for Cholesky), `"solve_bwd"` (backward sweep) and
-  `"solve_bwd_perm"` (inverse permutation into `X`) do the same in five calls
-  with the same `X`, `B`.
+* `"solve"`: `X = op(A)⁻¹ B` (`solve_mode` 0: `A`, 1: `Aᵀ`, 2: `Aᴴ`), followed by
+  `ir_n_steps` steps of iterative refinement; the sub-phases `"solve_fwd_perm"`
+  (permute `B` into the workspace), `"solve_fwd"` (forward sweep),
+  `"solve_diag"` (`D⁻¹` of LDLᵀ/LDLᴴ, the identity for Cholesky), `"solve_bwd"`
+  (backward sweep), `"solve_bwd_perm"` (inverse permutation into `X`) and
+  `"solve_refinement"` (refine `X` in place, [`refine!`](@ref)) do the same in
+  six calls with the same `X`, `B` (bitwise equal to `"solve"`).
 
 `X` and `B` are only read by the solve phases (pass anything, e.g. `nothing`,
 to the others): vectors, `n × nrhs` matrices, strided vectors or
 [`MatrixDescriptor`](@ref)s (row-major when `transposed`) on the solver's
-backend; `X === B` is allowed. A failed factorization does not throw (as in
-cuDSS): check `getparam(solver, "info")`; solving with it gives garbage.
+backend; `X === B` is allowed in every phase but `"solve_refinement"` (it needs
+the original `B`; `"solve"` keeps a copy of `B` when they alias). A failed
+factorization does not throw (as in cuDSS): check `getparam(solver, "info")`;
+solving with it gives garbage.
 
-`"solve_refinement"`, `"solve_fwd_schur"` and `"solve_bwd_schur"` raise
-[`NotSupportedError`](@ref) until their task (T16, T20); unknown phase
-strings raise `ArgumentError`. Executing a phase before the phases it depends
-on raises [`FactorizationError`](@ref).
+Refinement (PLAN §2.5): each step computes the residual `R = B - op(A) X` with
+the solver's current matrix values (KA SpMV over the full pattern), and, when
+`ir_tol > 0`, stops once `‖Rₖ‖₂ ≤ ir_tol ‖Bₖ‖₂` for every right-hand side `k`
+(this costs one host synchronization per step; `ir_tol = 0`, the default, never
+stops early and never synchronizes), then adds the correction `op(A)⁻¹ R`. The
+steps performed are the data parameter `"ir_n_steps"` ([`getparam`](@ref)).
+
+The flag `"user_host_interrupt"` (a `Threads.Atomic{Bool}`, [`setparam!`](@ref))
+is polled at the start of the analysis phases, between the launch groups of the
+factorization and between refinement steps: when set, the phase raises
+[`InterruptedError`](@ref). An interrupted factorization leaves the solver
+analyzed (the next phase must be `"factorization"`); an interrupted refinement
+leaves the last completed iterate in `X` and reports the steps completed in
+`"ir_n_steps"`.
+
+`"solve_fwd_schur"` and `"solve_bwd_schur"` raise [`NotSupportedError`](@ref)
+until their task (T20); unknown phase strings raise `ArgumentError`. Executing
+a phase before the phases it depends on raises [`FactorizationError`](@ref).
 With `asynchronous = false` the backend is synchronized before returning
-(`KernelAbstractions.synchronize`).
+(`KernelAbstractions.synchronize`). Phase summaries are logged (see
+[`SparseDirectSolver.set_log_level!`](@ref)).
 """
 function execute!(phase::AbstractString, solver::DirectSolver, X, B; asynchronous::Bool = true)
     p = _parse_phase(phase)
@@ -259,11 +287,10 @@ function execute!(phase::AbstractString, solver::DirectSolver, X, B; asynchronou
     elseif p == PHASE_FACTORIZATION || p == PHASE_REFACTORIZATION
         _factorize!(solver, p)
     elseif p == PHASE_SOLVE || p == PHASE_SOLVE_FWD_PERM || p == PHASE_SOLVE_FWD || p == PHASE_SOLVE_DIAG ||
-           p == PHASE_SOLVE_BWD || p == PHASE_SOLVE_BWD_PERM
+           p == PHASE_SOLVE_BWD || p == PHASE_SOLVE_BWD_PERM || p == PHASE_SOLVE_REFINEMENT
         _solve!(solver, p, X, B)
     else
-        throw(NotSupportedError("phase \"$phase\" is not implemented yet " *
-                                "($(p == PHASE_SOLVE_REFINEMENT ? "T16" : "T20"))"))
+        throw(NotSupportedError("phase \"$phase\" is not implemented yet (T20)"))
     end
     asynchronous || KernelAbstractions.synchronize(solver.backend)
     return nothing
@@ -292,6 +319,8 @@ end
 
 function _reorder!(solver::DirectSolver{T}) where {T}
     _check_analysis_supported(solver)
+    _poll_interrupt(solver.options.user_host_interrupt)
+    tic = time_ns()
     A = solver.A
     solver.host_rowptr = Array(A.rowptr)
     solver.host_colval = Array(A.colval)
@@ -301,8 +330,9 @@ function _reorder!(solver::DirectSolver{T}) where {T}
     pp = analysis_pairs(P, solver.host_rowptr, solver.host_colval, A.nzval, A.nrows, solver.structure,
                         solver.options; view = _stored_view(solver), index = A.index)
     solver.ordering = compute_ordering(P, solver.options; T, pp.pairs, pp.candidates)
-    solver.host_symbolic = solver.symbolic = solver.numeric = solver.workspace = nothing
+    solver.host_symbolic = solver.symbolic = solver.numeric = solver.workspace = solver.refinement = nothing
     solver.stage = STAGE_REORDERED
+    _log(LOG_INFO, () -> "reordering: n = $(A.nrows), nnz = $(nnz(A)), $(_elapsed(tic))")
     return solver
 end
 
@@ -310,6 +340,8 @@ function _symbolic!(solver::DirectSolver{T, INT}) where {T, INT}
     solver.stage >= STAGE_REORDERED ||
         throw(_phase_error("symbolic_factorization", "needs \"reordering\" (or run \"analysis\")"))
     _check_analysis_supported(solver)
+    _poll_interrupt(solver.options.user_host_interrupt)
+    tic = time_ns()
     opts = solver.options
     A = solver.A
     ord = solver.ordering
@@ -326,9 +358,12 @@ function _symbolic!(solver::DirectSolver{T, INT}) where {T, INT}
     solver.symbolic = Sd
     solver.numeric = allocate_numeric(Sd, T, solver.backend)
     solver.workspace = allocate_solve(Sd, T, solver.backend, nrhs)
+    solver.refinement = nothing
     solver.stage = STAGE_ANALYZED
     solver.fresh_factorization = true
     solver.info = 0
+    _log(LOG_INFO, () -> "symbolic_factorization: $(nsupernodes(Sh)) supernodes, nnz(L) = $(sp.nnz_L), " *
+                         "flops = $(sp.flops), $(_elapsed(tic))")
     return solver
 end
 
@@ -338,11 +373,26 @@ function _factorize!(solver::DirectSolver, p::Phase)
     p == PHASE_REFACTORIZATION && solver.stage < STAGE_FACTORIZED &&
         throw(_phase_error(name, "needs a previous \"factorization\""))
     p == PHASE_REFACTORIZATION && (solver.info = 0)
-    solver.info = _numeric_phase!(solver.numeric, solver.symbolic, solver.A.nzval, solver.options)
+    tic = time_ns()
+    try
+        solver.info = _numeric_phase!(solver.numeric, solver.symbolic, solver.A.nzval, solver.options)
+    catch err
+        if err isa InterruptedError
+            # the panels are partly overwritten: back to "analyzed", a "factorization" must follow
+            solver.stage = STAGE_ANALYZED
+            solver.fresh_factorization = true
+            solver.info = 0
+            _log(LOG_INFO, () -> "$name: interrupted")
+        end
+        rethrow()
+    end
     solver.stage = STAGE_FACTORIZED
     p == PHASE_FACTORIZATION && (solver.fresh_factorization = false)
+    _log(LOG_INFO, () -> "$name: info = $(solver.info), $(_elapsed(tic)) (launches, asynchronous)")
     return solver
 end
+
+_elapsed(tic) = string(round((time_ns() - tic) / 1.0e6; digits = 3), " ms")
 
 # function barrier: concrete storage types for the numeric phase
 _numeric_phase!(N::Numeric, S::Symbolic, nzval::AbstractVector, opts::Options) = factorize!(N, S, nzval; opts)
@@ -375,9 +425,19 @@ function _workspace!(solver::DirectSolver{T}, nrhs::Int) where {T}
     return ws
 end
 
-function _warn_ir_ignored(n)
-    @warn "ir_n_steps = $n: iterative refinement is not implemented yet (T16); the solve runs without it" maxlog = 1
-    return nothing
+# the refinement workspace for `nrhs` right-hand sides (the device map is built at the first use after an
+# analysis, the residual storage reallocated only when nrhs grows)
+function _refinement!(solver::DirectSolver{T, INT}, nrhs::Int) where {T, INT}
+    W = solver.refinement
+    if W === nothing
+        F = full_pattern_map(solver.host_rowptr, solver.host_colval, solver.A.nrows, solver.structure;
+                             view = _stored_view(solver), index = solver.A.index)
+        W = allocate_refinement(refinement_map(F), T, INT, solver.backend, max(nrhs, max_rhs(solver.workspace)))
+    elseif max_rhs(W) < nrhs
+        W = _grow_refinement(W, nrhs)
+    end
+    solver.refinement = W
+    return W
 end
 
 function _solve!(solver::DirectSolver{T}, p::Phase, X, B) where {T}
@@ -386,10 +446,8 @@ function _solve!(solver::DirectSolver{T}, p::Phase, X, B) where {T}
     opts = solver.options
     opts.solve_alg == SOLVE_DEFAULT ||
         throw(NotSupportedError("solve_alg = \"$(convert(String, opts.solve_alg))\" is not implemented yet (M11)"))
-    # SPD/HPD: A = Aᴴ, and A = Aᵀ for real T; the transposed solve of a complex matrix needs T16
-    opts.solve_mode == 1 && T <: Complex &&
-        throw(NotSupportedError("solve_mode = 1 (Aᵀ) for complex matrices is not implemented yet (T16)"))
-    opts.ir_n_steps > 0 && _warn_ir_ignored(opts.ir_n_steps)
+    opts.ir_mode == IR_PLAIN ||
+        throw(NotSupportedError("ir_mode = \"fgmres\" is not implemented yet (T18)"))
     Bd, bt = _rhs_data(B)
     Xd, xt = _rhs_data(X)
     xt == bt || throw(InvalidValueError("X and B must have the same layout (transposed or not)"))
@@ -403,25 +461,60 @@ end
 
 function _solve_phase!(solver::DirectSolver, p::Phase, X::AbstractVecOrMat, B::AbstractVecOrMat, transposed::Bool)
     S, N = solver.symbolic, solver.numeric
+    opts = solver.options
     n = S.n
     nrhs = rhs_count(B, n; transposed)
     rhs_count(X, n; transposed) == nrhs ||
         throw(DimensionMismatch("X has $(rhs_count(X, n; transposed)) right-hand sides, B has $nrhs"))
     ws = _workspace!(solver, nrhs)
-    det = solver.options.deterministic_mode == 1
+    det = opts.deterministic_mode == 1
+    cj = solve_conjugated(solver.structure, eltype(ws), solver.A.transposed, opts.solve_mode)
+    refine = opts.ir_n_steps > 0 && (p == PHASE_SOLVE || p == PHASE_SOLVE_REFINEMENT)
+    if p == PHASE_SOLVE_REFINEMENT && refine && Base.mightalias(X, B)
+        throw(InvalidValueError("\"solve_refinement\" needs the original right-hand side: X and B must not alias"))
+    end
+    W = refine ? _refinement!(solver, nrhs) : nothing
     if p == PHASE_SOLVE
-        sweep_solve!(X, ws, S, N, B; transposed, deterministic = det)
+        Bs, bt = B, transposed
+        if refine && Base.mightalias(X, B)     # the solve overwrites B: keep a copy for the residual
+            copy_rhs!(W.Bc, B; nrhs, transposed)
+            Bs, bt = W.Bc, false
+        end
+        permute_rhs!(ws.Y, B, S.perm; transposed, conjugate = cj)
+        forward_sweep!(ws, S, N; nrhs, deterministic = det)
+        diagonal_sweep!(ws, S, N; nrhs)
+        backward_sweep!(ws, S, N; nrhs)
+        unpermute_solution!(X, ws.Y, S.perm; transposed, conjugate = cj)
+        refine ? _refine_phase!(solver, W, ws, X, Bs, transposed, bt, cj, det) : (solver.ir_steps = 0)
     elseif p == PHASE_SOLVE_FWD_PERM
-        permute_rhs!(ws.Y, B, S.perm; transposed)
+        permute_rhs!(ws.Y, B, S.perm; transposed, conjugate = cj)
     elseif p == PHASE_SOLVE_FWD
         forward_sweep!(ws, S, N; nrhs, deterministic = det)
     elseif p == PHASE_SOLVE_DIAG
         diagonal_sweep!(ws, S, N; nrhs)
     elseif p == PHASE_SOLVE_BWD
         backward_sweep!(ws, S, N; nrhs)
-    else  # PHASE_SOLVE_BWD_PERM
-        unpermute_solution!(X, ws.Y, S.perm; transposed)
+    elseif p == PHASE_SOLVE_BWD_PERM
+        unpermute_solution!(X, ws.Y, S.perm; transposed, conjugate = cj)
+    else  # PHASE_SOLVE_REFINEMENT
+        refine ? _refine_phase!(solver, W, ws, X, B, transposed, transposed, cj, det) : (solver.ir_steps = 0)
     end
+    return nothing
+end
+
+function _refine_phase!(solver::DirectSolver, W::RefinementWorkspace, ws::SolveWorkspace, X, B, xt::Bool, bt::Bool,
+                        cj::Bool, det::Bool)
+    opts = solver.options
+    done = Ref(0)   # the corrections applied, also when the refinement is interrupted
+    try
+        refine!(X, B, W, ws, solver.symbolic, solver.numeric, vec(solver.A.nzval); nsteps = opts.ir_n_steps,
+                tol = opts.ir_tol, transposed = xt, b_transposed = bt, conjugate = cj, deterministic = det,
+                interrupt = opts.user_host_interrupt, progress = done)
+    finally
+        solver.ir_steps = done[]
+    end
+    steps = done[]
+    _log(LOG_INFO, () -> "solve_refinement: $steps of $(opts.ir_n_steps) steps")
     return nothing
 end
 
@@ -490,7 +583,9 @@ everything [`setparam!`](@ref)`(::Options, …)` accepts, stored in
 parameter `"info"` (an integer; CUDSS.jl resets it before a refactorization).
 `"pivot_sign"` (PLAN §1.7: a vector of `n` entries in `(-1, 0, 1)`, host or
 device, or `nothing`) is checked against the size of the matrix; the next
-`"factorization"`/`"refactorization"` copies it to the device.
+`"factorization"`/`"refactorization"` copies it to the device. Setting
+`"ir_n_steps"` (the number of refinement steps requested) makes
+[`getparam`](@ref) report that value again until the next solve.
 Computed data parameters (`"lu_nnz"`, `"diag"`, `"perm_row"`, …) cannot be set
 (`ArgumentError`): read them with [`getparam`](@ref) or [`getparam!`](@ref),
 which replaces cuDSS's set-buffer-then-get protocol.
@@ -506,6 +601,7 @@ function setparam!(solver::DirectSolver, name::AbstractString, value)
         throw(InvalidValueError("pivot_sign has $(length(value)) entries, the matrix has $(size(solver, 1)) rows"))
     else
         setparam!(solver.options, name, value)
+        name == "ir_n_steps" && (solver.ir_steps = -1)
     end
     return nothing
 end
@@ -527,6 +623,7 @@ The data parameters computed by the solver:
 | name | value | available after |
 | --- | --- | --- |
 | `"info"` | `Int`: `0`, or the original column (1-based) of the first non-positive pivot | always |
+| `"ir_n_steps"` | `Int`: refinement steps performed by the last `"solve"`/`"solve_refinement"` (≤ the configured `ir_n_steps`, fewer when `ir_tol` stopped early); the configured value before the first solve and after `setparam!(solver, "ir_n_steps", k)` | always |
 | `"lu_nnz"` | `Int64`: nonzeros of `L` (diagonal included, amalgamation zeros excluded) | analysis |
 | `"flops"` | `Float64`: factorization flops of the stored panels | analysis |
 | `"nsuperpanels"` | `Int`: supernodes after amalgamation | analysis |
@@ -549,6 +646,7 @@ one before the phase that computes it raises [`FactorizationError`](@ref).
 function getparam(solver::DirectSolver, name::AbstractString)
     spec = parameter_spec(name)
     name == "info" && return solver.info
+    name == "ir_n_steps" && solver.ir_steps >= 0 && return solver.ir_steps
     spec.status === :output || spec.status === :solver || return getparam(solver.options, name)
     name in SOLVER_OUTPUTS ||
         throw(NotSupportedError("the data parameter \"$name\" is not implemented yet ($(_output_task(name)))"))
