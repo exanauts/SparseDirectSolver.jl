@@ -30,7 +30,16 @@
 #   phase. No atomics; bitwise reproducible.
 #
 # The backward sweep only gathers from finished ancestor rows: conflict-free.
-# The diagonal sweep is the identity for Cholesky (D is used by LDLᵀ, T15).
+# The diagonal sweep is the identity for Cholesky; for LDLᵀ/LDLᴴ it applies
+# D⁻¹ (1×1 and 2×2 blocks).
+#
+# LDLᵀ/LDLᴴ (`LDL = true`): the panels are unit lower triangular (the TRSVs
+# divide by the stored 1), and pivoting permuted the columns of each
+# supernode (`numeric.piv`). As the reference `ref_solve_ldlt!` does, a front
+# reorders its slice of the right-hand side by its local pivot order before
+# its forward TRSV and restores the order after its backward TRSV, through the
+# rows `1:w` of its gather-list buffer in `U` (unused otherwise). Complex
+# symmetric `"S"` (`CONJ = false`) solves with `Lᵀ` instead of `Lᴴ`.
 #
 # As in the numeric kernels, per-node values sit in a `@localmem` control array
 # written by work item 1 before a barrier, so every loop containing a barrier
@@ -313,8 +322,9 @@ end
     return nothing
 end
 
-# backward gather + GEMV: y_j -= Σ_i conj(L21[i, j]) x[row_i] (the rows below belong to finished ancestors)
-@inline function _sv_bwd_gather!(Y, factor, rowval, ctl, r, li, ::Val{WG}) where {WG}
+# backward gather + GEMV: y_j -= Σ_i conj(L21[i, j]) x[row_i] (the rows below belong to finished ancestors;
+# no conj for complex symmetric LDLᵀ, `cj = Val(false)`)
+@inline function _sv_bwd_gather!(Y, factor, rowval, ctl, r, li, ::Val{WG}, cj::Val = Val(true)) where {WG}
     @inbounds begin
         f = ctl[_SV_F]
         w = ctl[_SV_W]
@@ -325,7 +335,7 @@ end
             col = p0 + (j - 1) * f
             t = zero(eltype(Y))
             for i in (w + 1):f
-                t += conj(factor[col + i]) * Y[rowval[rp + i], r]
+                t += _cj(factor[col + i], cj) * Y[rowval[rp + i], r]
             end
             Y[c0 + j, r] -= t
         end
@@ -334,27 +344,56 @@ end
 end
 
 # backward TRSV with L11ᴴ, step jj (column j = w - jj + 1): Y[c0 + k] -= conj(L[j, k]) x_j for k < j
-@inline function _sv_bwd_col!(Y, factor, ctl, jj, r, li, ::Val{WG}) where {WG}
+@inline function _sv_bwd_col!(Y, factor, ctl, jj, r, li, ::Val{WG}, cj::Val = Val(true)) where {WG}
     @inbounds begin
         f = ctl[_SV_F]
         j = ctl[_SV_W] - jj + 1
         c0 = ctl[_SV_C0] - 1
         p0 = ctl[_SV_P0] - 1
-        xj = Y[c0 + j, r] / conj(factor[p0 + (j - 1) * f + j])
+        xj = Y[c0 + j, r] / _cj(factor[p0 + (j - 1) * f + j], cj)
         for k in li:WG:(j - 1)
-            Y[c0 + k, r] -= conj(factor[p0 + (k - 1) * f + j]) * xj
+            Y[c0 + k, r] -= _cj(factor[p0 + (k - 1) * f + j], cj) * xj
         end
     end
     return nothing
 end
 
-@inline function _sv_bwd_diag!(Y, factor, ctl, r, li, ::Val{WG}) where {WG}
+@inline function _sv_bwd_diag!(Y, factor, ctl, r, li, ::Val{WG}, cj::Val = Val(true)) where {WG}
     @inbounds begin
         f = ctl[_SV_F]
         c0 = ctl[_SV_C0] - 1
         p0 = ctl[_SV_P0] - 1
         for j in li:WG:ctl[_SV_W]
-            Y[c0 + j, r] /= conj(factor[p0 + (j - 1) * f + j])
+            Y[c0 + j, r] /= _cj(factor[p0 + (j - 1) * f + j], cj)
+        end
+    end
+    return nothing
+end
+
+# LDLᵀ local pivot order, first half: copy the front's slice of Y to the rows 1:w of its buffer in U
+@inline function _sv_piv_save!(Y, U, ctl, r, li, ::Val{WG}) where {WG}
+    @inbounds begin
+        c0 = ctl[_SV_C0] - 1
+        rp = ctl[_SV_RP] - 1
+        for j in li:WG:ctl[_SV_W]
+            U[rp + j, r] = Y[c0 + j, r]
+        end
+    end
+    return nothing
+end
+
+# second half: forward Y[c0 + k] = (saved)[piv[c0 + k] - c0]; backward Y[c0 + piv[c0 + k] - c0] = (saved)[k]
+@inline function _sv_piv_apply!(Y, U, piv, ctl, r, li, ::Val{WG}, ::Val{FWD}) where {WG, FWD}
+    @inbounds begin
+        c0 = ctl[_SV_C0] - 1
+        rp = ctl[_SV_RP] - 1
+        for k in li:WG:ctl[_SV_W]
+            p = Int(piv[c0 + k]) - c0
+            if FWD
+                Y[c0 + k, r] = U[rp + p, r]
+            else
+                Y[c0 + p, r] = U[rp + k, r]
+            end
         end
     end
     return nothing
@@ -364,21 +403,23 @@ end
 # kernels
 
 """
-    solve_fwd_kernel!(backend, WG)(Y, U, factor, list, first, count, subtree_ptr, subtree_nodes, super_ptr,
+    solve_fwd_kernel!(backend, WG)(Y, U, factor, piv, list, first, count, subtree_ptr, subtree_nodes, super_ptr,
                                    rowptr, rowval, front_ptr, front_nrows, front_ncols, child_ptr, child_list,
-                                   relind_ptr, relind, Val(SUB), Val(DET), Val(WG); ndrange = WG * count * nrhs)
+                                   relind_ptr, relind, Val(SUB), Val(DET), Val(LDL), Val(WG);
+                                   ndrange = WG * count * nrhs)
 
 Forward sweep `L z = y` of right-hand side `r` by workgroup `G = g + count (r - 1)`
 over its fronts: the subtree `list[first + g - 1]`, its
 supernodes in processing order (`SUB = true`, regime A), or the single front
 `list[first + g - 1]` (regime B). Per front: (deterministic, `DET`) zero its
-update buffer and pull the children's; TRSV with `L11` on its columns of `Y`;
-GEMV with `L21` into its update buffer or (atomic variant) into the rows of
-`Y` below.
+update buffer and pull the children's; (`LDL`) reorder its columns of `Y` by
+its local pivot order `piv`; TRSV with `L11` on its columns of `Y`; GEMV with
+`L21` into its update buffer or (atomic variant) into the rows of `Y` below.
 """
-@kernel function solve_fwd_kernel!(Y, U, factor, list, first, count, subtree_ptr, subtree_nodes, super_ptr, rowptr,
-                                   rowval, front_ptr, front_nrows, front_ncols, child_ptr, child_list, relind_ptr,
-                                   relind, ::Val{SUB}, ::Val{DET}, ::Val{WG}) where {SUB, DET, WG}
+@kernel function solve_fwd_kernel!(Y, U, factor, piv, list, first, count, subtree_ptr, subtree_nodes, super_ptr,
+                                   rowptr, rowval, front_ptr, front_nrows, front_ncols, child_ptr, child_list,
+                                   relind_ptr, relind, ::Val{SUB}, ::Val{DET}, ::Val{LDL}, ::Val{WG}) where {SUB, DET,
+                                                                                                         LDL, WG}
     @uniform IT = eltype(front_ptr)
     li = @index(Local, Linear)
     G = @index(Group, Linear)
@@ -402,6 +443,12 @@ GEMV with `L21` into its update buffer or (atomic variant) into the rows of
                 @synchronize
             end
         end
+        if LDL
+            _sv_piv_save!(Y, U, ctl, _sv_rhs(G, count), li, Val(WG))
+            @synchronize
+            _sv_piv_apply!(Y, U, piv, ctl, _sv_rhs(G, count), li, Val(WG), Val(true))
+            @synchronize
+        end
         for j in 1:ctl[_SV_W]
             _sv_fwd_col!(Y, factor, ctl, j, _sv_rhs(G, count), li, Val(WG))
             @synchronize
@@ -414,17 +461,18 @@ GEMV with `L21` into its update buffer or (atomic variant) into the rows of
 end
 
 """
-    solve_bwd_kernel!(backend, WG)(Y, factor, list, first, count, subtree_ptr, subtree_nodes, super_ptr, rowptr,
-                                   rowval, front_ptr, front_nrows, front_ncols, child_ptr, Val(SUB), Val(WG);
-                                   ndrange = WG * count * nrhs)
+    solve_bwd_kernel!(backend, WG)(Y, U, factor, piv, list, first, count, subtree_ptr, subtree_nodes, super_ptr,
+                                   rowptr, rowval, front_ptr, front_nrows, front_ncols, child_ptr, Val(SUB),
+                                   Val(LDL), Val(CONJ), Val(WG); ndrange = WG * count * nrhs)
 
-Backward sweep `Lᴴ x = z` of right-hand side `r` by workgroup `G = g + count (r - 1)`
+Backward sweep `Lᴴ x = z` (`Lᵀ` when `CONJ = false`) of right-hand side `r` by workgroup `G = g + count (r - 1)`
 over its fronts (the subtree `list[first + g - 1]` in reverse processing order, `SUB = true`, or one
-front): gather the finished rows below, GEMV with `L21ᴴ`, TRSV with `L11ᴴ`.
+front): gather the finished rows below, GEMV with `L21ᴴ`, TRSV with `L11ᴴ`, then (`LDL`) restore the
+order before the front's local pivoting.
 """
-@kernel function solve_bwd_kernel!(Y, factor, list, first, count, subtree_ptr, subtree_nodes, super_ptr, rowptr, rowval,
-                                   front_ptr, front_nrows, front_ncols, child_ptr, ::Val{SUB},
-                                   ::Val{WG}) where {SUB, WG}
+@kernel function solve_bwd_kernel!(Y, U, factor, piv, list, first, count, subtree_ptr, subtree_nodes, super_ptr, rowptr,
+                                   rowval, front_ptr, front_nrows, front_ncols, child_ptr, ::Val{SUB}, ::Val{LDL},
+                                   ::Val{CONJ}, ::Val{WG}) where {SUB, LDL, CONJ, WG}
     @uniform IT = eltype(front_ptr)
     li = @index(Local, Linear)
     G = @index(Group, Linear)
@@ -439,14 +487,57 @@ front): gather the finished rows below, GEMV with `L21ᴴ`, TRSV with `L11ᴴ`.
             _sv_setup!(ctl, v, super_ptr, rowptr, front_ptr, front_nrows, front_ncols, child_ptr)
         end
         @synchronize
-        _sv_bwd_gather!(Y, factor, rowval, ctl, _sv_rhs(G, count), li, Val(WG))
+        _sv_bwd_gather!(Y, factor, rowval, ctl, _sv_rhs(G, count), li, Val(WG), Val(CONJ))
         @synchronize
         for jj in 1:ctl[_SV_W]
-            _sv_bwd_col!(Y, factor, ctl, jj, _sv_rhs(G, count), li, Val(WG))
+            _sv_bwd_col!(Y, factor, ctl, jj, _sv_rhs(G, count), li, Val(WG), Val(CONJ))
             @synchronize
         end
-        _sv_bwd_diag!(Y, factor, ctl, _sv_rhs(G, count), li, Val(WG))
+        _sv_bwd_diag!(Y, factor, ctl, _sv_rhs(G, count), li, Val(WG), Val(CONJ))
         @synchronize
+        if LDL
+            _sv_piv_save!(Y, U, ctl, _sv_rhs(G, count), li, Val(WG))
+            @synchronize
+            _sv_piv_apply!(Y, U, piv, ctl, _sv_rhs(G, count), li, Val(WG), Val(false))
+            @synchronize
+        end
+    end
+end
+
+# LDLᵀ regime-C path: reorder the front's columns of Y by its local pivot order (`FWD`) or restore the
+# order (backward), one workgroup per right-hand side
+@kernel function _sv_piv_kernel!(Y, U, piv, v, super_ptr, rowptr, front_ptr, front_nrows, front_ncols, child_ptr,
+                                 ::Val{FWD}, ::Val{WG}) where {FWD, WG}
+    @uniform IT = eltype(front_ptr)
+    li = @index(Local, Linear)
+    r = @index(Group, Linear)
+    ctl = @localmem IT (_SV_CTL,)
+    if li == 1
+        _sv_setup!(ctl, v, super_ptr, rowptr, front_ptr, front_nrows, front_ncols, child_ptr)
+    end
+    @synchronize
+    _sv_piv_save!(Y, U, ctl, r, li, Val(WG))
+    @synchronize
+    _sv_piv_apply!(Y, U, piv, ctl, r, li, Val(WG), Val(FWD))
+end
+
+# diagonal sweep of LDLᵀ/LDLᴴ: Y ← D⁻¹ Y (1×1 and 2×2 blocks), one work item per (column, right-hand side)
+@kernel function _sv_diag_kernel!(Y, d, pivot_kind, n, nrhs, ::Val{HERM}) where {HERM}
+    q = @index(Global, Linear)
+    k = (q - 1) % n + 1
+    r = (q - 1) ÷ n + 1
+    @inbounds if r <= nrhs
+        kind = pivot_kind[k]
+        if kind == PIVOT_KIND_2X2_FIRST
+            a, b, c = d[k], d[n + k], d[k + 1]
+            up = HERM ? conj(b) : b
+            det = a * c - up * b
+            y1, y2 = Y[k, r], Y[k + 1, r]
+            Y[k, r] = (c * y1 - up * y2) / det
+            Y[k + 1, r] = (a * y2 - b * y1) / det
+        elseif kind != PIVOT_KIND_2X2_SECOND
+            Y[k, r] /= d[k]
+        end
     end
 end
 
@@ -499,7 +590,7 @@ end
 # drivers
 
 function _check_solve(ws::SolveWorkspace{T}, S::Symbolic, N::Numeric{T}, nrhs::Integer) where {T}
-    _check_reference_cholesky(S, T)
+    _is_ldlt_structure(S.structure) ? _check_ldlt_eltype(T) : _check_reference_cholesky(S, T)
     length(N.factor) == S.layout.factor_len ||
         throw(InvalidValueError("the numeric storage was not allocated for this analysis"))
     size(ws.Y, 1) == S.n && size(ws.U, 1) == length(S.partition.rowval) && size(ws.tmp, 1) == ws.plan.maxm ||
@@ -521,35 +612,71 @@ function _solve_impls(N::Numeric, S::Symbolic, impl::Symbol)
 end
 
 function _launch_fwd!(ws::SolveWorkspace, S::Symbolic, N::Numeric, first::Int, count::Int, nrhs::Int, sub::Val,
-                      det::Val)
+                      det::Val, ldl::Val)
     WG = SOLVE_WORKGROUP
     solve_fwd_kernel!(KernelAbstractions.get_backend(ws.Y), WG)(
-        ws.Y, ws.U, N.factor, S.group_nodes, first, count, S.subtree_ptr, S.subtree_nodes, S.super_ptr, S.rowptr,
-        S.rowval, S.front_ptr, S.front_nrows, S.front_ncols, S.child_ptr, S.child_list, S.relind_ptr, S.relind, sub,
-        det, Val(WG); ndrange = WG * count * nrhs)
+        ws.Y, ws.U, N.factor, N.piv, S.group_nodes, first, count, S.subtree_ptr, S.subtree_nodes, S.super_ptr,
+        S.rowptr, S.rowval, S.front_ptr, S.front_nrows, S.front_ncols, S.child_ptr, S.child_list, S.relind_ptr,
+        S.relind, sub, det, ldl, Val(WG); ndrange = WG * count * nrhs)
     return nothing
 end
 
-function _launch_bwd!(ws::SolveWorkspace, S::Symbolic, N::Numeric, first::Int, count::Int, nrhs::Int, sub::Val)
+function _launch_bwd!(ws::SolveWorkspace, S::Symbolic, N::Numeric, first::Int, count::Int, nrhs::Int, sub::Val,
+                      ldl::Val, cj::Val)
     WG = SOLVE_WORKGROUP
     solve_bwd_kernel!(KernelAbstractions.get_backend(ws.Y), WG)(
-        ws.Y, N.factor, S.group_nodes, first, count, S.subtree_ptr, S.subtree_nodes, S.super_ptr, S.rowptr,
-        S.rowval, S.front_ptr, S.front_nrows, S.front_ncols, S.child_ptr, sub, Val(WG); ndrange = WG * count * nrhs)
+        ws.Y, ws.U, N.factor, N.piv, S.group_nodes, first, count, S.subtree_ptr, S.subtree_nodes, S.super_ptr,
+        S.rowptr, S.rowval, S.front_ptr, S.front_nrows, S.front_ncols, S.child_ptr, sub, ldl, cj, Val(WG);
+        ndrange = WG * count * nrhs)
     return nothing
 end
+
+# solve kind of the analysis: Cholesky, LDLᵀ/LDLᴴ with Lᴴ (Hermitian or real), LDLᵀ complex symmetric
+const _SV_CHOLESKY = 0
+const _SV_LDL_HERM = 1
+const _SV_LDL_SYM = 2
+
+_solve_kind(S::Symbolic, ::Type{T}) where {T} =
+    !_is_ldlt_structure(S.structure) ? _SV_CHOLESKY :
+    (T <: Complex && S.structure == STRUCTURE_SYMMETRIC) ? _SV_LDL_SYM : _SV_LDL_HERM
 
 # the flags as compile-time constants through explicit branches (closures over runtime flags allocate)
 function _launch_sweep!(ws::SolveWorkspace, S::Symbolic, N::Numeric, first::Int, count::Int, nrhs::Int,
-                        sub::Bool, det::Bool, forward::Bool)
-    if !forward
-        sub ? _launch_bwd!(ws, S, N, first, count, nrhs, Val(true)) :
-              _launch_bwd!(ws, S, N, first, count, nrhs, Val(false))
-    elseif sub
-        det ? _launch_fwd!(ws, S, N, first, count, nrhs, Val(true), Val(true)) :
-              _launch_fwd!(ws, S, N, first, count, nrhs, Val(true), Val(false))
+                        sub::Bool, det::Bool, forward::Bool, kind::Int)
+    if kind == _SV_CHOLESKY
+        _launch_sweep!(ws, S, N, first, count, nrhs, sub, det, forward, Val(false), Val(true))
+    elseif kind == _SV_LDL_HERM
+        _launch_sweep!(ws, S, N, first, count, nrhs, sub, det, forward, Val(true), Val(true))
     else
-        det ? _launch_fwd!(ws, S, N, first, count, nrhs, Val(false), Val(true)) :
-              _launch_fwd!(ws, S, N, first, count, nrhs, Val(false), Val(false))
+        _launch_sweep!(ws, S, N, first, count, nrhs, sub, det, forward, Val(true), Val(false))
+    end
+    return nothing
+end
+
+function _launch_sweep!(ws::SolveWorkspace, S::Symbolic, N::Numeric, first::Int, count::Int, nrhs::Int,
+                        sub::Bool, det::Bool, forward::Bool, ldl::Val, cj::Val)
+    if !forward
+        sub ? _launch_bwd!(ws, S, N, first, count, nrhs, Val(true), ldl, cj) :
+              _launch_bwd!(ws, S, N, first, count, nrhs, Val(false), ldl, cj)
+    elseif sub
+        det ? _launch_fwd!(ws, S, N, first, count, nrhs, Val(true), Val(true), ldl) :
+              _launch_fwd!(ws, S, N, first, count, nrhs, Val(true), Val(false), ldl)
+    else
+        det ? _launch_fwd!(ws, S, N, first, count, nrhs, Val(false), Val(true), ldl) :
+              _launch_fwd!(ws, S, N, first, count, nrhs, Val(false), Val(false), ldl)
+    end
+    return nothing
+end
+
+# LDLᵀ regime-C path: local pivot order of front s on the first nrhs columns of Y
+function _piv_dense!(ws::SolveWorkspace, S::Symbolic, N::Numeric, s::Int, nrhs::Int, forward::Bool)
+    WG = SOLVE_WORKGROUP
+    kernel! = _sv_piv_kernel!(KernelAbstractions.get_backend(ws.Y), WG)
+    args = (ws.Y, ws.U, N.piv, s, S.super_ptr, S.rowptr, S.front_ptr, S.front_nrows, S.front_ncols, S.child_ptr)
+    if forward
+        kernel!(args..., Val(true), Val(WG); ndrange = WG * nrhs)
+    else
+        kernel!(args..., Val(false), Val(WG); ndrange = WG * nrhs)
     end
     return nothing
 end
@@ -565,8 +692,9 @@ function _dense_front(ws::SolveWorkspace, S::Symbolic, N::Numeric, s::Int, nrhs:
 end
 
 function _fwd_dense!(ws::SolveWorkspace{T}, S::Symbolic, N::Numeric, s::Int, nrhs::Int, det::Bool,
-                     p::NamedTuple) where {T}
+                     p::NamedTuple, kind::Int) where {T}
     f, w, L11, L21, Yc = _dense_front(ws, S, N, s, nrhs)
+    kind == _SV_CHOLESKY || _piv_dense!(ws, S, N, s, nrhs, true)
     _trsm_impl!(p.trsm, 'L', 'L', 'N', 'N', one(T), L11, Yc)
     m = f - w
     m > 0 || return nothing
@@ -582,16 +710,19 @@ function _fwd_dense!(ws::SolveWorkspace{T}, S::Symbolic, N::Numeric, s::Int, nrh
     return nothing
 end
 
-function _bwd_dense!(ws::SolveWorkspace{T}, S::Symbolic, N::Numeric, s::Int, nrhs::Int, p::NamedTuple) where {T}
+function _bwd_dense!(ws::SolveWorkspace{T}, S::Symbolic, N::Numeric, s::Int, nrhs::Int, p::NamedTuple,
+                     kind::Int) where {T}
     f, w, L11, L21, Yc = _dense_front(ws, S, N, s, nrhs)
     m = f - w
+    tr = kind == _SV_LDL_SYM ? 'T' : 'C'
     if m > 0
         rp = S.partition.rowptr[s] + w
         kernel! = _sv_gather_kernel!(KernelAbstractions.get_backend(ws.Y), SOLVE_WORKGROUP)
         kernel!(ws.tmp, ws.Y, S.rowval, rp, m, nrhs; ndrange = m * nrhs)
-        _gemm_impl!(p.gemm, 'C', 'N', -one(T), L21, view(ws.tmp, 1:m, 1:nrhs), one(T), Yc)
+        _gemm_impl!(p.gemm, tr, 'N', -one(T), L21, view(ws.tmp, 1:m, 1:nrhs), one(T), Yc)
     end
-    _trsm_impl!(p.trsm, 'L', 'L', 'C', 'N', one(T), L11, Yc)
+    _trsm_impl!(p.trsm, 'L', 'L', tr, 'N', one(T), L11, Yc)
+    kind == _SV_CHOLESKY || _piv_dense!(ws, S, N, s, nrhs, false)
     return nothing
 end
 
@@ -615,6 +746,7 @@ function forward_sweep!(ws::SolveWorkspace, S::Symbolic, N::Numeric; nrhs::Integ
     nrhs > 0 || return ws
     det = deterministic || !ws.atomic
     p = _solve_impls(N, S, impl)
+    kind = _solve_kind(S, eltype(ws))
     plan = ws.plan
     nodes = S.schedule.group_nodes
     for k in eachindex(plan.kind)
@@ -628,10 +760,10 @@ function forward_sweep!(ws::SolveWorkspace, S::Symbolic, N::Numeric; nrhs::Integ
                     ndrange = WG * (b - a + 1) * Int(nrhs))
             end
             for q in a:b
-                _fwd_dense!(ws, S, N, nodes[q], Int(nrhs), det, p)
+                _fwd_dense!(ws, S, N, nodes[q], Int(nrhs), det, p, kind)
             end
         else
-            _launch_sweep!(ws, S, N, a, b - a + 1, Int(nrhs), plan.kind[k] == SOLVE_SUBTREES, det, true)
+            _launch_sweep!(ws, S, N, a, b - a + 1, Int(nrhs), plan.kind[k] == SOLVE_SUBTREES, det, true, kind)
         end
     end
     return ws
@@ -640,19 +772,31 @@ end
 """
     diagonal_sweep!(ws, symbolic, numeric; nrhs = max_rhs(ws)) -> ws
 
-Diagonal step `D W = Z` between the sweeps: the identity for Cholesky
-(`"SPD"`/`"HPD"`); LDLᵀ/LDLᴴ fill it in T15.
+Diagonal step `D W = Z` between the sweeps, in place on the first `nrhs`
+columns of `ws.Y`: the identity for Cholesky (`"SPD"`/`"HPD"`); for
+LDLᵀ/LDLᴴ one launch, one work item per (factor column, right-hand side),
+dividing by the 1×1 pivots of `numeric.d` and solving the 2×2 blocks
+(`d[k]`, `d[n + k]`, `d[k + 1]`; Hermitian or complex symmetric as the
+structure). Asynchronous.
 """
 function diagonal_sweep!(ws::SolveWorkspace, S::Symbolic, N::Numeric; nrhs::Integer = max_rhs(ws))
     _check_solve(ws, S, N, nrhs)
+    kind = _solve_kind(S, eltype(ws))
+    (kind == _SV_CHOLESKY || nrhs == 0 || S.n == 0) && return ws
+    kernel! = _sv_diag_kernel!(KernelAbstractions.get_backend(ws.Y), SOLVE_WORKGROUP)
+    if kind == _SV_LDL_HERM
+        kernel!(ws.Y, N.d, N.pivot_kind, S.n, Int(nrhs), Val(true); ndrange = S.n * Int(nrhs))
+    else
+        kernel!(ws.Y, N.d, N.pivot_kind, S.n, Int(nrhs), Val(false); ndrange = S.n * Int(nrhs))
+    end
     return ws
 end
 
 """
     backward_sweep!(ws, symbolic, numeric; nrhs = max_rhs(ws), impl = :auto) -> ws
 
-Backward sweep `Lᴴ X = W` in place on the first `nrhs` columns of `ws.Y`, the
-forward plan in reverse: per step the regime-C-path fronts (gather kernel,
+Backward sweep `Lᴴ X = W` (`Lᵀ` for complex symmetric LDLᵀ) in place on the
+first `nrhs` columns of `ws.Y`, the forward plan in reverse: per step the regime-C-path fronts (gather kernel,
 `gemm` with `L21ᴴ`, `trsm` with `L11ᴴ`) and one launch over the regime-B
 fronts, then one launch over all regime-A subtrees (supernodes in reverse
 processing order). Gather-based and conflict-free: no atomics, deterministic.
@@ -663,16 +807,17 @@ function backward_sweep!(ws::SolveWorkspace, S::Symbolic, N::Numeric; nrhs::Inte
     _check_solve(ws, S, N, nrhs)
     nrhs > 0 || return ws
     p = _solve_impls(N, S, impl)
+    kind = _solve_kind(S, eltype(ws))
     plan = ws.plan
     nodes = S.schedule.group_nodes
     for k in reverse(eachindex(plan.kind))
         a, b = plan.first[k], plan.last[k]
         if plan.kind[k] == SOLVE_DENSE
             for q in b:-1:a
-                _bwd_dense!(ws, S, N, nodes[q], Int(nrhs), p)
+                _bwd_dense!(ws, S, N, nodes[q], Int(nrhs), p, kind)
             end
         else
-            _launch_sweep!(ws, S, N, a, b - a + 1, Int(nrhs), plan.kind[k] == SOLVE_SUBTREES, false, false)
+            _launch_sweep!(ws, S, N, a, b - a + 1, Int(nrhs), plan.kind[k] == SOLVE_SUBTREES, false, false, kind)
         end
     end
     return ws
@@ -681,7 +826,8 @@ end
 """
     sweep_solve!(X, ws, symbolic, numeric, B; transposed = false, deterministic = false, impl = :auto) -> X
 
-Solve `A X = B` with the factor `P A Pᵀ = L Lᴴ` of [`factorize!`](@ref):
+Solve `A X = B` with the factor `P A Pᵀ = L Lᴴ` (or the LDLᵀ/LDLᴴ factor with
+its local pivot orders) of [`factorize!`](@ref):
 [`permute_rhs!`](@ref) into `ws.Y`, [`forward_sweep!`](@ref),
 [`diagonal_sweep!`](@ref), [`backward_sweep!`](@ref),
 [`unpermute_solution!`](@ref) into `X`. `B` and `X` are device arrays in the

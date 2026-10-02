@@ -191,7 +191,19 @@ function ref_ldlt!(N::Numeric{T, Vector{T}}, S::Symbolic, nzval::AbstractVector;
             end
         end
     end
+    _host_totals!(N)
     return 0
+end
+
+# the totals of the per-front statistics (host storage; `reduce_stats!` on the device)
+function _host_totals!(N::Numeric)
+    for q in 1:FRONT_STATS_FIELDS
+        N.totals[q] = sum((N.stats[(s - 1) * FRONT_STATS_FIELDS + q] for s in 1:(length(N.stats) ÷ FRONT_STATS_FIELDS));
+                          init = Int64(0))
+    end
+    N.totals[STAT_INFO] = count(s -> N.stats[(s - 1) * FRONT_STATS_FIELDS + STAT_INFO] != 0,
+                                1:(length(N.stats) ÷ FRONT_STATS_FIELDS))
+    return N
 end
 
 ref_ldlt!(N::Numeric, S::Symbolic, A::CSR; kwargs...) = ref_ldlt!(N, S, vec(A.nzval); kwargs...)
@@ -276,8 +288,8 @@ function _choose_pivot(F::AbstractMatrix{T}, k::Int, w::Int, prm::_LDLTParams) w
         end
         return (abs(F[big, big]) >= prm.eps ? big : k, 0)
     end
-    # Bunch–Kaufman inside the block
-    α = BUNCH_KAUFMAN_ALPHA
+    # Bunch–Kaufman inside the block (α in the working precision, as the device kernels: no Float64 on Metal)
+    α = real(T)(BUNCH_KAUFMAN_ALPHA)
     λ, r = zero(real(T)), 0
     for i in (k + 1):w
         a = abs(F[i, k])

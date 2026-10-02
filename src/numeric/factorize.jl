@@ -61,7 +61,7 @@ function cholesky_stats!(N::Numeric, S::Symbolic)
 end
 
 function _check_numeric(N::Numeric{T}, S::Symbolic, nzval::AbstractVector) where {T}
-    _check_reference_cholesky(S, T)
+    _is_ldlt_structure(S.structure) ? _check_ldlt_eltype(T) : _check_reference_cholesky(S, T)
     sizeof(T) <= S.elsize ||
         throw(InvalidValueError("the analysis was built for $(S.elsize)-byte elements, the numeric storage has " *
                                 "$(sizeof(T))-byte $T"))
@@ -70,7 +70,7 @@ function _check_numeric(N::Numeric{T}, S::Symbolic, nzval::AbstractVector) where
     length(N.factor) == S.layout.factor_len && length(N.stack) == S.layout.stack_len &&
         length(N.info) == nsupernodes(S) + 1 ||
         throw(InvalidValueError("the numeric storage was not allocated for this analysis"))
-    length(N.work) == S.layout.work_len ||
+    length(N.work) == S.layout.work_len && length(N.piv) == S.n && length(N.psign) == S.n ||
         throw(InvalidValueError("the numeric storage was not allocated for this analysis"))
     backend = KernelAbstractions.get_backend(N.factor)
     for x in (nzval, S.amap, N.info)
@@ -117,10 +117,14 @@ function _factor_panel_c!(factor::AbstractVector{T}, stack::AbstractVector{T}, w
     return nothing
 end
 
-"""
-    factorize!(numeric, symbolic, nzval; impl = :auto) -> info::Int
+_check_ldlt_eltype(::Type{T}) where {T} = T <: LinearAlgebra.BlasFloat ||
+    throw(NotSupportedError("LDLᵀ/LDLᴴ supports BLAS element types only, got $T"))
 
-Multifrontal Cholesky `P A Pᵀ = L Lᴴ` on the device: `nzval` are the stored
+"""
+    factorize!(numeric, symbolic, nzval; impl = :auto, opts = Options()) -> info::Int
+
+Structures `"S"`/`"H"`: [`factorize_ldlt!`](@ref) with the pivoting options
+`opts` (`impl` is not used). Structures `"SPD"`/`"HPD"`: multifrontal Cholesky `P A Pᵀ = L Lᴴ` on the device: `nzval` are the stored
 values of A (same pattern, view and index base as the analysis) on the backend
 of `numeric`, and `symbolic` has its maps on that backend
 (`adapt(backend, symbolic, INT)`). For every launch group of the schedule,
@@ -145,7 +149,9 @@ failed one hold garbage. Structure `"SPD"` (real) or `"HPD"`. Nothing is
 allocated on the device; the panels are bitwise reproducible for a fixed
 `impl` and backend (regimes A and B are deterministic by construction).
 """
-function factorize!(N::Numeric{T}, S::Symbolic, nzval::AbstractVector; impl::Symbol = :auto) where {T}
+function factorize!(N::Numeric{T}, S::Symbolic, nzval::AbstractVector; impl::Symbol = :auto,
+                    opts::Options = Options()) where {T}
+    _is_ldlt_structure(S.structure) && return factorize_ldlt!(N, S, nzval; opts)
     _check_numeric(N, S, nzval)
     p = _front_impls(N, S, impl)
     plan = N.plan
@@ -174,4 +180,5 @@ function factorize!(N::Numeric{T}, S::Symbolic, nzval::AbstractVector; impl::Sym
     return k == 0 ? 0 : S.partition.perm[k]
 end
 
-factorize!(N::Numeric, S::Symbolic, A::CSR; impl::Symbol = :auto) = factorize!(N, S, vec(A.nzval); impl)
+factorize!(N::Numeric, S::Symbolic, A::CSR; impl::Symbol = :auto, opts::Options = Options()) =
+    factorize!(N, S, vec(A.nzval); impl, opts)

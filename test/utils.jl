@@ -284,19 +284,22 @@ function device_solve(backend, ws, Sd, Nd, b::AbstractArray; kwargs...)
 end
 
 """
-    solve_alloc_budget(S, ws) -> Int
+    solve_alloc_budget(S, ws; ldlt = false) -> Int
 
 [`ka_cpu_alloc_budget`](@ref) for one `sweep_solve!` with the plan of `ws`
 on the CPU backend: two permutation launches, a forward and a backward launch
 per kernel launch of the plan, and per regime-C-path front up to three dense
 calls or kernels each way plus one pull launch per dense step; `@localmem` of
-the control array (`_SV_CTL` indices) per launch.
+the control array (`_SV_CTL` indices) per launch. `ldlt = true` (T15) adds
+the diagonal launch and, per regime-C-path front, the local pivot order kernel
+each way.
 """
-function solve_alloc_budget(S, ws)
+function solve_alloc_budget(S, ws; ldlt::Bool = false)
     plan = ws.plan
-    launches = 2
+    launches = ldlt ? 3 : 2
+    per_front = ldlt ? 8 : 6
     for k in eachindex(plan.kind)
-        launches += plan.kind[k] == SparseDirectSolver.SOLVE_DENSE ? 6 * (plan.last[k] - plan.first[k] + 1) + 1 : 2
+        launches += plan.kind[k] == SparseDirectSolver.SOLVE_DENSE ? per_front * (plan.last[k] - plan.first[k] + 1) + 1 : 2
     end
     return ka_cpu_alloc_budget(launches, launches * SparseDirectSolver._SV_CTL * sizeof(Int64))
 end
@@ -357,4 +360,79 @@ function madnlp_inertia_loop(A::SparseMatrixCSC{T}, nh, nj, opts) where {T}
         δw = δw == 0 ? 1.0e-4 : 8 * δw
     end
     return (false, iterations, S, N, δw)
+end
+
+# --- device LDLᵀ/LDLᴴ (T15) ---
+
+"""
+    ldlt_setup(backend, A, INT = Int32; view = 'L', opts = Options(), structure = sym_structure(T))
+        -> (S, Nr, Sd, Nd, nz)
+
+Host analysis `S` of the `view` triangle of the symmetric/Hermitian matrix `A`
+with its reference LDLᵀ/LDLᴴ factor `Nr` ([`reference_ldlt`](@ref)), the
+analysis adapted to `backend` with `INT` maps, device storage `Nd` and the
+values `nz` on `backend` (T15).
+"""
+function ldlt_setup(backend, A::SparseMatrixCSC{T}, ::Type{INT} = Int32; view = 'L', opts = Options(),
+                    structure = sym_structure(T)) where {T, INT}
+    S, Nr, info, C = reference_ldlt(A; view, opts, structure)
+    info == 0 || error("ldlt_setup: the reference factorization failed")
+    Sd = SparseDirectSolver.adapt(backend, S, INT)
+    Nd = SparseDirectSolver.allocate_numeric(Sd, T, backend)
+    return S, Nr, Sd, Nd, to_device(backend, C.nzval)
+end
+
+"""
+    d_error(Nh, Nr)
+
+`max |D_device - D_ref| / max |D_ref|` (both entries `d[k]` and the 2×2
+subdiagonals `d[n + k]`) of a host copy `Nh` of a device LDLᵀ factor and the
+reference factor `Nr`; compare with [`panel_tol`](@ref) (T15).
+"""
+d_error(Nh, Nr) = maximum(abs, Nh.d - Nr.d) / maximum(abs, Nr.d)
+
+"""
+    ldlt_alloc_budget(S) -> Int
+
+[`ka_cpu_alloc_budget`](@ref) for one LDLᵀ/LDLᴴ `factorize!` on the CPU
+backend: one launch per launch group, the `max |aᵢⱼ|` and statistics
+reductions; `@localmem` of the largest regime-A kernel (48 KiB) per group plus
+the two reductions (T15).
+"""
+function ldlt_alloc_budget(S)
+    launches = length(S.schedule.groups) + 2
+    localmem = launches * maximum(SparseDirectSolver.SUBTREE_LOCAL_SIZES) +
+               SparseDirectSolver.STATS_WORKGROUP * SparseDirectSolver.FRONT_STATS_FIELDS * sizeof(Int64)
+    return ka_cpu_alloc_budget(launches, localmem)
+end
+
+"""
+    madnlp_inertia_loop_device(backend, A, nh, nj, opts, INT = Int32) -> (done, iterations, solver, δw)
+
+The MadNLP-style inertia correction of [`madnlp_inertia_loop`](@ref) through
+the handle layer on `backend` (T15): one `DirectSolver` (`"S"`/`"H"`, lower
+triangle, options `opts`), one `"analysis"`; per iteration the regularized
+values are written into the solver's `nzval`, then `"factorization"` /
+`"refactorization"`, and `getparam(solver, "inertia")`, `"npivots"` decide.
+"""
+function madnlp_inertia_loop_device(backend, A::SparseMatrixCSC{T}, nh, nj, opts, ::Type{INT} = Int32) where {T, INT}
+    C = SparseDirectSolver.CSR(tril(A))
+    dpos = [C.rowptr[i] - 1 + findfirst(==(i), C.colval[C.rowptr[i]:(C.rowptr[i + 1] - 1)]) for i in 1:nh]
+    solver = DirectSolver(api_matrix(backend, tril(A), INT), sym_structure(T), 'L')
+    solver.options = opts
+    execute!("analysis", solver, nothing, nothing)
+    δw, iterations = 0.0, 0
+    nz = similar(C.nzval)
+    while iterations < 50
+        iterations += 1
+        nz .= C.nzval
+        nz[dpos] .+= T(δw)
+        copyto!(solver.A.nzval, nz)
+        execute!(iterations == 1 ? "factorization" : "refactorization", solver, nothing, nothing)
+        if getparam(solver, "inertia") == (nh, nj) && getparam(solver, "npivots") == 0
+            return (true, iterations, solver, δw)
+        end
+        δw = δw == 0 ? 1.0e-4 : 8 * δw
+    end
+    return (false, iterations, solver, δw)
 end

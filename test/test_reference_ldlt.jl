@@ -238,10 +238,6 @@ end
     end
 end
 
-const MADNLP_ORDERINGS = (("default ordering", Options()),
-                          ("default ordering, pivot_pairs = all", Options(pivot_pairs = "all")),
-                          ("interleaved", Options(user_perm = kkt_interleaved_perm(200, 100))))
-
 @testset "MadNLP-style inertia correction ($label): $T" for T in ELTYPES, (label, opts) in MADNLP_ORDERINGS
     nh, nj = 200, 100
     # primal regularization δw on an indefinite H, no dual regularization (δ = 0); the
