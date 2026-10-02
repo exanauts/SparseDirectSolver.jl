@@ -122,7 +122,8 @@ end
     # unknown phase strings: ArgumentError; phases of later tasks: NotSupportedError
     @test thrown(() -> execute!("solving", solver, x, b)) isa ArgumentError
     @test thrown(() -> execute!("Solve", solver, x, b)) isa ArgumentError
-    for phase in ("solve_refinement", "solve_fwd_schur", "solve_bwd_schur")
+    @test execute!("solve_refinement", solver, x, b) === nothing     # T16; ir_n_steps = 0: no-op
+    for phase in ("solve_fwd_schur", "solve_bwd_schur")
         @test thrown(() -> execute!(phase, solver, x, b)) isa NotSupportedError
     end
     # "solve_diag" (T15) is the identity for Cholesky
@@ -311,20 +312,16 @@ end
     @test x1 == api_solve(backend, solver, b)
     @test relres(A, x1, b) <= tol(T)
     setparam!(solver, "deterministic_mode", 0)
-    # solve_mode: A = Aᴴ, and A = Aᵀ for real matrices
+    # solve_mode: A = Aᴴ, and Aᵀ = conj(A) (T16)
     setparam!(solver, "solve_mode", 2)
     @test relres(A, api_solve(backend, solver, b), b) <= tol(T)
     setparam!(solver, "solve_mode", 1)
-    if T <: Real
-        @test relres(A, api_solve(backend, solver, b), b) <= tol(T)
-    else
-        @test thrown(() -> api_solve(backend, solver, b)) isa NotSupportedError
-    end
+    @test relres(sparse(transpose(A)), api_solve(backend, solver, b), b) <= tol(T)
     setparam!(solver, "solve_mode", 0)
-    # ir_n_steps is stored, refinement comes in T16 (warns once)
+    # iterative refinement (T16)
     setparam!(solver, "ir_n_steps", 2)
-    @test relres(A, (@test_logs (:warn, r"iterative refinement") match_mode = :any api_solve(backend, solver, b)), b) <=
-          tol(T)
+    @test relres(A, api_solve(backend, solver, b), b) <= tol(T)
+    @test getparam(solver, "ir_n_steps") == 2
     setparam!(solver, "ir_n_steps", 0)
 end
 
@@ -335,15 +332,12 @@ end
     Ct = csr_of_transpose(Lh)
     C = CSR(to_device(backend, Ct.rowptr), to_device(backend, Ct.colval), to_device(backend, Ct.nzval), 70, 70;
             transposed = true)
-    if T <: Real
-        solver = DirectSolver(C, spd_structure(T), 'L')
-        execute!("analysis", solver, nothing, nothing)
-        execute!("factorization", solver, nothing, nothing)
-        b = rand(T, 70)
-        @test relres(A, api_solve(backend, solver, b), b) <= tol(T)
-    else
-        @test thrown(() -> DirectSolver(C, spd_structure(T), 'L')) isa NotSupportedError
-    end
+    # complex Hermitian: the stored matrix is conj(A), the solve conjugates (T16)
+    solver = DirectSolver(C, spd_structure(T), 'L')
+    execute!("analysis", solver, nothing, nothing)
+    execute!("factorization", solver, nothing, nothing)
+    b = rand(T, 70)
+    @test relres(A, api_solve(backend, solver, b), b) <= tol(T)
 end
 
 @testset "LinearAlgebra layer ($(backend_name(backend)), $T, $INT)" for backend in BACKENDS, T in ELTYPES,

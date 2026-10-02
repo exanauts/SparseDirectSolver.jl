@@ -68,6 +68,22 @@ end
 random_spd(n::Integer, density::Real; kwargs...) = random_spd(Float64, n, density; kwargs...)
 
 """
+    badly_scaled_spd(T, n, density; exponent = 4, rng)
+
+`D A D` with `A = random_spd(T, n, density)` and `D` diagonal with entries
+`10^(±exponent)` (random signs): symmetric (Hermitian) positive definite, row
+`i` scaled by `dᵢ` on top of the column scaling, so the entries span
+`10^(±2 exponent)` relative to `A` (the default: rows scaled by up to `10^(±8)`).
+"""
+function badly_scaled_spd(::Type{T}, n::Integer, density::Real; exponent::Real = 4,
+                          rng::AbstractRNG = Random.default_rng()) where {T}
+    A = random_spd(T, n, density; rng)
+    D = Diagonal([real(T)(10)^(exponent * rand(rng, (-1, 1))) for _ in 1:n])
+    S = D * A * D
+    return (S + S') / 2
+end
+
+"""
     random_hpd(T, n, density; rng)
 
 Hermitian positive definite `B Bᴴ + n I` for complex `T`.
