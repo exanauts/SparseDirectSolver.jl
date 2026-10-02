@@ -8,7 +8,7 @@
 # the matrix, `info` as an `Int` (or a vector for batched routines).
 
 const VENDOR_FUNCTIONS = (:vendor_gemm!, :vendor_syrk!, :vendor_herk!, :vendor_trsm!, :vendor_potrf!,
-                          :vendor_getrf!, :vendor_sytrf!, :vendor_gemm_strided_batched!,
+                          :vendor_potrf_info!, :vendor_getrf!, :vendor_sytrf!, :vendor_gemm_strided_batched!,
                           :vendor_trsm_batched!, :vendor_potrf_batched!, :vendor_getrf_batched!)
 
 for f in VENDOR_FUNCTIONS
@@ -22,6 +22,7 @@ end
     vendor_herk!(uplo::Char, α, A, β, C) -> C                  # uplo triangle of α A Aᴴ + β C (complex)
     vendor_trsm!(side, uplo, trans, diag, α, A, B) -> B
     vendor_potrf!(uplo::Char, A) -> info::Int
+    vendor_potrf_info!(uplo::Char, A, info, idx) -> info       # LAPACK info into the device Int32 vector info[idx]
     vendor_getrf!(A, ipiv) -> info::Int
     vendor_sytrf!(uplo::Char, A, ipiv) -> info::Int            # Bunch–Kaufman (capability probe only)
     vendor_gemm_strided_batched!(transA, transB, α, A, B, β, C) -> C     # 3-D arrays
@@ -34,14 +35,15 @@ The generic methods throw `NotSupportedError`; backends add methods for their
 array types (host BLAS/LAPACK for `Array`s, cuBLAS/cuSOLVER for `CuArray`s).
 """ vendor_gemm!
 
-# Host arrays the CPU BLAS/LAPACK accept: plain matrices and the panel views
-# `reshape(view(buf, a:b), f, w)` / `view(A, i, j)` of host arrays with `Int` or
-# range indices (strided; `view(A, [1, 3], :)` is not and falls outside). Backends whose
-# arrays are `DenseArray`s (GPU arrays) must not reach host BLAS, hence the
-# explicit `Array` parent.
+# Host arrays the CPU BLAS/LAPACK accept: plain matrices, the panel views
+# `reshape(view(buf, a:b), f, w)` and `view(A, i, j)` of host arrays or panels with
+# `Int` or range indices (strided; `view(A, [1, 3], :)` is not and falls outside).
+# Backends whose arrays are `DenseArray`s (GPU arrays) must not reach host BLAS,
+# hence the explicit `Array` parent.
 const HostStridedIndex = Tuple{Vararg{Union{Int, AbstractRange{Int}}}}
-const HostMatrix{T} = Union{Matrix{T}, SubArray{T, 2, <:Array{T}, <:HostStridedIndex},
-                            Base.ReshapedArray{T, 2, <:SubArray{T, 1, <:Array{T}}}}
+const HostPanel{T} = Base.ReshapedArray{T, 2, <:SubArray{T, 1, <:Array{T}}}
+const HostMatrix{T} = Union{Matrix{T}, SubArray{T, 2, <:Array{T}, <:HostStridedIndex}, HostPanel{T},
+                            SubArray{T, 2, <:HostPanel{T}, <:HostStridedIndex}}
 
 const BlasT = LinearAlgebra.BlasFloat
 
@@ -54,6 +56,10 @@ vendor_herk!(uplo::Char, α, A::HostMatrix{T}, β, C::HostMatrix{T}) where {T <:
 vendor_trsm!(side::Char, uplo::Char, trans::Char, diag::Char, α, A::HostMatrix{T}, B::HostMatrix{T}) where {T <: BlasT} =
     BLAS.trsm!(side, uplo, trans, diag, T(α), A, B)
 vendor_potrf!(uplo::Char, A::HostMatrix{<:BlasT}) = Int(LAPACK.potrf!(uplo, A)[2])
+function vendor_potrf_info!(uplo::Char, A::HostMatrix{<:BlasT}, info::Vector{Int32}, idx::Integer)
+    info[idx] = Int32(LAPACK.potrf!(uplo, A)[2])
+    return info
+end
 function vendor_getrf!(A::HostMatrix{<:BlasT}, ipiv::AbstractVector{<:Integer})
     _, p, info = LAPACK.getrf!(A)
     view(ipiv, 1:length(p)) .= p

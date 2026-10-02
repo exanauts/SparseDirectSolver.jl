@@ -2,7 +2,8 @@ module SparseDirectSolverCUDAExt
 
 # CUDA support: CSR adapters (T02) and the vendor dense bindings of the dense
 # layer (T03, PLAN §2.6): cuBLAS gemm/syrk/herk/trsm/strided-batched gemm/
-# batched trsm, cuSOLVER potrf/getrf/sytrf/potrfBatched, cuBLAS getrfBatched.
+# batched trsm, cuSOLVER potrf (also with a device info)/getrf/sytrf/potrfBatched,
+# cuBLAS getrfBatched.
 
 using SparseDirectSolver
 using SparseDirectSolver: CSR, INDEX_ONE, INDEX_ZERO, InvalidValueError
@@ -82,6 +83,28 @@ SDS.vendor_trsm!(side::Char, uplo::Char, trans::Char, diag::Char, α, A::Strided
                  B::StridedCuMatrix{T}) where {T <: CuBlasT} = cuBLAS.trsm!(side, uplo, trans, diag, T(α), A, B)
 
 SDS.vendor_potrf!(uplo::Char, A::StridedCuMatrix{<:CuBlasT}) = Int(cuSOLVER.potrf!(uplo, A)[2])
+
+# cuSOLVER potrf writing its `devInfo` straight into `info[idx]`: unlike
+# `cuSOLVER.potrf!` there is no host read of the status (numeric phase, PLAN §3.9)
+for (bname, fname, elty) in ((:cusolverDnSpotrf_bufferSize, :cusolverDnSpotrf, :Float32),
+                             (:cusolverDnDpotrf_bufferSize, :cusolverDnDpotrf, :Float64),
+                             (:cusolverDnCpotrf_bufferSize, :cusolverDnCpotrf, :ComplexF32),
+                             (:cusolverDnZpotrf_bufferSize, :cusolverDnZpotrf, :ComplexF64))
+    @eval function SDS.vendor_potrf_info!(uplo::Char, A::StridedCuMatrix{$elty}, info::CuVector{Cint}, idx::Integer)
+        n = LinearAlgebra.checksquare(A)
+        lda = max(1, stride(A, 2))
+        dh = cuSOLVER.dense_handle()
+        function bufferSize()
+            out = Ref{Cint}(0)
+            cuSOLVER.$bname(dh, uplo, n, A, lda, out)
+            return out[] * sizeof($elty)
+        end
+        CUDACore.with_workspace(dh.workspace_gpu, bufferSize) do buffer
+            cuSOLVER.$fname(dh, uplo, n, A, lda, buffer, sizeof(buffer) ÷ sizeof($elty), pointer(info, idx))
+        end
+        return info
+    end
+end
 
 # cuSOLVER pivots are `Cint`; other index vectors go through a temporary
 function _with_cint(f, ipiv::CuVector, k::Integer)

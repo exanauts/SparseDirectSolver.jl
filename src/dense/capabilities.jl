@@ -182,7 +182,12 @@ function _probe_capabilities(backend, ::Type{T}) where {T}
     end
     vendor_potrf = _probe() do
         X = dev(copy(S))
-        vendor_potrf!('L', X) == 0 && isapprox(lower(X), L; rtol = sqrt(eps(real(T))))
+        ok = vendor_potrf!('L', X) == 0 && isapprox(lower(X), L; rtol = sqrt(eps(real(T))))
+        # the asynchronous variant of the numeric phase (device info, no host read)
+        Y = dev(copy(S))
+        info = KernelAbstractions.zeros(backend, Int32, 2)
+        vendor_potrf_info!('L', Y, info, 2)
+        ok && Array(info) == Int32[0, 0] && isapprox(lower(Y), L; rtol = sqrt(eps(real(T))))
     end
     vendor_getrf = _probe() do
         X = dev(copy(A))

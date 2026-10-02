@@ -1127,7 +1127,7 @@ obtained on this machine (CUDSS.jl is in `../CUDSS.jl`).
 
 ---
 
-## T09 — GPU multifrontal Cholesky with assembly kernels (regime C on every front)   `[ ]`
+## T09 — GPU multifrontal Cholesky with assembly kernels (regime C on every front)   `[!]`
 
 **Reads**: PLAN §2.4, §3.4, §2.7.
 
@@ -1155,6 +1155,110 @@ obtained on this machine (CUDSS.jl is in `../CUDSS.jl`).
   identical panels (`==`).
 * Refactorization with new values is correct; no allocations during
   `factorize!` on CPU (`@allocated` on the second call ≤ a small constant).
+
+### Report
+
+- Status: [!] (done on the CPU backend; the driver needs an analysis without regime-A subtrees, small dense-layer
+  additions, `Numeric` moved and extended; CUDA from CI)
+- What was built (internal, nothing exported):
+  - `src/numeric/storage.jl` (moved from `src/reference/cholesky.jl`): `Numeric{T, VT, VS, VI}` gains `info`
+    (`ns + 1` device `Int32`: the `potrf` status of front `s` at `s`, the reduced result at `ns + 1`) and `plan`;
+    `NumericPlan` (host, built once by `allocate_numeric`: per step the contiguous range of `group_nodes`, the
+    largest child count = trip count of the extend-add, a 1-entry host staging buffer for the `info` read).
+  - `src/numeric/assembly.jl`: KA kernels, one 1-D workgroup (256) per front of a step, owner-pull, no atomics:
+    `zero_fronts!` (panel + update-stack CB), `scatter_A!` (work items stride over the front's `amap_src`
+    entries; the item holding the first entry of a run of duplicates sums the run in `nzval` order, so the
+    summation order equals the reference's), `extend_add!` (children in `child_list` order, one barrier per
+    child, lower triangle of each CB through `relind` into the parent's panel or CB).
+  - `src/numeric/factorize.jl`: `factorize!(numeric, symbolic, nzval | CSR; impl = :auto) -> info`: per step of
+    the schedule one launch each of zero/scatter/extend-add, then per front `potrf_info!`, `trsm!('R','L','C')`
+    and `herk!`/`syrk!` (into the CB on the update stack) through the dense interface with `impl` passed on;
+    `cholesky_stats!` (one workgroup, `@localmem` tree reduction) fills `stats` like `ref_factorize!` and reduces
+    the smallest failed factor column; one `copyto!` of that `Int32` is the only host synchronization; `info` is
+    returned in original numbering (`perm[k]`), as the reference.
+  - `src/numeric/extract.jl`: `host_numeric(numeric)` (host copy usable by `ref_solve!`/`extract_L`),
+    `panel(symbolic, numeric, s)`; `extract_L` already copies a device factor.
+  - Dense layer: `potrf_info!(uplo, A, info, idx; impl)` (asynchronous potrf, LAPACK info into `info[idx]` of a
+    device `Int32` vector; vendor/generic results validated on the device by the new `ka_chol_check_info!`, as
+    `potrf!` does since T03); `vendor_potrf_info!` (host LAPACK; CUDA: raw `cusolverDn?potrf` with `devInfo =
+    pointer(info, idx)` and the handle's cached workspace, no host read); `ka_potrf!(...; offset)`; the
+    `vendor_potrf` capability probe now also checks `vendor_potrf_info!`; `HostMatrix` accepts index views of
+    panels (`view(reshape(view(buf, r), f, w), i, j)`, the `F11`/`F21` blocks); `select_impl` no longer builds the
+    `dense_impls` vector (it allocated 176 bytes per dense call); internal `_potrf_info_impl!`, `_trsm_impl!`,
+    `_herk_impl!`/`_syrk_impl!` take an already resolved impl, and `factorize!` resolves the three impls once per
+    call (`_front_impls`), so the per-front calls do no capability lookup (review round 1).
+  - `memory_estimates` slot 11 includes the `Int32` status vector.
+  - Tests: `test/test_numeric_cholesky_c.jl`, a `potrf_info!` testset in `test/test_dense.jl`, `panel_tol(T)` in
+    `test/utils.jl`.
+- Tests: `SDS_TEST_GPU=0 julia --project=. -e 'using Pkg; Pkg.test()'` (Julia 1.13.1, ubuntu-latest, CPU):
+  43099 pass / 0 fail / 0 broken (test_numeric_cholesky_c: 458, 29 s; test_dense +540 for `potrf_info!`).
+  Review round 1, under CI's flags (`Pkg.test(; coverage = true, julia_args = ["--check-bounds=yes"])`,
+  `SDS_TEST_ONLY=test_numeric_cholesky_c`): Julia 1.10.10 458 pass / 0 fail, Julia 1.12.1 458 pass / 0 fail.
+  The first CI run on this PR failed the allocation assertion (4 per job: 2176 B on Julia 1, 9696 B on 1.10);
+  see the measurements below.
+  Covered, per backend and `T ∈ ELTYPES`: panels within `100·eps·max|L|` of the T08 reference on
+  `laplacian2d(40,40)` (Int32 and Int64 maps), `random_spd(500,0.01)`, `laplacian3d(10,10,10)`, equal `stats`,
+  `extract_L`, `relres ≤ tol(T)` with `ref_solve!` on the copied-back factor (`nrhs` 1 and 5); two factorizations
+  give `==` panels (all backends; the first result is copied, since `host_numeric` returns a host `Numeric` as is); every `impl` in `dense_impls(:potrf, …)` (CPU: vendor, generic,
+  ka, also against a copy); views `'U'`/`'F'` × index `'O'`/`'Z'` give `==` panels; refactorization with new
+  values and back (`==` against a copy of the first factor);
+  `info == j` (and the front's local `info` in `stats`) for `singular_block_matrix` with `A[j,j] ∈ {-3, 0}` under
+  three analyses, plus a pivot that turns negative only after elimination; regime-A analyses raise
+  `NotSupportedError`; the plan covers every front once.
+  CUDA/AMDGPU: pending CI on the PR.
+- Measurements (ubuntu-latest CPU backend, Float64, `subtree_budgets = Int[]`, best of 3; `:auto` = host LAPACK):
+
+  ```text
+  matrix            fronts steps  ref_factorize!  factorize!(:auto)  factorize!(:ka)  @allocated(:auto)
+  lap2d 100²         3407    45      5.2 ms          14.5 ms            67 ms            64 B
+  lap3d 20³          1380    47     48.2 ms          63.6 ms           379 ms            64 B
+  random_spd 2000     254    42     43.4 ms          68.5 ms           361 ms            64 B
+  ```
+
+  With `:auto` the CPU panels are bitwise equal to the reference (same LAPACK calls on the same data).
+  `@allocated factorize!(:auto)` of the allocation test (`random_spd(300, 0.02)`, 21–26 fronts, 10–12 steps,
+  over the four `T`), review round 1:
+
+  ```text
+  Julia    plain             --code-coverage --check-bounds=yes (CI)
+  1.13.1   64 B              not run
+  1.12.1   64 B              2176 B (constant: 2112 B = the stats kernel's @localmem MArray on the heap)
+  1.10.10  9632–11488 B      11744–13600 B (80–288 B per KA CPU launch: args boxed behind KA's `__run`)
+  ```
+
+  Resolving the impls once per phase did not change these numbers (the capability lookup did not allocate
+  after compilation); the allocations are inside the KA 0.9 CPU backend. The test asserts
+  `≤ ka_cpu_alloc_budget(launches, localmem)` (`test/utils.jl`): 1024 B, plus 320 B per launch on Julia < 1.12
+  and, under coverage, the `@localmem` bytes plus 64 B per launch; the launch count is bounded by
+  `3·nsteps + nfronts + 1`. So the strict 1024 B holds on Julia ≥ 1.12 without coverage. `:generic`
+  (LinearAlgebra wrappers, `cholesky!` objects) and `:ka` (fallback launches) allocate 9–39 KB per
+  factorization of that matrix on Julia 1.12/1.13 (1.4–4.7 MB for `:ka` on 1.10 under coverage).
+- Deviations from PLAN.md / this task:
+  - Regime-A subtrees have no update-stack slots in the T07 layout (their CBs are meant to stay in local memory),
+    so the regime-C driver cannot run them: `factorize!` raises `NotSupportedError` unless the analysis has no
+    subtrees (`Options(subtree_budgets = Int[])`, which the tests use). Regime-B fronts go through the regime-C
+    path, step by step, as asked. T11 must replace the error by the subtree launch (step 0).
+  - The "level" of the driver is the schedule step (T07: level × chunk over B/C fronts), so the update-stack
+    offsets of the layout are used as they are.
+  - `Numeric` moved to `src/numeric/storage.jl`, with a fourth type parameter (`VI`, the `Int32` status vector) and
+    a host `plan` field. PLAN §3.2 lists `Numeric{T, VT}`.
+  - The dense interface got `potrf_info!` / `vendor_potrf_info!` because `potrf!` returns `info` to the host, and
+    `cuSOLVER.potrf!` reads it, so each would synchronize once per front. `:generic` still synchronizes on CUDA
+    inside `cholesky!` (documented); `:auto` picks `:vendor` there.
+  - The extend-add loops over the full `m×m` square of each child CB and skips the upper half (simple index
+    math); packing CBs (T07 note) would remove that.
+- Open issues / follow-ups:
+  - The CUDA `vendor_potrf_info!` binding (raw `cusolverDn?potrf` + `CUDACore.with_workspace`) could only be
+    loaded, not run, here; the CI `cuda` job checks it through the capability probe (`caps.vendor_potrf`), the
+    `potrf_info!` testset and the T09 tests.
+  - Per-front dense calls dominate on CPU (14.5 ms vs 5.2 ms for the reference on lap2d 100²: ~3400 fronts × 3
+    calls + 135 launches). On a GPU this is ~10k small vendor launches per factorization; T10/T11 fuse them.
+  - `:ka` and `:generic` allocate per front on CPU, and the KA CPU backend allocates per launch on Julia 1.10
+    and for `@localmem` under coverage (see measurements): issue #53 (`found-by-agent`).
+- Suggested plan changes:
+  - PLAN §2.6: add the asynchronous `potrf_info!` (device status, no host read) to the dense interface list;
+    the same will be needed for `getrf`/`sytrf` (T15/T19).
+  - PLAN §3.2: `Numeric{T, VT, VS, VI}` with the `Int32` status vector and the host launch plan.
 
 ---
 

@@ -27,6 +27,10 @@ const DENSE_OPS = (
     trsm_strided_batched = (generic = nothing, vendor = :vendor_trsm_batched),
 )
 
+# DENSE_OPS as a concretely typed table (`:none` = no such path), for `select_impl`
+const _DENSE_OP_FIELDS = Dict{Symbol, Tuple{Symbol, Symbol}}(
+    op => (something(spec.generic, :none), something(spec.vendor, :none)) for (op, spec) in pairs(DENSE_OPS))
+
 function _flag_char(x, allowed::String, what::String)
     c = x isa Symbol ? (length(String(x)) == 1 ? only(String(x)) : '?') : x isa AbstractChar ? Char(x) : '?'
     c = uppercase(c)
@@ -97,9 +101,14 @@ anything else raises `InvalidValueError`.
 function select_impl(op::Symbol, X::AbstractArray, impl::Symbol)
     impl in DENSE_IMPLS || throw(InvalidValueError("invalid dense impl :$impl; expected one of $DENSE_IMPLS"))
     impl === :ka && return :ka
-    impls = dense_impls(op, KernelAbstractions.get_backend(X), eltype(X))
-    impl === :auto && return first(impls)
-    impl in impls ||
+    haskey(DENSE_OPS, op) || throw(InvalidValueError("unknown dense op :$op; expected one of $(keys(DENSE_OPS))"))
+    # same answer as `dense_impls`, without building the vector (called per front)
+    gfield, vfield = _DENSE_OP_FIELDS[op]
+    caps = capabilities(KernelAbstractions.get_backend(X), eltype(X))
+    vendor = vfield !== :none && getfield(caps, vfield)::Bool
+    generic = gfield !== :none && getfield(caps, gfield)::Bool
+    impl === :auto && return vendor ? :vendor : generic ? :generic : :ka
+    (impl === :vendor ? vendor : generic) ||
         throw(NotSupportedError("impl = :$impl is not available for $op with $(eltype(X)) on $(KernelAbstractions.get_backend(X))"))
     return impl
 end
@@ -138,8 +147,12 @@ overwrites it with the same symmetric update.
 function syrk!(C::AbstractMatrix, A::AbstractMatrix, α, β; uplo = 'L', impl::Symbol = :auto)
     ul = _uplo_char(uplo)
     _check_syrk_dims(C, A)
+    return _syrk_impl!(select_impl(:syrk, C, impl), ul, C, A, α, β)
+end
+
+# `syrk!` with an already resolved implementation `p` (no capability lookup)
+function _syrk_impl!(p::Symbol, ul::Char, C::AbstractMatrix, A::AbstractMatrix, α, β)
     T = eltype(C)
-    p = select_impl(:syrk, C, impl)
     if p === :vendor
         vendor_syrk!(ul, T(α), A, T(β), C)
     elseif p === :generic
@@ -162,7 +175,13 @@ function herk!(C::AbstractMatrix, A::AbstractMatrix, α::Real, β::Real; uplo = 
     T <: Real && return syrk!(C, A, α, β; uplo, impl)
     ul = _uplo_char(uplo)
     _check_syrk_dims(C, A)
-    p = select_impl(:herk, C, impl)
+    return _herk_impl!(select_impl(:herk, C, impl), ul, C, A, α, β)
+end
+
+# `herk!` with an already resolved implementation `p` (`:syrk` for real `T`), no capability lookup
+function _herk_impl!(p::Symbol, ul::Char, C::AbstractMatrix, A::AbstractMatrix, α::Real, β::Real)
+    T = eltype(C)
+    T <: Real && return _syrk_impl!(p, ul, C, A, α, β)
     if p === :vendor
         vendor_herk!(ul, real(T)(α), A, real(T)(β), C)
     elseif p === :generic
@@ -197,7 +216,11 @@ or upper triangular, with unit diagonal if `diag = :U`; `trans ∈ (:N, :T, :C)`
 function trsm!(side, uplo, trans, diag, α, A::AbstractMatrix, B::AbstractMatrix; impl::Symbol = :auto)
     sd, ul, tr, dg = _side_char(side), _uplo_char(uplo), _trans_char(trans), _diag_char(diag)
     _check_trsm_dims(sd, A, B)
-    p = select_impl(:trsm, B, impl)
+    return _trsm_impl!(select_impl(:trsm, B, impl), sd, ul, tr, dg, α, A, B)
+end
+
+# `trsm!` with an already resolved implementation `p` (no capability lookup)
+function _trsm_impl!(p::Symbol, sd::Char, ul::Char, tr::Char, dg::Char, α, A::AbstractMatrix, B::AbstractMatrix)
     if p === :vendor
         vendor_trsm!(sd, ul, tr, dg, eltype(B)(α), A, B)
     elseif p === :generic
@@ -233,6 +256,41 @@ function potrf!(uplo, A::AbstractMatrix; impl::Symbol = :auto)
         info = ka_potrf!(ul, A, _device_info(A))
         return Int(only(Array(info)))
     end
+end
+
+"""
+    potrf_info!(uplo, A, info, idx = 1; impl = :auto) -> info
+
+Asynchronous [`potrf!`](@ref): Cholesky of the `uplo` triangle of `A` in place,
+with the LAPACK `info` (0, or the first non-positive pivot column) written to
+`info[idx]` of the device `Int32` vector `info` instead of being returned, so
+the numeric phase can factor many fronts and read their status once
+(PLAN §3.9). `:vendor` (`vendor_potrf_info!`) and `:generic` results are
+validated on the device by [`ka_chol_check_info!`](@ref) (cuSOLVER can miss a
+non-positive last pivot, see `potrf!`); `:ka` is [`ka_potrf!`](@ref). The
+`:vendor` and `:ka` paths do not synchronize with the host; `:generic` does
+when the backend's `cholesky!` reads its `info` (CUDA).
+"""
+function potrf_info!(uplo, A::AbstractMatrix, info::AbstractVector{Int32}, idx::Integer = 1; impl::Symbol = :auto)
+    ul = _uplo_char(uplo)
+    LinearAlgebra.checksquare(A)
+    1 <= idx <= length(info) || throw(DimensionMismatch("info index $idx outside 1:$(length(info))"))
+    return _potrf_info_impl!(select_impl(:potrf, A, impl), ul, A, info, idx)
+end
+
+# `potrf_info!` with an already resolved implementation `p` (no capability lookup)
+function _potrf_info_impl!(p::Symbol, ul::Char, A::AbstractMatrix, info::AbstractVector{Int32}, idx::Integer)
+    if p === :vendor
+        vendor_potrf_info!(ul, A, info, idx)
+        ka_chol_check_info!(info, idx, A)
+    elseif p === :generic
+        cholesky!(Hermitian(A, ul == 'L' ? :L : :U), NoPivot(); check = false)
+        fill!(view(info, idx:idx), Int32(0))
+        ka_chol_check_info!(info, idx, A)
+    else
+        ka_potrf!(ul, A, info; offset = idx - 1)
+    end
+    return info
 end
 
 """

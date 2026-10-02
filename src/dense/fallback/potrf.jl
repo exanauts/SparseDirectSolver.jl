@@ -8,7 +8,7 @@
 @inline _chol_get(A, ::Val{LOWER}, i, k, b) where {LOWER} = LOWER ? _get(A, i, k, b) : conj(_get(A, k, i, b))
 @inline _chol_set!(A, v, ::Val{LOWER}, i, k, b) where {LOWER} = LOWER ? _set!(A, v, i, k, b) : _set!(A, conj(v), k, i, b)
 
-@kernel function _ka_potrf_kernel!(A, info, lower::Val, ::Val{WG}, n) where {WG}
+@kernel function _ka_potrf_kernel!(A, info, lower::Val, ::Val{WG}, n, offset) where {WG}
     @uniform T = eltype(A)
     st = @localmem Int32 (1,)
     li = @index(Local, Linear)
@@ -49,31 +49,34 @@
         @synchronize
     end
     if li == 1
-        @inbounds info[gi[2]] = st[1]
+        @inbounds info[offset + gi[2]] = st[1]
     end
 end
 
 """
-    ka_potrf!(uplo, A, info; workgroup = Val(128)) -> info
+    ka_potrf!(uplo, A, info; workgroup = Val(128), offset = 0) -> info
 
 KernelAbstractions fallback Cholesky of the `uplo` triangle of `A` in place
 (`A = LLᴴ` for `'L'`, `UᴴU` for `'U'`), unblocked, one 1-D workgroup per
 matrix. `A` is a matrix or a 3-D strided batch; `info` is a device vector of
 `Int32` with one entry per matrix, set to 0 on success or to the first column
-`j` (1-based) whose pivot is not positive, as LAPACK `potrf`. Asynchronous:
-the caller reads `info` at a phase boundary.
+`j` (1-based) whose pivot is not positive, as LAPACK `potrf`; matrix `b` of
+the batch writes `info[offset + b]`. Asynchronous: the caller reads `info` at a
+phase boundary.
 """
-function ka_potrf!(uplo, A::AbstractArray, info::AbstractVector{Int32}; workgroup::Val{WG} = Val(KA_WORKGROUP)) where {WG}
+function ka_potrf!(uplo, A::AbstractArray, info::AbstractVector{Int32}; workgroup::Val{WG} = Val(KA_WORKGROUP),
+                   offset::Integer = 0) where {WG}
     ul = _uplo_char(uplo)
     _ilog2(WG)
     n = size(A, 1)
     size(A, 2) == n || throw(DimensionMismatch("potrf: matrices are $(size(A, 1))×$(size(A, 2)), not square"))
     nb = _nbatch(A)
-    length(info) >= nb || throw(DimensionMismatch("info has length $(length(info)) < batch count $nb"))
+    0 <= offset && offset + nb <= length(info) ||
+        throw(DimensionMismatch("info has length $(length(info)) < offset $offset + batch count $nb"))
     nb == 0 && return info
     backend = KernelAbstractions.get_backend(A)
     kernel! = _ka_potrf_kernel!(backend, (WG, 1))
-    kernel!(A, info, Val(ul == 'L'), workgroup, n; ndrange = (WG, nb))
+    kernel!(A, info, Val(ul == 'L'), workgroup, n, Int(offset); ndrange = (WG, nb))
     return info
 end
 
@@ -107,5 +110,38 @@ function ka_chol_diag_info!(info::AbstractVector{Int32}, L::AbstractArray)
     nb == 0 && return info
     kernel! = _ka_chol_diag_kernel!(KernelAbstractions.get_backend(L), (1, 1))
     kernel!(info, L, size(L, 1); ndrange = (1, nb))
+    return info
+end
+
+@kernel function _ka_chol_check_kernel!(info, A, n, idx)
+    li = @index(Local, Linear)
+    if li == 1
+        @inbounds if info[idx] == 0
+            st = Int32(0)
+            for j in 1:n
+                d = _get(A, j, j, 1)
+                if !(isfinite(real(d)) && real(d) > 0 && iszero(imag(d)))
+                    st = Int32(j)
+                    break
+                end
+            end
+            info[idx] = st
+        end
+    end
+end
+
+"""
+    ka_chol_check_info!(info, idx, L) -> info
+
+Device-side validation of the `info[idx]` a vendor or generic Cholesky left for
+the computed factor `L` (a matrix): when `info[idx] == 0`, it is replaced by
+the first `j` whose diagonal entry `L[j, j]` is not a finite positive real
+(still 0 if there is none); a nonzero `info[idx]` is kept. Asynchronous (see
+[`potrf_info!`](@ref)).
+"""
+function ka_chol_check_info!(info::AbstractVector{Int32}, idx::Integer, L::AbstractMatrix)
+    1 <= idx <= length(info) || throw(DimensionMismatch("info index $idx outside 1:$(length(info))"))
+    kernel! = _ka_chol_check_kernel!(KernelAbstractions.get_backend(L), 1)
+    kernel!(info, L, size(L, 1), Int(idx); ndrange = 1)
     return info
 end

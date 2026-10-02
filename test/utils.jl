@@ -139,3 +139,33 @@ function offdiag_pattern(A::SparseMatrixCSC)
     keep = I .!= J
     return sparse(I[keep], J[keep], trues(count(keep)), size(A)...)
 end
+
+# ---------------------------------------------------------------------------
+# numeric phase (T09)
+
+"""
+    panel_tol(T)
+
+Elementwise tolerance of device panels against the reference panels, relative
+to `max |L|`: `100·eps(real(T))` (TASKS.md T09).
+"""
+panel_tol(::Type{T}) where {T} = 100 * eps(real(T))
+
+"""
+    ka_cpu_alloc_budget(launches, localmem_bytes) -> Int
+
+Bytes the KernelAbstractions CPU backend itself may allocate for `launches`
+kernel launches whose `@localmem` buffers total `localmem_bytes`, on top of
+the 1024 B allowed to an allocation-free phase (PLAN §3.9). Measured (T09
+review round 1): 0 on Julia ≥ 1.12 without coverage (the local runs); on Julia
+1.10 every launch boxes its arguments behind KA's `__run` inference barrier
+(80–288 B per launch), hence 320 B per launch below 1.12 (1.11 not measured);
+with `--code-coverage` (CI's `julia-runtest`) the `@localmem` `MArray`s are
+heap-allocated, hence `localmem_bytes` plus 64 B of header per launch.
+"""
+function ka_cpu_alloc_budget(launches::Integer, localmem_bytes::Integer)
+    b = 1024
+    VERSION < v"1.12" && (b += 320 * launches)
+    Base.JLOptions().code_coverage != 0 && (b += localmem_bytes + 64 * launches)
+    return b
+end
