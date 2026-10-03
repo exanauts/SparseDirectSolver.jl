@@ -107,6 +107,29 @@ api_matrix(backend, A::SparseMatrixCSC, ::Type{INT}) where {INT} = to_device(bac
 api_matrix(::CPU, A::SparseMatrixCSC{T}, ::Type{INT}) where {T, INT} = CSR(SparseMatrixCSC{T, INT}(A))
 
 """
+    api_batch_matrix(backend, members, view, INT = Int32)
+
+The uniform batch `members` (one sparsity pattern, see `batch_members`) as the
+public API takes it on `backend` (T17): the `view` triangle's CSR pattern with
+the values of every member one after the other, as a [`CSR`](@ref) on the CPU
+backend and a vendor CSR matrix with a long `nzVal` on a GPU (as in CUDSS.jl).
+"""
+function api_batch_matrix(backend, members, view, ::Type{INT} = Int32) where {INT}
+    rowptr, colval, nzval = batch_csr(members, view, INT)
+    return api_csr(backend, rowptr, colval, nzval, size(members[1], 1))
+end
+
+"""
+    api_csr(backend, rowptr, colval, nzval, n)
+
+The square `n × n` CSR matrix of the host arrays `rowptr`, `colval` (one-based,
+their element type is the index type) and `nzval` (a uniform batch when longer
+than `colval`) as the public API takes it on `backend`: a [`CSR`](@ref) on the
+CPU backend, a vendor CSR matrix on a GPU (T17).
+"""
+api_csr(::CPU, rowptr, colval, nzval, n) = CSR(copy(rowptr), copy(colval), copy(vec(nzval)), n, n)
+
+"""
     device_allocated(backend, f) -> Union{Int, Missing}
 
 Bytes of device memory allocated by `f()` (T13): `@allocated` on the CPU
@@ -129,6 +152,9 @@ if CUDA_LOADED
     end
     to_host(A::CuSparseMatrixCSR) = host_csc(A.rowPtr, A.colVal, A.nzVal, size(A)...)
     index_eltype(A::CuSparseMatrixCSR) = eltype(A.rowPtr)
+    api_csr(::CUDABackend, rowptr::Vector{INT}, colval::Vector{INT}, nzval, n) where {INT} =
+        CuSparseMatrixCSR{eltype(nzval), INT}(CuVector{INT}(rowptr), CuVector{INT}(colval), CuVector(vec(nzval)),
+                                              (n, n))
 end
 
 if AMDGPU_LOADED
@@ -141,6 +167,9 @@ if AMDGPU_LOADED
     end
     to_host(A::ROCSparseMatrixCSR) = host_csc(A.rowPtr, A.colVal, A.nzVal, size(A)...)
     index_eltype(A::ROCSparseMatrixCSR) = eltype(A.rowPtr)
+    api_csr(::ROCBackend, rowptr::Vector{INT}, colval::Vector{INT}, nzval, n) where {INT} =
+        ROCSparseMatrixCSR{eltype(nzval), INT}(ROCVector{INT}(rowptr), ROCVector{INT}(colval), ROCVector(vec(nzval)),
+                                               (n, n))
 end
 
 let gpus = String[]

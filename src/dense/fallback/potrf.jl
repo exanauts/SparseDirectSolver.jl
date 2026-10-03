@@ -115,17 +115,18 @@ end
 
 @kernel function _ka_chol_check_kernel!(info, A, n, idx)
     li = @index(Local, Linear)
+    b = @index(Group, Linear)
     if li == 1
-        @inbounds if info[idx] == 0
+        @inbounds if info[idx + b - 1] == 0
             st = Int32(0)
             for j in 1:n
-                d = _get(A, j, j, 1)
+                d = _get(A, j, j, b)
                 if !(isfinite(real(d)) && real(d) > 0 && iszero(imag(d)))
                     st = Int32(j)
                     break
                 end
             end
-            info[idx] = st
+            info[idx + b - 1] = st
         end
     end
 end
@@ -143,5 +144,21 @@ function ka_chol_check_info!(info::AbstractVector{Int32}, idx::Integer, L::Abstr
     1 <= idx <= length(info) || throw(DimensionMismatch("info index $idx outside 1:$(length(info))"))
     kernel! = _ka_chol_check_kernel!(KernelAbstractions.get_backend(L), 1)
     kernel!(info, L, size(L, 1), Int(idx); ndrange = 1)
+    return info
+end
+
+"""
+    ka_chol_check_info!(info, offset, L::AbstractArray{T,3}) -> info
+
+Batched form: the check of `ka_chol_check_info!(info, offset + b, L[:, :, b])`
+for every member `b` of the 3-D strided batch `L`, one launch.
+"""
+function ka_chol_check_info!(info::AbstractVector{Int32}, offset::Integer, L::AbstractArray{<:Any, 3})
+    nb = size(L, 3)
+    0 <= offset && offset + nb <= length(info) ||
+        throw(DimensionMismatch("info has length $(length(info)) < offset $offset + batch count $nb"))
+    nb == 0 && return info
+    kernel! = _ka_chol_check_kernel!(KernelAbstractions.get_backend(L), 1)
+    kernel!(info, L, size(L, 1), Int(offset) + 1; ndrange = nb)
     return info
 end

@@ -134,13 +134,14 @@ end
 end
 
 """
-    front_cholesky_kernel!(backend, WG)(factor, stack, info, nzval, amap, amap_ptr, amap_src, nodes, first,
+    front_cholesky_kernel!(backend, WG)(factor, stack, info, nzval, amap, amap_ptr, amap_src, nodes, bm,
                                         front_ptr, front_nrows, front_ncols, cb_ptr, child_ptr, child_list,
                                         relind_ptr, relind, maxchild, Val(ASM), Val(W), Val(NL), Val(WG);
-                                        ndrange = WG * count)
+                                        ndrange = WG * count * bm.nact)
 
-Fused regime-B kernel: workgroup `g` takes front `s = nodes[first + g - 1]`
-(width `w ≤ W`), and, when `ASM`, zeroes and assembles it (A through the
+Fused regime-B kernel: workgroup `G` takes front `s = nodes[bm.first + g - 1]`
+(width `w ≤ W`) of batch member `k` (`g`, `k` from the [`BatchMap`](@ref) `bm`),
+and, when `ASM`, zeroes and assembles it (A through the
 `amap`, then the `maxchild` children's contribution blocks in `child_list`
 order), then factors `F11 = L11 L11ᴴ` in `@localmem` (`NL = W(W+1)/2`
 entries), solves `F21 ← F21 L11⁻ᴴ`, updates its contribution block on the
@@ -148,59 +149,70 @@ update stack (`cb_ptr[s] > 0`, packed lower triangle) and sets `info[s]` (0, or 
 the first non-positive pivot; the front is then left partially factored).
 Without `ASM` the panels and contribution blocks must already be assembled.
 """
-@kernel function front_cholesky_kernel!(factor, stack, info, nzval, amap, amap_ptr, amap_src, nodes, first,
+@kernel function front_cholesky_kernel!(factor, stack, info, nzval, amap, amap_ptr, amap_src, nodes, bm,
                                         front_ptr, front_nrows, front_ncols, cb_ptr, child_ptr, child_list,
                                         relind_ptr, relind, maxchild, ::Val{ASM}, ::Val{W}, ::Val{NL},
                                         ::Val{WG}) where {ASM, W, NL, WG}
     @uniform TT = eltype(factor)
     @uniform RT = real(eltype(factor))
     li = @index(Local, Linear)
-    g = @index(Group, Linear)
+    G = @index(Group, Linear)
     L11 = @localmem TT (NL,)
     st = @localmem Int32 (1,)
     piv = @localmem RT (1,)
     if ASM
-        @inbounds s = nodes[first + g - 1]
-        _zero_front!(factor, stack, s, li, front_ptr, front_nrows, front_ncols, cb_ptr, Val(WG))
+        @inbounds s = nodes[bm.first + _bm_node(bm, G) - 1]
+        k = _bm_gmember(bm, G)
+        _zero_front!(factor, _mview(stack, k, bm.nbatch), s, li, member_panels(front_ptr, k, bm.nbatch), front_nrows,
+                     front_ncols, cb_ptr, Val(WG))
     end
     @synchronize
     if ASM
-        @inbounds s = nodes[first + g - 1]
-        _scatter_front!(factor, nzval, amap, amap_ptr, amap_src, s, li, Val(WG))
+        @inbounds s = nodes[bm.first + _bm_node(bm, G) - 1]
+        k = _bm_gmember(bm, G)
+        _scatter_front!(factor, _mview(nzval, k, bm.nbatch), amap, amap_ptr, amap_src, s,
+                        _member_shift(front_ptr, s, k, bm.nbatch), li, Val(WG))
     end
     @synchronize
-    for k in 1:maxchild
-        @inbounds s = nodes[first + g - 1]
-        _extend_add_child!(factor, stack, s, k, li, front_ptr, front_nrows, front_ncols, cb_ptr, child_ptr,
-                           child_list, relind_ptr, relind, Val(WG))
+    for kc in 1:maxchild
+        @inbounds s = nodes[bm.first + _bm_node(bm, G) - 1]
+        k = _bm_gmember(bm, G)
+        _extend_add_child!(factor, _mview(stack, k, bm.nbatch), s, kc, li, member_panels(front_ptr, k, bm.nbatch),
+                           front_nrows, front_ncols, cb_ptr, child_ptr, child_list, relind_ptr, relind, Val(WG))
         @synchronize
     end
-    @inbounds s = nodes[first + g - 1]
-    _front_load!(L11, st, factor, s, li, front_ptr, front_nrows, front_ncols, Val(W), Val(WG))
+    @inbounds s = nodes[bm.first + _bm_node(bm, G) - 1]
+    k = _bm_gmember(bm, G)
+    _front_load!(L11, st, factor, s, li, member_panels(front_ptr, k, bm.nbatch), front_nrows, front_ncols, Val(W),
+                 Val(WG))
     @synchronize
     for j in 1:W
-        @inbounds s = nodes[first + g - 1]
+        @inbounds s = nodes[bm.first + _bm_node(bm, G) - 1]
         _front_chol_update!(L11, st, piv, j, s, li, front_ncols, Val(W), Val(WG))
         @synchronize
-        @inbounds s = nodes[first + g - 1]
+        @inbounds s = nodes[bm.first + _bm_node(bm, G) - 1]
         _front_chol_scale!(L11, st, piv, j, s, li, front_ncols, Val(W), Val(WG))
         @synchronize
     end
-    @inbounds s = nodes[first + g - 1]
-    _front_trsm!(factor, info, L11, st, s, li, front_ptr, front_nrows, front_ncols, Val(W), Val(WG))
+    @inbounds s = nodes[bm.first + _bm_node(bm, G) - 1]
+    k = _bm_gmember(bm, G)
+    _front_trsm!(factor, _iview(info, k, bm.nbatch), L11, st, s, li, member_panels(front_ptr, k, bm.nbatch),
+                 front_nrows, front_ncols, Val(W), Val(WG))
     @synchronize
-    @inbounds s = nodes[first + g - 1]
-    _front_syrk!(factor, stack, st, s, li, front_ptr, front_nrows, front_ncols, cb_ptr, Val(WG))
+    @inbounds s = nodes[bm.first + _bm_node(bm, G) - 1]
+    k = _bm_gmember(bm, G)
+    _front_syrk!(factor, _mview(stack, k, bm.nbatch), st, s, li, member_panels(front_ptr, k, bm.nbatch), front_nrows,
+                 front_ncols, cb_ptr, Val(WG))
 end
 
-function _launch_front_cholesky!(factor, stack, info, nzval, amap, amap_ptr, amap_src, nodes, first, count,
+function _launch_front_cholesky!(factor, stack, info, nzval, amap, amap_ptr, amap_src, nodes, bm::BatchMap, count,
                                  front_ptr, front_nrows, front_ncols, cb_ptr, child_ptr, child_list, relind_ptr,
                                  relind, maxchild, asm::Val, ::Val{W}, ::Val{WG}) where {W, WG}
     _ilog2(WG)
     kernel! = front_cholesky_kernel!(KernelAbstractions.get_backend(factor), WG)
-    kernel!(factor, stack, info, nzval, amap, amap_ptr, amap_src, nodes, Int(first), front_ptr, front_nrows,
+    kernel!(factor, stack, info, nzval, amap, amap_ptr, amap_src, nodes, bm, front_ptr, front_nrows,
             front_ncols, cb_ptr, child_ptr, child_list, relind_ptr, relind, Int(maxchild), asm, Val(W),
-            Val(W * (W + 1) ÷ 2), Val(WG); ndrange = WG * count)
+            Val(W * (W + 1) ÷ 2), Val(WG); ndrange = WG * count * bm.nact)
     return nothing
 end
 
@@ -218,16 +230,16 @@ end
 
 Regime-B launch: assemble and factor the `count` fronts
 `symbolic.group_nodes[first:(first + count - 1)]` (widths `≤ W`,
-`W ∈ $(REGIME_B_WIDTHS)`, at most `maxchild` children each) with one
-[`front_cholesky_kernel!`](@ref) launch, one workgroup per front; `info[s]`
-receives each front's status. Asynchronous.
+`W ∈ $(REGIME_B_WIDTHS)`, at most `maxchild` children each) of every active
+batch member with one [`front_cholesky_kernel!`](@ref) launch, one workgroup
+per (front, member); `info[s]` receives each front's status. Asynchronous.
 """
 function factorize_fronts_b!(N::Numeric, S::Symbolic, nzval::AbstractVector, first::Integer, count::Integer,
                              maxchild::Integer, W::Integer)
     count > 0 || return N
     _with_width_class(Int(W)) do w
         _launch_front_cholesky!(N.factor, N.stack, N.info, nzval, S.amap, S.amap_ptr, S.amap_src, S.group_nodes,
-                                first, count, S.front_ptr, S.front_nrows, S.front_ncols, S.cb_ptr, S.child_ptr,
+                                batch_map(N; first), count, S.front_ptr, S.front_nrows, S.front_ncols, S.cb_ptr, S.child_ptr,
                                 S.child_list, S.relind_ptr, S.relind, maxchild, Val(true), w,
                                 Val(FRONT_WORKGROUP))
     end
@@ -252,7 +264,8 @@ function front_cholesky!(factor::AbstractVector, stack::AbstractVector, info::Ab
                          width::Integer = REGIME_B_MAX_WIDTH, workgroup::Val = Val(FRONT_WORKGROUP))
     count > 0 || return info
     _with_width_class(Int(width)) do w
-        _launch_front_cholesky!(factor, stack, info, factor, nodes, nodes, nodes, nodes, first, count, front_ptr,
+        _launch_front_cholesky!(factor, stack, info, factor, nodes, nodes, nodes, nodes, single_batch(; first), count,
+                                front_ptr,
                                 front_nrows, front_ncols, cb_ptr, nodes, nodes, nodes, nodes, 0, Val(false), w,
                                 workgroup)
     end

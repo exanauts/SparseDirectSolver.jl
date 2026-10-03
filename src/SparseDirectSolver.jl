@@ -52,6 +52,7 @@ include("symbolic/layout.jl")
 include("symbolic/maps.jl")
 
 # numeric storage, CPU reference multifrontal factorization (PLAN §7, the oracle)
+include("numeric/batch.jl")
 include("numeric/storage.jl")
 include("reference/cholesky.jl")
 include("reference/ldlt.jl")

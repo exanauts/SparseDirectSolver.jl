@@ -10,11 +10,14 @@
 "Workgroup size of the per-phase reduction of the front statistics."
 const STATS_WORKGROUP = 256
 
-@kernel function _cholesky_stats_kernel!(stats, info, super_ptr, front_ncols, ns, ::Val{WG}, ::Val{NF},
+@kernel function _cholesky_stats_kernel!(stats_all, info_all, super_ptr, front_ncols, ns, bm, ::Val{WG}, ::Val{NF},
                                          ::Val{LOG2WG}) where {WG, NF, LOG2WG}
     li = @index(Local, Linear)
+    G = @index(Group, Linear)
     best = @localmem Int64 (WG,)
     @inbounds begin
+        stats = _mview(stats_all, _bm_gmember(bm, G), bm.nbatch)
+        info = _iview(info_all, _bm_gmember(bm, G), bm.nbatch)
         m = typemax(Int64)
         for s in li:WG:ns
             fi = Int64(info[s])
@@ -39,7 +42,8 @@ const STATS_WORKGROUP = 256
         @synchronize
     end
     if li == 1
-        @inbounds info[ns + 1] = best[1] == typemax(Int64) ? Int32(0) : Int32(best[1])
+        @inbounds _iview(info_all, _bm_gmember(bm, G), bm.nbatch)[ns + 1] =
+            best[1] == typemax(Int64) ? Int32(0) : Int32(best[1])
     end
 end
 
@@ -49,14 +53,15 @@ end
 Fill the per-front statistics of a Cholesky factorization from the per-front
 `potrf` status `numeric.info[1:ns]` (`npos` = `w`, or the failed local column
 minus one; `info` = the failed local column) and reduce the smallest failed
-factor column into `numeric.info[ns + 1]` (0 = none). One workgroup, no
-atomics. Asynchronous.
+factor column into `numeric.info[ns + 1]` (0 = none), for every active batch
+member. One workgroup per member, no atomics. Asynchronous.
 """
 function cholesky_stats!(N::Numeric, S::Symbolic)
     WG = STATS_WORKGROUP
+    bm = batch_map(N)
     kernel! = _cholesky_stats_kernel!(KernelAbstractions.get_backend(N.factor), WG)
-    kernel!(N.stats, N.info, S.super_ptr, S.front_ncols, nsupernodes(S), Val(WG), Val(FRONT_STATS_FIELDS),
-            Val(_ilog2(WG)); ndrange = WG)
+    kernel!(N.stats, N.info, S.super_ptr, S.front_ncols, nsupernodes(S), bm, Val(WG), Val(FRONT_STATS_FIELDS),
+            Val(_ilog2(WG)); ndrange = WG * bm.nact)
     return N
 end
 
@@ -65,12 +70,14 @@ function _check_numeric(N::Numeric{T}, S::Symbolic, nzval::AbstractVector) where
     sizeof(T) <= S.elsize ||
         throw(InvalidValueError("the analysis was built for $(S.elsize)-byte elements, the numeric storage has " *
                                 "$(sizeof(T))-byte $T"))
-    length(nzval) == S.nnz ||
-        throw(InvalidValueError("nzval has $(length(nzval)) entries, the analysis expects $(S.nnz)"))
-    length(N.factor) == S.layout.factor_len && length(N.stack) == S.layout.stack_len &&
-        length(N.info) == nsupernodes(S) + 1 ||
+    nb = N.nbatch
+    length(nzval) == nb * S.nnz ||
+        throw(InvalidValueError("nzval has $(length(nzval)) entries, the analysis expects $(S.nnz)" *
+                                (nb > 1 ? " per member for $nb batch members" : "")))
+    length(N.factor) == nb * S.layout.factor_len && length(N.stack) == nb * S.layout.stack_len &&
+        length(N.info) == nb * (nsupernodes(S) + 1) ||
         throw(InvalidValueError("the numeric storage was not allocated for this analysis"))
-    length(N.work) == S.layout.work_len && length(N.piv) == S.n && length(N.psign) == S.n ||
+    length(N.work) == nb * S.layout.work_len && length(N.piv) == nb * S.n && length(N.psign) == S.n ||
         throw(InvalidValueError("the numeric storage was not allocated for this analysis"))
     backend = KernelAbstractions.get_backend(N.factor)
     for x in (nzval, S.amap, N.info)
@@ -84,16 +91,79 @@ end
 # the dense implementations of the regime-C front kernels, resolved once per phase (backend and `T` are
 # fixed), so the per-front calls do no capability lookup (its lock and closure allocate);
 # `factorization_alg = "algo1"` (no vendor calls) turns `:auto` into the KA kernels
+# uniform batch: the strided-batched ops (`b*`), `:ka` or `:vendor` from the capabilities, or `:none` (no
+# batched path: `impl = :generic`, then every member takes the single-matrix path)
 function _front_impls(N::Numeric{T}, S::Symbolic, impl::Symbol) where {T}
     impl === :auto && !S.schedule.vendor_c && (impl = :ka)
+    batched = N.nbatch > 1 && impl !== :generic
+    bimpl(op) = batched ? (impl === :ka ? :ka : select_impl(op, N.factor, :auto)) : :none
     return (potrf = select_impl(:potrf, N.factor, impl), trsm = select_impl(:trsm, N.factor, impl),
-            herk = select_impl(T <: Real ? :syrk : :herk, N.factor, impl))
+            herk = select_impl(T <: Real ? :syrk : :herk, N.factor, impl), bpotrf = bimpl(:potrf_batched),
+            btrsm = bimpl(:trsm_strided_batched), bgemm = bimpl(:gemm_strided_batched))
 end
 
-# regime-C dense kernels of front `s` (assembled panel + contribution block), `p` from `_front_impls`
+# regime-C dense kernels of front `s` (assembled panel + contribution block) of every active batch member,
+# `p` from `_front_impls`
 function _factor_front_c!(N::Numeric{T}, S::Symbolic, s::Int, p::NamedTuple) where {T}
     L, sc = S.layout, S.schedule
-    _factor_panel_c!(N.factor, N.stack, N.work, N.info, s, L.panel_ptr[s], sc.rows[s], sc.width[s], L.cb_ptr[s], p)
+    if N.nbatch == 1
+        _factor_panel_c!(N.factor, N.stack, N.work, N.info, s, L.panel_ptr[s], sc.rows[s], sc.width[s], L.cb_ptr[s],
+                         p)
+        return nothing
+    end
+    plan = N.plan
+    nb = N.nbatch
+    runs = plan.runs
+    for r in 1:(length(runs) - 1)
+        j0, j1 = runs[r], runs[r + 1] - 1
+        if p.bpotrf === :none
+            for j in j0:j1
+                k = Int(plan.members_host[j])
+                _factor_panel_c!(N.factor, _mview(N.stack, k, nb), N.work, N.info, (s - 1) * nb + k,
+                                 panel_offset(L.panel_ptr, s, k, nb), sc.rows[s], sc.width[s], L.cb_ptr[s], p)
+            end
+        else
+            _factor_panels_c_batched!(N, S, s, j0, j1 - j0 + 1, p)
+        end
+    end
+    return nothing
+end
+
+# regime C of front `s` for the `count` consecutive members `members_host[j0:(j0 + count - 1)]`: their panels
+# are one `f×w×count` strided batch (interleaved layout), factored by strided-batched `potrf`, `trsm` and `gemm`
+# (`F21 F21ᴴ` into `count` blocks of the workspace), then packed into the members' contribution blocks
+function _factor_panels_c_batched!(N::Numeric{T}, S::Symbolic, s::Int, j0::Int, count::Int,
+                                   p::NamedTuple) where {T}
+    L, sc = S.layout, S.schedule
+    nb = N.nbatch
+    f, w = sc.rows[s], sc.width[s]
+    m = f - w
+    k0 = Int(N.plan.members_host[j0])
+    off = panel_offset(L.panel_ptr, s, k0, nb) - 1
+    P3 = reshape(view(N.factor, (off + 1):(off + f * w * count)), f, w, count)
+    F11 = view(P3, 1:w, 1:w, :)
+    ioff = (s - 1) * nb + k0 - 1                              # info of front s, member k0 (interleaved)
+    ptrs = N.plan.vendor_ptrs[s]                              # (F11, F21) member pointers, or nothing
+    if p.bpotrf === :vendor && ptrs !== nothing
+        vendor_potrf_batched_ptrs!('L', w, view(ptrs[1], k0:(k0 + count - 1)), f,
+                                   view(N.info, (ioff + 1):(ioff + count)), count)
+        ka_chol_check_info!(N.info, ioff, F11)
+    else
+        _potrf_batched_impl!(p.bpotrf, F11, N.info, ioff)
+    end
+    m > 0 || return nothing
+    F21 = view(P3, (w + 1):f, 1:w, :)
+    if p.btrsm === :vendor && ptrs !== nothing
+        vendor_trsm_batched_ptrs!('R', 'L', 'C', 'N', one(T), m, w, view(ptrs[1], k0:(k0 + count - 1)), f,
+                                  view(ptrs[2], k0:(k0 + count - 1)), f, count)
+    else
+        trsm_strided_batched!('R', 'L', 'C', 'N', one(T), F11, F21; impl = p.btrsm)
+    end
+    c0 = L.cb_ptr[s]
+    c0 > 0 || return nothing                                  # no parent: nothing to update
+    C = reshape(view(N.work, 1:(m * m * count)), m, m, count)
+    gemm_strided_batched!(C, F21, F21, -one(T), zero(T); transB = 'C', impl = p.bgemm)
+    pack_add!(N.stack, c0, N.work, m, N.members, j0 - 1, count, nb)
     return nothing
 end
 
@@ -145,7 +215,14 @@ the analysis used `factorization_alg = "algo1"`, no vendor calls). Then
 
 Returns `info = 0` on success, else the original column of the smallest
 non-positive pivot of the factor (as [`ref_factorize!`](@ref)); fronts above a
-failed one hold garbage. `opts.user_host_interrupt` is polled before every
+failed one hold garbage. Uniform batch (`numeric.nbatch > 1`, PLAN §3.5): the
+active members of `numeric` ([`set_members!`](@ref)) are factorized by the same
+launches with the batch index as one more grid dimension (`nzval` holds the
+values of every member, member after member), a regime-C front by
+strided-batched `potrf`/`trsm`/`gemm` over each run of consecutive members
+(vendor `potrf`/`trsm` on the member pointers built at allocation; per member
+with `impl = :generic`); the return value is the first nonzero member `info`
+(see [`member_info!`](@ref) for all of them). `opts.user_host_interrupt` is polled before every
 launch group (a host read): when set, [`InterruptedError`](@ref) is raised and
 the factor is incomplete. Structure `"SPD"` (real) or `"HPD"`. Nothing is
 allocated on the device; the panels are bitwise reproducible for a fixed
@@ -180,9 +257,35 @@ function factorize!(N::Numeric{T}, S::Symbolic, nzval::AbstractVector; impl::Sym
         end
     end
     cholesky_stats!(N, S)
-    copyto!(plan.info_host, 1, N.info, nsupernodes(S) + 1, 1)  # the phase's only host synchronization
-    k = Int(plan.info_host[1])
-    return k == 0 ? 0 : S.partition.perm[k]
+    nb = N.nbatch
+    copyto!(plan.info_host, 1, N.info, nsupernodes(S) * nb + 1, nb)  # the phase's only host synchronization
+    nb == 1 && return _original_column(S, plan.info_host[1])
+    for j in 1:plan.nact[]
+        k = Int(plan.members_host[j])
+        r = _original_column(S, plan.info_host[k])
+        r == 0 || return r
+    end
+    return 0
+end
+
+_original_column(S::Symbolic, k::Integer) = k == 0 ? 0 : S.partition.perm[k]
+
+"""
+    member_info!(info, numeric, symbolic) -> info
+
+Write the `info` of the last [`factorize!`](@ref) of every active batch member
+`k` into `info[k]` (the original column of the member's first non-positive
+pivot, 0 = success; inactive members keep their entries). Host data only: the
+statuses were read by `factorize!` (Cholesky) or are 0 (LDLᵀ/LDLᴴ).
+"""
+function member_info!(info::AbstractVector{<:Integer}, N::Numeric, S::Symbolic)
+    plan = N.plan
+    chol = !_is_ldlt_structure(S.structure)
+    for j in 1:plan.nact[]
+        k = Int(plan.members_host[j])
+        info[k] = chol ? _original_column(S, plan.info_host[k]) : 0
+    end
+    return info
 end
 
 factorize!(N::Numeric, S::Symbolic, A::CSR; impl::Symbol = :auto, opts::Options = Options()) =

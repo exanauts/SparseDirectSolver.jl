@@ -9,7 +9,8 @@
 
 const VENDOR_FUNCTIONS = (:vendor_gemm!, :vendor_syrk!, :vendor_herk!, :vendor_trsm!, :vendor_potrf!,
                           :vendor_potrf_info!, :vendor_getrf!, :vendor_sytrf!, :vendor_gemm_strided_batched!,
-                          :vendor_trsm_batched!, :vendor_potrf_batched!, :vendor_getrf_batched!)
+                          :vendor_trsm_batched!, :vendor_potrf_batched!, :vendor_getrf_batched!,
+                          :vendor_batch_pointers, :vendor_trsm_batched_ptrs!, :vendor_potrf_batched_ptrs!)
 
 for f in VENDOR_FUNCTIONS
     @eval $f(args...) = throw(NotSupportedError(string($(string(f)), " has no vendor binding for argument types ",
@@ -29,6 +30,13 @@ end
     vendor_trsm_batched!(side, uplo, trans, diag, α, A, B) -> B          # 3-D arrays
     vendor_potrf_batched!(uplo, A, info) -> info                         # 3-D A, Int32 info
     vendor_getrf_batched!(A, ipiv, info) -> info                         # 3-D A, Int32 ipiv matrix
+    vendor_batch_pointers(A) -> ptrs                                     # device vector of the member pointers of 3-D A
+    vendor_trsm_batched_ptrs!(side, uplo, trans, diag, α, m, n, Aptrs, lda, Bptrs, ldb, count)
+    vendor_potrf_batched_ptrs!(uplo, n, Aptrs, lda, info, count) -> info # Int32 info, count entries
+
+The `_ptrs` variants take device vectors of member pointers built once by
+`vendor_batch_pointers` (the uniform-batch regime C, T17: no allocation in the
+numeric phase); `vendor_trsm_batched!`/`vendor_potrf_batched!` build them per call.
 
 Vendor dense routines behind the `impl = :vendor` path of the dense interface.
 The generic methods throw `NotSupportedError`; backends add methods for their

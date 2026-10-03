@@ -4,6 +4,12 @@
 # `Symmetric`/`Hermitian` wrappers, as CUDSS.jl does. A `SparseMatrixCSC` is not
 # accepted by `cholesky` (that method belongs to CHOLMOD): wrap it with `CSR(A)`.
 #
+# Uniform batches are detected from the values, as in CUDSS.jl: a matrix whose
+# `nzval` is longer than `colval` (`length(nzval) ÷ length(colval) > 1` members,
+# or an `nnz × nbatch` matrix of values) gives a batched solver; `ldiv!` then
+# takes the right-hand sides of every member (`n × nbatch`, `n × nrhs × nbatch`
+# or strided vectors).
+#
 # PLAN §3.1 turns iterative refinement on in this layer: the solvers created
 # by `cholesky`/`ldlt` start with `ir_n_steps = 2` (the handle layer keeps the
 # cuDSS default 0); `ir_tol` (default 0: no early exit, no synchronization per
@@ -29,6 +35,8 @@ change it with [`setparam!`](@ref)). `view` selects the triangle
 of `A` that is read (`'L'`, `'U'`, `'F'`). As in CUDSS.jl a failed
 factorization does not throw unless `check = true` (then
 [`FactorizationError`](@ref)); otherwise check `getparam(solver, "info")`.
+A uniform batch (values of several members in `A.nzval`, see
+[`DirectSolver`](@ref)) is factorized member by member with one analysis.
 """
 function LinearAlgebra.cholesky(A::CSR{T}, ::NoPivot = NoPivot(); view::Char = 'F', check::Bool = false) where {T}
     solver = _linear_algebra_defaults!(DirectSolver(A, T <: Real ? "SPD" : "HPD", view))
@@ -39,8 +47,10 @@ function LinearAlgebra.cholesky(A::CSR{T}, ::NoPivot = NoPivot(); view::Char = '
 end
 
 function _check_info(solver::DirectSolver, check::Bool)
-    check && solver.info != 0 &&
-        throw(FactorizationError(solver.info, "the matrix is not positive definite (pivot $(solver.info))"))
+    if check && any(!=(0), solver.info)
+        info = _info_value(solver)
+        throw(FactorizationError(info, "the matrix is not positive definite (pivot $info)"))
+    end
     return nothing
 end
 
@@ -97,7 +107,7 @@ end
 
 # one method per argument kind: LinearAlgebra has `ldiv!` methods for `Factorization` with
 # vectors and with matrices, so a `Union` here would be ambiguous
-for RHS in (AbstractVector, AbstractMatrix, MatrixDescriptor)
+for RHS in (AbstractVector, AbstractMatrix, AbstractArray{<:Any, 3}, MatrixDescriptor)
     @eval function LinearAlgebra.ldiv!(solver::DirectSolver, B::$RHS)
         execute!("solve", solver, B, B; asynchronous = false)
         return B
@@ -113,17 +123,19 @@ end
     ldiv!(X, solver::DirectSolver, B) -> X
 
 Solve `A X = B` with the factorization in `solver` (`"solve"`, synchronized),
-in place in `B` or into `X`. `B`, `X`: vectors, matrices or
-[`MatrixDescriptor`](@ref)s on the solver's backend.
+in place in `B` or into `X`. `B`, `X`: vectors, matrices,
+`n × nrhs × nbatch` arrays (uniform batch) or [`MatrixDescriptor`](@ref)s on
+the solver's backend.
 """ LinearAlgebra.ldiv!(::DirectSolver, ::AbstractVector)
 
 """
     solver \\ B
 
-`ldiv!(similar(B), solver, B)` for a vector or matrix `B`.
+`ldiv!(similar(B), solver, B)` for a vector, matrix or `n × nrhs × nbatch` array `B`.
 """
 Base.:\(solver::DirectSolver, B::AbstractVector) = ldiv!(similar(B), solver, B)
 Base.:\(solver::DirectSolver, B::AbstractMatrix) = ldiv!(similar(B), solver, B)
+Base.:\(solver::DirectSolver, B::AbstractArray{<:Any, 3}) = ldiv!(similar(B), solver, B)
 # disambiguation with LinearAlgebra's real-factorization / complex-RHS method: the element types must match
 Base.:\(solver::DirectSolver{T}, B::Union{Array{Complex{T}, 1}, Array{Complex{T}, 2}}) where {T <: Union{Float32, Float64}} =
     ldiv!(similar(B), solver, B)
@@ -152,11 +164,14 @@ permutations cancel, `det L = 1`), the product of the 1×1 pivots and of the
 determinants of the 2×2 blocks; `sign` is `±1` (real or Hermitian) or `det D /
 |det D|` (complex symmetric). With perturbed pivots (`"npivots" > 0`) this is
 the determinant of `A + E`. Raises [`FactorizationError`](@ref) when the
-factorization failed (`"info" ≠ 0`).
+factorization failed (`"info" ≠ 0`) and [`NotSupportedError`](@ref) for a
+uniform batch (read the members' diagonals with `getparam(solver, "diag")`).
 """
 function LinearAlgebra.logabsdet(solver::DirectSolver{T}) where {T}
-    solver.stage >= STAGE_FACTORIZED && solver.info == 0 ||
-        throw(FactorizationError(solver.info, "logabsdet needs a successful factorization"))
+    solver.nbatch == 1 ||
+        throw(NotSupportedError("logabsdet of a uniform batch of $(solver.nbatch) matrices; use getparam(solver, \"diag\")"))
+    solver.stage >= STAGE_FACTORIZED && solver.info[1] == 0 ||
+        throw(FactorizationError(solver.info[1], "logabsdet needs a successful factorization"))
     _is_ldlt_structure(solver.structure) && return _logabsdet_ldlt(solver)
     d = Array(getparam(solver, "diag"))
     return 2 * sum(x -> log(abs(x)), d; init = zero(real(T))), one(T)
