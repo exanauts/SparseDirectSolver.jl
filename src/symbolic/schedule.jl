@@ -232,6 +232,18 @@ function nlaunches(sc::Schedule)
 end
 
 """
+    front_flops(f, w) -> Int64
+
+Multiply-add count of the partial dense factorization of an `f×f` front with
+`w` pivot columns: `Σ_{j=f-w+1}^{f} j²` (the elimination of column `k` updates
+the trailing `(f-k)×(f-k)` block). The work measure of the regime-A split.
+"""
+function front_flops(f::Integer, w::Integer)
+    sq(n) = Int64(n) * (n + 1) * (2n + 1) ÷ 6
+    return sq(f) - sq(f - w)
+end
+
+"""
     build_schedule(sp::SupernodePartition, opts::Options = Options(), ::Type{T} = Float64) -> Schedule
 
 Regime assignment, binning, levels and launch groups (PLAN §2.3 step 5) for
@@ -243,7 +255,11 @@ the supernodes of `sp`, with byte budgets for the element type `T`:
    and its subtree's serial stack peak (packed lower-triangular `f×f` fronts
    plus the packed `m×m` contribution blocks waiting for their parent,
    `m = f - w`) fits the [`subtree_capacity`](@ref) of the largest of
-   `opts.subtree_budgets`; the maximal eligible subtrees are the regime-A
+   `opts.subtree_budgets`, and its subtree's flops ([`front_flops`](@ref))
+   are at most `total ÷ opts.subtree_parallelism` (`0`: no flop limit), so
+   that a large tree of small fronts is split into enough subtrees to fill
+   the device instead of running on one workgroup; the maximal
+   eligible subtrees are the regime-A
    subtrees, each with the smallest budget class that holds it (empty
    `subtree_budgets` disables regime A);
 3. regime B: the rest, binned by the smallest width class in `8, 16, 32, 64, …`
@@ -269,6 +285,15 @@ function build_schedule(sp::SupernodePartition, opts::Options = Options(), ::Typ
         sp.snparent[s] != 0 && push!(children[sp.snparent[s]], s)
     end
     level = tree_height(sp.snparent)
+    # flops of every subtree; children precede parents in the supernode numbering
+    work = [front_flops(rows[s], width[s]) for s in 1:ns]
+    total = sum(work; init = Int64(0))
+    for s in 1:ns
+        p = sp.snparent[s]
+        p != 0 && (work[p] += work[s])
+    end
+    par = opts.subtree_parallelism
+    maxwork = par <= 0 ? typemax(Int64) : total ÷ par
     big = [width[s] > cw || rows[s] > cr for s in 1:ns]
     # 2. regime A: serial stack peak (entries) with children ordered by decreasing peak - cb (Liu)
     peak = zeros(Int, ns)
@@ -283,7 +308,7 @@ function build_schedule(sp::SupernodePartition, opts::Options = Options(), ::Typ
             acc += cb[c]
         end
         peak[s] = max(pk, acc + packed_length(rows[s]))
-        eligible[s] = !big[s] && all(c -> eligible[c], kids) && peak[s] <= maxcap
+        eligible[s] = !big[s] && all(c -> eligible[c], kids) && peak[s] <= maxcap && work[s] <= maxwork
     end
     regime = fill(REGIME_B, ns)
     subtree = zeros(Int, ns)

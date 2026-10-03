@@ -59,6 +59,42 @@
 - **Compile latency.** The `Val`-specialized kernels make the first factorization cost minutes, which is bad for MadNLP users. Limit the specialization set (a few width classes), use PrecompileTools workloads on the CPU backend, and consider `@device_override`-free generic paths for rare sizes.
 - **Type stability and allocation.** Keep integer types uniform (Int32 on device). Keep the `pivot_stats` and inertia readback to a single host transfer per factorization. MadNLP needs inertia every iteration, and that one sync is unavoidable unless inertia correction moves to the device.
 
+## Experiment 0 results (2026-10-02, RTX 4080)
+
+Measured with `bench/profile_phases.jl` (CUPTI trace of one warm refactorization and solve per harness matrix; `bench/profile/phase_split.md`, the state before the fix in `bench/profile/phase_split_main_9d280d0.md`) and `bench/compare.jl` (`bench/comparison/comparison.md`).
+
+**The gap was not launch overhead.** GPU busy time (sum of kernel durations) equals wall time on every harness row, so the host never starves the device. The time goes into kernels that run on far too few thread blocks.
+
+**Root cause on every pglib KKT dump: one thread block.** The regime-A rule took a front into a fused subtree whenever its whole subtree's stack fit the local-memory budget, with no parallelism criterion. KKT trees of small fronts fit as a whole, so the entire factorization (3134 supernodes on case1354 condensed, 19.6k on case1354 K2) and the forward solve ran in one 128-thread workgroup on one of 76 SMs, at about 12 µs per front.
+
+**Fix (branch `perf/exp0-baseline-split`).** A new analysis tuning knob `subtree_parallelism` (default 4096): a regime-A subtree may do at most 1/4096 of the factorization flops. 4096 was best or near-best in a sweep over 128..4096 and a work floor never helped. Refactorization and solve, before and after:
+
+| matrix | refactorization | solve |
+| --- | --- | --- |
+| case118 condensed, Cholesky | 3.9 → 1.2 ms | 2.7 → 0.8 ms |
+| case118 K2, LDLᵀ | 13.8 → 2.0 ms | 7.7 → 0.9 ms |
+| case1354 condensed, Cholesky | 39.9 → 3.0 ms | 19.7 → 1.6 ms |
+| case1354 condensed, LDLᵀ | 56.3 → 9.6 ms | 22.6 → 1.2 ms |
+| case1354 K2, LDLᵀ | 146 → 7.2 ms | 78.7 → 2.6 ms |
+| SuiteSparse and Laplacian matrices | unchanged within noise (lap2d_300 36 → 31 ms) | unchanged |
+
+SDS/cuDSS geometric means over the harness (`comparison.md`), before → after:
+
+| feature | factorization | refactorization | solve |
+| --- | --- | --- | --- |
+| Cholesky, Float64 | 5.64× → 2.47× | 9.06× → 3.89× | 8.93× → 4.36× |
+| LDLᵀ, static pivoting | 20.4× → 6.37× | 29.8× → 9.90× | 13.4× → 3.96× |
+| LDLᵀ + 2 IR steps, K2 dumps | 23.4× → 3.18× | 36.0× → 5.45× | 33.3× → 7.57× |
+
+A side effect: the default solve (`deterministic_mode = 0`) now uses its atomic regime-B forward sweep on the small KKT and test matrices too, so two solves are no longer bitwise identical there. That was always the documented contract (bitwise reproducibility needs `deterministic_mode = 1`), but before the fix these matrices never reached the atomic path. MadNLP should set `deterministic_mode = 1` if it relies on repeatable solves.
+
+**What is left, by measurement:**
+1. **KKT refactor+solve is now level-bound.** 30–60 kernels per refactorization and 35–85 per solve, the longest kernel under 15% of busy time, regime-B fronts on one or two blocks per level. This is where performance.md's launch minimization (experiment 5: level merging, graph capture) now pays, together with experiment 6 for the solve. Remaining refactorization gap on case1354: 5× (Cholesky) and 9–14× (LDLᵀ).
+2. **LDLᵀ regime B/C is the single largest gap on everything else** (lap2d_300 43×, bcsstk17 59×, lap3d_40 250×, apache2 186× vs cuDSS): `front_ldlt_kernel` runs one front per workgroup on 1–2 blocks (issue #75). Experiments 1–2 unchanged in priority.
+3. **Large Cholesky** (lap3d_40 4.4×, apache2 2.4×, solve 11–13×): 1222/6608 kernels per refactorization, `extend_add` on 2 blocks. Level merging and wider extend-add grids.
+
+Revised order: experiments 1–2 (LDLᵀ kernels, #75) and 5–6 (launches and solve) now have the largest measured payoff; experiment 3 (matching and scaling) remains the accuracy blocker on K2 (relres unchanged by this fix).
+
 ## Recommendations: Prioritized Experiment Plan
 
 | # | Experiment | Payoff | Effort | Key measurement | Success criterion |

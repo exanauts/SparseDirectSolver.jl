@@ -62,6 +62,9 @@ end
     n = size(A, 1)
     for view in ('L', 'U', 'F')
         solver = DirectSolver(api_matrix(backend, triangle_view(A, view), INT), spd_structure(T), view)
+        # deterministic_mode = 1: the bitwise comparisons below need the atomic-free forward sweep (the default atomic
+        # sweep sums regime-B updates in a run-dependent order on a GPU)
+        setparam!(solver, "deterministic_mode", 1)
         b = rand(T, n, 3)
         bd = to_device(backend, b)
         xd = similar(bd)
@@ -88,6 +91,7 @@ end
         @test to_host(cd) == x
         # the named wrappers
         solver2 = DirectSolver(api_matrix(backend, triangle_view(A, view), INT), spd_structure(T), view)
+        setparam!(solver2, "deterministic_mode", 1)
         @test analyze!(solver2) === solver2
         @test factorize!(solver2) === solver2
         @test refactorize!(solver2; asynchronous = false) === solver2
@@ -281,6 +285,8 @@ end
     A = laplacian3d(T, 6, 6, 5)
     n = size(A, 1)
     solver = api_solver(backend, A)
+    # deterministic_mode = 1 for the bitwise comparisons of the layouts (atomic sweep: run-dependent sums on a GPU)
+    setparam!(solver, "deterministic_mode", 1)
     for nrhs in (1, 2, 5, 3)      # the workspace grows to 5 right-hand sides and stays
         b = api_rhs(T, n, nrhs)
         x = api_solve(backend, solver, b)
@@ -350,6 +356,8 @@ end
         F = cholesky(api_matrix(backend, triangle_view(A, view), INT); view)
         @test F isa DirectSolver{T, INT}
         @test !F.fresh_factorization && getparam(F, "info") == 0
+        # deterministic_mode = 1 for the bitwise comparisons below (atomic sweep: run-dependent sums on a GPU)
+        setparam!(F, "deterministic_mode", 1)
         @test relres(A, to_host(F \ bd), b) <= tol(T)
         @test relres(A, to_host(F \ bd[:, 1]), b[:, 1]) <= tol(T)
         xd = similar(bd)

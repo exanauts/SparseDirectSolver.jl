@@ -205,10 +205,52 @@ triangle(A, view) = view == 'L' ? tril(A) : view == 'U' ? triu(A) : A
     @test thrown(() -> setparam!(Options(), "memory_budget", 1)) isa ArgumentError
 end
 
+@testset "subtree_parallelism: flop limit of the regime-A subtrees" begin
+    @test Options().subtree_parallelism == SDS.SUBTREE_PARALLELISM == 4096
+    @test Options(subtree_parallelism = 0).subtree_parallelism == 0
+    @test copy(Options(subtree_parallelism = 7)).subtree_parallelism == 7
+    @test thrown(() -> Options(subtree_parallelism = -1)) isa InvalidValueError
+    @test thrown(() -> Options(subtree_parallelism = 1.5)) isa InvalidValueError
+    # multiply-adds of a partial front factorization: Σ_{j=f-w+1}^{f} j²
+    @test SDS.front_flops(3, 1) == 9 && SDS.front_flops(3, 3) == 14 && SDS.front_flops(5, 2) == 41
+    @test SDS.front_flops(1000, 64) == sum(Int64(j)^2 for j in 937:1000)
+    A = laplacian2d(Float64, 60, 60)
+    schedules = map((0, 64, 4096)) do par
+        S = SDS.symbolic_analysis(SDS.CSR(tril(A)), "SPD", 'L'; opts = Options(subtree_parallelism = par))
+        check_schedule(S)
+        S
+    end
+    S0 = schedules[1]
+    sp = S0.partition
+    ns = SDS.nsupernodes(S0)
+    work = [SDS.front_flops(S0.schedule.rows[s], S0.schedule.width[s]) for s in 1:ns]
+    total = sum(work)
+    for s in 1:ns                                    # subtree flops (children numbered before parents)
+        sp.snparent[s] != 0 && (work[sp.snparent[s]] += work[s])
+    end
+    for (par, S) in zip((64, 4096), schedules[2:end])
+        sc = S.schedule
+        @test S.partition.snparent == sp.snparent    # the limit changes the schedule only
+        maxwork = total ÷ par
+        # every subtree within the limit, regime A shrinks, and the subtrees are maximal: the parent of a
+        # subtree root is over the limit or was already outside regime A without it
+        @test all(t -> work[sc.subtree_root[t]] <= maxwork, 1:SDS.nsubtrees(sc))
+        @test all(s -> sc.regime[s] != SDS.REGIME_A || S0.schedule.regime[s] == SDS.REGIME_A, 1:ns)
+        @test all(sc.subtree_root) do r
+            q = sp.snparent[r]
+            q == 0 || work[q] > maxwork || S0.schedule.regime[q] != SDS.REGIME_A
+        end
+    end
+    # a large tree of small fronts is split over many workgroups (measured 7, 56, 240 subtrees)
+    @test SDS.nsubtrees(schedules[1].schedule) < SDS.nsubtrees(schedules[2].schedule) <
+          SDS.nsubtrees(schedules[3].schedule)
+    @test SDS.nsubtrees(schedules[3].schedule) >= 100
+end
+
 @testset "small example" begin
     # arrow matrix: four leaves 1..4 coupled to the 2×2 root block 5..6
     A = sparse(Float64[4 0 0 0 1 1; 0 4 0 0 1 1; 0 0 4 0 1 1; 0 0 0 4 1 1; 1 1 1 1 4 1; 1 1 1 1 1 4])
-    opts = Options(reordering_alg = "algo5", use_superpanels = 0)
+    opts = Options(reordering_alg = "algo5", use_superpanels = 0, subtree_parallelism = 0)
     S = SDS.symbolic_analysis(SDS.CSR(A), "SPD", 'L'; opts)
     sc = S.schedule
     @test SDS.nsupernodes(S) == 5
@@ -219,6 +261,9 @@ end
     @test SDS.nlaunches(sc) == 1
     @test S.layout.stack_len == 0
     check_schedule(S)
+    # the default flop limit (1/4096 of 31 multiply-adds) leaves no front of this tiny tree in regime A
+    @test SDS.nsubtrees(SDS.symbolic_analysis(SDS.CSR(A), "SPD", 'L';
+                                              opts = Options(reordering_alg = "algo5", use_superpanels = 0)).schedule) == 0
     # without regime A: one level of four B fronts (same bin), then the root
     S0 = SDS.symbolic_analysis(SDS.CSR(A), "SPD", 'L'; opts = Options(reordering_alg = "algo5", use_superpanels = 0,
                                                                       subtree_budgets = Int[]))
