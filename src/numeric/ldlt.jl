@@ -203,19 +203,25 @@ end
     return nothing
 end
 
-# stage 1: lanes 1:_LT_S1 fold lanes _LT_S1+1:NL (nothing when NL ≤ _LT_S1)
-@inline function _lt_stage1!(red, redi, li, nl::Val{NL}, pass::Val) where {NL}
-    if NL > _LT_S1 && li <= _LT_S1
-        for b in (li + _LT_S1):_LT_S1:NL
+# lanes of pass `P` at column k that can hold a partial result (the others hold the neutral one): one per row
+# below k (pass 1, with k the column the step advances to), per row from k (pass 2), per column from k (pass 3)
+@inline _lt_nused(ctl, k, ::Val{P}) where {P} =
+    @inbounds P == 3 ? Int(ctl[_ST_W]) - k + 1 : Int(ctl[_ST_F]) - k + 1
+
+# stage 1: lanes 1:_LT_S1 fold lanes _LT_S1+1:min(NL, nu) (nothing when NL ≤ _LT_S1)
+@inline function _lt_stage1!(red, redi, ctl, li, nl::Val{NL}, pass::Val{P}) where {NL, P}
+    @inbounds if NL > _LT_S1 && li <= _LT_S1
+        k = Int(ctl[_LT_K]) + (P == 1 ? Int(ctl[_LT_STEP]) : 0)
+        for b in (li + _LT_S1):_LT_S1:min(NL, _lt_nused(ctl, k, pass))
             _lt_combine!(red, redi, li, b, nl, pass)
         end
     end
     return nothing
 end
 
-# work item 1: fold lanes 2:min(NL, _LT_S1) into lane 1
-@inline function _lt_final!(red, redi, nl::Val{NL}, pass::Val) where {NL}
-    for b in 2:min(NL, _LT_S1)
+# work item 1: fold lanes 2:min(NL, _LT_S1, nu) into lane 1 (k: the column of the step)
+@inline function _lt_final!(red, redi, ctl, k, nl::Val{NL}, pass::Val) where {NL}
+    for b in 2:min(NL, _LT_S1, _lt_nused(ctl, k, pass))
         _lt_combine!(red, redi, 1, b, nl, pass)
     end
     return nothing
@@ -401,7 +407,7 @@ end
             _lt_select!(fa, ctl, pv, d, pivot_kind, piv, psign, perm, aux, p, k, 0, pk, h)
             return nothing
         end
-        _lt_final!(red, redi, nl, Val(1))
+        _lt_final!(red, redi, ctl, k, nl, Val(1))
         λ = red[1]
         r = Int(redi[1])
         cm = red[NL + 1]
@@ -429,7 +435,7 @@ end
                               p::_LDLTDevice{R}, nl::Val{NL}, pk::Val, h::Val) where {R, NL}
     @inbounds begin
         IT = eltype(ctl)
-        _lt_final!(red, redi, nl, Val(2))
+        _lt_final!(red, redi, ctl, Int(ctl[_LT_K]), nl, Val(2))
         σ = red[1]
         mr = red[NL + 1]
         mk = red[2 * NL + 1]
@@ -468,7 +474,7 @@ end
 @inline function _lt_decide3!(fa, ctl, pv, red, redi, d, pivot_kind, piv, psign, perm, aux,
                               p::_LDLTDevice, nl::Val{NL}, pk::Val, h::Val) where {NL}
     @inbounds begin
-        _lt_final!(red, redi, nl, Val(3))
+        _lt_final!(red, redi, ctl, Int(ctl[_LT_K]), nl, Val(3))
         k = Int(ctl[_LT_K])
         best = Int(redi[1])
         c, r = best, 0
@@ -766,7 +772,7 @@ statistics, updates its packed contribution block on the update stack
     @synchronize
     for it in 1:ctl[_ST_W]
         if WG > _LT_S1
-            _lt_stage1!(red, redi, li, Val(WG), Val(1))
+            _lt_stage1!(red, redi, ctl, li, Val(WG), Val(1))
             @synchronize
         end
         if li == 1
@@ -780,7 +786,7 @@ statistics, updates its packed contribution block on the update stack
             _lt_pass2!(factor, ctl, red, redi, li, Val(WG), prm, Val(false))
             @synchronize
             if WG > _LT_S1
-                _lt_stage1!(red, redi, li, Val(WG), Val(2))
+                _lt_stage1!(red, redi, ctl, li, Val(WG), Val(2))
                 @synchronize
             end
             if li == 1
@@ -796,7 +802,7 @@ statistics, updates its packed contribution block on the update stack
                        Val(false))
             @synchronize
             if WG > _LT_S1
-                _lt_stage1!(red, redi, li, Val(WG), Val(3))
+                _lt_stage1!(red, redi, ctl, li, Val(WG), Val(3))
                 @synchronize
             end
             if li == 1
