@@ -19,10 +19,13 @@
 # pivot (the reference's `_choose_pivot`, its column maxima as workgroup
 # reductions with the reference's tie-breaking, in one to three passes; work
 # item 1 decides and stores D, perturbing a tiny 1×1 pivot, and counts the
-# statistics), the workgroup swaps rows/columns, applies the rank-1/rank-2
-# update to the remaining fully-summed columns, scales the pivot columns into
-# L and reduces the next column (pass 1 of the next step). Five barriers per
-# step when the first pass settles the pivot.
+# statistics), swaps rows/columns, and applies the rank-1/rank-2 update to the
+# remaining fully-summed columns while reducing the next column (pass 1 of the
+# next step). The pivot columns stay unscaled (`L D`) until the end of the
+# front, when `_lt_finalize!` divides them by D exactly as the reference does
+# after each step; then the contribution block is updated (regimes B/C: tiled
+# through local memory for blocks of `_LT_TILED_M` rows or more). Four barriers
+# per step when the first pass settles the pivot.
 # Only the lower triangle of the front is stored; the upper entries the
 # algorithm reads are `conj` (Hermitian) or plain (complex symmetric) mirrors.
 # Pivot decisions, control words and the per-front counts live in `@localmem`;
@@ -47,7 +50,8 @@ const _LT_R = _ST_CTL + 5      # 2×2 partner column (0: 1×1 pivot)
 const _LT_STAT = _ST_CTL + 5   # _LT_STAT + q: statistic q ∈ 1:5 (STAT_NPOS … STAT_N2X2) of the front
 const _LT_PHASE = _ST_CTL + 11 # pivot search state: 0 chosen, 2 Bunch–Kaufman pass 2 due, 3 fallback scan due
 const _LT_RBK = _ST_CTL + 12   # Bunch–Kaufman candidate row r of pass 1 (0: none)
-const _LT_CTL = _ST_CTL + 12
+const _LT_NTILE = _ST_CTL + 13 # tiles of the F₂₂ update of the regime-B/C kernel (0: no contribution block)
+const _LT_CTL = _ST_CTL + 13
 
 # `pv` slots: 1–4 the pivot (d, or the inverse 2×2 block e11, e12, e21, e22), 5–6 the new diagonal
 # entries of the pivot block (d, or a and c), 7–8 λ and the column maximum of pass 1
@@ -629,53 +633,130 @@ end
     return nothing
 end
 
-# update of the remaining fully-summed columns (lower part, rows to f) with the unscaled pivot columns:
-# F[i, j] -= l_i F[k, j] (1×1) or l1_i F[k, j] + l2_i F[k+1, j] (2×2), as the reference
-@inline function _lt_update!(fa, ctl, pv, li, ::Val{WG}, pk::Val, h::Val) where {WG}
+# update of the remaining fully-summed columns with the unscaled pivot column(s), as the reference:
+# F[i, j] -= l_i F[k, j] (1×1, `l_i = F[i, k] / d`) or l1_i F[k, j] + l2_i F[k+1, j] (2×2). The pivot
+# columns stay unscaled (W = L D) until `_lt_finalize!`, so the step needs no scale phase. The trailing
+# triangle of the block is shared over the workgroup; each work item owns rows `w+1:f` and forms their
+# multipliers once. With `TRACK`, the pass-1 partials of the next column are reduced from the values
+# written (each lane's entries of that column come in increasing row order, as in `_lt_pass1!`).
+@inline function _lt_update!(fa, ctl, pv, red, redi, li, ::Val{WG}, ::Val{TRACK}, p::_LDLTDevice{R}, pk::Val,
+                             h::Val) where {WG, TRACK, R}
     @inbounds begin
         k = Int(ctl[_LT_K])
         w = Int(ctl[_ST_W])
+        λ = zero(R)
+        r = 0
+        cm = zero(R)
         if k <= w
             F = _lt_front(fa, ctl, pk)
+            f = Int(ctl[_ST_F])
             step = Int(ctl[_LT_STEP])
             kk = k + step - 1
-            nr = Int(ctl[_ST_F]) - kk
-            nc = w - kk
-            for q in (li - 1):WG:(nr * nc - 1)
-                i = kk + 1 + q % nr
-                j = kk + 1 + q ÷ nr
+            j0 = kk + 1                                   # the next column
+            nt = w - kk
+            for q in (li - 1):WG:(nt * nt - 1)
+                i = kk + 1 + q % nt
+                j = kk + 1 + q ÷ nt
                 i >= j || continue
                 if step == 1
                     l = _fget(F, i, k) / pv[1]
-                    _fset!(F, i, j, _fget(F, i, j) - l * _cj(_fget(F, j, k), h))
+                    v = _fget(F, i, j) - l * _cj(_fget(F, j, k), h)
                 else
                     x1 = _fget(F, i, k)
                     x2 = _fget(F, i, k + 1)
                     l1 = x1 * pv[1] + x2 * pv[3]
                     l2 = x1 * pv[2] + x2 * pv[4]
-                    _fset!(F, i, j, _fget(F, i, j) - (l1 * _cj(_fget(F, j, k), h) + l2 * _cj(_fget(F, j, k + 1), h)))
+                    v = _fget(F, i, j) - (l1 * _cj(_fget(F, j, k), h) + l2 * _cj(_fget(F, j, k + 1), h))
+                end
+                _fset!(F, i, j, v)
+                if TRACK && j == j0 && i > j0
+                    a = abs(v)
+                    cm = max(cm, a)
+                    if a > λ
+                        λ = a
+                        r = i
+                    end
                 end
             end
+            m = f - w
+            if m >= WG                                    # one row per work item, its multipliers formed once
+                for i in (w + li):WG:f
+                    if step == 1
+                        l = _fget(F, i, k) / pv[1]
+                        for j in (kk + 1):w
+                            v = _fget(F, i, j) - l * _cj(_fget(F, j, k), h)
+                            _fset!(F, i, j, v)
+                            TRACK && j == j0 && (cm = max(cm, abs(v)))
+                        end
+                    else
+                        x1 = _fget(F, i, k)
+                        x2 = _fget(F, i, k + 1)
+                        l1 = x1 * pv[1] + x2 * pv[3]
+                        l2 = x1 * pv[2] + x2 * pv[4]
+                        for j in (kk + 1):w
+                            v = _fget(F, i, j) - (l1 * _cj(_fget(F, j, k), h) + l2 * _cj(_fget(F, j, k + 1), h))
+                            _fset!(F, i, j, v)
+                            TRACK && j == j0 && (cm = max(cm, abs(v)))
+                        end
+                    end
+                end
+            else                                          # few rows: one entry per work item
+                for q in (li - 1):WG:(m * nt - 1)
+                    i = w + 1 + q % m
+                    j = kk + 1 + q ÷ m
+                    if step == 1
+                        l = _fget(F, i, k) / pv[1]
+                        v = _fget(F, i, j) - l * _cj(_fget(F, j, k), h)
+                    else
+                        x1 = _fget(F, i, k)
+                        x2 = _fget(F, i, k + 1)
+                        l1 = x1 * pv[1] + x2 * pv[3]
+                        l2 = x1 * pv[2] + x2 * pv[4]
+                        v = _fget(F, i, j) - (l1 * _cj(_fget(F, j, k), h) + l2 * _cj(_fget(F, j, k + 1), h))
+                    end
+                    _fset!(F, i, j, v)
+                    TRACK && j == j0 && (cm = max(cm, abs(v)))
+                end
+            end
+        end
+        if TRACK
+            red[li] = λ
+            redi[li] = r % eltype(redi)
+            red[WG + li] = cm
         end
     end
     return nothing
 end
 
-# scale the pivot columns below the pivot block into L
-@inline function _lt_scale!(fa, ctl, pv, li, ::Val{WG}, pk::Val) where {WG}
+# scale the pivot columns into L, row by row (rows `2:f`, columns `1:min(i - 1, w)`): `l = x / d` (1×1) or
+# `(x1 e11 + x2 e21, x1 e12 + x2 e22)` with the inverse 2×2 block recomputed from D exactly as
+# `_lt_select!` formed it; the zero below a 2×2 block's diagonal stays
+@inline function _lt_finalize!(fa, ctl, d, pivot_kind, li, ::Val{WG}, pk::Val, h::Val) where {WG}
     @inbounds begin
-        k = Int(ctl[_LT_K])
-        if k <= Int(ctl[_ST_W])
-            F = _lt_front(fa, ctl, pk)
-            step = Int(ctl[_LT_STEP])
-            for i in (k + step + li - 1):WG:Int(ctl[_ST_F])
-                if step == 1
-                    _fset!(F, i, k, _fget(F, i, k) / pv[1])
+        n = length(pivot_kind)
+        F = _lt_front(fa, ctl, pk)
+        f = Int(ctl[_ST_F])
+        w = Int(ctl[_ST_W])
+        c0 = Int(ctl[_LT_C0])
+        for i in (1 + li):WG:f
+            jmax = min(i - 1, w)
+            j = 1
+            while j <= jmax
+                g = c0 + j - 1
+                if pivot_kind[g] == PIVOT_KIND_2X2_FIRST
+                    if j + 1 <= jmax
+                        a, b, c2 = d[g], d[n + g], d[g + 1]
+                        up = _cj(b, h)
+                        det = a * c2 - up * b
+                        x1 = _fget(F, i, j)
+                        x2 = _fget(F, i, j + 1)
+                        _fset!(F, i, j, x1 * (c2 / det) + x2 * (-b / det))
+                        _fset!(F, i, j + 1, x1 * (-up / det) + x2 * (a / det))
+                    end
+                    j += 2
                 else
-                    x1 = _fget(F, i, k)
-                    x2 = _fget(F, i, k + 1)
-                    _fset!(F, i, k, x1 * pv[1] + x2 * pv[3])
-                    _fset!(F, i, k + 1, x1 * pv[2] + x2 * pv[4])
+                    _fset!(F, i, j, _fget(F, i, j) / d[g])
+                    j += 1
                 end
             end
         end
@@ -725,6 +806,109 @@ end
     return nothing
 end
 
+# tiled F₂₂ ← F₂₂ − (L₂₁ D) L₂₁ᴴ of the regime-B/C kernel (`L₂₁` in the panel, after `_lt_finalize!`): the
+# packed m×m block is cut into `_LT_TB × _LT_TB` tiles (lower ones only); per tile and chunk of `_LT_TB`
+# columns, `W₂₁ = L₂₁ D` (1×1 and 2×2 blocks, as `_lt_cb_update!`) of the tile's rows and `L₂₁` of its columns
+# are staged in the local buffer `tb` (`2 _LT_TB²` entries, then the `_LT_TB²` accumulators), and every work
+# item accumulates `_LT_TB² / WG` entries over the chunk in column order
+const _LT_TB = 16
+const _LT_TBUF = 3 * _LT_TB * _LT_TB
+
+# smallest contribution block taking the tiled update (smaller ones: `_lt_cb_update!`, one entry per work item)
+const _LT_TILED_M = 64
+
+@inline _lt_cb_ntiles(f, w, coff) = coff < 0 || f - w < _LT_TILED_M ? 0 : (nt = cld(f - w, _LT_TB); nt * (nt + 1) ÷ 2)
+@inline _lt_cb_nchunks(ctl) = @inbounds cld(Int(ctl[_ST_W]), _LT_TB)
+
+# tile `tt` (column-major over the lower tiles) → (I, J), I ≥ J
+@inline function _lt_cb_tile(ctl, tt)
+    nt = @inbounds cld(Int(ctl[_ST_F]) - Int(ctl[_ST_W]), _LT_TB)
+    J = 1
+    t = tt
+    while t > nt - J + 1
+        t -= nt - J + 1
+        J += 1
+    end
+    return (J + t - 1, J)
+end
+
+# stage chunk `kc` of tile `tt`: tb[1:TB²] = W₂₁ rows of block I, tb[TB² .+ (1:TB²)] = L₂₁ rows of block J
+@inline function _lt_cb_load!(tb, factor, ctl, d, pivot_kind, tt, kc, li, ::Val{WG}, h::Val) where {WG}
+    @inbounds begin
+        n = length(pivot_kind)
+        T = eltype(tb)
+        F = _lt_front(factor, ctl, Val(false))
+        w = Int(ctl[_ST_W])
+        m = Int(ctl[_ST_F]) - w
+        c0 = Int(ctl[_LT_C0])
+        I, J = _lt_cb_tile(ctl, tt)
+        TB2 = _LT_TB * _LT_TB
+        for e in (li - 1):WG:(2 * TB2 - 1)
+            isw = e < TB2
+            e2 = isw ? e : e - TB2
+            ri = e2 % _LT_TB
+            k = (kc - 1) * _LT_TB + e2 ÷ _LT_TB + 1
+            i = ((isw ? I : J) - 1) * _LT_TB + ri + 1
+            v = zero(T)
+            if i <= m && k <= w
+                x = _fget(F, w + i, k)
+                if !isw
+                    v = x
+                else
+                    g = c0 + k - 1
+                    kd = pivot_kind[g]
+                    if kd == PIVOT_KIND_2X2_FIRST
+                        v = x * d[g] + _fget(F, w + i, k + 1) * d[n + g]
+                    elseif kd == PIVOT_KIND_2X2_SECOND
+                        v = _fget(F, w + i, k - 1) * _cj(d[n + g - 1], h) + x * d[g]
+                    else
+                        v = x * d[g]
+                    end
+                end
+            end
+            tb[e + 1] = v
+        end
+    end
+    return nothing
+end
+
+# accumulate the staged chunk into the tile accumulators tb[2TB² .+ (1:TB²)]
+@inline function _lt_cb_acc!(tb, ctl, kc, li, ::Val{WG}, h::Val) where {WG}
+    @inbounds begin
+        TB2 = _LT_TB * _LT_TB
+        nk = min(_LT_TB, Int(ctl[_ST_W]) - (kc - 1) * _LT_TB)
+        for e in (li - 1):WG:(TB2 - 1)
+            r = e % _LT_TB
+            c = e ÷ _LT_TB
+            acc = kc == 1 ? zero(eltype(tb)) : tb[2 * TB2 + e + 1]
+            for q in 0:(nk - 1)
+                acc += tb[r + q * _LT_TB + 1] * _cj(tb[TB2 + c + q * _LT_TB + 1], h)
+            end
+            tb[2 * TB2 + e + 1] = acc
+        end
+    end
+    return nothing
+end
+
+# subtract the tile from the packed block (real diagonal for Hermitian)
+@inline function _lt_cb_store!(tb, ctl, ca, coff, tt, li, ::Val{WG}, ::Val{H}) where {WG, H}
+    @inbounds begin
+        T = eltype(tb)
+        m = Int(ctl[_ST_F]) - Int(ctl[_ST_W])
+        I, J = _lt_cb_tile(ctl, tt)
+        TB2 = _LT_TB * _LT_TB
+        for e in (li - 1):WG:(TB2 - 1)
+            i = (I - 1) * _LT_TB + e % _LT_TB + 1
+            j = (J - 1) * _LT_TB + e ÷ _LT_TB + 1
+            (i <= m && j <= m && i >= j) || continue
+            acc = tb[2 * TB2 + e + 1]
+            pos = coff + _packed(i, j, m)
+            ca[pos] = (H && i == j) ? T(real(ca[pos]) - real(acc)) : ca[pos] - acc
+        end
+    end
+    return nothing
+end
+
 # work item 1: per-front statistics and status
 @inline function _lt_stats!(stats, info, ctl, s)
     @inbounds begin
@@ -741,7 +925,7 @@ end
 # ---------------------------------------------------------------------------
 # regimes B/C: one workgroup per front, panel in global memory
 
-@inline function _lt_front_setup!(ctl, s, super_ptr, front_ptr, front_nrows, front_ncols)
+@inline function _lt_front_setup!(ctl, s, super_ptr, front_ptr, front_nrows, front_ncols, cb_ptr)
     @inbounds begin
         IT = eltype(ctl)
         ctl[_ST_NODE] = s % IT
@@ -749,6 +933,7 @@ end
         ctl[_ST_W] = front_ncols[s] % IT
         ctl[_ST_LF] = front_ptr[s] % IT
         _lt_reset!(ctl, super_ptr[s])
+        ctl[_LT_NTILE] = _lt_cb_ntiles(Int(front_nrows[s]), Int(front_ncols[s]), Int(cb_ptr[s]) - 1) % IT
     end
     return nothing
 end
@@ -796,11 +981,11 @@ statistics, updates its packed contribution block on the update stack
     pv = @localmem TT (_LT_NPV,)
     red = @localmem R (3 * WG,)
     redi = @localmem IT (2 * WG,)
-    L11 = @localmem TT (max(W * (W + 1) ÷ 2, 1),)
+    L11 = @localmem TT (max(W * (W + 1) ÷ 2, _LT_TBUF),)          # F₁₁, then the tiles of the F₂₂ update
     if li == 1
         @inbounds s = nodes[bm.first + _bm_node(bm, G) - 1]
         _lt_front_setup!(ctl, s, super_ptr, member_panels(front_ptr, _bm_gmember(bm, G), bm.nbatch), front_nrows,
-                         front_ncols)
+                         front_ncols, cb_ptr)
     end
     @synchronize
     @inbounds s = nodes[bm.first + _bm_node(bm, G) - 1]
@@ -871,16 +1056,33 @@ statistics, updates its packed contribution block on the update stack
         end
         _lt_swap!(_lt_fa(L11, factor, Val(W)), ctl, pv, _mview(piv, _bm_gmember(bm, G), bm.nbatch), li, Val(WG), _lt_pk(Val(W)), Val(HERM))
         @synchronize
-        _lt_update!(_lt_fa(L11, factor, Val(W)), ctl, pv, li, Val(WG), _lt_pk(Val(W)), Val(HERM))
-        @synchronize
-        _lt_scale!(_lt_fa(L11, factor, Val(W)), ctl, pv, li, Val(WG), _lt_pk(Val(W)))
-        _lt_pass1!(_lt_fa(L11, factor, Val(W)), ctl, red, redi, li, Val(WG), prm, _lt_pk(Val(W)))
+        _lt_update!(_lt_fa(L11, factor, Val(W)), ctl, pv, red, redi, li, Val(WG), Val(true), prm, _lt_pk(Val(W)),
+                    Val(HERM))
         @synchronize
     end
+    @inbounds s = nodes[bm.first + _bm_node(bm, G) - 1]
+    k = _bm_gmember(bm, G)
+    nb = bm.nbatch
+    _lt_finalize!(_lt_fa(L11, factor, Val(W)), ctl, _mview(d, k, nb), _mview(pivot_kind, k, nb), li, Val(WG),
+                  _lt_pk(Val(W)), Val(HERM))
+    @synchronize
     _lt_stage!(L11, factor, ctl, li, Val(W), Val(WG), false)
     @synchronize
+    for tt in 1:ctl[_LT_NTILE]
+        for kc in 1:_lt_cb_nchunks(ctl)
+            k = _bm_gmember(bm, G)
+            _lt_cb_load!(L11, factor, ctl, _mview(d, k, bm.nbatch), _mview(pivot_kind, k, bm.nbatch), tt, kc, li,
+                         Val(WG), Val(HERM))
+            @synchronize
+            _lt_cb_acc!(L11, ctl, kc, li, Val(WG), Val(HERM))
+            @synchronize
+        end
+        @inbounds s = nodes[bm.first + _bm_node(bm, G) - 1]
+        @inbounds coff = Int(cb_ptr[s]) - 1
+        _lt_cb_store!(L11, ctl, _mview(stack, _bm_gmember(bm, G), bm.nbatch), coff, tt, li, Val(WG), Val(HERM))
+    end
     @inbounds s = nodes[bm.first + _bm_node(bm, G) - 1]
-    @inbounds coff = Int(cb_ptr[s]) - 1
+    @inbounds coff = ctl[_LT_NTILE] == 0 ? Int(cb_ptr[s]) - 1 : -1
     k = _bm_gmember(bm, G)
     nb = bm.nbatch
     _lt_cb_update!(factor, ctl, _mview(stack, k, nb), coff, _mview(d, k, nb), _mview(pivot_kind, k, nb), li, Val(WG),
@@ -1014,12 +1216,15 @@ stack.
             end
             _lt_swap!(buf, ctl, pv, _mview(piv, _bm_gmember(bm, G), bm.nbatch), li, Val(WG), Val(true), Val(HERM))
             @synchronize
-            _lt_update!(buf, ctl, pv, li, Val(WG), Val(true), Val(HERM))
+            _lt_update!(buf, ctl, pv, red, redi, li, Val(WG), Val(false), prm, Val(true), Val(HERM))
             @synchronize
-            _lt_scale!(buf, ctl, pv, li, Val(WG), Val(true))
             _lt_pass1!(buf, ctl, red, redi, li, Val(_LT_S1), prm, Val(true))
             @synchronize
         end
+        mb = _bm_gmember(bm, G)
+        _lt_finalize!(buf, ctl, _mview(d, mb, bm.nbatch), _mview(pivot_kind, mb, bm.nbatch), li, Val(WG), Val(true),
+                      Val(HERM))
+        @synchronize
         mb = _bm_gmember(bm, G)
         _lt_cb_update!(buf, ctl, buf, _lt_local_cb_offset(ctl), _mview(d, mb, bm.nbatch),
                        _mview(pivot_kind, mb, bm.nbatch), li, Val(WG), Val(true), Val(HERM))
