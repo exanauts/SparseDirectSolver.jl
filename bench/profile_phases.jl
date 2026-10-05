@@ -12,8 +12,8 @@
 # The SDS phases are run with `asynchronous = false`, as in bench/compare.jl. The
 # wall time is the best of 5 warm runs, each after 0.2 s of device load so that
 # the GPU is at full clock; the profiled run is a sixth one.
-# LDLᵀ is skipped on matrices whose LDLᵀ factorization took more than 10 s in
-# bench/comparison/sds.csv (GHS_psdef/apache2, lap3d_40): issue #75.
+# LDLᵀ is skipped on GHS_psdef/apache2 (93 s per refactorization before issue #75,
+# 2.1 s after; lap3d_40 is profiled again).
 
 using LinearAlgebra
 using SparseArrays

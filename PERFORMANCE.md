@@ -10,7 +10,8 @@ Performance issues carry the GitHub label `performance` ([list](https://github.c
 | --- | --- | --- | --- |
 | #81 (PR) | regime-A subtrees ran a whole KKT tree on one workgroup; flop limit `subtree_parallelism` | 0 | merged |
 | #82 | KKT refactorization and solve are level-bound after #81: 54–59 launches per refactorization, 62–85 per solve | 5, 6 | open |
-| #75 | device LDLᵀ: serial pivot search, one workgroup per regime-B/C front, no vendor `sytrf` | 1, 2 | open, triaged; step 1 (cooperative pivot search) and step 2 (regime B in local memory) in PRs from `perf/exp1-pivot-search`, `perf/exp1-regime-b-local` |
+| #75 | device LDLᵀ: serial pivot search, one workgroup per regime-B/C front, no vendor `sytrf` | 1, 2 | open, triaged; steps 1–3 in PRs from `perf/exp1-pivot-search`, `perf/exp1-regime-b-local`, `perf/exp2-regime-c-blas`; criteria partly met (see Experiments 1–2 results) |
+| #86 | device LDLᵀ differs from `ref_ldlt!` on the K2 dumps (pivot sequence, `nperturbed`; rounding with max\|L\| 1e14–1e16), pre-existing | 1, 3 | open (found-by-agent) |
 | #60 | regime-A follow-ups: CUDA timings (partly answered by experiment 0) and per-backend local-memory caps | 7 | open, triaged |
 | #25 | T25 performance pass (task) | 5, 6, 7 | open |
 
@@ -180,6 +181,47 @@ LDLᵀ refactorization, `main` → step 1 → step 2:
 | kkt_pglib_opf_case14_ieee_k2_15 | 0.97 | 1.03 | 1.07 | 3.33× |  |
 
 K2 dumps: inertia and `nperturbed` unchanged on all nine. T15 matrix on CUDA: 8.3 → 5.6 s. Experiment-1 criterion still not met (lap2d 3.7×, bcsstk17 4.1×, case1354 condensed 2.6× the Cholesky time); KKT dumps within +3–6% of step 1.
+
+### Step 3: regime C through GEMMs
+
+Every front on the regime-C path, and every regime-B bin of width class ≥ 32 and row class ≥ 256 (`ldlt_blocked_path`), now runs its pivot steps in static blocks of `nb = 32` columns (`src/numeric/ldlt_c.jl`). Per block, `panel_ldlt_kernel!` (one workgroup per front, the fronts of a launch group concurrently in chunks whose workspace is at most twice the largest front's) runs the reference's pivot search on a lazily updated panel: the block's pivots are kept as columns of `Lb` (multipliers) and `Wb` (unscaled pivot columns) in the workspace, and an entry of a column that is not a pivot column yet is read as its stored value minus the pending pivots, in pivot order with 2×2 pivots as one term (the arithmetic of the right-looking reference). After the block, one GEMM updates the trailing fully-summed columns and one accumulates the contribution block, through `src/dense/interface.jl` (`:vendor` on CUDA, `:generic`/`:ka` elsewhere); `pack_add!` adds it to the update stack. A 2×2 pivot that starts at a block's last column takes the next block's first column, which is saved across the GEMM and restored by the next block. The fallback scan of this kernel tests (candidate column, 64 rows) tasks over the whole workgroup. Launch shapes depend on the analysis only (no host synchronization); `"algo2"` with empty `subtree_budgets` still forces every front onto this path, and a new test compares panels, D, `piv` and `pivot_kind` with the reference there for every element type, block sizes that make 2×2 pivots straddle blocks, and every dense implementation.
+
+LDLᵀ refactorization, `main` → step 3:
+
+| matrix | main ms | step 1 ms | step 2 ms | step 3 ms | step 3 / cuDSS | step 3 / SDS Cholesky |
+| --- | --- | --- | --- | --- | --- | --- |
+| lap2d_300 | 228 | 192 | 116 | 41.2 | 7.99× | 1.31× |
+| lap3d_40 | 14,777* | 14,494* | 8,753* | 424 | 7.27× | 1.89× |
+| HB/bcsstk17 | 206 | 167 | 115 | 48.1 | 14.3× | 1.73× |
+| Boeing/bcsstk38 | 137 | 106 | 72.9 | 39.2 | 11.8× | 1.73× |
+| GHS_psdef/apache2 | 92,576* | 97,296* | 50,736* | 2,120* | 4.33× | 2.06× |
+| kkt_pglib_opf_case118_ieee_condensed_1 | 1.77 | 1.82 | 1.91 | 1.94 | 4.96× | 2.12× |
+| kkt_pglib_opf_case118_ieee_condensed_10 | 1.72 | 1.79 | 1.87 | 1.83 | 5.25× | 2.08× |
+| kkt_pglib_opf_case118_ieee_condensed_20 | 1.87 | 1.82 | 1.88 | 1.87 | 5.34× | 2.14× |
+| kkt_pglib_opf_case118_ieee_k2_1 | 1.69 | 1.69 | 1.8 | 1.81 | 4.98× |  |
+| kkt_pglib_opf_case118_ieee_k2_10 | 1.62 | 1.68 | 1.76 | 1.75 | 4.93× |  |
+| kkt_pglib_opf_case118_ieee_k2_20 | 1.6 | 1.66 | 1.74 | 1.73 | 4.33× |  |
+| kkt_pglib_opf_case1354_pegase_condensed_1 | 10.9 | 7.2 | 7.51 | 7.52 | 11× | 2.57× |
+| kkt_pglib_opf_case1354_pegase_condensed_10 | 10.9 | 7.3 | 7.56 | 7.56 | 11.8× | 2.59× |
+| kkt_pglib_opf_case1354_pegase_condensed_20 | 11 | 7.32 | 7.56 | 7.57 | 10.7× | 2.59× |
+| kkt_pglib_opf_case1354_pegase_k2_1 | 8.31 | 6.6 | 6.95 | 6.91 | 8.46× |  |
+| kkt_pglib_opf_case1354_pegase_k2_10 | 7.15 | 6.05 | 6.27 | 6.32 | 7.64× |  |
+| kkt_pglib_opf_case1354_pegase_k2_20 | 9.1 | 6.71 | 6.84 | 6.95 | 8.62× |  |
+| kkt_pglib_opf_case14_ieee_condensed_1 | 0.446 | 0.503 | 0.484 | 0.492 | 2.56× | 1.35× |
+| kkt_pglib_opf_case14_ieee_condensed_10 | 0.443 | 0.52 | 0.517 | 0.51 | 2.22× | 1.5× |
+| kkt_pglib_opf_case14_ieee_condensed_11 | 0.448 | 0.463 | 0.515 | 0.544 | 1.87× | 1.66× |
+| kkt_pglib_opf_case14_ieee_k2_1 | 0.669 | 0.697 | 0.728 | 0.726 | 2.59× |  |
+| kkt_pglib_opf_case14_ieee_k2_10 | 0.722 | 0.708 | 0.727 | 0.722 | 3.04× |  |
+| kkt_pglib_opf_case14_ieee_k2_15 | 0.97 | 1.03 | 1.07 | 1.08 | 3.37× |  |
+
+- GEMMs on fronts with `f > 512` (the calls of lap3d_40 and apache2 replayed through `_gemm_impl!(:vendor, …)`): 0.41 TFLOP/s, 56–57% of the 0.73 TFLOP/s cuBLAS DGEMM measures on a 4096² product.
+- K2 dumps: inertia and `nperturbed` unchanged on all nine (and equal to `main`).
+- `kkt_matrix(Float64, 3000, 1000, 1e-8)`, default analysis and "C only" (`"algo2"`): CUDA 33.9 s (`main`) → 2.5 s; KA CPU backend 7.0 s → 3.3–3.4 s; `ref_ldlt!` 2.5–2.7 s. Half of its pivot steps end in a fallback scan where no column is acceptable (1444 scans, about 76 candidates each), so every candidate must be rejected exactly, and each entry read by the scan subtracts up to 32 pending pivots: with `nb = 8` the same matrix takes 0.86 s. A tiled variant of the scan (pending rows staged in local memory) was slower (4.6 s) because of its barriers; the remaining lever is to keep the scan's entries current instead of lazy, or a smaller `nb` for fronts where the fallback dominates.
+- Workspace: lap3d_40 101 MB (Cholesky 62 MB), apache2 223 MB (109 MB), next to a 128/578 MB update stack and 202 MB/1.7 GB of factor.
+
+**Criteria.** Experiment 1 (LDLᵀ refactorization within 1.5× of SDS Cholesky on the same pattern): met on lap2d_300 (1.31×) and case14 condensed_1 (1.35×), not yet on bcsstk17/bcsstk38 (1.73×), lap3d_40 (1.89×), apache2 (2.06×) and the other KKT dumps (1.5–2.6×); inertia unchanged on all K2 dumps (met). Experiment 2: ≥ 50% of cuBLAS DGEMM peak on fronts > 512 (met, 56%); "C only" faster than the reference on the CPU backend and ≥ 5× faster on the GPU: not met on the fallback-heavy T15 matrix (CPU backend 0.8×, CUDA 1.1× the reference; 13.7× faster than `main` on CUDA). What remains: the fallback scan on such fronts, the latency of the small KKT fronts in regime B (KKT dumps 1.9–12× cuDSS, level- and launch-bound, experiment 5), and `_extend_add_kernel` on lap3d_40 (92 of 424 ms, as for Cholesky). #75 stays open for these.
+
+`bench/comparison/comparison.{md,png}` are regenerated with the step-3 LDLᵀ rows: SDS/cuDSS geometric mean of "LDLᵀ, static pivoting" (23 matrices) factorization 6.37× → 4.41×, refactorization 9.90× → 6.27×. The "LDLᵀ + 2 refinement steps" row (9 K2 dumps) reads 5.45× → 7.19×, but it is dominated by the three case1354 K2 dumps, whose `compare.jl` medians vary 2–3× between reruns of the same code (8.8–27.6 ms for `main`, 7.5–16.5 ms for step 3, fresh solver per sample); the profile above (6.3–7.0 ms after, 7.2–9.1 ms before) is the reliable number there.
 
 ## Recommendations: Prioritized Experiment Plan
 
