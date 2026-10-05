@@ -14,11 +14,14 @@
 #   front's packed contribution block on the update stack.
 #
 # Per pivot step (a loop over the `w` columns of the front with a uniform trip
-# count; a 2×2 pivot leaves the last iterations idle): work item 1 chooses the
-# pivot (serial search, the reference's `_choose_pivot`), the workgroup swaps
-# rows/columns, work item 1 stores D (perturbing a tiny 1×1 pivot) and counts
-# the statistics, the workgroup applies the rank-1/rank-2 update to the
-# remaining fully-summed columns and then scales the pivot columns into L.
+# count; a 2×2 pivot leaves the last iterations idle): the workgroup chooses the
+# pivot (the reference's `_choose_pivot`, its column maxima as workgroup
+# reductions with the reference's tie-breaking, in one to three passes; work
+# item 1 decides and stores D, perturbing a tiny 1×1 pivot, and counts the
+# statistics), the workgroup swaps rows/columns, applies the rank-1/rank-2
+# update to the remaining fully-summed columns, scales the pivot columns into
+# L and reduces the next column (pass 1 of the next step). Five barriers per
+# step when the first pass settles the pivot.
 # Only the lower triangle of the front is stored; the upper entries the
 # algorithm reads are `conj` (Hermitian) or plain (complex symmetric) mirrors.
 # Pivot decisions, control words and the per-front counts live in `@localmem`;
