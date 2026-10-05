@@ -78,7 +78,7 @@ const DEFAULT_SUBTREE_BUDGETS = [16 * 1024, 32 * 1024, 48 * 1024]
 # Regime A runs a subtree on one workgroup. A tree of small fronts fits the
 # local-memory budgets as a whole and then ran on one workgroup of one SM: the
 # pglib KKT dumps were factored 10-20x slower than with regime A off
-# (performance.md, experiment 0; bench/profile/phase_split.md). A subtree may do
+# (PERFORMANCE.md, experiment 0; bench/profile/phase_split.md). A subtree may do
 # at most `1/SUBTREE_PARALLELISM` of the factorization flops. 4096 was the best
 # or near-best value of a sweep over 128..4096 on the harness (RTX 4080); it
 # leaves the SuiteSparse and Laplacian subtrees as they were.

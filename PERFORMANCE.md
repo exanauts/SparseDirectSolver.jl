@@ -2,6 +2,20 @@
 
 **Bottom line:** For MadNLP-style repeated KKT solves, SparseDirectSolver.jl (SDS) will not beat cuDSS by out-BLASing it on large fronts. Its realistic edge comes from three places. First, robust indefinite numerics that cuDSS lacks: true 2×2 Bunch–Kaufman pivots, per-row pivot signs, and correct inertia. Second, a refactorize+solve path that is device-resident, launch-minimal and graph-captured, which removes the host synchronizations and launches that dominate at OPF scale. Third, a GPU-resident or cached analysis phase. The immediate blockers are not raw FLOP rate. They are (a) the serial, reference-faithful pivot search and the one-workgroup-per-front regime-C LDLᵀ (issue #75), and (b) missing matching and scaling, without which K2 systems produce max|L| of 1e14–1e16 (issue #71).
 
+## Tracked issues
+
+Performance issues carry the GitHub label `performance` ([list](https://github.com/exanauts/SparseDirectSolver.jl/issues?q=label%3Aperformance)). Keep this table in step with them: add a row when an issue is opened, and update the status when its PR merges or it closes.
+
+| issue | what | experiment | status |
+| --- | --- | --- | --- |
+| #81 (PR) | regime-A subtrees ran a whole KKT tree on one workgroup; flop limit `subtree_parallelism` | 0 | open PR |
+| #82 | KKT refactorization and solve are level-bound after #81: 54–59 launches per refactorization, 62–85 per solve | 5, 6 | open |
+| #75 | device LDLᵀ: serial pivot search, one workgroup per regime-B/C front, no vendor `sytrf` | 1, 2 | open, triaged |
+| #60 | regime-A follow-ups: CUDA timings (partly answered by experiment 0) and per-backend local-memory caps | 7 | open, triaged |
+| #25 | T25 performance pass (task) | 5, 6, 7 | open |
+
+Related accuracy issues that gate the K2 results: #71 (max\|L\| 1e14–1e16 on the K2 dumps, needs scaling) and #67 (pivot-pair matching), both experiment 3 / T21.
+
 ## TL;DR
 - **Current state:** SDS is a KernelAbstractions multifrontal solver. Symbolic analysis runs on the host (AMD or METIS ND, amalgamation, MA57-style pivot pairs). Numeric factorization runs in three regimes: fused subtree kernels, level-batched fused front kernels, and vendor potrf/trsm/syrk. SPD Cholesky and LDLᵀ with in-front Bunch–Kaufman and static perturbation both work on CUDA. LU, batching, matching and scaling, mixed precision and the non-CUDA backends do not exist yet. The LDLᵀ is deliberately slow: it reproduces the CPU reference pivot for pivot.
 - **cuDSS weak spots to exploit:** analysis (reordering) always runs on the host and is synchronous. It is the documented bottleneck in MadNLP/ExaModels: Pacaud, Shin, Montoison, Schanen and Anitescu (arXiv:2405.14236) report that "the analysis phase is four times slower for cuDSS compared to CHOLMOD". QOCO-GPU reports the same bottleneck. Symmetric-indefinite pivoting is diagonal-only within a supernode plus epsilon perturbation, with no LBLᵀ. The defaults (no matching) give relres 0.26–170 on the K2 dumps. Hybrid, MG and MGMN modes force synchronous phases.
@@ -89,7 +103,7 @@ SDS/cuDSS geometric means over the harness (`comparison.md`), before → after:
 A side effect: the default solve (`deterministic_mode = 0`) now uses its atomic regime-B forward sweep on the small KKT and test matrices too, so two solves are no longer bitwise identical there. That was always the documented contract (bitwise reproducibility needs `deterministic_mode = 1`), but before the fix these matrices never reached the atomic path. MadNLP should set `deterministic_mode = 1` if it relies on repeatable solves.
 
 **What is left, by measurement:**
-1. **KKT refactor+solve is now level-bound.** 30–60 kernels per refactorization and 35–85 per solve, the longest kernel under 15% of busy time, regime-B fronts on one or two blocks per level. This is where performance.md's launch minimization (experiment 5: level merging, graph capture) now pays, together with experiment 6 for the solve. Remaining refactorization gap on case1354: 5× (Cholesky) and 9–14× (LDLᵀ).
+1. **KKT refactor+solve is now level-bound.** 30–60 kernels per refactorization and 35–85 per solve, the longest kernel under 15% of busy time, regime-B fronts on one or two blocks per level. This is where the launch minimization of experiment 5 (level merging, graph capture) now pays, together with experiment 6 for the solve (issue #82). Remaining refactorization gap on case1354: 5× (Cholesky) and 9–14× (LDLᵀ).
 2. **LDLᵀ regime B/C is the single largest gap on everything else** (lap2d_300 43×, bcsstk17 59×, lap3d_40 250×, apache2 186× vs cuDSS): `front_ldlt_kernel` runs one front per workgroup on 1–2 blocks (issue #75). Experiments 1–2 unchanged in priority.
 3. **Large Cholesky** (lap3d_40 4.4×, apache2 2.4×, solve 11–13×): 1222/6608 kernels per refactorization, `extend_add` on 2 blocks. Level merging and wider extend-add grids.
 
