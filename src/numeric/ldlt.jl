@@ -10,8 +10,9 @@
 #   Cholesky kernel of `src/numeric/subtree.jl`).
 # * Regimes B and C: `front_ldlt_kernel!`, one workgroup per front of a launch
 #   group, fused assembly (zero, scatter A, owner-pull extend-add), then the
-#   pivoted factorization of the panel in global memory and the update of the
-#   front's packed contribution block on the update stack.
+#   pivoted factorization of the panel (regime B: `F₁₁` staged in `@localmem`,
+#   the rows below it in global memory; regime C: all in global memory) and the
+#   update of the front's packed contribution block on the update stack.
 #
 # Per pivot step (a loop over the `w` columns of the front with a uniform trip
 # count; a 2×2 pivot leaves the last iterations idle): the workgroup chooses the
@@ -117,9 +118,59 @@ end
 # F[i, j] from the lower triangle (upper entries: conj for Hermitian, plain for complex symmetric)
 @inline _fsym(F, i, j, h::Val) = i >= j ? _fget(F, i, j) : _cj(_fget(F, j, i), h)
 
-# the front of the current node from the control words: offset `_ST_LF` (1-based) into `fa`
+# regime B: the fully-summed block F₁₁ (rows and columns `1:w`) packed `W×W` lower triangle in local
+# memory `l`, the rows `w+1:f` in the `f×w` panel in global memory
+struct _SplitFront{L, A}
+    l::L
+    a::A
+    off::Int
+    f::Int
+    w::Int
+    W::Int
+end
+
+@inline _fget(F::_SplitFront, i, j) = @inbounds i <= F.w ? F.l[_packed(i, j, F.W)] : F.a[F.off + (j - 1) * F.f + i]
+@inline function _fset!(F::_SplitFront, i, j, v)
+    @inbounds if i <= F.w
+        F.l[_packed(i, j, F.W)] = v
+    else
+        F.a[F.off + (j - 1) * F.f + i] = v
+    end
+    return nothing
+end
+
+# the front of the current node from the control words: offset `_ST_LF` (1-based) into `fa`; `Val(W)`
+# with `fa = (L11, factor)`: F₁₁ staged in the local `L11` (width class `W`)
 @inline _lt_front(fa, ctl, ::Val{true}) = @inbounds _PackedFront(fa, Int(ctl[_ST_LF]) - 1, Int(ctl[_ST_F]))
 @inline _lt_front(fa, ctl, ::Val{false}) = @inbounds _PanelFront(fa, Int(ctl[_ST_LF]) - 1, Int(ctl[_ST_F]))
+@inline _lt_front(fa::Tuple, ctl, ::Val{W}) where {W} =
+    @inbounds _SplitFront(fa[1], fa[2], Int(ctl[_ST_LF]) - 1, Int(ctl[_ST_F]), Int(ctl[_ST_W]), W)
+
+# the buffers and the front mode of the regime-B/C kernel: `W = 0` panel in global memory, else F₁₁ staged
+@inline _lt_fa(L11, factor, ::Val{0}) = factor
+@inline _lt_fa(L11, factor, ::Val{W}) where {W} = (L11, factor)
+@inline _lt_pk(::Val{0}) = Val(false)
+@inline _lt_pk(w::Val) = w
+
+# copy F₁₁ between the panel and local memory (`load`), or write it back with a unit diagonal
+@inline function _lt_stage!(L11, factor, ctl, li, ::Val{W}, ::Val{WG}, load::Bool) where {W, WG}
+    @inbounds if W > 0
+        f = Int(ctl[_ST_F])
+        w = Int(ctl[_ST_W])
+        p0 = Int(ctl[_ST_LF]) - 1
+        for q in (li - 1):WG:(w * w - 1)
+            j = q ÷ w + 1
+            i = q - (j - 1) * w + 1
+            i >= j || continue
+            if load
+                L11[_packed(i, j, W)] = factor[p0 + (j - 1) * f + i]
+            else
+                factor[p0 + (j - 1) * f + i] = i == j ? one(eltype(factor)) : L11[_packed(i, j, W)]
+            end
+        end
+    end
+    return nothing
+end
 
 # ---------------------------------------------------------------------------
 # cooperative pivot search (the reference's `_choose_pivot` on the lower triangle, pivot for pivot)
@@ -320,7 +371,7 @@ end
     @inbounds begin
         n = length(perm)
         IT = eltype(ctl)
-        T = eltype(fa)
+        T = eltype(pv)
         k = Int(ctl[_LT_K])
         c0 = Int(ctl[_LT_C0])
         g = c0 + k - 1
@@ -562,7 +613,7 @@ end
                 end
                 if i == k
                     _fset!(F, k, k, pv[5])
-                    r == 0 || _fset!(F, k + 1, k, zero(eltype(fa)))   # the 2×2 block lives in D, L's is I
+                    r == 0 || _fset!(F, k + 1, k, zero(eltype(pv)))   # the 2×2 block lives in D, L's is I
                 elseif r != 0 && i == k + 1
                     _fset!(F, k + 1, k + 1, pv[6])
                 end
@@ -718,14 +769,16 @@ end
     front_ldlt_kernel!(backend, WG)(factor, stack, info, stats, d, piv, pivot_kind, psign, perm, aux, nzval, amap,
                                     amap_ptr, amap_src, nodes, bm, super_ptr, front_ptr, front_nrows,
                                     front_ncols, cb_ptr, child_ptr, child_list, relind_ptr, relind, maxchild, prm,
-                                    Val(WG); ndrange = WG * count * bm.nact)
+                                    Val(W), Val(WG); ndrange = WG * count * bm.nact)
 
 LDLᵀ/LDLᴴ kernel of regimes B and C: workgroup `G` takes front
 `s = nodes[bm.first + g - 1]` of batch member `k` (`g`, `k` from the
 [`BatchMap`](@ref) `bm`; the per-member arrays are the member's), zeroes and assembles it (A through the `amap`, then
 the `maxchild` children's packed contribution blocks in `child_list` order),
-factors its `w` fully-summed columns in place in the panel with in-block
-Bunch–Kaufman pivoting, threshold acceptance and perturbation (`prm`, a
+factors its `w` fully-summed columns in place with in-block
+Bunch–Kaufman pivoting (`W = 0`, regime C: in the panel; regime B, width
+class `W ≥ w`: `F₁₁` staged as a packed `W×W` lower triangle in `@localmem`,
+the rows below it in the panel; the pivot search is a workgroup reduction), threshold acceptance and perturbation (`prm`, a
 `_LDLTDevice{R, HERM}`; `HERM`: Hermitian or real symmetric, else complex symmetric),
 writes D, the local pivot order `piv`, the pivot kinds and the front's
 statistics, updates its packed contribution block on the update stack
@@ -734,7 +787,7 @@ statistics, updates its packed contribution block on the update stack
 @kernel function front_ldlt_kernel!(factor, stack, info, stats, d, piv, pivot_kind, psign, perm, aux, nzval, amap,
                                     amap_ptr, amap_src, nodes, bm, super_ptr, front_ptr, front_nrows, front_ncols,
                                     cb_ptr, child_ptr, child_list, relind_ptr, relind, maxchild,
-                                    prm::_LDLTDevice{R, HERM}, ::Val{WG}) where {R, HERM, WG}
+                                    prm::_LDLTDevice{R, HERM}, ::Val{W}, ::Val{WG}) where {R, HERM, W, WG}
     @uniform TT = eltype(factor)
     @uniform IT = eltype(front_ptr)
     li = @index(Local, Linear)
@@ -743,6 +796,7 @@ statistics, updates its packed contribution block on the update stack
     pv = @localmem TT (_LT_NPV,)
     red = @localmem R (3 * WG,)
     redi = @localmem IT (2 * WG,)
+    L11 = @localmem TT (max(W * (W + 1) ÷ 2, 1),)
     if li == 1
         @inbounds s = nodes[bm.first + _bm_node(bm, G) - 1]
         _lt_front_setup!(ctl, s, super_ptr, member_panels(front_ptr, _bm_gmember(bm, G), bm.nbatch), front_nrows,
@@ -768,7 +822,9 @@ statistics, updates its packed contribution block on the update stack
                            front_nrows, front_ncols, cb_ptr, child_ptr, child_list, relind_ptr, relind, Val(WG))
         @synchronize
     end
-    _lt_pass1!(factor, ctl, red, redi, li, Val(WG), prm, Val(false))
+    _lt_stage!(L11, factor, ctl, li, Val(W), Val(WG), true)
+    @synchronize
+    _lt_pass1!(_lt_fa(L11, factor, Val(W)), ctl, red, redi, li, Val(WG), prm, _lt_pk(Val(W)))
     @synchronize
     for it in 1:ctl[_ST_W]
         if WG > _LT_S1
@@ -778,12 +834,12 @@ statistics, updates its packed contribution block on the update stack
         if li == 1
             k = _bm_gmember(bm, G)
             nb = bm.nbatch
-            _lt_decide1!(factor, ctl, pv, red, redi, _mview(d, k, nb), _mview(pivot_kind, k, nb), _mview(piv, k, nb),
-                         psign, perm, _mview(aux, k, nb), prm, Val(WG), Val(false), Val(HERM))
+            _lt_decide1!(_lt_fa(L11, factor, Val(W)), ctl, pv, red, redi, _mview(d, k, nb), _mview(pivot_kind, k, nb), _mview(piv, k, nb),
+                         psign, perm, _mview(aux, k, nb), prm, Val(WG), _lt_pk(Val(W)), Val(HERM))
         end
         @synchronize
         if ctl[_LT_PHASE] == 2
-            _lt_pass2!(factor, ctl, red, redi, li, Val(WG), prm, Val(false))
+            _lt_pass2!(_lt_fa(L11, factor, Val(W)), ctl, red, redi, li, Val(WG), prm, _lt_pk(Val(W)))
             @synchronize
             if WG > _LT_S1
                 _lt_stage1!(red, redi, ctl, li, Val(WG), Val(2))
@@ -792,14 +848,14 @@ statistics, updates its packed contribution block on the update stack
             if li == 1
                 k = _bm_gmember(bm, G)
                 nb = bm.nbatch
-                _lt_decide2!(factor, ctl, pv, red, redi, _mview(d, k, nb), _mview(pivot_kind, k, nb),
-                             _mview(piv, k, nb), psign, perm, _mview(aux, k, nb), prm, Val(WG), Val(false), Val(HERM))
+                _lt_decide2!(_lt_fa(L11, factor, Val(W)), ctl, pv, red, redi, _mview(d, k, nb), _mview(pivot_kind, k, nb),
+                             _mview(piv, k, nb), psign, perm, _mview(aux, k, nb), prm, Val(WG), _lt_pk(Val(W)), Val(HERM))
             end
             @synchronize
         end
         if ctl[_LT_PHASE] == 3
-            _lt_pass3!(factor, ctl, red, redi, li, Val(WG), _mview(aux, _bm_gmember(bm, G), bm.nbatch), prm,
-                       Val(false))
+            _lt_pass3!(_lt_fa(L11, factor, Val(W)), ctl, red, redi, li, Val(WG), _mview(aux, _bm_gmember(bm, G), bm.nbatch), prm,
+                       _lt_pk(Val(W)))
             @synchronize
             if WG > _LT_S1
                 _lt_stage1!(red, redi, ctl, li, Val(WG), Val(3))
@@ -808,19 +864,21 @@ statistics, updates its packed contribution block on the update stack
             if li == 1
                 k = _bm_gmember(bm, G)
                 nb = bm.nbatch
-                _lt_decide3!(factor, ctl, pv, red, redi, _mview(d, k, nb), _mview(pivot_kind, k, nb),
-                             _mview(piv, k, nb), psign, perm, _mview(aux, k, nb), prm, Val(WG), Val(false), Val(HERM))
+                _lt_decide3!(_lt_fa(L11, factor, Val(W)), ctl, pv, red, redi, _mview(d, k, nb), _mview(pivot_kind, k, nb),
+                             _mview(piv, k, nb), psign, perm, _mview(aux, k, nb), prm, Val(WG), _lt_pk(Val(W)), Val(HERM))
             end
             @synchronize
         end
-        _lt_swap!(factor, ctl, pv, _mview(piv, _bm_gmember(bm, G), bm.nbatch), li, Val(WG), Val(false), Val(HERM))
+        _lt_swap!(_lt_fa(L11, factor, Val(W)), ctl, pv, _mview(piv, _bm_gmember(bm, G), bm.nbatch), li, Val(WG), _lt_pk(Val(W)), Val(HERM))
         @synchronize
-        _lt_update!(factor, ctl, pv, li, Val(WG), Val(false), Val(HERM))
+        _lt_update!(_lt_fa(L11, factor, Val(W)), ctl, pv, li, Val(WG), _lt_pk(Val(W)), Val(HERM))
         @synchronize
-        _lt_scale!(factor, ctl, pv, li, Val(WG), Val(false))
-        _lt_pass1!(factor, ctl, red, redi, li, Val(WG), prm, Val(false))
+        _lt_scale!(_lt_fa(L11, factor, Val(W)), ctl, pv, li, Val(WG), _lt_pk(Val(W)))
+        _lt_pass1!(_lt_fa(L11, factor, Val(W)), ctl, red, redi, li, Val(WG), prm, _lt_pk(Val(W)))
         @synchronize
     end
+    _lt_stage!(L11, factor, ctl, li, Val(W), Val(WG), false)
+    @synchronize
     @inbounds s = nodes[bm.first + _bm_node(bm, G) - 1]
     @inbounds coff = Int(cb_ptr[s]) - 1
     k = _bm_gmember(bm, G)
@@ -1094,12 +1152,13 @@ end
 # ---------------------------------------------------------------------------
 # driver
 
-function _launch_front_ldlt!(N::Numeric, S::Symbolic, nzval, first, count, maxchild, prm, ::Val{WG}) where {WG}
+function _launch_front_ldlt!(N::Numeric, S::Symbolic, nzval, first, count, maxchild, prm, ::Val{W},
+                             ::Val{WG}) where {W, WG}
     bm = batch_map(N; first)
     kernel! = front_ldlt_kernel!(KernelAbstractions.get_backend(N.factor), WG)
     kernel!(N.factor, N.stack, N.info, N.stats, N.d, N.piv, N.pivot_kind, N.psign, S.perm, N.aux, nzval, S.amap,
             S.amap_ptr, S.amap_src, S.group_nodes, bm, S.super_ptr, S.front_ptr, S.front_nrows, S.front_ncols,
-            S.cb_ptr, S.child_ptr, S.child_list, S.relind_ptr, S.relind, Int(maxchild), prm, Val(WG);
+            S.cb_ptr, S.child_ptr, S.child_list, S.relind_ptr, S.relind, Int(maxchild), prm, Val(W), Val(WG);
             ndrange = WG * count * bm.nact)
     return nothing
 end
@@ -1128,7 +1187,14 @@ function _factorize_ldlt_groups!(N::Numeric, S::Symbolic, nzval::AbstractVector,
     for k in eachindex(plan.group_first)
         _poll_interrupt(flag)
         a, b = plan.group_first[k], plan.group_last[k]
-        _launch_front_ldlt!(N, S, nzval, a, b - a + 1, plan.group_maxchild[k], prm, Val(LDLT_WORKGROUP))
+        W = plan.group_width[k]
+        if W == 0                                   # regime C: the panel in global memory
+            _launch_front_ldlt!(N, S, nzval, a, b - a + 1, plan.group_maxchild[k], prm, Val(0), Val(LDLT_WORKGROUP))
+        else                                        # regime B: F₁₁ in local memory
+            _with_width_class(W) do w
+                _launch_front_ldlt!(N, S, nzval, a, b - a + 1, plan.group_maxchild[k], prm, w, Val(LDLT_WORKGROUP))
+            end
+        end
     end
     return nothing
 end
@@ -1144,8 +1210,8 @@ choice, same storage): `opts.pivot_type`, `pivot_threshold`, `pivot_epsilon`,
 other than `n` raises [`InvalidValueError`](@ref)). Regime-A groups are one
 [`subtree_ldlt_kernel!`](@ref) launch per budget class; every regime-B and
 regime-C launch group is one [`front_ldlt_kernel!`](@ref) launch (fused
-assembly and factorization, one workgroup per front; no vendor calls, see the
-T15 report); then [`reduce_stats!`](@ref). `opts.user_host_interrupt` is polled
+assembly and factorization, one workgroup per front, `F₁₁` in local memory for
+regime-B width classes; no vendor calls, see the T15 report); then [`reduce_stats!`](@ref). `opts.user_host_interrupt` is polled
 before every launch group ([`InterruptedError`](@ref)). With `pivot_epsilon_alg = "algo1"`
 [`abs_max!`](@ref) computes the scale first. Fills `numeric.factor`
 (unit-lower panels), `d`, `piv`, `pivot_kind`, `stats` and `totals`. The
