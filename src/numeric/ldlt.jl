@@ -1403,7 +1403,7 @@ function _factorize_ldlt_groups!(N::Numeric, S::Symbolic, nzval::AbstractVector,
         _poll_interrupt(flag)
         a, b = plan.group_first[k], plan.group_last[k]
         W = plan.group_width[k]
-        if W == 0                                   # regime C: blocked pivot steps and GEMMs (src/numeric/ldlt_c.jl)
+        if W == 0 || ldlt_blocked_path(S.schedule, S.schedule.group_nodes[a])   # blocked steps and GEMMs (ldlt_c.jl)
             _factorize_ldlt_c_group!(N, S, nzval, a, b, plan.group_maxchild[k], prm, gimpl, nbv, herm)
         elseif W <= _LT_GLOBAL_MAX_W                # narrow regime-B bins: the panel in global memory
             _launch_front_ldlt!(N, S, nzval, a, b - a + 1, plan.group_maxchild[k], prm, Val(0), Val(LDLT_WORKGROUP))

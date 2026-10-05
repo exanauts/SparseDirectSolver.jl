@@ -41,7 +41,7 @@ function parse_args(args)
 end
 
 const OPTS = parse_args(ARGS)
-const SLOW_LDLT = ("GHS_psdef/apache2", "lap3d_40")
+const SLOW_LDLT = ("GHS_psdef/apache2",)
 const OUTDIR = joinpath(@__DIR__, "profile")
 
 # kernel name without the KernelAbstractions/CUDA template arguments

@@ -45,7 +45,9 @@ offsets, 1-based:
   (`t = 0:nsteps`); `stack_len = maximum(step_top)` is the high-water mark;
 * `work_len`: entries of the regime-C `syrk` workspace (largest `m^2` of a
   front on the regime-C path, [`takes_c_path`](@ref), with a block on the stack;
-  LDLᵀ/LDLᴴ: the largest [`ldlt_c_work_len`](@ref));
+  LDLᵀ/LDLᴴ: the largest sum of [`ldlt_c_work_len`](@ref) over a chunk of
+  concurrent fronts on the blocked path, [`ldlt_blocked_path`](@ref) and
+  [`ldlt_c_chunk_end`](@ref));
 * `local_front`, `local_cb` (regime A, `0` elsewhere): local-memory offset of the
   packed front of `s` and of its contribution block after the move (`0` for a
   subtree root, whose block goes to the update stack); `local_len[t]`: entries
@@ -173,10 +175,59 @@ const LDLT_C_NB = 32
 
 Workspace entries of a regime-C LDLᵀ/LDLᴴ front with `f` rows and `w`
 fully-summed columns: the `m×m` contribution block (`m = f - w`, when `cb`),
-`Lb` and `Wb` (`f × (nb + 1)` each) and the saved column (`f`).
+`Lb` and `Wb` (`f × (nb + 1)` each), the saved column and the next pivot
+column of pass 1 (`f` each).
 """
 ldlt_c_work_len(f::Integer, w::Integer, cb::Bool, nb::Integer = LDLT_C_NB) =
-    (cb ? (f - w)^2 : 0) + 2 * f * (nb + 1) + f
+    (cb ? (Int(f) - Int(w))^2 : 0) + 2 * Int(f) * (nb + 1) + 2 * Int(f)
+
+"""
+Smallest width class and row class of a regime-B bin that the LDLᵀ/LDLᴴ factorization runs on the blocked
+regime-C path ([`ldlt_blocked_path`](@ref)) instead of the fused front kernel.
+"""
+const LDLT_BLOCKED_MIN_WCLASS = 32
+const LDLT_BLOCKED_MIN_FCLASS = 256
+
+"""
+    ldlt_blocked_path(sc, s) -> Bool
+
+Front `s` takes the blocked LDLᵀ/LDLᴴ path (`panel_ldlt_kernel!` and GEMMs,
+`src/numeric/ldlt_c.jl`): it is on the regime-C path ([`takes_c_path`](@ref)),
+or in a regime-B bin of width class `≥ LDLT_BLOCKED_MIN_WCLASS` and row class
+`≥ LDLT_BLOCKED_MIN_FCLASS`, where the GEMMs beat the fused kernel's in-kernel
+updates.
+"""
+function ldlt_blocked_path(sc, s::Integer)
+    takes_c_path(sc, s) && return true
+    sc.regime[s] == REGIME_B || return false
+    nf = length(sc.fclasses)
+    return sc.wclasses[(sc.bin[s] - 1) ÷ nf + 1] >= LDLT_BLOCKED_MIN_WCLASS &&
+           sc.fclasses[(sc.bin[s] - 1) % nf + 1] >= LDLT_BLOCKED_MIN_FCLASS
+end
+
+"""
+    ldlt_c_chunk_end(sc, cb_len, q, last, cap) -> Int
+
+The fronts `sc.group_nodes[q:e]` of a regime-C launch group (`e ≤ last`) that
+the blocked LDLᵀ/LDLᴴ path factors concurrently, one workgroup each: the
+longest run from `q` whose [`ldlt_c_work_len`](@ref) slices, laid out one after
+another, fit `cap` entries (at least one front). `cb_len[s] > 0` when front `s`
+has a contribution block on the update stack.
+"""
+function ldlt_c_chunk_end(sc, cb_len::AbstractVector, q::Integer, last::Integer, cap::Integer)
+    nodes = sc.group_nodes
+    s = nodes[q]
+    acc = ldlt_c_work_len(sc.rows[s], sc.width[s], cb_len[s] > 0)
+    e = Int(q)
+    while e < last
+        s = nodes[e + 1]
+        len = ldlt_c_work_len(sc.rows[s], sc.width[s], cb_len[s] > 0)
+        acc + len <= cap || break
+        acc += len
+        e += 1
+    end
+    return e
+end
 
 """
     build_layout(sp::SupernodePartition, schedule::Schedule; ldlt = false) -> Layout
@@ -236,8 +287,21 @@ function build_layout(sp::SupernodePartition, sc::Schedule; ldlt::Bool = false)
         step_top[t + 1] = max(step_top[t + 1], cb_ptr[s] + cb_len[s] - 1)
     end
     work_len = if ldlt
-        maximum((takes_c_path(sc, s) ? ldlt_c_work_len(sc.rows[s], sc.width[s], cb_len[s] > 0) : 0 for s in 1:ns);
-                init = 0)
+        # the fronts of a regime-C group run concurrently in chunks of at most twice the largest workspace
+        single = maximum((ldlt_blocked_path(sc, s) ? ldlt_c_work_len(sc.rows[s], sc.width[s], cb_len[s] > 0) : 0
+                          for s in 1:ns); init = 0)
+        len = single
+        for g in sc.groups
+            (g.regime == REGIME_A || !ldlt_blocked_path(sc, sc.group_nodes[g.first])) && continue
+            q = g.first
+            while q <= g.last
+                e = ldlt_c_chunk_end(sc, cb_len, q, g.last, 2 * single)
+                len = max(len, sum(s -> ldlt_c_work_len(sc.rows[s], sc.width[s], cb_len[s] > 0),
+                                   view(sc.group_nodes, q:e)))
+                q = e + 1
+            end
+        end
+        len
     else
         maximum((cb_len[s] > 0 && takes_c_path(sc, s) ? (sc.rows[s] - sc.width[s])^2 : 0 for s in 1:ns); init = 0)
     end

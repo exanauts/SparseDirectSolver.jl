@@ -31,7 +31,19 @@ const _LTC_T0 = _LT_CTL + 2    # first slot of a pivot of this block (2 when it 
 const _LTC_LO = _LT_CTL + 3    # workspace offset (1-based) of Lb
 const _LTC_WO = _LT_CTL + 4    # workspace offset (1-based) of Wb
 const _LTC_SO = _LT_CTL + 5    # workspace offset (1-based) of the saved column
-const _LTC_CTL = _LT_CTL + 5
+const _LTC_IDLE = _LT_CTL + 6  # 1: the front has fewer blocks (nothing to do in this launch)
+const _LTC_CTL = _LT_CTL + 6
+
+# workspace offset (0-based) of the slice of the front at position q of a chunk `nodes[qa:…]`: the slices of
+# the fronts before it (`ldlt_c_work_len`, as `ldlt_c_chunk_end` lays them out)
+@inline function _ltc_slice(nodes, qa, q, front_nrows, front_ncols, cb_ptr)
+    base = 0
+    @inbounds for q2 in qa:(q - 1)
+        s2 = nodes[q2]
+        base += ldlt_c_work_len(front_nrows[s2], front_ncols[s2], cb_ptr[s2] > 0)
+    end
+    return base
+end
 
 # front mode of the panel kernel (`Val(_Lazy{H})`)
 struct _Lazy{H} end
@@ -96,25 +108,31 @@ end
 @inline _lt_raw_front(fa::Tuple{A, B, K}, ctl, ::Val{_Lazy{H}}) where {A, B, K, H} =
     @inbounds _PanelFront(fa[1], Int(ctl[_ST_LF]) - 1, Int(ctl[_ST_F]))
 
-# block setup (work item 1): the front's control words, the block's columns, the workspace offsets
-@inline function _ltc_setup!(ctl, s, b, nb, super_ptr, p0, front_nrows, front_ncols, pivot_kind, wofs)
+# block setup (work item 1): the front at position q of the chunk, its control words, the block's columns,
+# the workspace offsets of its slice
+@inline function _ltc_setup!(ctl, nodes, qa, q, b, nb, super_ptr, front_ptr, front_nrows, front_ncols, cb_ptr,
+                             pivot_kind)
     @inbounds begin
         IT = eltype(ctl)
+        s = Int(nodes[q])
         f = Int(front_nrows[s])
         w = Int(front_ncols[s])
         ctl[_ST_NODE] = s % IT
         ctl[_ST_F] = f % IT
         ctl[_ST_W] = w % IT
-        ctl[_ST_LF] = p0 % IT
+        ctl[_ST_LF] = front_ptr[s] % IT
         _lt_reset!(ctl, super_ptr[s])
         c0 = Int(super_ptr[s])
         k0 = (b - 1) * nb + 1
-        late = k0 > 1 && pivot_kind[c0 + k0 - 2] == PIVOT_KIND_2X2_FIRST   # column k0 ended the last block
+        idle = k0 > w
+        late = !idle && k0 > 1 && pivot_kind[c0 + k0 - 2] == PIVOT_KIND_2X2_FIRST   # k0 ended the last block
+        ctl[_LTC_IDLE] = idle % IT
         ctl[_LT_K] = (late ? k0 + 1 : k0) % IT
-        ctl[_LT_KEND] = min(k0 + nb - 1, w) % IT
+        ctl[_LT_KEND] = (idle ? 0 : min(k0 + nb - 1, w)) % IT
         ctl[_LTC_K0] = k0 % IT
         ctl[_LTC_T0] = (late ? 2 : 1) % IT
-        lo, wo, so = wofs
+        lo, wo, so = _ltc_offsets(f, f - w, nb, cb_ptr[s] > 0) .+ _ltc_slice(nodes, qa, q, front_nrows, front_ncols,
+                                                                           cb_ptr)
         ctl[_LTC_LO] = (lo + 1) % IT
         ctl[_LTC_WO] = (wo + 1) % IT
         ctl[_LTC_SO] = (so + 1) % IT
@@ -124,7 +142,7 @@ end
 
 # zero Lb and Wb, restore the column saved by the last block, identity pivot order (first block)
 @inline function _ltc_prepare!(factor, lw, piv, ctl, b, nb, li, ::Val{WG}) where {WG}
-    @inbounds begin
+    @inbounds if ctl[_LTC_IDLE] == 0
         T = eltype(lw)
         f = Int(ctl[_ST_F])
         lo = Int(ctl[_LTC_LO]) - 1
@@ -140,6 +158,37 @@ end
             end
         end
         b == 1 && _lt_init_piv!(piv, ctl, li, Val(WG))
+    end
+    return nothing
+end
+
+# pass 1 of `_lt_pass1!` on the lazy panel, keeping the materialized column (rows k+1:f) after the saved
+# column in the workspace for `_ltc_commit!`
+@inline function _ltc_pass1!(fa, lw, ctl, red, redi, li, ::Val{NL}, p::_LDLTDevice{R}, h::Val) where {NL, R}
+    @inbounds if li <= NL
+        k = Int(ctl[_LT_K]) + Int(ctl[_LT_STEP])
+        w = Int(ctl[_ST_W])
+        f = Int(ctl[_ST_F])
+        λ = zero(R)
+        r = 0
+        cm = zero(R)
+        if k <= Int(ctl[_LT_KEND])                     # also for 'N': the commit reads the column
+            F = _ltc_front(fa, ctl, h)
+            co = Int(ctl[_LTC_SO]) - 1 + f
+            for i in (k + li):NL:f
+                x = _fget(F, i, k)
+                lw[co + i] = x
+                a = abs(x)
+                cm = max(cm, a)
+                if i <= w && a > λ
+                    λ = a
+                    r = i
+                end
+            end
+        end
+        red[li] = λ
+        redi[li] = r % eltype(redi)
+        red[NL + li] = cm
     end
     return nothing
 end
@@ -178,9 +227,12 @@ end
             t = k - Int(ctl[_LTC_K0]) + 1
             lo = Int(ctl[_LTC_LO]) - 1
             wo = Int(ctl[_LTC_WO]) - 1
+            # pass 1 left column k materialized when the pivot is the 1×1 one at k (no interchange)
+            kept = step == 1 && Int(ctl[_LT_C]) == k
+            co = Int(ctl[_LTC_SO]) - 1 + f
             for i in (k + step - 1 + li):WG:f
                 if step == 1
-                    x = _fget(F, i, k)
+                    x = kept ? lw[co + i] : _fget(F, i, k)
                     _fset!(F, i, k, x)
                     lw[wo + (t - 1) * f + i] = x
                     lw[lo + (t - 1) * f + i] = x / pv[1]
@@ -202,7 +254,7 @@ end
 
 # after the block: save the first column of the next block when a 2×2 pivot took it; statistics
 @inline function _ltc_block_end!(factor, lw, stats, ctl, pivot_kind, b, li, ::Val{WG}) where {WG}
-    @inbounds begin
+    @inbounds if ctl[_LTC_IDLE] == 0
         kend = Int(ctl[_LT_KEND])
         f = Int(ctl[_ST_F])
         c0 = Int(ctl[_LT_C0])
@@ -226,33 +278,37 @@ end
 end
 
 """
-    panel_ldlt_kernel!(backend, WG)(factor, lw, d, piv, pivot_kind, psign, perm, aux, stats, s, b, nb, p0, wofs,
-                                    super_ptr, front_nrows, front_ncols, prm, Val(WG); ndrange = WG)
+    panel_ldlt_kernel!(backend, WG)(factor, lw, d, piv, pivot_kind, psign, perm, aux, stats, nodes, qa, b, nb,
+                                    super_ptr, front_ptr, k, nbatch, front_nrows, front_ncols, cb_ptr, prm, Val(WG);
+                                    ndrange = WG * count)
 
 Block `b` (columns `(b - 1) nb + 1 : min(b nb, w)`) of the regime-C LDLᵀ/LDLᴴ
-pivot steps of front `s` (panel at `factor[p0]`, workspace `lw` with `Lb`,
-`Wb` and the saved column at the offsets `wofs`): the reference's pivot
-sequence on the lazily updated panel (see the top of `src/numeric/ldlt_c.jl`),
-D, `piv`, the pivot kinds and the front's statistics (added to those of the
-earlier blocks). One workgroup.
+pivot steps of the `count` fronts `nodes[qa:(qa + count - 1)]`, one workgroup
+each (panel of batch member `k` of `nbatch` at `member_panels(front_ptr, k, nbatch)[s]`, workspace slice in `lw` after those of the
+fronts before it: `Lb`, `Wb`, the saved column, the pass-1 column): the
+reference's pivot sequence on the lazily updated panel (see the top of
+`src/numeric/ldlt_c.jl`), D, `piv`, the pivot kinds and the front's statistics
+(added to those of the earlier blocks). Fronts with fewer blocks do nothing.
 """
-@kernel function panel_ldlt_kernel!(factor, lw, d, piv, pivot_kind, psign, perm, aux, stats, s, b, nb, p0, wofs,
-                                    super_ptr, front_nrows, front_ncols, prm::_LDLTDevice{R, HERM},
-                                    ::Val{WG}) where {R, HERM, WG}
+@kernel function panel_ldlt_kernel!(factor, lw, d, piv, pivot_kind, psign, perm, aux, stats, nodes, qa, b, nb,
+                                    super_ptr, front_ptr, mk, nbatch, front_nrows, front_ncols, cb_ptr,
+                                    prm::_LDLTDevice{R, HERM}, ::Val{WG}) where {R, HERM, WG}
     @uniform TT = eltype(factor)
     @uniform IT = eltype(front_ncols)
     li = @index(Local, Linear)
+    G = @index(Group, Linear)
     ctl = @localmem IT (_LTC_CTL,)
     pv = @localmem TT (_LT_NPV,)
     red = @localmem R (3 * WG,)
     redi = @localmem IT (2 * WG,)
     if li == 1
-        _ltc_setup!(ctl, s, b, nb, super_ptr, p0, front_nrows, front_ncols, pivot_kind, wofs)
+        _ltc_setup!(ctl, nodes, qa, qa + G - 1, b, nb, super_ptr, member_panels(front_ptr, mk, nbatch), front_nrows,
+                    front_ncols, cb_ptr, pivot_kind)
     end
     @synchronize
     _ltc_prepare!(factor, lw, piv, ctl, b, nb, li, Val(WG))
     @synchronize
-    _lt_pass1!((factor, lw, pivot_kind), ctl, red, redi, li, Val(WG), prm, Val(_Lazy{HERM}))
+    _ltc_pass1!((factor, lw, pivot_kind), lw, ctl, red, redi, li, Val(WG), prm, Val(HERM))
     @synchronize
     for it in 1:nb
         _lt_stage1!(red, redi, ctl, li, Val(WG), Val(1))
@@ -289,31 +345,33 @@ earlier blocks). One workgroup.
         @synchronize
         _ltc_commit!((factor, lw, pivot_kind), lw, ctl, pv, li, Val(WG), Val(HERM))
         @synchronize
-        _lt_pass1!((factor, lw, pivot_kind), ctl, red, redi, li, Val(WG), prm, Val(_Lazy{HERM}))
+        _ltc_pass1!((factor, lw, pivot_kind), lw, ctl, red, redi, li, Val(WG), prm, Val(HERM))
         @synchronize
     end
     _ltc_block_end!(factor, lw, stats, ctl, pivot_kind, b, li, Val(WG))
 end
 
 """
-    finish_ldlt_kernel!(backend, WG)(factor, d, pivot_kind, info, s, p0, super_ptr, front_nrows, front_ncols,
-                                     Val(HERM), Val(WG); ndrange = WG)
+    finish_ldlt_kernel!(backend, WG)(factor, d, pivot_kind, info, nodes, qa, super_ptr, front_ptr, k, nbatch,
+                                     front_nrows, front_ncols, Val(HERM), Val(WG); ndrange = WG * count)
 
-After the blocks of a regime-C front: scale the pivot columns into L
-(`_lt_finalize!`), clear the upper triangle of `F₁₁`, set the unit diagonal
-and the front's status. One workgroup.
+After the blocks of the regime-C fronts `nodes[qa:(qa + count - 1)]`, one
+workgroup each: scale the pivot columns into L (`_lt_finalize!`), clear the
+upper triangle of `F₁₁`, set the unit diagonal and the front's status.
 """
-@kernel function finish_ldlt_kernel!(factor, d, pivot_kind, info, s, p0, super_ptr, front_nrows, front_ncols,
-                                     ::Val{HERM}, ::Val{WG}) where {HERM, WG}
+@kernel function finish_ldlt_kernel!(factor, d, pivot_kind, info, nodes, qa, super_ptr, front_ptr, mk, nbatch,
+                                     front_nrows, front_ncols, ::Val{HERM}, ::Val{WG}) where {HERM, WG}
     @uniform IT = eltype(front_ncols)
     li = @index(Local, Linear)
+    G = @index(Group, Linear)
     ctl = @localmem IT (_LT_CTL,)
     if li == 1
         @inbounds begin
+            s = nodes[qa + G - 1]
             ctl[_ST_NODE] = s % IT
             ctl[_ST_F] = front_nrows[s] % IT
             ctl[_ST_W] = front_ncols[s] % IT
-            ctl[_ST_LF] = p0 % IT
+            ctl[_ST_LF] = member_panels(front_ptr, mk, nbatch)[s] % IT
             ctl[_LT_C0] = super_ptr[s] % IT
         end
     end
@@ -328,67 +386,93 @@ and the front's status. One workgroup.
             i = q - (j - 1) * w + 1
             i <= j && (factor[p + (j - 1) * f + i] = i == j ? one(eltype(factor)) : zero(eltype(factor)))
         end
-        li == 1 && (info[s] = Int32(0))
+        li == 1 && (info[ctl[_ST_NODE]] = Int32(0))
     end
 end
 
-# regime C of front `s` of batch member `k`: blocks of pivot steps, GEMMs on the trailing columns and the
-# contribution block, the last scaling, the contribution block onto the update stack
-function _factor_front_ldlt_c!(N::Numeric{T}, S::Symbolic, s::Int, k::Int, prm, gimpl::Symbol,
+# regime C of the fronts `nodes[qa:qe]` of batch member `k`, concurrently: per block one panel launch, then the
+# GEMMs of every front on its trailing columns and its contribution block; the last scaling; the contribution
+# blocks onto the update stack
+function _factor_chunk_ldlt_c!(N::Numeric{T}, S::Symbolic, qa::Int, qe::Int, k::Int, prm, gimpl::Symbol,
                                ::Val{NB}, ::Val{HERM}) where {T, NB, HERM}
     L, sc = S.layout, S.schedule
+    nodes = sc.group_nodes
     nb = N.nbatch
-    f, w = sc.rows[s], sc.width[s]
-    m = f - w
-    c0 = L.cb_ptr[s]
-    cb = m > 0 && c0 > 0
-    p0 = panel_offset(L.panel_ptr, s, k, nb)
-    P = reshape(view(N.factor, p0:(p0 + f * w - 1)), f, w)
-    lw = view(N.work, 1:S.layout.work_len)
-    wofs = _ltc_offsets(f, m, NB, cb)
-    Lb = reshape(view(lw, (wofs[1] + 1):(wofs[1] + f * (NB + 1))), f, NB + 1)
-    Wb = reshape(view(lw, (wofs[2] + 1):(wofs[2] + f * (NB + 1))), f, NB + 1)
+    count = qe - qa + 1
+    lw = view(N.work, 1:L.work_len)
     tB = HERM ? 'C' : 'T'
     d, piv, kind = _mview(N.d, k, nb), _mview(N.piv, k, nb), _mview(N.pivot_kind, k, nb)
     backend = KernelAbstractions.get_backend(N.factor)
     panel! = panel_ldlt_kernel!(backend, LDLT_C_WORKGROUP)
-    for b in 1:cld(w, NB)
-        panel!(N.factor, lw, d, piv, kind, N.psign, S.perm, _mview(N.aux, k, nb), _mview(N.stats, k, nb), s, b, NB, p0,
-               wofs, S.super_ptr, S.front_nrows, S.front_ncols, prm, Val(LDLT_C_WORKGROUP); ndrange = LDLT_C_WORKGROUP)
-        k1 = b * NB + 1                                   # first column of the next block
-        if k1 <= w
-            _gemm_impl!(gimpl, 'N', tB, -one(T), view(Lb, k1:f, :), view(Wb, k1:w, :), one(T), view(P, k1:f, k1:w))
-        end
-        if cb
-            C = reshape(view(lw, 1:(m * m)), m, m)
-            _gemm_impl!(gimpl, 'N', tB, -one(T), view(Lb, (w + 1):f, :), view(Wb, (w + 1):f, :),
-                        b == 1 ? zero(T) : one(T), C)
+    nblocks = 0
+    for q in qa:qe
+        nblocks = max(nblocks, cld(sc.width[nodes[q]], NB))
+    end
+    for b in 1:nblocks
+        panel!(N.factor, lw, d, piv, kind, N.psign, S.perm, _mview(N.aux, k, nb), _mview(N.stats, k, nb),
+               S.group_nodes, qa, b, NB, S.super_ptr, S.front_ptr, k, nb, S.front_nrows, S.front_ncols, S.cb_ptr, prm,
+               Val(LDLT_C_WORKGROUP); ndrange = LDLT_C_WORKGROUP * count)
+        base = 0
+        for q in qa:qe
+            s = nodes[q]
+            f, w = sc.rows[s], sc.width[s]
+            m = f - w
+            cb = m > 0 && L.cb_ptr[s] > 0
+            if b <= cld(w, NB)
+                p0 = panel_offset(L.panel_ptr, s, k, nb)
+                P = reshape(view(N.factor, p0:(p0 + f * w - 1)), f, w)
+                lo, wo, _ = _ltc_offsets(f, m, NB, cb)
+                Lb = reshape(view(lw, (base + lo + 1):(base + lo + f * (NB + 1))), f, NB + 1)
+                Wb = reshape(view(lw, (base + wo + 1):(base + wo + f * (NB + 1))), f, NB + 1)
+                k1 = b * NB + 1                           # first column of the next block
+                if k1 <= w
+                    _gemm_impl!(gimpl, 'N', tB, -one(T), view(Lb, k1:f, :), view(Wb, k1:w, :), one(T),
+                                view(P, k1:f, k1:w))
+                end
+                if cb
+                    C = reshape(view(lw, (base + 1):(base + m * m)), m, m)
+                    _gemm_impl!(gimpl, 'N', tB, -one(T), view(Lb, (w + 1):f, :), view(Wb, (w + 1):f, :),
+                                b == 1 ? zero(T) : one(T), C)
+                end
+            end
+            base += ldlt_c_work_len(f, w, cb)
         end
     end
-    finish_ldlt_kernel!(backend, LDLT_C_WORKGROUP)(N.factor, d, kind, _iview(N.info, k, nb), s, p0, S.super_ptr,
-                                                   S.front_nrows, S.front_ncols, Val(HERM), Val(LDLT_C_WORKGROUP);
-                                                   ndrange = LDLT_C_WORKGROUP)
-    cb && pack_add!(_mview(N.stack, k, nb), c0, lw, m)
+    finish_ldlt_kernel!(backend, LDLT_C_WORKGROUP)(N.factor, d, kind, _iview(N.info, k, nb), S.group_nodes, qa,
+                                                   S.super_ptr, S.front_ptr, k, nb, S.front_nrows, S.front_ncols,
+                                                   Val(HERM),
+                                                   Val(LDLT_C_WORKGROUP); ndrange = LDLT_C_WORKGROUP * count)
+    base = 0
+    for q in qa:qe
+        s = nodes[q]
+        f, w = sc.rows[s], sc.width[s]
+        m = f - w
+        cb = m > 0 && L.cb_ptr[s] > 0
+        cb && pack_add!(_mview(N.stack, k, nb), L.cb_ptr[s], view(lw, (base + 1):(base + m * m)), m)
+        base += ldlt_c_work_len(f, w, cb)
+    end
     return nothing
 end
 
-# a regime-C launch group of the LDLᵀ/LDLᴴ phase: assembly launches, then every front of every active member
+# a regime-C launch group of the LDLᵀ/LDLᴴ phase: assembly launches, then its fronts in chunks
+# (`ldlt_c_chunk_end`) for every active member
 function _factorize_ldlt_c_group!(N::Numeric, S::Symbolic, nzval, a::Int, b::Int, maxchild::Int, prm, gimpl::Symbol,
                                   nbv::Val, herm::Val)
     zero_fronts!(N, S, a, b - a + 1)
     scatter_A!(N, S, nzval, a, b - a + 1)
     extend_add!(N, S, a, b - a + 1, maxchild)
-    nodes = S.schedule.group_nodes
     plan = N.plan
-    for q in a:b
-        s = nodes[q]
+    q = a
+    while q <= b
+        e = ldlt_c_chunk_end(S.schedule, S.layout.cb_len, q, b, S.layout.work_len)
         if N.nbatch == 1
-            _factor_front_ldlt_c!(N, S, s, 1, prm, gimpl, nbv, herm)
+            _factor_chunk_ldlt_c!(N, S, q, e, 1, prm, gimpl, nbv, herm)
         else
             for j in 1:plan.nact[]
-                _factor_front_ldlt_c!(N, S, s, Int(plan.members_host[j]), prm, gimpl, nbv, herm)
+                _factor_chunk_ldlt_c!(N, S, q, e, Int(plan.members_host[j]), prm, gimpl, nbv, herm)
             end
         end
+        q = e + 1
     end
     return nothing
 end
