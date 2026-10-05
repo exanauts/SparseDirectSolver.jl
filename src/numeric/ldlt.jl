@@ -51,7 +51,8 @@ const _LT_STAT = _ST_CTL + 5   # _LT_STAT + q: statistic q ∈ 1:5 (STAT_NPOS �
 const _LT_PHASE = _ST_CTL + 11 # pivot search state: 0 chosen, 2 Bunch–Kaufman pass 2 due, 3 fallback scan due
 const _LT_RBK = _ST_CTL + 12   # Bunch–Kaufman candidate row r of pass 1 (0: none)
 const _LT_NTILE = _ST_CTL + 13 # tiles of the F₂₂ update of the regime-B/C kernel (0: no contribution block)
-const _LT_CTL = _ST_CTL + 13
+const _LT_KEND = _ST_CTL + 14  # last column a pivot step may start at (w; the block's last column in regime C)
+const _LT_CTL = _ST_CTL + 14
 
 # `pv` slots: 1–4 the pivot (d, or the inverse 2×2 block e11, e12, e21, e22), 5–6 the new diagonal
 # entries of the pivot block (d, or a and c), 7–8 λ and the column maximum of pass 1
@@ -149,6 +150,9 @@ end
 @inline _lt_front(fa, ctl, ::Val{false}) = @inbounds _PanelFront(fa, Int(ctl[_ST_LF]) - 1, Int(ctl[_ST_F]))
 @inline _lt_front(fa::Tuple, ctl, ::Val{W}) where {W} =
     @inbounds _SplitFront(fa[1], fa[2], Int(ctl[_ST_LF]) - 1, Int(ctl[_ST_F]), Int(ctl[_ST_W]), W)
+
+# the front as stored, for the interchanges (the regime-C panel kernel moves stored values; see `_LazyFront`)
+@inline _lt_raw_front(fa, ctl, pk::Val) = _lt_front(fa, ctl, pk)
 
 # the buffers and the front mode of the regime-B/C kernel: `W = 0` panel in global memory, else F₁₁ staged
 @inline _lt_fa(L11, factor, ::Val{0}) = factor
@@ -290,7 +294,7 @@ end
         λ = zero(R)
         r = 0
         cm = zero(R)
-        if k <= w && p.ptype != _LT_PIVOT_NONE
+        if k <= Int(ctl[_LT_KEND]) && p.ptype != _LT_PIVOT_NONE
             F = _lt_front(fa, ctl, pk)
             for i in (k + li):NL:Int(ctl[_ST_F])
                 a = _fabs(F, i, k)
@@ -457,7 +461,7 @@ end
         ctl[_LT_K] = k % IT
         ctl[_LT_STEP] = zero(IT)
         ctl[_LT_PHASE] = zero(IT)
-        k <= Int(ctl[_ST_W]) || return nothing
+        k <= Int(ctl[_LT_KEND]) || return nothing
         if p.ptype == _LT_PIVOT_NONE
             _lt_select!(fa, ctl, pv, d, pivot_kind, piv, psign, perm, aux, p, k, 0, pk, h)
             return nothing
@@ -565,6 +569,7 @@ end
         ctl[_LT_R] = zero(IT)
         ctl[_LT_PHASE] = zero(IT)
         ctl[_LT_RBK] = zero(IT)
+        ctl[_LT_KEND] = ctl[_ST_W]
         for q in 1:5
             ctl[_LT_STAT + q] = zero(IT)
         end
@@ -588,11 +593,11 @@ end
 @inline function _lt_swap!(fa, ctl, pv, piv, li, ::Val{WG}, pk::Val, h::Val) where {WG}
     @inbounds begin
         k = Int(ctl[_LT_K])
-        if k <= Int(ctl[_ST_W])
+        if k <= Int(ctl[_LT_KEND])
             r = Int(ctl[_LT_R])
             p = r == 0 ? k : k + 1
             q = r == 0 ? Int(ctl[_LT_C]) : r
-            F = _lt_front(fa, ctl, pk)
+            F = _lt_raw_front(fa, ctl, pk)
             for i in li:WG:Int(ctl[_ST_F])
                 if p != q
                     if i < p
@@ -647,7 +652,7 @@ end
         λ = zero(R)
         r = 0
         cm = zero(R)
-        if k <= w
+        if k <= Int(ctl[_LT_KEND])
             F = _lt_front(fa, ctl, pk)
             f = Int(ctl[_ST_F])
             step = Int(ctl[_LT_STEP])
@@ -1384,7 +1389,8 @@ function _launch_subtrees_ldlt!(N::Numeric{T}, S::Symbolic, nzval, first, count,
     return nothing
 end
 
-function _factorize_ldlt_groups!(N::Numeric, S::Symbolic, nzval::AbstractVector, prm, flag)
+function _factorize_ldlt_groups!(N::Numeric, S::Symbolic, nzval::AbstractVector, prm, flag, gimpl::Symbol,
+                                 nbv::Val, herm::Val)
     plan = N.plan
     for k in eachindex(plan.sub_first)
         _poll_interrupt(flag)
@@ -1397,13 +1403,25 @@ function _factorize_ldlt_groups!(N::Numeric, S::Symbolic, nzval::AbstractVector,
         _poll_interrupt(flag)
         a, b = plan.group_first[k], plan.group_last[k]
         W = plan.group_width[k]
-        if W <= _LT_GLOBAL_MAX_W                    # regime C and narrow bins: the panel in global memory
+        if W == 0                                   # regime C: blocked pivot steps and GEMMs (src/numeric/ldlt_c.jl)
+            _factorize_ldlt_c_group!(N, S, nzval, a, b, plan.group_maxchild[k], prm, gimpl, nbv, herm)
+        elseif W <= _LT_GLOBAL_MAX_W                # narrow regime-B bins: the panel in global memory
             _launch_front_ldlt!(N, S, nzval, a, b - a + 1, plan.group_maxchild[k], prm, Val(0), Val(LDLT_WORKGROUP))
         else                                        # regime B: F₁₁ in local memory
             _with_width_class(W) do w
                 _launch_front_ldlt!(N, S, nzval, a, b - a + 1, plan.group_maxchild[k], prm, w, Val(LDLT_WORKGROUP))
             end
         end
+    end
+    return nothing
+end
+
+function _factorize_ldlt_herm!(N::Numeric{T}, S::Symbolic, nzval, opts, prm, gimpl, nbv::Val, ::Val{H}) where {T, H}
+    if H
+        _factorize_ldlt_groups!(N, S, nzval, prm, opts.user_host_interrupt, gimpl, nbv, Val(true))
+    else
+        _factorize_ldlt_groups!(N, S, nzval, _ldlt_device_params(S, T, opts, Val(false)), opts.user_host_interrupt,
+                                gimpl, nbv, Val(false))
     end
     return nothing
 end
@@ -1427,8 +1445,11 @@ before every launch group ([`InterruptedError`](@ref)). With `pivot_epsilon_alg 
 factorization always completes (`info = 0`); the phase allocates nothing on
 the device, never synchronizes with the host, and is deterministic.
 """
-function factorize_ldlt!(N::Numeric{T}, S::Symbolic, nzval::AbstractVector; opts::Options = Options()) where {T}
+function factorize_ldlt!(N::Numeric{T}, S::Symbolic, nzval::AbstractVector; impl::Symbol = :auto,
+                         opts::Options = Options(), nb::Integer = LDLT_C_NB) where {T}
     _check_numeric(N, S, nzval)
+    1 <= nb <= LDLT_C_NB || throw(InvalidValueError("nb = $nb: the regime-C block size must be in 1:$LDLT_C_NB"))
+    gimpl = select_impl(:gemm, N.factor, impl === :auto && !S.schedule.vendor_c ? :ka : impl)
     herm = _ldlt_herm(S, T)
     prm = _ldlt_device_params(S, T, opts, Val(true))           # validates the options
     ps = opts.pivot_sign
@@ -1440,10 +1461,14 @@ function factorize_ldlt!(N::Numeric{T}, S::Symbolic, nzval::AbstractVector; opts
         copyto!(N.psign, ps)
     end
     prm.scaled && abs_max!(N.aux, nzval, batch_map(N))
-    if herm
-        _factorize_ldlt_groups!(N, S, nzval, prm, opts.user_host_interrupt)
-    else
-        _factorize_ldlt_groups!(N, S, nzval, _ldlt_device_params(S, T, opts, Val(false)), opts.user_host_interrupt)
+    if nb == LDLT_C_NB
+        if herm
+            _factorize_ldlt_herm!(N, S, nzval, opts, prm, gimpl, Val(LDLT_C_NB), Val(true))
+        else
+            _factorize_ldlt_herm!(N, S, nzval, opts, prm, gimpl, Val(LDLT_C_NB), Val(false))
+        end
+    else                                                       # other block sizes: tests only (dynamic dispatch)
+        _factorize_ldlt_herm!(N, S, nzval, opts, prm, gimpl, Val(Int(nb)), Val(herm))
     end
     reduce_stats!(N, S)
     return 0

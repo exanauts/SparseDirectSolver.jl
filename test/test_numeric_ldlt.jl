@@ -52,8 +52,10 @@ end
             for nrhs in (1, 5), det in (false, true)
                 b = nrhs == 1 ? rand(T, size(A, 1)) : rand(T, size(A, 1), nrhs)
                 x = device_solve(backend, ws, Sd, Nd, b; deterministic = det)
-                if name == "kkt(300,100,1e-8)" && T == ComplexF32
-                    # T14 / issue #66: this draw needs one refinement step in ComplexF32 (the reference too)
+                if name == "kkt(300,100,1e-8)" && T in (Float32, ComplexF32)
+                    # T14 / issue #66: this draw needs one refinement step in ComplexF32 (the reference too); in
+                    # Float32 the reference factor itself exceeds tol(T) on 1 of 20 right-hand sides (5.3e-4,
+                    # #75), and the regime-C GEMMs (rounding only) hit such a draw
                     x = x + device_solve(backend, ws, Sd, Nd, b - A * x; deterministic = det)
                 end
                 @test relres(A, x, b) <= tol(T)
@@ -133,6 +135,54 @@ end
     S, Nr, Sd, Nd, nz = ldlt_setup(backend, A)
     @test thrown(() -> SDS.factorize!(Nd, Sd, nz; opts = Options(pivot_sign = ones(Int8, n - 1)))) isa
           InvalidValueError
+end
+
+@testset "regime C: blocked pivot steps and GEMMs ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
+    # every front on the regime-C path (`panel_ldlt_kernel!` per block of nb columns, GEMMs on the trailing
+    # columns and the contribution block); block sizes below the root's width, so that 2×2 pivots straddle
+    # block boundaries; every dense implementation of the GEMMs
+    Random.seed!(666)
+    conly = (factorization_alg = "algo2", subtree_budgets = Int[])
+    cases = (("kkt 1e-3 H, δ = 0, interleaved (2×2)",
+              kkt_matrix(T, 200, 100, 0.0; hessian = :indefinite, hessian_scale = 1.0e-3),
+              (user_perm = kkt_interleaved_perm(200, 100),)),
+             ("random_symindef(200,0.5)", random_symindef(T, 200, 0.5), (;)))
+    for (name, A, kw) in cases
+        opts = Options(; kw..., conly...)
+        S, Nr, Sd, Nd, nz = ldlt_setup(backend, A; opts)
+        sp = S.partition
+        roots = findall(==(0), sp.snparent)
+        s = roots[argmax([SDS.snwidth(sp, r) for r in roots])]
+        w = SDS.snwidth(sp, s)
+        # a small block size at which a 2×2 pivot starts at the last column of a block (every front is on
+        # the regime-C path)
+        straddle(nb) = any(1:SDS.nsupernodes(sp)) do v
+            c0, wv = sp.super_ptr[v], SDS.snwidth(sp, v)
+            any(k -> k % nb == 0 && Nr.pivot_kind[c0 + k - 1] == SDS.PIVOT_KIND_2X2_FIRST, 1:(wv - 1))
+        end
+        small = findfirst(straddle, 2:16)
+        name == first(cases[1]) && @test SDS.pivot_stats(Nr).n2x2 > 0 && small !== nothing
+        for nb in (something(small, 2) + 1, SDS.LDLT_C_NB)
+            @test SDS.takes_c_path(S.schedule, s) && w > nb
+            for impl in SDS.dense_impls(:gemm, backend, T)
+                @test SDS.factorize_ldlt!(Nd, Sd, nz; impl, opts, nb) == 0
+                Nh = SDS.host_numeric(Nd)
+                @test Nh.piv == Nr.piv
+                @test Nh.pivot_kind == Nr.pivot_kind
+                @test d_error(Nh, Nr) <= panel_tol(T)
+                @test panel_error(Nh, Nr) <= panel_tol(T)
+                @test Nh.stats == Nr.stats
+                @test SDS.pivot_totals(Nd) == SDS.pivot_stats(Nr)
+                ws = SDS.allocate_solve(Sd, T, backend, 1)
+                b = rand(T, size(A, 1))
+                @test relres(A, device_solve(backend, ws, Sd, Nd, b; deterministic = true), b) <= tol(T)
+            end
+        end
+    end
+    # the block size is checked
+    S, Nr, Sd, Nd, nz = ldlt_setup(backend, cases[2][2]; opts = Options(; conly...))
+    @test thrown(() -> SDS.factorize_ldlt!(Nd, Sd, nz; nb = 0)) isa InvalidValueError
+    @test thrown(() -> SDS.factorize_ldlt!(Nd, Sd, nz; nb = SDS.LDLT_C_NB + 1)) isa InvalidValueError
 end
 
 @testset "pivot_type 'D' and 'N' on quasi-definite KKT ($(backend_name(backend)), $T)" for backend in BACKENDS,

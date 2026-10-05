@@ -44,7 +44,8 @@ offsets, 1-based:
 * `step_top[t + 1]`: last update-stack entry in use during step `t`
   (`t = 0:nsteps`); `stack_len = maximum(step_top)` is the high-water mark;
 * `work_len`: entries of the regime-C `syrk` workspace (largest `m^2` of a
-  front on the regime-C path, [`takes_c_path`](@ref), with a block on the stack);
+  front on the regime-C path, [`takes_c_path`](@ref), with a block on the stack;
+  LDLᵀ/LDLᴴ: the largest [`ldlt_c_work_len`](@ref));
 * `local_front`, `local_cb` (regime A, `0` elsewhere): local-memory offset of the
   packed front of `s` and of its contribution block after the move (`0` for a
   subtree root, whose block goes to the update stack); `local_len[t]`: entries
@@ -164,8 +165,21 @@ end
 
 _high_water(cb_ptr, cb_len, ids) = maximum((cb_ptr[s] + cb_len[s] - 1 for s in ids); init = 0)
 
+"Pivot columns per block of the regime-C LDLᵀ/LDLᴴ path (`panel_ldlt_kernel!`)."
+const LDLT_C_NB = 32
+
 """
-    build_layout(sp::SupernodePartition, schedule::Schedule) -> Layout
+    ldlt_c_work_len(f, w, cb::Bool, nb = LDLT_C_NB) -> Int
+
+Workspace entries of a regime-C LDLᵀ/LDLᴴ front with `f` rows and `w`
+fully-summed columns: the `m×m` contribution block (`m = f - w`, when `cb`),
+`Lb` and `Wb` (`f × (nb + 1)` each) and the saved column (`f`).
+"""
+ldlt_c_work_len(f::Integer, w::Integer, cb::Bool, nb::Integer = LDLT_C_NB) =
+    (cb ? (f - w)^2 : 0) + 2 * f * (nb + 1) + f
+
+"""
+    build_layout(sp::SupernodePartition, schedule::Schedule; ldlt = false) -> Layout
 
 Panel offsets in supernode order, D offsets, and the update-stack offsets of
 the contribution blocks that leave their front through global memory (B/C
@@ -174,10 +188,11 @@ Blocks whose lifetimes `[step(s), step(parent)]` overlap never share entries;
 the offsets are the placement with the lowest high-water mark among a
 step-by-step first fit and two offline placements (lowest free offset, largest
 blocks first and largest size × lifetime first; issue #48). Also the regime-C
-workspace and the local-memory offsets of the regime-A subtrees
-([`subtree_local_layout`](@ref)).
+workspace (with `ldlt`, structures `"S"`/`"H"`, the larger one of the blocked
+LDLᵀ/LDLᴴ path, [`ldlt_c_work_len`](@ref)) and the local-memory offsets of the
+regime-A subtrees ([`subtree_local_layout`](@ref)).
 """
-function build_layout(sp::SupernodePartition, sc::Schedule)
+function build_layout(sp::SupernodePartition, sc::Schedule; ldlt::Bool = false)
     ns = nsupernodes(sp)
     n = sp.n
     panel_ptr = Vector{Int}(undef, ns + 1)
@@ -220,8 +235,12 @@ function build_layout(sp::SupernodePartition, sc::Schedule)
     for s in ids, t in cb_first[s]:cb_last[s]
         step_top[t + 1] = max(step_top[t + 1], cb_ptr[s] + cb_len[s] - 1)
     end
-    work_len = maximum((cb_len[s] > 0 && takes_c_path(sc, s) ? (sc.rows[s] - sc.width[s])^2 : 0 for s in 1:ns);
-                       init = 0)
+    work_len = if ldlt
+        maximum((takes_c_path(sc, s) ? ldlt_c_work_len(sc.rows[s], sc.width[s], cb_len[s] > 0) : 0 for s in 1:ns);
+                init = 0)
+    else
+        maximum((cb_len[s] > 0 && takes_c_path(sc, s) ? (sc.rows[s] - sc.width[s])^2 : 0 for s in 1:ns); init = 0)
+    end
     local_front, local_cb, local_len = subtree_local_layout(sp, sc)
     return Layout(panel_ptr, panel_ptr[end] - 1, d_ptr, 2n, cb_ptr, cb_len, cb_first, cb_last, step_top,
                   maximum(step_top; init = 0), work_len, local_front, local_cb, local_len)
