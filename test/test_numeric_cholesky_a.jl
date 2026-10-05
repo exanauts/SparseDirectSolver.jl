@@ -2,10 +2,13 @@
 # workgroup per leaf subtree, fronts and contribution blocks in local memory),
 # together with regimes B and C, checked against the T08 reference panels.
 
-# default budgets (16, 32, 48 KiB): regimes A, B and C on the 3-D Laplacian and the random SPD matrix
-const NUMERIC_A_OPTS = Options()
+# default budgets (16, 32, 48 KiB): regimes A, B and C on the 3-D Laplacian and the random SPD matrix; regime-A
+# subtrees as large as the budgets allow (`subtree_parallelism = 0`; the default split leaves these small
+# matrices few or no subtrees, see "subtree_parallelism" in test_symbolic_schedule.jl)
+const NUMERIC_A_OPTS = Options(subtree_parallelism = 0)
 # small budgets and regime-C thresholds: all three regimes on a 2-D Laplacian
-const NUMERIC_ABC_OPTS = Options(subtree_budgets = [8192, 16384], regime_c_width = 16, regime_c_rows = 128)
+const NUMERIC_ABC_OPTS = Options(subtree_budgets = [8192, 16384], regime_c_width = 16, regime_c_rows = 128,
+                                 subtree_parallelism = 0)
 
 numeric_a_matrices(::Type{T}) where {T} =
     (("laplacian2d(40,40) A+B+C", laplacian2d(T, 40, 40), NUMERIC_ABC_OPTS),
@@ -57,11 +60,11 @@ end
     @test SDS.nsubtrees(S.schedule) == 0
     # the local capacity depends on the element size: wider numeric elements than the analysis's are rejected
     C = SDS.CSR(tril(laplacian2d(Float32, 10, 10)))
-    S32 = SDS.symbolic_analysis(C, "SPD", 'L')
+    S32 = SDS.symbolic_analysis(C, "SPD", 'L'; opts = NUMERIC_A_OPTS)
     @test S32.elsize == sizeof(Float32) && SDS.nsubtrees(S32.schedule) > 0
     @test thrown(() -> SDS.factorize!(SDS.allocate_numeric(S32, Float64), S32, Float64.(C.nzval))) isa
           InvalidValueError
-    S64 = SDS.symbolic_analysis(SDS.CSR(tril(laplacian2d(Float64, 10, 10))), "SPD", 'L')
+    S64 = SDS.symbolic_analysis(SDS.CSR(tril(laplacian2d(Float64, 10, 10))), "SPD", 'L'; opts = NUMERIC_A_OPTS)
     @test SDS.factorize!(SDS.allocate_numeric(S64, Float32), S64, Float32.(C.nzval)) == 0
 end
 
@@ -94,9 +97,10 @@ end
 @testset "budget classes and kernel sizes ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
     # the same matrix under different budgets: other subtrees, other local sizes, same factor
     A = laplacian3d(T, 8, 8, 8)
-    for opts in (Options(subtree_budgets = [8192]), Options(subtree_budgets = [65536]),
-                 Options(subtree_budgets = [8192, 20000, 1 << 20], regime_c_width = 32),
-                 Options(subtree_budgets = [32768], factorization_alg = "algo2"))
+    for opts in (Options(subtree_budgets = [8192], subtree_parallelism = 0),
+                 Options(subtree_budgets = [65536], subtree_parallelism = 0),
+                 Options(subtree_budgets = [8192, 20000, 1 << 20], regime_c_width = 32, subtree_parallelism = 0),
+                 Options(subtree_budgets = [32768], factorization_alg = "algo2", subtree_parallelism = 0))
         S, Nr, _, Sd, Nd, nz = numeric_setup(backend, A; opts)
         @test SDS.nsubtrees(S.schedule) > 0
         @test SDS.factorize!(Nd, Sd, nz) == 0
@@ -112,7 +116,8 @@ end
                                                                                             T in ELTYPES
     A = laplacian2d(T, 100, 100)
     b = rand(T, size(A, 1), 2)
-    x = map((Options(reordering_alg = "algo3"), Options(reordering_alg = "algo3", subtree_budgets = Int[]))) do opts
+    x = map((Options(reordering_alg = "algo3", subtree_parallelism = 0),
+             Options(reordering_alg = "algo3", subtree_budgets = Int[]))) do opts
         S, Nr, _, Sd, Nd, nz = numeric_setup(backend, A; opts)
         @test SDS.factorize!(Nd, Sd, nz) == 0
         Nh = SDS.host_numeric(Nd)
@@ -168,7 +173,8 @@ end
 
 @testset "info: first non-positive pivot ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
     n, j = 60, 23
-    for opts in (NUMERIC_A_OPTS, Options(reordering_alg = "algo5"), Options(use_superpanels = 0), NUMERIC_ABC_OPTS)
+    for opts in (NUMERIC_A_OPTS, Options(reordering_alg = "algo5", subtree_parallelism = 0),
+                 Options(use_superpanels = 0, subtree_parallelism = 0), NUMERIC_ABC_OPTS)
         A = singular_block_matrix(T, n, j; stored_zero = true)
         A[j, j] = 3
         _, Nr, info_ref, Sd, Nd, nz = numeric_setup(backend, A; opts)
@@ -190,7 +196,7 @@ end
     end
     # a non-positive pivot that only appears after elimination: [1 2; 2 1] block at columns 3, 4
     A = sparse(T[4 0 0 0; 0 4 0 0; 0 0 1 2; 0 0 2 1])
-    _, _, info_ref, Sd, Nd, nz = numeric_setup(backend, A; opts = Options(reordering_alg = "algo5"))
+    _, _, info_ref, Sd, Nd, nz = numeric_setup(backend, A; opts = Options(reordering_alg = "algo5", subtree_parallelism = 0))
     @test SDS.nsubtrees(Sd.schedule) > 0
     @test info_ref == 4
     @test SDS.factorize!(Nd, Sd, nz) == 4

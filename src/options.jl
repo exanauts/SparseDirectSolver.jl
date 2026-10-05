@@ -75,8 +75,19 @@ const DEFAULT_AMALGAMATION = AmalgamationParams((32, 0.25, 8))
 # regime A local-memory budgets (bytes): 16, 32 and 48 KiB (PLAN §2.3 step 5)
 const DEFAULT_SUBTREE_BUDGETS = [16 * 1024, 32 * 1024, 48 * 1024]
 
+# Regime A runs a subtree on one workgroup. A tree of small fronts fits the
+# local-memory budgets as a whole and then ran on one workgroup of one SM: the
+# pglib KKT dumps were factored 10-20x slower than with regime A off
+# (PERFORMANCE.md, experiment 0; bench/profile/phase_split.md). A subtree may do
+# at most `1/SUBTREE_PARALLELISM` of the factorization flops. 4096 was the best
+# or near-best value of a sweep over 128..4096 on the harness (RTX 4080); it
+# leaves the SuiteSparse and Laplacian subtrees as they were.
+"Default `subtree_parallelism`: a regime-A subtree does at most this fraction (inverse) of the factorization flops."
+const SUBTREE_PARALLELISM = 4096
+
 # `Options` fields that are analysis tuning knobs, not parameter strings (T07)
-const TUNING_OPTIONS = (:regime_c_width, :regime_c_rows, :subtree_budgets, :memory_budget)
+const TUNING_OPTIONS = (:regime_c_width, :regime_c_rows, :subtree_budgets, :subtree_parallelism,
+                        :memory_budget)
 
 """
     Options(; kwargs...)
@@ -121,6 +132,7 @@ defaults below. Keyword arguments are applied through [`setparam!`](@ref), so
 | `regime_c_width` | `64` | fronts wider than this go to regime C (vendor dense calls) |
 | `regime_c_rows` | `512` | fronts with more rows than this go to regime C |
 | `subtree_budgets` | `[16384, 32768, 49152]` | regime A local-memory budgets in bytes; empty disables regime A |
+| `subtree_parallelism` | `4096` | a regime-A subtree does at most `1/subtree_parallelism` of the factorization flops (`0`: no limit) |
 | `memory_budget` | `-1` | update-stack bytes per level chunk (negative: no limit, no chunking) |
 | `user_perm`, `user_schur_indices`, `user_nd_partition_tree`, `ubatch_mask`, `pivot_sign` | `nothing` | not provided |
 | `user_host_interrupt` | `nothing` | not provided |
@@ -128,7 +140,7 @@ defaults below. Keyword arguments are applied through [`setparam!`](@ref), so
 Vectors are stored as host copies; `user_host_interrupt` is stored by reference
 because it is polled while a phase runs.
 
-The last four rows are analysis tuning knobs of the schedule (PLAN §2.3 step 5,
+The last five rows are analysis tuning knobs of the schedule (PLAN §2.3 step 5,
 TASKS T07). They are not cuDSS parameter strings, so [`setparam!`](@ref) does not
 know them; set them with `Options(; regime_c_width = 128)` (validated) or by
 assigning the field.
@@ -169,6 +181,7 @@ mutable struct Options
     regime_c_width::Int
     regime_c_rows::Int
     subtree_budgets::Vector{Int}
+    subtree_parallelism::Int
     memory_budget::Int64
     # user-provided data parameters (inputs of the phases)
     user_perm::Union{Nothing, Vector{Int}}
@@ -184,7 +197,7 @@ mutable struct Options
             0, 0, 0.0, PIVOT_AUTO, 0.01, nothing, PIVOT_EPSILON_DEFAULT, -1,
             0, 0, 1, 0, 0, 10, 0, -1, 1, 0, 0, -1,
             IR_PLAIN, nothing, DEFAULT_AMALGAMATION, SCHEDULE_AUTO, PIVOT_PAIRS_DEFAULT,
-            64, 512, copy(DEFAULT_SUBTREE_BUDGETS), -1,
+            64, 512, copy(DEFAULT_SUBTREE_BUDGETS), SUBTREE_PARALLELISM, -1,
             nothing, nothing, nothing, nothing, nothing, nothing,
         )
         for (name, value) in kwargs
@@ -464,6 +477,9 @@ for field in (:regime_c_width, :regime_c_rows)
     @eval _parse_tuning(::Val{$(QuoteNode(field))}, value) =
         _parse_int($(String(field)), value, 1, typemax(Int), "an integer ≥ 1")
 end
+
+_parse_tuning(::Val{:subtree_parallelism}, value) =
+    _parse_int("subtree_parallelism", value, 0, typemax(Int), "an integer ≥ 0 (0: no limit)")
 
 _parse_tuning(::Val{:memory_budget}, value) =
     Int64(_parse_int("memory_budget", value, typemin(Int64), typemax(Int64), "an integer (negative: no limit)"))
