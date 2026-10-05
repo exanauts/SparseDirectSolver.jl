@@ -11,6 +11,7 @@ using Aqua
 using KernelAbstractions
 using SparseDirectSolver
 using Metis  # activates SparseDirectSolverMetisExt (nested-dissection orderings, T05)
+using Krylov  # activates SparseDirectSolverKrylovExt (ir_mode = "fgmres", T18)
 
 const SDS = SparseDirectSolver
 

@@ -275,6 +275,12 @@ the solver's current matrix values (KA SpMV over the full pattern), and, when
 (this costs one host synchronization per step; `ir_tol = 0`, the default, never
 stops early and never synchronizes), then adds the correction `op(A)⁻¹ R`. The
 steps performed are the data parameter `"ir_n_steps"` ([`getparam`](@ref)).
+With `ir_mode = "fgmres"` (needs `using Krylov`, else [`NotSupportedError`](@ref))
+the refinement is FGMRES on the correction system, right-preconditioned by the
+factorization ([`fgmres_refine!`](@ref)): at most `ir_n_steps` iterations (one
+SpMV and one solve each, as a plain step), stopping once every relative
+residual is below `ir_tol` (`ir_tol = 0`: all `ir_n_steps` iterations);
+`"ir_n_steps"` then reports the FGMRES iterations.
 
 The flag `"user_host_interrupt"` (a `Threads.Atomic{Bool}`, [`setparam!`](@ref))
 is polled at the start of the analysis phases, between the launch groups of the
@@ -498,8 +504,6 @@ function _solve!(solver::DirectSolver{T}, p::Phase, X, B) where {T}
     opts = solver.options
     opts.solve_alg == SOLVE_DEFAULT ||
         throw(NotSupportedError("solve_alg = \"$(convert(String, opts.solve_alg))\" is not implemented yet (M11)"))
-    opts.ir_mode == IR_PLAIN ||
-        throw(NotSupportedError("ir_mode = \"fgmres\" is not implemented yet (T18)"))
     Bd, bt = _rhs_data(B)
     Xd, xt = _rhs_data(X)
     xt == bt || throw(InvalidValueError("X and B must have the same layout (transposed or not)"))
@@ -567,14 +571,16 @@ function _refine_phase!(solver::DirectSolver, W::RefinementWorkspace, ws::SolveW
     opts = solver.options
     done = Ref(0)   # the corrections applied, also when the refinement is interrupted
     try
-        refine!(X, B, W, ws, solver.symbolic, solver.numeric, vec(solver.A.nzval); nsteps = opts.ir_n_steps,
-                tol = opts.ir_tol, transposed = xt, b_transposed = bt, conjugate = cj, deterministic = det,
-                interrupt = opts.user_host_interrupt, progress = done)
+        driver = opts.ir_mode == IR_FGMRES ? fgmres_refine! : refine!
+        driver(X, B, W, ws, solver.symbolic, solver.numeric, vec(solver.A.nzval); nsteps = opts.ir_n_steps,
+               tol = opts.ir_tol, transposed = xt, b_transposed = bt, conjugate = cj, deterministic = det,
+               interrupt = opts.user_host_interrupt, progress = done)
     finally
         solver.ir_steps = done[]
     end
     steps = done[]
-    _log(LOG_INFO, () -> "solve_refinement: $steps of $(opts.ir_n_steps) steps")
+    unit = opts.ir_mode == IR_FGMRES ? "FGMRES iterations" : "steps"
+    _log(LOG_INFO, () -> "solve_refinement: $steps of $(opts.ir_n_steps) $unit")
     return nothing
 end
 

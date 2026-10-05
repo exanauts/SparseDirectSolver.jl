@@ -28,7 +28,9 @@ CUDA:
 * GPU triangular solves with multiple right-hand sides, forward, diagonal and
   backward sub-phases, permutations, `solve_mode` (transposed and conjugated
   systems), and iterative refinement (`ir_n_steps`, `ir_tol`), allocation-free
-  after the analysis; `user_host_interrupt` is polled between launch groups;
+  after the analysis, or FGMRES-IR with the factorization as preconditioner
+  (`ir_mode = "fgmres"`, after `using Krylov`); `user_host_interrupt` is
+  polled between launch groups;
 * the public API: `DirectSolver`, `execute!` with cuDSS phase strings, named
   phase wrappers, `update!`, `setparam!`/`getparam`, and the `LinearAlgebra`
   layer (`cholesky`, `cholesky!`, `ldlt`, `ldlt!`, `ldiv!`, `\`, `logabsdet`),
@@ -37,7 +39,7 @@ CUDA:
 
 Not there yet: LU (`"G"`), batches, Schur complements, matching and scaling
 (badly scaled MadNLP K2 systems still need them, see the refinement table in
-`TASKS.md`), FGMRES refinement, mixed precision, and the AMDGPU, oneAPI and
+`TASKS.md`), mixed precision, and the AMDGPU, oneAPI and
 Metal extensions. Unsupported structures, phases and parameters raise
 `NotSupportedError` rather than falling back silently.
 

@@ -1,27 +1,6 @@
 # T16: iterative refinement ("solve_refinement", `ir_n_steps`, `ir_tol`), the
 # solve sub-phases composed, `solve_mode`, `user_host_interrupt` and logging.
 
-# a solver on `backend` after "analysis" and "factorization" of the `view` triangle of `A`
-function ir_solver(backend, A::SparseMatrixCSC{T}, structure, ::Type{INT} = Int32; view = 'L',
-                   params = ()) where {T, INT}
-    solver = DirectSolver(api_matrix(backend, triangle_view(A, view), INT), structure, view)
-    for (name, value) in params
-        setparam!(solver, name, value)
-    end
-    execute!("analysis", solver, nothing, nothing)
-    execute!("factorization", solver, nothing, nothing)
-    return solver
-end
-
-function ir_solve(backend, solver, b; steps = nothing, tol = nothing)
-    steps === nothing || setparam!(solver, "ir_n_steps", steps)
-    tol === nothing || setparam!(solver, "ir_tol", tol)
-    bd = to_device(backend, b)
-    xd = similar(bd)
-    execute!("solve", solver, xd, bd; asynchronous = false)
-    return to_host(xd)
-end
-
 # a logger that sets `flag` when the refinement logs the residual after `step` corrections (an interrupt
 # raised between two refinement steps, deterministically)
 struct InterruptAtStepLogger <: Base.CoreLogging.AbstractLogger
@@ -35,8 +14,6 @@ function Base.CoreLogging.handle_message(L::InterruptAtStepLogger, level, messag
     startswith(string(message), "refinement: step $(L.step),") && (L.flag[] = true)
     return nothing
 end
-
-const SOLVE_SUBPHASES = ("solve_fwd_perm", "solve_fwd", "solve_diag", "solve_bwd", "solve_bwd_perm", "solve_refinement")
 
 @testset "refinement on a badly scaled SPD matrix ($(backend_name(backend)))" for backend in BACKENDS
     T = Float64
