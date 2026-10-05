@@ -41,7 +41,16 @@ const _LT_STEP = _ST_CTL + 3   # size of the pivot taken at _LT_K (1 or 2; 0 bef
 const _LT_C = _ST_CTL + 4      # chosen 1×1 pivot column (2×2: k)
 const _LT_R = _ST_CTL + 5      # 2×2 partner column (0: 1×1 pivot)
 const _LT_STAT = _ST_CTL + 5   # _LT_STAT + q: statistic q ∈ 1:5 (STAT_NPOS … STAT_N2X2) of the front
-const _LT_CTL = _ST_CTL + 10
+const _LT_PHASE = _ST_CTL + 11 # pivot search state: 0 chosen, 2 Bunch–Kaufman pass 2 due, 3 fallback scan due
+const _LT_RBK = _ST_CTL + 12   # Bunch–Kaufman candidate row r of pass 1 (0: none)
+const _LT_CTL = _ST_CTL + 12
+
+# `pv` slots: 1–4 the pivot (d, or the inverse 2×2 block e11, e12, e21, e22), 5–6 the new diagonal
+# entries of the pivot block (d, or a and c), 7–8 λ and the column maximum of pass 1
+const _LT_NPV = 8
+
+# lanes of the stage-1 combine of the cooperative pivot search (`NL` partial results → `_LT_S1` → 1)
+const _LT_S1 = 16
 
 # resolved pivoting parameters passed to the kernels (isbits); `H`: Hermitian (or real symmetric) vs complex
 # symmetric (a type parameter, so the kernels need no extra `Val` argument: launches with more than 32
@@ -110,21 +119,35 @@ end
 @inline _lt_front(fa, ctl, ::Val{false}) = @inbounds _PanelFront(fa, Int(ctl[_ST_LF]) - 1, Int(ctl[_ST_F]))
 
 # ---------------------------------------------------------------------------
-# pivot choice (work item 1; the reference's `_colmax`, `_accept_1x1`, `_accept_2x2`,
-# `_best_1x1`, `_choose_pivot` on the lower triangle)
+# cooperative pivot search (the reference's `_choose_pivot` on the lower triangle, pivot for pivot)
+#
+# The column maxima of the search are reductions: every lane (work item `li ≤ NL`) reduces a strided
+# share of the rows (or, in the fallback scan, of the candidate columns) into its slots of `red`/`redi`,
+# `_lt_stage1!` folds them into `_LT_S1` slots and work item 1 into one (`_lt_final!`), then decides.
+# `max` of absolute values is exact in any order (a NaN propagates as in the serial loop), and an
+# arg-max keeps the first maximum (the smallest index on a tie, index 0 = none), so every decision
+# equals the serial one. Slots: `red[1:NL]`, `red[NL .+ (1:NL)]`, `red[2NL .+ (1:NL)]` (values
+# A, B, C), `redi[1:NL]`, `redi[NL .+ (1:NL)]` (indices of A and B). Per pivot step:
+#
+# * pass 1 (always; computed in the scale phase of the previous step, or before the first step):
+#   A/idx = λ and r (largest `|F[i, k]|` of the block rows `k+1:w`, first maximum), B = the column
+#   maximum of column k over rows `k+1:f` (the threshold test of a 1×1 pivot at k);
+# * pass 2 (Bunch–Kaufman when `|a_kk| < αλ`): A = σ (column r over the block rows `k:w` but r),
+#   B = column r over rows `k:f` but r and k, C = column k over rows `k:f` but k and r;
+# * pass 3 (the fallback when the choice fails the threshold): A/idx = the acceptable 1×1 pivot with
+#   the largest `|a_jj|` (`_best_1x1`, one lane per candidate column), B/idx = the largest `|a_jj|`
+#   (pivot type 'D').
 
-@inline function _lt_colmax(F, c, k, f, skip)
-    m = zero(real(eltype(F.a)))
+# `F[i, c]` bound of the threshold test: `d ≥ u maxᵢ |F[i, c]|` over rows `k:f` but c, with an early
+# exit (`u ≥ 0` is finite: `u · max = max(u · |F[i, c]|)`, and a NaN fails both forms)
+@inline function _lt_threshold_ok(F, c, k, f, u, d)
+    m = zero(d)
     for i in k:f
-        (i == c || i == skip) && continue
+        i == c && continue
         m = max(m, _fabs(F, i, c))
+        d >= u * m || return false
     end
-    return m
-end
-
-@inline function _lt_accept_1x1(F, c, k, f, u, ε)
-    d = _fabs(F, c, c)
-    return d >= ε && d >= u * _lt_colmax(F, c, k, f, 0)
+    return d >= u * m
 end
 
 @inline _lt_det2(F, k, r, h::Val) = _fget(F, k, k) * _fget(F, r, r) - _fsym(F, k, r, h) * _fget(F, r, k)
@@ -134,76 +157,334 @@ end
     return !iszero(det) && isfinite(det) && max(_fabs(F, k, k), _fabs(F, r, k), _fabs(F, r, r)) >= ε
 end
 
-@inline function _lt_accept_2x2(F, k, r, f, u, ε, h::Val)
+# the 2×2 pivot on (k, r) with the column maxima m1 (column k without rows k, r) and m2 (column r
+# without rows r, k) is acceptable (the reference's `_accept_2x2`)
+@inline function _lt_accept_2x2(F, k, r, m1, m2, u, ε, h::Val)
     _lt_nonsingular_2x2(F, k, r, ε, h) || return false
     det = _lt_det2(F, k, r, h)
     e11 = abs(_fget(F, r, r) / det)
     e12 = abs(_fsym(F, k, r, h) / det)
     e21 = abs(_fget(F, r, k) / det)
     e22 = abs(_fget(F, k, k) / det)
-    m1 = _lt_colmax(F, k, k, f, r)
-    m2 = _lt_colmax(F, r, k, f, k)
     return u * (e11 * m1 + e21 * m2) <= 1 && u * (e12 * m1 + e22 * m2) <= 1
 end
 
-@inline function _lt_best_1x1(F, k, w, f, u, ε)
-    best = 0
-    bv = zero(real(eltype(F.a)))
-    for j in k:w
-        _lt_accept_1x1(F, j, k, f, u, ε) || continue
-        a = _fabs(F, j, j)
-        if best == 0 || a > bv
-            best = j
-            bv = a
+# fold arg-max slot b into slot a (first maximum, index 0 = none)
+@inline function _lt_argmax!(red, redi, a, b)
+    @inbounds begin
+        ib = redi[b]
+        if ib != 0
+            ia = redi[a]
+            if ia == 0 || red[b] > red[a] || (red[b] == red[a] && ib < ia)
+                red[a] = red[b]
+                redi[a] = ib
+            end
         end
     end
-    return best
+    return nothing
 end
 
-# `(c, 0)`: 1×1 pivot at column c; `(k, r)`: 2×2 pivot on columns k and r (as `_choose_pivot`)
-@inline function _lt_choose(F, k, w, f, p::_LDLTDevice{R}, ε, h::Val) where {R}
-    p.ptype == _LT_PIVOT_NONE && return (k, 0)
-    u = p.u
-    if p.ptype == _LT_PIVOT_DIAGONAL
-        _lt_accept_1x1(F, k, k, f, u, ε) && return (k, 0)
-        best = _lt_best_1x1(F, k, w, f, u, ε)
-        best != 0 && return (best, 0)
-        big = k
-        for j in (k + 1):w
-            _fabs(F, j, j) > _fabs(F, big, big) && (big = j)
-        end
-        return (_fabs(F, big, big) >= ε ? big : k, 0)
+# fold lane b into lane a for the partial results of pass `P`
+@inline function _lt_combine!(red, redi, a, b, ::Val{NL}, ::Val{P}) where {NL, P}
+    @inbounds if P == 1
+        _lt_argmax!(red, redi, a, b)
+        red[NL + a] = max(red[NL + a], red[NL + b])
+    elseif P == 2
+        red[a] = max(red[a], red[b])
+        red[NL + a] = max(red[NL + a], red[NL + b])
+        red[2 * NL + a] = max(red[2 * NL + a], red[2 * NL + b])
+    else
+        _lt_argmax!(red, redi, a, b)
+        _lt_argmax!(red, redi, NL + a, NL + b)
     end
-    α = R(BUNCH_KAUFMAN_ALPHA)
-    λ = zero(R)
-    r = 0
-    for i in (k + 1):w
-        a = _fabs(F, i, k)
-        if a > λ
-            λ = a
-            r = i
+    return nothing
+end
+
+# stage 1: lanes 1:_LT_S1 fold lanes _LT_S1+1:NL (nothing when NL ≤ _LT_S1)
+@inline function _lt_stage1!(red, redi, li, nl::Val{NL}, pass::Val) where {NL}
+    if NL > _LT_S1 && li <= _LT_S1
+        for b in (li + _LT_S1):_LT_S1:NL
+            _lt_combine!(red, redi, li, b, nl, pass)
         end
     end
-    akk = _fabs(F, k, k)
-    c, r2 = k, 0
-    if !(r == 0 || akk >= α * λ)
-        σ = zero(R)                                  # largest off-diagonal of column r in the block
-        for i in k:w
-            i != r && (σ = max(σ, _fabs(F, i, r)))
+    return nothing
+end
+
+# work item 1: fold lanes 2:min(NL, _LT_S1) into lane 1
+@inline function _lt_final!(red, redi, nl::Val{NL}, pass::Val) where {NL}
+    for b in 2:min(NL, _LT_S1)
+        _lt_combine!(red, redi, 1, b, nl, pass)
+    end
+    return nothing
+end
+
+# pass 1 partials of the next column k = K + STEP (before the step that advances to it)
+@inline function _lt_pass1!(fa, ctl, red, redi, li, ::Val{NL}, p::_LDLTDevice{R}, pk::Val) where {NL, R}
+    @inbounds if li <= NL
+        k = Int(ctl[_LT_K]) + Int(ctl[_LT_STEP])
+        w = Int(ctl[_ST_W])
+        λ = zero(R)
+        r = 0
+        cm = zero(R)
+        if k <= w && p.ptype != _LT_PIVOT_NONE
+            F = _lt_front(fa, ctl, pk)
+            for i in (k + li):NL:Int(ctl[_ST_F])
+                a = _fabs(F, i, k)
+                cm = max(cm, a)
+                if i <= w && a > λ
+                    λ = a
+                    r = i
+                end
+            end
         end
+        red[li] = λ
+        redi[li] = r % eltype(redi)
+        red[NL + li] = cm
+    end
+    return nothing
+end
+
+# pass 2 partials (column r of the Bunch–Kaufman candidate, column k without row r)
+@inline function _lt_pass2!(fa, ctl, red, redi, li, ::Val{NL}, ::_LDLTDevice{R}, pk::Val) where {NL, R}
+    @inbounds if li <= NL
+        k = Int(ctl[_LT_K])
+        r = Int(ctl[_LT_RBK])
+        w = Int(ctl[_ST_W])
+        σ = zero(R)
+        mr = zero(R)
+        mk = zero(R)
+        F = _lt_front(fa, ctl, pk)
+        for i in (k + li - 1):NL:Int(ctl[_ST_F])
+            if i != r
+                a = _fabs(F, i, r)
+                i <= w && (σ = max(σ, a))
+                i != k && (mr = max(mr, a))
+                i != k && (mk = max(mk, _fabs(F, i, k)))
+            end
+        end
+        red[li] = σ
+        red[NL + li] = mr
+        red[2 * NL + li] = mk
+    end
+    return nothing
+end
+
+# pass 3 partials: one lane per candidate column j of the block k:w
+@inline function _lt_pass3!(fa, ctl, red, redi, li, ::Val{NL}, aux, p::_LDLTDevice{R}, pk::Val) where {NL, R}
+    @inbounds if li <= NL
+        k = Int(ctl[_LT_K])
+        w = Int(ctl[_ST_W])
+        f = Int(ctl[_ST_F])
+        ε = _lt_eps(p, aux)
+        u = p.u
+        F = _lt_front(fa, ctl, pk)
+        bv = zero(R)
+        bi = 0
+        gv = zero(R)
+        gi = 0
+        for j in (k + li - 1):NL:w
+            a = _fabs(F, j, j)
+            if p.ptype == _LT_PIVOT_DIAGONAL && !isnan(a) && (gi == 0 || a > gv)
+                gv = a
+                gi = j
+            end
+            a >= ε || continue                           # not acceptable (or NaN)
+            bi != 0 && !(a > bv) && continue             # cannot replace this lane's best
+            _lt_threshold_ok(F, j, k, f, u, a) || continue
+            bv = a
+            bi = j
+        end
+        IT = eltype(redi)
+        red[li] = bv
+        redi[li] = bi % IT
+        red[NL + li] = gv
+        redi[NL + li] = gi % IT
+    end
+    return nothing
+end
+
+# work item 1: take the pivot (c, r) at column k (`r = 0`: 1×1 at column c; else 2×2 on k and r) from the
+# values before the interchange: D (perturbing a tiny 1×1 pivot), the pivot kinds, the statistics, `pv`
+# (the pivot, its inverse block and the new diagonal entries that `_lt_swap!` writes) and the step size
+@inline function _lt_select!(fa, ctl, pv, d, pivot_kind, piv, psign, perm, aux, p::_LDLTDevice, c, r, pk::Val,
+                             h::Val{H}) where {H}
+    @inbounds begin
+        n = length(perm)
+        IT = eltype(ctl)
+        T = eltype(fa)
+        k = Int(ctl[_LT_K])
+        c0 = Int(ctl[_LT_C0])
+        g = c0 + k - 1
+        F = _lt_front(fa, ctl, pk)
+        ctl[_LT_C] = c % IT
+        ctl[_LT_R] = r % IT
+        ctl[_LT_PHASE] = zero(IT)
+        if r == 0
+            ε = _lt_eps(p, aux)
+            x = _fget(F, c, c)
+            dk = H ? T(real(x)) : x
+            kind = PIVOT_KIND_1X1
+            if !(abs(dk) >= ε)                        # tiny (or NaN): perturb
+                iszero(dk) && (ctl[_LT_STAT + STAT_NZERO] += one(IT))
+                dk = _perturbation_sign(dk, Int(psign[perm[piv[c0 + c - 1]]]), H) * ε
+                kind = PIVOT_KIND_PERTURBED
+                ctl[_LT_STAT + STAT_NPERTURBED] += one(IT)
+            end
+            d[g] = dk
+            d[n + g] = zero(T)
+            pivot_kind[g] = kind
+            if H
+                if real(dk) > 0
+                    ctl[_LT_STAT + STAT_NPOS] += one(IT)
+                elseif real(dk) < 0
+                    ctl[_LT_STAT + STAT_NNEG] += one(IT)
+                end
+            end
+            pv[1] = dk
+            pv[5] = dk
+            ctl[_LT_STEP] = one(IT)
+        else
+            # after the interchange of k + 1 and r: F[k + 1, k] = F[r, k], F[k + 1, k + 1] = F[r, r]
+            a = _fget(F, k, k)
+            b = _fget(F, r, k)
+            c2 = _fget(F, r, r)
+            if H
+                a = T(real(a))
+                c2 = T(real(c2))
+            end
+            up = _cj(b, h)
+            det = a * c2 - up * b
+            pv[1] = c2 / det
+            pv[2] = -up / det
+            pv[3] = -b / det
+            pv[4] = a / det
+            pv[5] = a
+            pv[6] = c2
+            d[g] = a
+            d[g + 1] = c2
+            d[n + g] = b
+            d[n + g + 1] = zero(T)
+            pivot_kind[g] = PIVOT_KIND_2X2_FIRST
+            pivot_kind[g + 1] = PIVOT_KIND_2X2_SECOND
+            ctl[_LT_STAT + STAT_N2X2] += one(IT)
+            if H
+                if real(det) < 0
+                    ctl[_LT_STAT + STAT_NPOS] += one(IT)
+                    ctl[_LT_STAT + STAT_NNEG] += one(IT)
+                elseif real(a) > 0
+                    ctl[_LT_STAT + STAT_NPOS] += IT(2)
+                else
+                    ctl[_LT_STAT + STAT_NNEG] += IT(2)
+                end
+            end
+            ctl[_LT_STEP] = IT(2)
+        end
+    end
+    return nothing
+end
+
+# work item 1 after pass 1: advance to column k, then take the pivot at k when the search ends here,
+# else request pass 2 or the fallback scan
+@inline function _lt_decide1!(fa, ctl, pv, red, redi, d, pivot_kind, piv, psign, perm, aux,
+                              p::_LDLTDevice{R}, nl::Val{NL}, pk::Val, h::Val) where {R, NL}
+    @inbounds begin
+        IT = eltype(ctl)
+        k = Int(ctl[_LT_K]) + Int(ctl[_LT_STEP])
+        ctl[_LT_K] = k % IT
+        ctl[_LT_STEP] = zero(IT)
+        ctl[_LT_PHASE] = zero(IT)
+        k <= Int(ctl[_ST_W]) || return nothing
+        if p.ptype == _LT_PIVOT_NONE
+            _lt_select!(fa, ctl, pv, d, pivot_kind, piv, psign, perm, aux, p, k, 0, pk, h)
+            return nothing
+        end
+        _lt_final!(red, redi, nl, Val(1))
+        λ = red[1]
+        r = Int(redi[1])
+        cm = red[NL + 1]
+        pv[7] = λ
+        pv[8] = cm
+        ctl[_LT_RBK] = r % IT
+        ctl[_LT_C] = k % IT                              # the Bunch–Kaufman choice so far: 1×1 at k
+        ctl[_LT_R] = zero(IT)
+        F = _lt_front(fa, ctl, pk)
+        ε = _lt_eps(p, aux)
+        akk = _fabs(F, k, k)
+        if p.ptype == _LT_PIVOT_BK && !(r == 0 || akk >= R(BUNCH_KAUFMAN_ALPHA) * λ)
+            ctl[_LT_PHASE] = IT(2)
+        elseif akk >= ε && akk >= p.u * cm
+            _lt_select!(fa, ctl, pv, d, pivot_kind, piv, psign, perm, aux, p, k, 0, pk, h)
+        else
+            ctl[_LT_PHASE] = IT(3)
+        end
+    end
+    return nothing
+end
+
+# work item 1 after pass 2: the rest of the Bunch–Kaufman choice and its threshold test
+@inline function _lt_decide2!(fa, ctl, pv, red, redi, d, pivot_kind, piv, psign, perm, aux,
+                              p::_LDLTDevice{R}, nl::Val{NL}, pk::Val, h::Val) where {R, NL}
+    @inbounds begin
+        IT = eltype(ctl)
+        _lt_final!(red, redi, nl, Val(2))
+        σ = red[1]
+        mr = red[NL + 1]
+        mk = red[2 * NL + 1]
+        λ = real(pv[7])
+        cm = real(pv[8])
+        k = Int(ctl[_LT_K])
+        r = Int(ctl[_LT_RBK])
+        F = _lt_front(fa, ctl, pk)
+        ε = _lt_eps(p, aux)
+        u = p.u
+        α = R(BUNCH_KAUFMAN_ALPHA)
+        akk = _fabs(F, k, k)
+        c, r2 = k, 0
         if akk * σ >= α * λ^2
-            # 1×1 at k
-        elseif _fabs(F, r, r) >= α * σ
+            ok = akk >= ε && akk >= u * cm
+        elseif (arr = _fabs(F, r, r); arr >= α * σ)
             c = r
+            ok = arr >= ε && arr >= u * max(mr, _fabs(F, k, r))
         else
             r2 = r
+            ok = _lt_accept_2x2(F, k, r, mk, mr, u, ε, h)
+        end
+        if ok
+            _lt_select!(fa, ctl, pv, d, pivot_kind, piv, psign, perm, aux, p, c, r2, pk, h)
+        else
+            ctl[_LT_C] = c % IT
+            ctl[_LT_R] = r2 % IT
+            ctl[_LT_PHASE] = IT(3)
         end
     end
-    (r2 == 0 ? _lt_accept_1x1(F, c, k, f, u, ε) : _lt_accept_2x2(F, k, r2, f, u, ε, h)) && return (c, r2)
-    best = _lt_best_1x1(F, k, w, f, u, ε)
-    best != 0 && return (best, 0)
-    r2 != 0 && _lt_nonsingular_2x2(F, k, r2, ε, h) && return (c, r2)
-    return (c, 0)
+    return nothing
+end
+
+# work item 1 after pass 3: the acceptable 1×1 pivot with the largest |a_jj|, else the Bunch–Kaufman
+# choice when it is not tiny (or, for 'D', the largest diagonal), else column k perturbed
+@inline function _lt_decide3!(fa, ctl, pv, red, redi, d, pivot_kind, piv, psign, perm, aux,
+                              p::_LDLTDevice, nl::Val{NL}, pk::Val, h::Val) where {NL}
+    @inbounds begin
+        _lt_final!(red, redi, nl, Val(3))
+        k = Int(ctl[_LT_K])
+        best = Int(redi[1])
+        c, r = best, 0
+        if best == 0
+            F = _lt_front(fa, ctl, pk)
+            ε = _lt_eps(p, aux)
+            if p.ptype == _LT_PIVOT_DIAGONAL
+                big = isnan(_fabs(F, k, k)) ? k : Int(redi[NL + 1])
+                c = _fabs(F, big, big) >= ε ? big : k
+            else
+                c, r = Int(ctl[_LT_C]), Int(ctl[_LT_R])
+                if r != 0 && !_lt_nonsingular_2x2(F, k, r, ε, h)
+                    r = 0
+                end
+            end
+        end
+        _lt_select!(fa, ctl, pv, d, pivot_kind, piv, psign, perm, aux, p, c, r, pk, h)
+    end
+    return nothing
 end
 
 # ---------------------------------------------------------------------------
@@ -218,6 +499,8 @@ end
         ctl[_LT_STEP] = zero(IT)
         ctl[_LT_C] = zero(IT)
         ctl[_LT_R] = zero(IT)
+        ctl[_LT_PHASE] = zero(IT)
+        ctl[_LT_RBK] = zero(IT)
         for q in 1:5
             ctl[_LT_STAT + q] = zero(IT)
         end
@@ -236,35 +519,18 @@ end
     return nothing
 end
 
-# work item 1: advance to the next column and choose its pivot
-@inline function _lt_choose!(fa, ctl, aux, p::_LDLTDevice, pk::Val, h::Val)
-    @inbounds begin
-        IT = eltype(ctl)
-        k = Int(ctl[_LT_K]) + Int(ctl[_LT_STEP])
-        ctl[_LT_K] = k % IT
-        ctl[_LT_STEP] = zero(IT)
-        w = Int(ctl[_ST_W])
-        if k <= w
-            F = _lt_front(fa, ctl, pk)
-            c, r = _lt_choose(F, k, w, Int(ctl[_ST_F]), p, _lt_eps(p, aux), h)
-            ctl[_LT_C] = c % IT
-            ctl[_LT_R] = r % IT
-        end
-    end
-    return nothing
-end
-
-# symmetric interchange of the columns/rows p < q of the front (lower triangle), as `_swap_front!`
-@inline function _lt_swap!(fa, ctl, piv, li, ::Val{WG}, pk::Val, h::Val) where {WG}
+# symmetric interchange of the columns/rows p < q of the front (lower triangle), as `_swap_front!`, then
+# the new diagonal entries of the pivot block from `pv` (and the zero below a 2×2 block's diagonal)
+@inline function _lt_swap!(fa, ctl, pv, piv, li, ::Val{WG}, pk::Val, h::Val) where {WG}
     @inbounds begin
         k = Int(ctl[_LT_K])
         if k <= Int(ctl[_ST_W])
             r = Int(ctl[_LT_R])
             p = r == 0 ? k : k + 1
             q = r == 0 ? Int(ctl[_LT_C]) : r
-            if p != q
-                F = _lt_front(fa, ctl, pk)
-                for i in li:WG:Int(ctl[_ST_F])
+            F = _lt_front(fa, ctl, pk)
+            for i in li:WG:Int(ctl[_ST_F])
+                if p != q
                     if i < p
                         x = _fget(F, p, i)
                         _fset!(F, p, i, _fget(F, q, i))
@@ -285,89 +551,18 @@ end
                         _fset!(F, i, q, x)
                     end
                 end
-                if li == 1
-                    c0 = Int(ctl[_LT_C0])
-                    x = piv[c0 + p - 1]
-                    piv[c0 + p - 1] = piv[c0 + q - 1]
-                    piv[c0 + q - 1] = x
+                if i == k
+                    _fset!(F, k, k, pv[5])
+                    r == 0 || _fset!(F, k + 1, k, zero(eltype(fa)))   # the 2×2 block lives in D, L's is I
+                elseif r != 0 && i == k + 1
+                    _fset!(F, k + 1, k + 1, pv[6])
                 end
             end
-        end
-    end
-    return nothing
-end
-
-# work item 1: store the pivot block in D (perturbing a tiny 1×1 pivot), the pivot kinds and the
-# statistics; `pv` receives d (1×1) or the entries (e11, e12, e21, e22) of the inverse 2×2 block
-@inline function _lt_pivot!(fa, ctl, pv, d, pivot_kind, piv, psign, perm, aux, p::_LDLTDevice, pk::Val,
-                            h::Val{H}) where {H}
-    @inbounds begin
-        n = length(perm)
-        IT = eltype(ctl)
-        T = eltype(fa)
-        k = Int(ctl[_LT_K])
-        if k <= Int(ctl[_ST_W])
-            F = _lt_front(fa, ctl, pk)
-            g = Int(ctl[_LT_C0]) + k - 1
-            if ctl[_LT_R] == 0
-                ε = _lt_eps(p, aux)
-                x = _fget(F, k, k)
-                dk = H ? T(real(x)) : x
-                kind = PIVOT_KIND_1X1
-                if !(abs(dk) >= ε)                        # tiny (or NaN): perturb
-                    iszero(dk) && (ctl[_LT_STAT + STAT_NZERO] += one(IT))
-                    dk = _perturbation_sign(dk, Int(psign[perm[piv[g]]]), H) * ε
-                    kind = PIVOT_KIND_PERTURBED
-                    ctl[_LT_STAT + STAT_NPERTURBED] += one(IT)
-                end
-                _fset!(F, k, k, dk)
-                d[g] = dk
-                d[n + g] = zero(T)
-                pivot_kind[g] = kind
-                if H
-                    if real(dk) > 0
-                        ctl[_LT_STAT + STAT_NPOS] += one(IT)
-                    elseif real(dk) < 0
-                        ctl[_LT_STAT + STAT_NNEG] += one(IT)
-                    end
-                end
-                pv[1] = dk
-                ctl[_LT_STEP] = one(IT)
-            else
-                a = _fget(F, k, k)
-                b = _fget(F, k + 1, k)
-                c2 = _fget(F, k + 1, k + 1)
-                if H
-                    a = T(real(a))
-                    c2 = T(real(c2))
-                end
-                up = _cj(b, h)
-                _fset!(F, k, k, a)
-                _fset!(F, k + 1, k + 1, c2)
-                _fset!(F, k + 1, k, zero(T))              # the 2×2 block lives in D, L's block is the identity
-                det = a * c2 - up * b
-                pv[1] = c2 / det
-                pv[2] = -up / det
-                pv[3] = -b / det
-                pv[4] = a / det
-                d[g] = a
-                d[g + 1] = c2
-                d[n + g] = b
-                d[n + g + 1] = zero(T)
-                pivot_kind[g] = PIVOT_KIND_2X2_FIRST
-                pivot_kind[g + 1] = PIVOT_KIND_2X2_SECOND
-                ctl[_LT_STAT + STAT_N2X2] += one(IT)
-                if H
-                    if real(det) < 0
-                        ctl[_LT_STAT + STAT_NPOS] += one(IT)
-                        ctl[_LT_STAT + STAT_NNEG] += one(IT)
-                    elseif real(a) > 0
-                        ctl[_LT_STAT + STAT_NPOS] += IT(2)
-                    else
-                        ctl[_LT_STAT + STAT_NNEG] += IT(2)
-                    end
-                end
-                ctl[_LT_STEP] = IT(2)
+            if li == 1 && p != q
+                c0 = Int(ctl[_LT_C0])
+                x = piv[c0 + p - 1]
+                piv[c0 + p - 1] = piv[c0 + q - 1]
+                piv[c0 + q - 1] = x
             end
         end
     end
@@ -536,7 +731,9 @@ statistics, updates its packed contribution block on the update stack
     li = @index(Local, Linear)
     G = @index(Group, Linear)
     ctl = @localmem IT (_LT_CTL,)
-    pv = @localmem TT (4,)
+    pv = @localmem TT (_LT_NPV,)
+    red = @localmem R (3 * WG,)
+    redi = @localmem IT (2 * WG,)
     if li == 1
         @inbounds s = nodes[bm.first + _bm_node(bm, G) - 1]
         _lt_front_setup!(ctl, s, super_ptr, member_panels(front_ptr, _bm_gmember(bm, G), bm.nbatch), front_nrows,
@@ -562,23 +759,57 @@ statistics, updates its packed contribution block on the update stack
                            front_nrows, front_ncols, cb_ptr, child_ptr, child_list, relind_ptr, relind, Val(WG))
         @synchronize
     end
+    _lt_pass1!(factor, ctl, red, redi, li, Val(WG), prm, Val(false))
+    @synchronize
     for it in 1:ctl[_ST_W]
-        if li == 1
-            _lt_choose!(factor, ctl, _mview(aux, _bm_gmember(bm, G), bm.nbatch), prm, Val(false), Val(HERM))
+        if WG > _LT_S1
+            _lt_stage1!(red, redi, li, Val(WG), Val(1))
+            @synchronize
         end
-        @synchronize
-        _lt_swap!(factor, ctl, _mview(piv, _bm_gmember(bm, G), bm.nbatch), li, Val(WG), Val(false), Val(HERM))
-        @synchronize
         if li == 1
             k = _bm_gmember(bm, G)
             nb = bm.nbatch
-            _lt_pivot!(factor, ctl, pv, _mview(d, k, nb), _mview(pivot_kind, k, nb), _mview(piv, k, nb), psign, perm,
-                       _mview(aux, k, nb), prm, Val(false), Val(HERM))
+            _lt_decide1!(factor, ctl, pv, red, redi, _mview(d, k, nb), _mview(pivot_kind, k, nb), _mview(piv, k, nb),
+                         psign, perm, _mview(aux, k, nb), prm, Val(WG), Val(false), Val(HERM))
         end
+        @synchronize
+        if ctl[_LT_PHASE] == 2
+            _lt_pass2!(factor, ctl, red, redi, li, Val(WG), prm, Val(false))
+            @synchronize
+            if WG > _LT_S1
+                _lt_stage1!(red, redi, li, Val(WG), Val(2))
+                @synchronize
+            end
+            if li == 1
+                k = _bm_gmember(bm, G)
+                nb = bm.nbatch
+                _lt_decide2!(factor, ctl, pv, red, redi, _mview(d, k, nb), _mview(pivot_kind, k, nb),
+                             _mview(piv, k, nb), psign, perm, _mview(aux, k, nb), prm, Val(WG), Val(false), Val(HERM))
+            end
+            @synchronize
+        end
+        if ctl[_LT_PHASE] == 3
+            _lt_pass3!(factor, ctl, red, redi, li, Val(WG), _mview(aux, _bm_gmember(bm, G), bm.nbatch), prm,
+                       Val(false))
+            @synchronize
+            if WG > _LT_S1
+                _lt_stage1!(red, redi, li, Val(WG), Val(3))
+                @synchronize
+            end
+            if li == 1
+                k = _bm_gmember(bm, G)
+                nb = bm.nbatch
+                _lt_decide3!(factor, ctl, pv, red, redi, _mview(d, k, nb), _mview(pivot_kind, k, nb),
+                             _mview(piv, k, nb), psign, perm, _mview(aux, k, nb), prm, Val(WG), Val(false), Val(HERM))
+            end
+            @synchronize
+        end
+        _lt_swap!(factor, ctl, pv, _mview(piv, _bm_gmember(bm, G), bm.nbatch), li, Val(WG), Val(false), Val(HERM))
         @synchronize
         _lt_update!(factor, ctl, pv, li, Val(WG), Val(false), Val(HERM))
         @synchronize
         _lt_scale!(factor, ctl, pv, li, Val(WG), Val(false))
+        _lt_pass1!(factor, ctl, red, redi, li, Val(WG), prm, Val(false))
         @synchronize
     end
     @inbounds s = nodes[bm.first + _bm_node(bm, G) - 1]
@@ -652,7 +883,9 @@ stack.
     G = @index(Group, Linear)
     buf = @localmem TT (NE,)
     ctl = @localmem IT (_LT_CTL,)
-    pv = @localmem TT (4,)
+    pv = @localmem TT (_LT_NPV,)
+    red = @localmem R (3 * _LT_S1,)
+    redi = @localmem IT (2 * _LT_S1,)
     if li == 1
         @inbounds t = trees[bm.first + _bm_node(bm, G) - 1]
         @inbounds ctl[_ST_FIRST] = subtree_ptr[t]
@@ -676,23 +909,48 @@ stack.
                                  relind, li, Val(WG))
             @synchronize
         end
+        _lt_pass1!(buf, ctl, red, redi, li, Val(_LT_S1), prm, Val(true))
+        @synchronize
         for it in 1:ctl[_ST_W]
-            if li == 1
-                _lt_choose!(buf, ctl, _mview(aux, _bm_gmember(bm, G), bm.nbatch), prm, Val(true), Val(HERM))
-            end
-            @synchronize
-            _lt_swap!(buf, ctl, _mview(piv, _bm_gmember(bm, G), bm.nbatch), li, Val(WG), Val(true), Val(HERM))
-            @synchronize
             if li == 1
                 mb = _bm_gmember(bm, G)
                 nb = bm.nbatch
-                _lt_pivot!(buf, ctl, pv, _mview(d, mb, nb), _mview(pivot_kind, mb, nb), _mview(piv, mb, nb), psign,
-                           perm, _mview(aux, mb, nb), prm, Val(true), Val(HERM))
+                _lt_decide1!(buf, ctl, pv, red, redi, _mview(d, mb, nb), _mview(pivot_kind, mb, nb),
+                             _mview(piv, mb, nb), psign, perm, _mview(aux, mb, nb), prm, Val(_LT_S1), Val(true),
+                             Val(HERM))
             end
+            @synchronize
+            if ctl[_LT_PHASE] == 2
+                _lt_pass2!(buf, ctl, red, redi, li, Val(_LT_S1), prm, Val(true))
+                @synchronize
+                if li == 1
+                    mb = _bm_gmember(bm, G)
+                    nb = bm.nbatch
+                    _lt_decide2!(buf, ctl, pv, red, redi, _mview(d, mb, nb), _mview(pivot_kind, mb, nb),
+                                 _mview(piv, mb, nb), psign, perm, _mview(aux, mb, nb), prm, Val(_LT_S1), Val(true),
+                                 Val(HERM))
+                end
+                @synchronize
+            end
+            if ctl[_LT_PHASE] == 3
+                _lt_pass3!(buf, ctl, red, redi, li, Val(_LT_S1), _mview(aux, _bm_gmember(bm, G), bm.nbatch), prm,
+                           Val(true))
+                @synchronize
+                if li == 1
+                    mb = _bm_gmember(bm, G)
+                    nb = bm.nbatch
+                    _lt_decide3!(buf, ctl, pv, red, redi, _mview(d, mb, nb), _mview(pivot_kind, mb, nb),
+                                 _mview(piv, mb, nb), psign, perm, _mview(aux, mb, nb), prm, Val(_LT_S1), Val(true),
+                                 Val(HERM))
+                end
+                @synchronize
+            end
+            _lt_swap!(buf, ctl, pv, _mview(piv, _bm_gmember(bm, G), bm.nbatch), li, Val(WG), Val(true), Val(HERM))
             @synchronize
             _lt_update!(buf, ctl, pv, li, Val(WG), Val(true), Val(HERM))
             @synchronize
             _lt_scale!(buf, ctl, pv, li, Val(WG), Val(true))
+            _lt_pass1!(buf, ctl, red, redi, li, Val(_LT_S1), prm, Val(true))
             @synchronize
         end
         mb = _bm_gmember(bm, G)
@@ -844,7 +1102,7 @@ function _launch_subtrees_ldlt!(N::Numeric{T}, S::Symbolic, nzval, first, count,
     kernel!(N.factor, N.stack, N.info, N.stats, N.d, N.piv, N.pivot_kind, N.psign, S.perm, N.aux, nzval, S.amap,
             S.amap_ptr, S.amap_src, S.group_nodes, bm, S.subtree_ptr, S.subtree_nodes, S.super_ptr,
             S.front_ptr, S.front_nrows, S.front_ncols, S.cb_ptr, S.local_front, S.local_cb, S.child_ptr, S.child_list,
-            S.relind_ptr, S.relind, prm, Val((LB - SUBTREE_LOCAL_RESERVE) ÷ sizeof(T)), Val(WG);
+            S.relind_ptr, S.relind, prm, Val((LB - SUBTREE_LOCAL_RESERVE_LDLT) ÷ sizeof(T)), Val(WG);
             ndrange = WG * count * bm.nact)
     return nothing
 end

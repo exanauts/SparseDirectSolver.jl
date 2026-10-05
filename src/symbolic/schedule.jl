@@ -40,6 +40,23 @@ const SUBTREE_LOCAL_SIZES = (8192, 16384, 32768, 49152)
 const SUBTREE_LOCAL_RESERVE = 256
 
 """
+Bytes of the regime-A LDLᵀ/LDLᴴ kernel's local memory kept for its control words, pivot block and the
+reduction slots of the cooperative pivot search (structures `"S"`/`"H"`; at most 944 bytes for
+`ComplexF64` with `Int64` maps).
+"""
+const SUBTREE_LOCAL_RESERVE_LDLT = 1024
+
+"""
+    subtree_local_reserve(structure) -> Int
+
+[`SUBTREE_LOCAL_RESERVE_LDLT`](@ref) for the LDLᵀ/LDLᴴ structures `"S"`/`"H"`, else
+[`SUBTREE_LOCAL_RESERVE`](@ref).
+"""
+subtree_local_reserve(structure) =
+    _structure(structure) in (STRUCTURE_SYMMETRIC, STRUCTURE_HERMITIAN) ? SUBTREE_LOCAL_RESERVE_LDLT :
+    SUBTREE_LOCAL_RESERVE
+
+"""
     subtree_local_bytes(budget) -> Int
 
 `@localmem` bytes of the regime-A kernel of a budget class: the largest of
@@ -50,14 +67,15 @@ instances serves every budget.
 subtree_local_bytes(budget::Integer) = foldl((acc, b) -> b <= budget ? b : acc, SUBTREE_LOCAL_SIZES; init = 0)
 
 """
-    subtree_capacity(budget, elsize) -> Int
+    subtree_capacity(budget, elsize, reserve = SUBTREE_LOCAL_RESERVE) -> Int
 
 Entries of `elsize` bytes a regime-A subtree may keep in local memory under
-`budget`: [`subtree_local_bytes`](@ref) minus `SUBTREE_LOCAL_RESERVE`, divided
-by `elsize` (`0` when the budget is too small).
+`budget`: [`subtree_local_bytes`](@ref) minus `reserve` (the kernel's other local
+memory, [`subtree_local_reserve`](@ref)), divided by `elsize` (`0` when the
+budget is too small).
 """
-subtree_capacity(budget::Integer, elsize::Integer) =
-    max(subtree_local_bytes(budget) - SUBTREE_LOCAL_RESERVE, 0) ÷ Int(elsize)
+subtree_capacity(budget::Integer, elsize::Integer, reserve::Integer = SUBTREE_LOCAL_RESERVE) =
+    max(subtree_local_bytes(budget) - Int(reserve), 0) ÷ Int(elsize)
 
 """
     packed_length(m) -> Int
@@ -244,7 +262,8 @@ function front_flops(f::Integer, w::Integer)
 end
 
 """
-    build_schedule(sp::SupernodePartition, opts::Options = Options(), ::Type{T} = Float64) -> Schedule
+    build_schedule(sp::SupernodePartition, opts::Options = Options(), ::Type{T} = Float64;
+                   reserve = SUBTREE_LOCAL_RESERVE) -> Schedule
 
 Regime assignment, binning, levels and launch groups (PLAN §2.3 step 5) for
 the supernodes of `sp`, with byte budgets for the element type `T`:
@@ -255,7 +274,8 @@ the supernodes of `sp`, with byte budgets for the element type `T`:
    and its subtree's serial stack peak (packed lower-triangular `f×f` fronts
    plus the packed `m×m` contribution blocks waiting for their parent,
    `m = f - w`) fits the [`subtree_capacity`](@ref) of the largest of
-   `opts.subtree_budgets`, and its subtree's flops ([`front_flops`](@ref))
+   `opts.subtree_budgets` (local memory minus `reserve` bytes,
+   [`subtree_local_reserve`](@ref) of the structure), and its subtree's flops ([`front_flops`](@ref))
    are at most `total ÷ opts.subtree_parallelism` (`0`: no flop limit), so
    that a large tree of small fronts is split into enough subtrees to fill
    the device instead of running on one workgroup; the maximal
@@ -269,12 +289,13 @@ the supernodes of `sp`, with byte budgets for the element type `T`:
    (packed) contribution-block bytes stay `≤ opts.memory_budget` (a single front larger
    than the budget gets its own chunk; a negative budget means no chunking).
 """
-function build_schedule(sp::SupernodePartition, opts::Options = Options(), ::Type{T} = Float64) where {T}
+function build_schedule(sp::SupernodePartition, opts::Options = Options(), ::Type{T} = Float64;
+                        reserve::Integer = SUBTREE_LOCAL_RESERVE) where {T}
     ns = nsupernodes(sp)
     elsize = sizeof(T)
     cw, cr = opts.regime_c_width, opts.regime_c_rows
     budgets = sort(opts.subtree_budgets)
-    capacity = [subtree_capacity(b, elsize) for b in budgets]
+    capacity = [subtree_capacity(b, elsize, reserve) for b in budgets]
     maxcap = isempty(budgets) ? 0 : maximum(capacity)
     alg = opts.factorization_alg
     width = [snwidth(sp, s) for s in 1:ns]

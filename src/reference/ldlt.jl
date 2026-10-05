@@ -243,10 +243,22 @@ function _colmax(F::AbstractMatrix{T}, c::Int, k::Int, skip::Int = 0) where {T}
     return m
 end
 
+# `d ≥ u maxᵢ |F[i, c]|` over the remaining rows k:f but c, with an early exit: `u ≥ 0` is finite, so
+# `u · max = max(u · |F[i, c]|)`, and a NaN fails both forms (the device kernels test the same way)
+function _threshold_ok(F::AbstractMatrix, c::Int, k::Int, u, d)
+    m = zero(d)
+    for i in k:size(F, 1)
+        i == c && continue
+        m = max(m, abs(F[i, c]))
+        d >= u * m || return false
+    end
+    return d >= u * m
+end
+
 # acceptable 1×1 pivot at column c: not tiny and passing the threshold test
 function _accept_1x1(F, c, k, prm::_LDLTParams)
     d = abs(F[c, c])
-    return d >= prm.eps && d >= prm.u * _colmax(F, c, k)
+    return d >= prm.eps && _threshold_ok(F, c, k, prm.u, d)
 end
 
 # the 2×2 block on columns (k, r) is nonsingular and not tiny
@@ -264,12 +276,17 @@ function _accept_2x2(F, k, r, prm::_LDLTParams)
     return prm.u * (e11 * m1 + e21 * m2) <= 1 && prm.u * (e12 * m1 + e22 * m2) <= 1
 end
 
-# the acceptable 1×1 pivot of the block k:w with the largest |aⱼⱼ| (0 if none)
+# the acceptable 1×1 pivot of the block k:w with the largest |aⱼⱼ| (0 if none; the first on a tie);
+# a column that cannot beat the best so far is not tested
 function _best_1x1(F, k, w, prm::_LDLTParams)
     best = 0
+    bv = zero(real(eltype(F)))
     for j in k:w
-        _accept_1x1(F, j, k, prm) || continue
-        (best == 0 || abs(F[j, j]) > abs(F[best, best])) && (best = j)
+        a = abs(F[j, j])
+        a >= prm.eps || continue
+        best != 0 && !(a > bv) && continue
+        _threshold_ok(F, j, k, prm.u, a) || continue
+        best, bv = j, a
     end
     return best
 end
