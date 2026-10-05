@@ -814,6 +814,10 @@ end
 const _LT_TB = 16
 const _LT_TBUF = 3 * _LT_TB * _LT_TB
 
+# widest regime-B width class that keeps its panel in global memory (staging F₁₁ costs more than it saves on
+# narrow fronts: two more phases per front)
+const _LT_GLOBAL_MAX_W = 16
+
 # smallest contribution block taking the tiled update (smaller ones: `_lt_cb_update!`, one entry per work item)
 const _LT_TILED_M = 64
 
@@ -1393,7 +1397,7 @@ function _factorize_ldlt_groups!(N::Numeric, S::Symbolic, nzval::AbstractVector,
         _poll_interrupt(flag)
         a, b = plan.group_first[k], plan.group_last[k]
         W = plan.group_width[k]
-        if W == 0                                   # regime C: the panel in global memory
+        if W <= _LT_GLOBAL_MAX_W                    # regime C and narrow bins: the panel in global memory
             _launch_front_ldlt!(N, S, nzval, a, b - a + 1, plan.group_maxchild[k], prm, Val(0), Val(LDLT_WORKGROUP))
         else                                        # regime B: F₁₁ in local memory
             _with_width_class(W) do w
