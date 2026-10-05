@@ -2382,12 +2382,90 @@ tasks below are refined.
 
 Each keeps the same structure; the test criteria are the minimum.
 
-### T18 — FGMRES-IR extension (Krylov.jl)   `[ ]`
+### T18 — FGMRES-IR extension (Krylov.jl)   `[!]`
 
 `ext/SparseDirectSolverKrylovExt.jl`: `ir_mode = "fgmres"` runs FGMRES with
 the factorization as right preconditioner; test: on an ill-conditioned
 Float64 system where plain IR stalls (`relres` not improving over 5 steps),
 FGMRES-IR reaches `relres ≤ 1e-12` within 20 iterations on CPU and CUDA.
+
+#### Report
+
+- Status: [!] (done on the KA CPU backend; CUDA from CI; deviations below)
+- What was built:
+  - `ext/SparseDirectSolverKrylovExt.jl` (new, weak dependency `Krylov = "0.10"`): registers
+    `fgmres_correction` in `SparseDirectSolver.FGMRES_PROVIDER` (same provider pattern as the Metis extension),
+    which runs `Krylov.fgmres!` (no restart, `rtol = 0`, `atol`, `itmax`) with the factorization as right
+    preconditioner; the `FgmresWorkspace` and its right-hand side vector are cached in the refinement workspace
+    and reallocated only when the length, the array type or a larger `itmax` require it.
+  - `src/solve/refinement.jl`: `RefinementOperator` (`op(A)` on the stacked compact columns, new KA kernel
+    `_spmv_kernel!` over the existing refinement map, member values per column for uniform batches, conjugated
+    for `conj(M)`), `FactorPreconditioner` (`op(A)⁻¹`: permute, forward/diagonal/backward sweeps, unpermute,
+    conjugating when `op(A) = conj(M)`; polls `user_host_interrupt`), both with `size`/`eltype`/`mul!`;
+    `fgmres_refine!` (residual `R₀ = B − op(A)X₀`, optional early exit on `ir_tol`, FGMRES on `op(A) D = R₀`,
+    `X += D`), `FGMRES_PROVIDER`, `fgmres_available()`. `RefinementWorkspace` gains the field `krylov`.
+  - `src/solver.jl`: `ir_mode = "fgmres"` selects `fgmres_refine!` for `"solve"` and `"solve_refinement"` (the
+    T16 `NotSupportedError` is gone); without `using Krylov` the refinement raises `NotSupportedError` (only
+    when refinement runs, `ir_n_steps > 0`). `getparam(solver, "ir_n_steps")` reports the FGMRES iterations.
+  - `test/test_fgmres.jl` (new); `ir_solver`, `ir_solve`, `SOLVE_SUBPHASES` moved from `test/test_refinement.jl`
+    to `test/utils.jl` (shared by both files); `test/runtests.jl` loads Krylov; Krylov added to
+    `test/Project.toml` and `bench/Project.toml`. `bench/refinement.jl --mode=fgmres`. README feature list.
+- Tests: `SDS_TEST_GPU=0 SDS_TEST_ONLY=test_fgmres`: 148 pass (CPU, 5.6 min, mostly compilation).
+  Full `SDS_TEST_GPU=0 julia --project=. -e 'using Pkg; Pkg.test()'` (CPU): 62532 pass, 1 fail, 1 broken (the
+  T16 `@test_broken`); the failure was the T16 logging test matching the `"solve_refinement: k of n steps"`
+  message I had changed. After restoring that message (FGMRES logs `"… FGMRES iterations"`),
+  `SDS_TEST_ONLY=test_refinement,test_aqua,test_fgmres`: 675 pass, 1 broken. Combined: 62533 pass, 0 fail,
+  1 broken. CUDA/AMDGPU: pending CI on the PR.
+  The criterion test: `kkt_matrix(Float64, 150, 5, 0)` with `pivot_pairs = "none"`, `pivot_epsilon = 1`
+  (5 duals perturbed far above their pivots: the factor is that of `A + E`, rank-5 `E`, `ρ((A+E)⁻¹E) ≈ 1`).
+  Plain IR: relres 7.8e-5 → 7.2e-5, 6.8e-5, …, 5.9e-5 after 5 steps, 1.0e-4 after 20 (asserted: no step of the
+  first 5 gains a digit, 20 steps stay > 1e-8); FGMRES-IR: ≤ 1e-12 with `ir_tol = 1e-12` in ≤ 20 iterations
+  (2.7e-16 after 10 iterations), for `INT ∈ (Int32, Int64)`. Also tested for all four element types: SPD/HPD
+  and `"S"`/`"H"` with 1 and 3 right-hand sides, `ir_tol` early exit, `X === B`, sub-phases composed equal
+  `"solve"` bitwise, `solve_mode` 1/2; a uniform batch (3 members × 2 rhs, `ubatch_index`); the interrupt (X
+  keeps the unrefined solution, 0 iterations reported, next solve works); `NotSupportedError` without the
+  provider.
+- Measurements: relres `‖b − Ax‖/‖b‖` on the MadNLP K2 dumps (regenerated in this session with
+  `bench/dump_madnlp_kkt.jl`, current MadNLP/ExaModelsPower), handle layer `"S"`, default pivoting, no matching,
+  KA CPU backend, `b = A·1`, `ir_tol = 0`, `bench/refinement.jl --steps=0,2,5,10,20 --mode=ir|fgmres`:
+
+  | K2 dump | n | npivots | ir 2 | ir 5 | ir 10 | ir 20 | fgmres 2 | fgmres 5 | fgmres 10 | fgmres 20 |
+  | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+  | case118 k2_1 (relres₀ 0.031) | 3150 | 5 | 4.2e-10 | 7.5e-16 | 7.6e-16 | 9.9e-16 | 4.7e-11 | 1.3e-15 | 1.3e-15 | 1.3e-15 |
+  | case118 k2_10 (4.8e-5) | 3150 | 3 | 1.5e-11 | 3.3e-17 | 3.4e-17 | 3.1e-17 | 2.3e-12 | 2.9e-16 | 2.9e-16 | 2.9e-16 |
+  | case118 k2_20 (6.8e-7) | 3150 | 3 | 3.6e-14 | 8.8e-19 | 3.8e-18 | 3.8e-18 | 3.4e-14 | 8.9e-18 | 8.9e-18 | 8.9e-18 |
+  | case1354 k2_1 (0.12) | 33811 | 34 | 7.1e-4 | 5.1e-7 | 1.4e-12 | 8.1e-16 | 4.3e-4 | 9.0e-10 | 4.1e-15 | 4.0e-15 |
+  | case1354 k2_10 (0.038) | 33811 | 46 | 5.0e-3 | 4.2e-4 | 5.3e-6 | 9.2e-10 | 1.5e-3 | 5.1e-7 | 2.6e-12 | 1.6e-15 |
+  | case1354 k2_20 (4.9e-3) | 33811 | 32 | 1.3e-4 | 8.3e-7 | 2.8e-10 | 1.4e-15 | 7.3e-5 | 2.5e-8 | 5.9e-15 | 1.3e-15 |
+
+  FGMRES-IR with 10 iterations beats the cuDSS bar of issue #71 (4.6e-11 on case1354 with `matching_alg =
+  "algo5"` and 5 IR steps) on all three case1354 dumps without matching; plain IR needs 20 steps and still
+  misses it on k2_10. Each FGMRES iteration costs one SpMV and one solve (as one IR step) plus Krylov's
+  orthogonalization (`O(k n)` per iteration) and one host synchronization per iteration.
+- Deviations from PLAN.md / this task:
+  - FGMRES runs on one vector holding every right-hand side and every active batch member (the block-diagonal
+    system `I ⊗ op(A)`), so the SpMV and the sweeps stay one launch group per application and no single-column
+    variants of the kernels are needed. The stopping test is joint: `‖R₀ − op(A)D‖₂ ≤ ir_tol · minₖ‖Bₖ‖₂`,
+    which bounds every column's relative residual by `ir_tol`. With several right-hand sides this can take
+    more iterations than separate FGMRES runs per column (MadNLP solves one right-hand side).
+  - `ir_n_steps` is the maximum number of FGMRES iterations (no restart; the Krylov basis holds `2·ir_n_steps`
+    vectors of `n·ncols` entries, allocated at the first FGMRES solve and kept). `ir_tol = 0` runs all
+    `ir_n_steps` iterations (Krylov.jl stops earlier only on an exact residual).
+  - FGMRES is not synchronization-free: Krylov.jl reads its dot products and norms on the host every iteration,
+    and allocates small host vectors. The "no host synchronization inside solve" rule holds only for
+    `ir_mode = "ir"` with `ir_tol = 0`.
+  - An interrupt during FGMRES leaves `X` at the unrefined solution (the correction is added only at the end)
+    and reports 0 iterations; plain IR keeps the last completed step.
+  - The stalling test matrix is `kkt_matrix` with parameters (no new generator).
+- Open issues / follow-ups:
+  - The CUDA path (Krylov.jl on `CuVector`, the new SpMV kernel) is exercised only by CI.
+  - Mixed precision (`factor_precision = Float32`, M13) can reuse `FactorPreconditioner` unchanged: the operators
+    already work in the input precision.
+- Suggested plan changes:
+  - PLAN §1.3 `ir_mode`/§2.5: document "`ir_n_steps` = maximum FGMRES iterations, joint stopping over the
+    stacked right-hand sides, one host synchronization per iteration".
+  - Given the K2 table, consider recommending `ir_mode = "fgmres"` with `ir_n_steps ≈ 10`, `ir_tol ≈ 1e-12` for
+    MadNLP's K2 systems, independent of T21.
 
 ### T19 — General LU (`"G"`): CPU reference + GPU   `[ ]`
 

@@ -579,7 +579,8 @@ function _refine_phase!(solver::DirectSolver, W::RefinementWorkspace, ws::SolveW
         solver.ir_steps = done[]
     end
     steps = done[]
-    _log(LOG_INFO, () -> "solve_refinement ($(convert(String, opts.ir_mode))): $steps of $(opts.ir_n_steps) steps")
+    unit = opts.ir_mode == IR_FGMRES ? "FGMRES iterations" : "steps"
+    _log(LOG_INFO, () -> "solve_refinement: $steps of $(opts.ir_n_steps) $unit")
     return nothing
 end
 
