@@ -175,11 +175,11 @@ const LDLT_C_NB = 32
 
 Workspace entries of a regime-C LDLᵀ/LDLᴴ front with `f` rows and `w`
 fully-summed columns: the `m×m` contribution block (`m = f - w`, when `cb`),
-`Lb` and `Wb` (`f × (nb + 1)` each), the saved column and the next pivot
-column of pass 1 (`f` each).
+`Lb` and `Wb` (`f × (nb + 1)` each), the saved column, the next pivot
+column of pass 1 and the rejection flags of the fallback scan (`f` each).
 """
 ldlt_c_work_len(f::Integer, w::Integer, cb::Bool, nb::Integer = LDLT_C_NB) =
-    (cb ? (Int(f) - Int(w))^2 : 0) + 2 * Int(f) * (nb + 1) + 2 * Int(f)
+    (cb ? (Int(f) - Int(w))^2 : 0) + 2 * Int(f) * (nb + 1) + 3 * Int(f)
 
 """
 Smallest width class and row class of a regime-B bin that the LDLᵀ/LDLᴴ factorization runs on the blocked

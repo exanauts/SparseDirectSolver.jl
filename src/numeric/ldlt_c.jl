@@ -193,6 +193,90 @@ end
     return nothing
 end
 
+# rows per task of the fallback scan of the panel kernel
+const _LTC_CHUNK = 64
+
+# the fallback scan (`_lt_pass3!`) of the panel kernel in two steps over the whole workgroup. Flags (after the
+# pass-1 column in the workspace; 1: rejected) are cleared for the candidate columns k:w, then every
+# (candidate column, chunk of `_LTC_CHUNK` rows) task tests its entries with the per-entry form of the
+# threshold test (`d ≥ u |F[i, j]|`, see `_lt_threshold_ok`; a NaN fails it) and flags the column on a
+# violation; a column whose diagonal is not acceptable (`|a_jj| < ε` or NaN) is flagged too. A whole column
+# per work item (as `_lt_pass3!`) is far slower here: every entry reads the block's pending pivots.
+@inline function _ltc_flags_clear!(lw, ctl, li, ::Val{WG}) where {WG}
+    @inbounds begin
+        f = Int(ctl[_ST_F])
+        fo = Int(ctl[_LTC_SO]) - 1 + 2 * f
+        for j in (Int(ctl[_LT_K]) + li - 1):WG:Int(ctl[_ST_W])
+            lw[fo + j] = zero(eltype(lw))
+        end
+    end
+    return nothing
+end
+
+@inline function _ltc_scan!(fa, lw, ctl, li, ::Val{WG}, aux, p::_LDLTDevice, h::Val) where {WG}
+    @inbounds begin
+        k = Int(ctl[_LT_K])
+        w = Int(ctl[_ST_W])
+        f = Int(ctl[_ST_F])
+        fo = Int(ctl[_LTC_SO]) - 1 + 2 * f
+        ε = _lt_eps(p, aux)
+        u = p.u
+        F = _ltc_front(fa, ctl, h)
+        nc = w - k + 1
+        nch = cld(f - k + 1, _LTC_CHUNK)
+        for q in (li - 1):WG:(nc * nch - 1)
+            j = k + q % nc
+            iszero(lw[fo + j]) || continue                # already rejected
+            i0 = k + (q ÷ nc) * _LTC_CHUNK
+            a = _fabs(F, j, j)
+            ok = a >= ε
+            if ok
+                for i in i0:min(i0 + _LTC_CHUNK - 1, f)
+                    i == j && continue
+                    if !(a >= u * _fabs(F, i, j))
+                        ok = false
+                        break
+                    end
+                end
+            end
+            ok || (lw[fo + j] = one(eltype(lw)))
+        end
+    end
+    return nothing
+end
+
+# the lane partials of pass 3 from the flags: the unflagged column with the largest |a_jj| (first on a tie)
+# and, for pivot type 'D', the largest |a_jj|
+@inline function _ltc_pick!(fa, lw, ctl, red, redi, li, ::Val{NL}, p::_LDLTDevice{R}, h::Val) where {NL, R}
+    @inbounds if li <= NL
+        k = Int(ctl[_LT_K])
+        f = Int(ctl[_ST_F])
+        fo = Int(ctl[_LTC_SO]) - 1 + 2 * f
+        F = _ltc_front(fa, ctl, h)
+        bv = zero(R)
+        bi = 0
+        gv = zero(R)
+        gi = 0
+        for j in (k + li - 1):NL:Int(ctl[_ST_W])
+            a = _fabs(F, j, j)
+            if p.ptype == _LT_PIVOT_DIAGONAL && !isnan(a) && (gi == 0 || a > gv)
+                gv = a
+                gi = j
+            end
+            if iszero(lw[fo + j]) && (bi == 0 || a > bv)
+                bv = a
+                bi = j
+            end
+        end
+        IT = eltype(redi)
+        red[li] = bv
+        redi[li] = bi % IT
+        red[NL + li] = gv
+        redi[NL + li] = gi % IT
+    end
+    return nothing
+end
+
 # swap rows p and q of Lb and Wb along with the interchange of the step (`_lt_swap!` moves the stored panel)
 @inline function _ltc_swap_rows!(lw, ctl, nb, li, ::Val{WG}) where {WG}
     @inbounds begin
@@ -330,7 +414,11 @@ reference's pivot sequence on the lazily updated panel (see the top of
             @synchronize
         end
         if ctl[_LT_PHASE] == 3
-            _lt_pass3!((factor, lw, pivot_kind), ctl, red, redi, li, Val(WG), aux, prm, Val(_Lazy{HERM}))
+            _ltc_flags_clear!(lw, ctl, li, Val(WG))
+            @synchronize
+            _ltc_scan!((factor, lw, pivot_kind), lw, ctl, li, Val(WG), aux, prm, Val(HERM))
+            @synchronize
+            _ltc_pick!((factor, lw, pivot_kind), lw, ctl, red, redi, li, Val(WG), prm, Val(HERM))
             @synchronize
             _lt_stage1!(red, redi, ctl, li, Val(WG), Val(3))
             @synchronize
