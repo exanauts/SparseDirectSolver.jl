@@ -34,7 +34,9 @@ sides:
 * `R` (`n × nrhs`): the residual, then the correction;
 * `Bc` (`n × nrhs`): a copy of the right-hand side when `X` and `B` alias;
 * `norms` (`2 nrhs`, real): `‖Rₖ‖₂²` and `‖Bₖ‖₂²` per right-hand side, and
-  `norms_host`, its host copy (the early-exit test of `ir_tol`).
+  `norms_host`, its host copy (the early-exit test of `ir_tol`);
+* `krylov`: the storage of FGMRES-IR (`ir_mode = "fgmres"`), owned by the
+  Krylov.jl extension (`nothing` until its first solve).
 """
 struct RefinementWorkspace{T, R <: Real, VI <: AbstractVector, MT <: AbstractMatrix{T}, VR <: AbstractVector{R}}
     rowptr::VI
@@ -44,6 +46,7 @@ struct RefinementWorkspace{T, R <: Real, VI <: AbstractVector, MT <: AbstractMat
     Bc::MT
     norms::VR
     norms_host::Vector{R}
+    krylov::Base.RefValue{Any}
 end
 
 max_rhs(W::RefinementWorkspace) = size(W.R, 2)
@@ -88,7 +91,7 @@ function allocate_refinement(map::NTuple{3, Vector{Int}}, ::Type{T}, ::Type{INT}
     Bc = KernelAbstractions.zeros(backend, T, n, nrhs)
     norms = KernelAbstractions.zeros(backend, real(T), 2 * nrhs)
     return RefinementWorkspace{T, real(T), typeof(dev(Int[])), typeof(R), typeof(norms)}(
-        dev(rowptr), dev(colval), dev(src), R, Bc, norms, zeros(real(T), 2 * nrhs))
+        dev(rowptr), dev(colval), dev(src), R, Bc, norms, zeros(real(T), 2 * nrhs), Ref{Any}(nothing))
 end
 
 function _to_index_type(::Type{INT}, v::Vector{Int}) where {INT}
@@ -104,7 +107,8 @@ function _grow_refinement(W::RefinementWorkspace{T, R, VI, MT, VR}, nrhs::Intege
     Rm = KernelAbstractions.zeros(backend, T, n, nrhs)
     Bc = KernelAbstractions.zeros(backend, T, n, nrhs)
     norms = KernelAbstractions.zeros(backend, R, 2 * nrhs)
-    return RefinementWorkspace{T, R, VI, MT, VR}(W.rowptr, W.colval, W.src, Rm, Bc, norms, zeros(R, 2 * nrhs))
+    return RefinementWorkspace{T, R, VI, MT, VR}(W.rowptr, W.colval, W.src, Rm, Bc, norms, zeros(R, 2 * nrhs),
+                                            Ref{Any}(nothing))
 end
 
 # compact column r (user column `_bm_ucol(bm, r)` of the `nrhs` user columns, values of member
@@ -346,6 +350,198 @@ function refine!(X::AbstractVecOrMat, B::AbstractVecOrMat, W::RefinementWorkspac
         progress[] = steps
     end
     return steps
+end
+
+# --- FGMRES-IR (`ir_mode = "fgmres"`, Krylov.jl extension) ----------------------
+#
+# FGMRES on the correction system `op(A) D = R₀` (`R₀ = B - op(A) X₀`, `X₀` the
+# solution of the sweeps), right-preconditioned by the factorization, then
+# `X = X₀ + D`. Krylov.jl works on vectors: the compact columns of all
+# right-hand sides (and active batch members) are stacked into one vector of
+# length `n ncols`, i.e. FGMRES runs on the block-diagonal system `I ⊗ op(A)`
+# with the operators below; both apply all columns per launch.
+
+"""
+    FGMRES_PROVIDER
+
+`Ref` to the FGMRES driver of the Krylov.jl extension
+(`SparseDirectSolverKrylovExt`), set in its `__init__`; `nothing` while
+Krylov.jl is not loaded (`ir_mode = "fgmres"` then raises
+[`NotSupportedError`](@ref)). Called as
+`provider(cache, A, P, R, len; atol, itmax) -> (D, iterations)`: FGMRES for
+`A D = R[1:len]` with right preconditioner `P` (`mul!(y, P, x)`), absolute
+residual tolerance `atol`, at most `itmax` iterations, storage kept in `cache`
+(a `Ref{Any}`).
+"""
+const FGMRES_PROVIDER = Ref{Any}(nothing)
+
+"""
+    fgmres_available() -> Bool
+
+Whether the Krylov.jl extension is loaded (`ir_mode = "fgmres"` works).
+"""
+fgmres_available() = FGMRES_PROVIDER[] !== nothing
+
+"""
+    RefinementOperator(W, nzval, n, ncols, bm, conjugate)
+
+`op(A)` (the full matrix `M` of the [`RefinementWorkspace`](@ref) `W` with
+the values `nzval`, `conj(M)` when `conjugate`) acting on the `n × ncols`
+compact columns stacked into vectors of length `n ncols` (column `r` uses
+the values of the member of compact column `r` of the [`BatchMap`](@ref)
+`bm`). Supports `size`, `eltype` and `mul!(y, op, x)` (one launch,
+asynchronous): the matrix operator of FGMRES-IR.
+"""
+struct RefinementOperator{T, RW <: RefinementWorkspace{T}, V <: AbstractVector, BM <: BatchMap}
+    W::RW
+    nzval::V
+    n::Int
+    ncols::Int
+    bm::BM
+    conjugate::Bool
+end
+
+Base.size(op::RefinementOperator) = (op.n * op.ncols, op.n * op.ncols)
+Base.size(op::RefinementOperator, d::Integer) = d <= 2 ? op.n * op.ncols : 1
+Base.eltype(::RefinementOperator{T}) where {T} = T
+
+@kernel function _spmv_kernel!(y, rowptr, colval, src, nzval_all, x, n, ncols, bm, ::Val{CJ}) where {CJ}
+    q = @index(Global, Linear)
+    i = (q - 1) % n + 1
+    r = (q - 1) ÷ n + 1
+    @inbounds if r <= ncols
+        nzval = _mview(nzval_all, _bm_cmember(bm, r), bm.nbatch)
+        off = (r - 1) * n
+        acc = zero(eltype(y))
+        for c in Int(rowptr[i]):(Int(rowptr[i + 1]) - 1)
+            s = Int(src[c])
+            v = nzval[abs(s)]
+            v = xor(s < 0, CJ) ? conj(v) : v
+            acc += v * x[Int(colval[c]) + off]
+        end
+        y[i + off] = acc
+    end
+end
+
+function LinearAlgebra.mul!(y::AbstractVector, op::RefinementOperator, x::AbstractVector)
+    m = op.n * op.ncols
+    length(x) == m && length(y) == m ||
+        throw(DimensionMismatch("the operator has size $m, x has $(length(x)) and y $(length(y)) entries"))
+    m > 0 || return y
+    W = op.W
+    kernel! = _spmv_kernel!(KernelAbstractions.get_backend(W.R), PERMUTE_WORKGROUP)
+    if op.conjugate
+        kernel!(y, W.rowptr, W.colval, W.src, op.nzval, x, op.n, op.ncols, op.bm, Val(true); ndrange = m)
+    else
+        kernel!(y, W.rowptr, W.colval, W.src, op.nzval, x, op.n, op.ncols, op.bm, Val(false); ndrange = m)
+    end
+    return y
+end
+
+"""
+    FactorPreconditioner(ws, S, N, nrhs, ncols, conjugate, deterministic, interrupt)
+
+`op(A)⁻¹` through the factorization in `N` (permutation, forward, diagonal
+and backward sweeps in the solve workspace `ws`; `conj(M⁻¹ conj(x))` when
+`conjugate`) on the stacked compact columns (`nrhs` per active member,
+`ncols` in all) of the [`RefinementOperator`](@ref). `mul!(y, P, x)` polls
+`interrupt` first ([`InterruptedError`](@ref)); asynchronous otherwise. The
+right preconditioner of FGMRES-IR.
+"""
+struct FactorPreconditioner{T, WS <: SolveWorkspace{T}, SY <: Symbolic, NU <: Numeric}
+    ws::WS
+    S::SY
+    N::NU
+    nrhs::Int
+    ncols::Int
+    conjugate::Bool
+    deterministic::Bool
+    interrupt::Union{Nothing, Threads.Atomic{Bool}}
+end
+
+Base.size(P::FactorPreconditioner) = (P.S.n * P.ncols, P.S.n * P.ncols)
+Base.size(P::FactorPreconditioner, d::Integer) = d <= 2 ? P.S.n * P.ncols : 1
+Base.eltype(::FactorPreconditioner{T}) where {T} = T
+
+function LinearAlgebra.mul!(y::AbstractVector, P::FactorPreconditioner, x::AbstractVector)
+    _poll_interrupt(P.interrupt)
+    perm = P.S.perm
+    permute_rhs!(P.ws.Y, x, perm; conjugate = P.conjugate)
+    forward_sweep!(P.ws, P.S, P.N; nrhs = P.nrhs, deterministic = P.deterministic)
+    diagonal_sweep!(P.ws, P.S, P.N; nrhs = P.nrhs)
+    backward_sweep!(P.ws, P.S, P.N; nrhs = P.nrhs)
+    unpermute_solution!(y, P.ws.Y, perm; conjugate = P.conjugate)
+    return y
+end
+
+# smallest ‖Bₖ‖ over the right-hand sides (1 for Bₖ = 0, as in `_max_relative_residual`)
+function _min_rhs_norm(norms::Vector{R}, nrhs::Int) where {R}
+    m = typemax(R)
+    for k in 1:nrhs
+        bk = sqrt(norms[2k])
+        m = min(m, bk > 0 ? bk : one(R))
+    end
+    return m
+end
+
+"""
+    fgmres_refine!(X, B, W, ws, symbolic, numeric, nzval; nsteps, tol = 0, transposed = false,
+                   b_transposed = transposed, conjugate = false, deterministic = false,
+                   interrupt = nothing, progress = Ref(0)) -> iterations
+
+FGMRES-IR (`ir_mode = "fgmres"`, needs Krylov.jl) of the solution `X` of
+`op(A) X = B`, with the arguments of [`refine!`](@ref):
+
+    R₀ = B - op(A) X                         (residual!)
+    stop if tol > 0 and maxₖ ‖R₀ₖ‖₂ / ‖Bₖ‖₂ ≤ tol
+    D = FGMRES(op(A), R₀; right preconditioner op(A)⁻¹ by the factor,
+               at most nsteps iterations, ‖R₀ - op(A) D‖₂ ≤ tol minₖ ‖Bₖ‖₂)
+    X += D                                   (add_correction!)
+
+on the stacked compact columns ([`RefinementOperator`](@ref),
+[`FactorPreconditioner`](@ref)). Each iteration costs one SpMV and one solve,
+as a step of plain refinement. `tol = 0` runs `nsteps` iterations (FGMRES
+stops earlier only on an exact residual). The joint criterion bounds every
+column's relative residual by `tol`. Returns the iterations performed (also
+in `progress[]`); an interrupt (polled before every preconditioner
+application) leaves `X` unchanged and `progress[] = 0`. FGMRES synchronizes
+with the host every iteration (Krylov.jl's dot products and norms).
+"""
+function fgmres_refine!(X::AbstractVecOrMat, B::AbstractVecOrMat, W::RefinementWorkspace, ws::SolveWorkspace,
+                        S::Symbolic, N::Numeric, nzval::AbstractVector; nsteps::Integer, tol::Real = 0,
+                        transposed::Bool = false, b_transposed::Bool = transposed, conjugate::Bool = false,
+                        deterministic::Bool = false, interrupt::Union{Nothing, Threads.Atomic{Bool}} = nothing,
+                        progress::Base.RefValue{Int} = Ref(0))
+    provider = FGMRES_PROVIDER[]
+    provider === nothing &&
+        throw(NotSupportedError("ir_mode = \"fgmres\" needs Krylov.jl: load it with `using Krylov`"))
+    nu = rhs_count(X, S.n; transposed)
+    nu % N.nbatch == 0 || throw(DimensionMismatch("$nu right-hand sides for a batch of $(N.nbatch) members"))
+    nrhs = nu ÷ N.nbatch
+    ncols = _ncols(N, nrhs)
+    max_rhs(W) >= ncols && max_rhs(ws) >= ncols ||
+        throw(DimensionMismatch("the refinement workspace holds $(max_rhs(W)) right-hand sides, need $ncols"))
+    progress[] = 0
+    nsteps > 0 && S.n * ncols > 0 || return 0
+    bm = batch_map(N; nrhs)
+    _poll_interrupt(interrupt)
+    residual!(W, nzval, X, B; nrhs = nu, transposed, b_transposed, conjugate, bm)
+    R = real(eltype(W.R))
+    atol = zero(R)
+    if tol > 0
+        norms = residual_norms!(W, B; nrhs = nu, transposed = b_transposed, bm)
+        rel = _max_relative_residual(norms, ncols)
+        _log(LOG_DEBUG, () -> "fgmres refinement: initial relative residual $rel")
+        rel <= tol && return 0
+        atol = R(tol) * _min_rhs_norm(norms, ncols)
+    end
+    A = RefinementOperator(W, nzval, S.n, ncols, bm, conjugate)
+    P = FactorPreconditioner(ws, S, N, nrhs, ncols, conjugate, deterministic, interrupt)
+    D, iters = provider(W.krylov, A, P, W.R, S.n * ncols; atol, itmax = Int(nsteps))
+    permute_rhs!(ws.Y, D, S.perm)
+    add_correction!(X, ws.Y, S.perm; nrhs = nu, transposed, bm)
+    progress[] = iters
+    return iters
 end
 
 """

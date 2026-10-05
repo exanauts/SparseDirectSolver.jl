@@ -465,3 +465,42 @@ function batch_relres(members, X::AbstractArray, B::AbstractArray)
     Br = reshape(Array(B), n, :, nb)
     return [relres(members[k], Xr[:, :, k], Br[:, :, k]) for k in 1:nb]
 end
+
+# ---------------------------------------------------------------------------
+# refinement (T16, T18)
+
+"The six solve sub-phases in order; composed they equal `\"solve\"` (T16)."
+const SOLVE_SUBPHASES = ("solve_fwd_perm", "solve_fwd", "solve_diag", "solve_bwd", "solve_bwd_perm", "solve_refinement")
+
+"""
+    ir_solver(backend, A, structure, INT = Int32; view = 'L', params = ())
+
+A [`DirectSolver`](@ref) on `backend` after `"analysis"` and `"factorization"`
+of the `view` triangle of `A`, with the parameters `params` (name/value pairs)
+set first (T16, T18).
+"""
+function ir_solver(backend, A::SparseMatrixCSC{T}, structure, ::Type{INT} = Int32; view = 'L',
+                   params = ()) where {T, INT}
+    solver = DirectSolver(api_matrix(backend, triangle_view(A, view), INT), structure, view)
+    for (name, value) in params
+        setparam!(solver, name, value)
+    end
+    execute!("analysis", solver, nothing, nothing)
+    execute!("factorization", solver, nothing, nothing)
+    return solver
+end
+
+"""
+    ir_solve(backend, solver, b; steps = nothing, tol = nothing) -> x
+
+`"solve"` of `b` (host array, moved to `backend`) with `ir_n_steps = steps`
+and `ir_tol = tol` when given; returns the solution on the host (T16, T18).
+"""
+function ir_solve(backend, solver, b; steps = nothing, tol = nothing)
+    steps === nothing || setparam!(solver, "ir_n_steps", steps)
+    tol === nothing || setparam!(solver, "ir_tol", tol)
+    bd = to_device(backend, b)
+    xd = similar(bd)
+    execute!("solve", solver, xd, bd; asynchronous = false)
+    return to_host(xd)
+end
