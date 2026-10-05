@@ -7,7 +7,9 @@
 # reproducible. Contribution blocks on the update stack are packed lower
 # triangles (`_packed`, `m(m+1)/2` entries). On the KA CPU backend, values
 # derived from the group index are recomputed in every segment between barriers
-# (see `src/dense/fallback/common.jl`).
+# (see `src/dense/fallback/common.jl`). Uniform batch: one workgroup per (front,
+# active member), the kernels see the member's panels (`MemberPanels` in place
+# of `front_ptr`), update stack and values (`src/numeric/batch.jl`).
 
 "Workgroup size of the assembly kernels."
 const ASSEMBLY_WORKGROUP = 256
@@ -16,7 +18,8 @@ const ASSEMBLY_WORKGROUP = 256
 @inline function _zero_front!(factor, stack, s, li, front_ptr, front_nrows, front_ncols, cb_ptr, ::Val{WG}) where {WG}
     @inbounds begin
         z = zero(eltype(factor))
-        for q in (front_ptr[s] + li - 1):WG:(front_ptr[s + 1] - 1)
+        p0 = front_ptr[s]
+        for q in (p0 + li - 1):WG:(p0 + front_nrows[s] * front_ncols[s] - 1)
             factor[q] = z
         end
         c = cb_ptr[s]
@@ -30,12 +33,14 @@ const ASSEMBLY_WORKGROUP = 256
     return nothing
 end
 
-@kernel function _zero_fronts_kernel!(factor, stack, nodes, first, front_ptr, front_nrows, front_ncols, cb_ptr,
+@kernel function _zero_fronts_kernel!(factor, stack, nodes, bm, front_ptr, front_nrows, front_ncols, cb_ptr,
                                       ::Val{WG}) where {WG}
     li = @index(Local, Linear)
-    g = @index(Group, Linear)
-    @inbounds s = nodes[first + g - 1]
-    _zero_front!(factor, stack, s, li, front_ptr, front_nrows, front_ncols, cb_ptr, Val(WG))
+    G = @index(Group, Linear)
+    @inbounds s = nodes[bm.first + _bm_node(bm, G) - 1]
+    k = _bm_gmember(bm, G)
+    _zero_front!(factor, _mview(stack, k, bm.nbatch), s, li, member_panels(front_ptr, k, bm.nbatch), front_nrows,
+                 front_ncols, cb_ptr, Val(WG))
 end
 
 """
@@ -48,17 +53,19 @@ Asynchronous.
 function zero_fronts!(N::Numeric, S::Symbolic, first::Integer, count::Integer)
     count > 0 || return N
     WG = ASSEMBLY_WORKGROUP
+    bm = batch_map(N; first)
     kernel! = _zero_fronts_kernel!(KernelAbstractions.get_backend(N.factor), WG)
-    kernel!(N.factor, N.stack, S.group_nodes, Int(first), S.front_ptr, S.front_nrows, S.front_ncols, S.cb_ptr,
-            Val(WG); ndrange = WG * count)
+    kernel!(N.factor, N.stack, S.group_nodes, bm, S.front_ptr, S.front_nrows, S.front_ncols, S.cb_ptr,
+            Val(WG); ndrange = WG * count * bm.nact)
     return N
 end
 
 # value of nzval entry `x` as added at amap offset `off` (negative: conjugate)
 @inline _amap_value(::Type{T}, x, off) where {T} = off < 0 ? T(conj(x)) : T(x)
 
-# assemble the values of A into the zeroed panel of front `s` (work item `li` of `WG`)
-@inline function _scatter_front!(factor, nzval, amap, amap_ptr, amap_src, s, li, ::Val{WG}) where {WG}
+# assemble the values of A into the zeroed panel of front `s` (work item `li` of `WG`); `shift` moves the
+# `amap` offsets (single-matrix layout) to the batch member's panel
+@inline function _scatter_front!(factor, nzval, amap, amap_ptr, amap_src, s, shift, li, ::Val{WG}) where {WG}
     @inbounds begin
         T = eltype(factor)
         a = amap_ptr[s]
@@ -77,19 +84,25 @@ end
                     v += _amap_value(T, nzval[p], off)
                     kk += 1
                 end
-                factor[dest] = v
+                factor[dest + shift] = v
             end
         end
     end
     return nothing
 end
 
-@kernel function _scatter_A_kernel!(factor, nzval, amap, amap_ptr, amap_src, nodes, first, ::Val{WG}) where {WG}
+@kernel function _scatter_A_kernel!(factor, nzval, amap, amap_ptr, amap_src, nodes, bm, front_ptr,
+                                    ::Val{WG}) where {WG}
     li = @index(Local, Linear)
-    g = @index(Group, Linear)
-    @inbounds s = nodes[first + g - 1]
-    _scatter_front!(factor, nzval, amap, amap_ptr, amap_src, s, li, Val(WG))
+    G = @index(Group, Linear)
+    @inbounds s = nodes[bm.first + _bm_node(bm, G) - 1]
+    k = _bm_gmember(bm, G)
+    _scatter_front!(factor, _mview(nzval, k, bm.nbatch), amap, amap_ptr, amap_src, s,
+                    _member_shift(front_ptr, s, k, bm.nbatch), li, Val(WG))
 end
+
+# shift of the factor offsets of front `s` from the single-matrix layout to batch member `k`
+@inline _member_shift(front_ptr, s, k, nb) = @inbounds Int(member_panels(front_ptr, k, nb)[s]) - Int(front_ptr[s])
 
 """
     scatter_A!(numeric, symbolic, nzval, first, count) -> numeric
@@ -103,8 +116,10 @@ negative offsets add the conjugate). Asynchronous.
 function scatter_A!(N::Numeric, S::Symbolic, nzval::AbstractVector, first::Integer, count::Integer)
     count > 0 || return N
     WG = ASSEMBLY_WORKGROUP
+    bm = batch_map(N; first)
     kernel! = _scatter_A_kernel!(KernelAbstractions.get_backend(N.factor), WG)
-    kernel!(N.factor, nzval, S.amap, S.amap_ptr, S.amap_src, S.group_nodes, Int(first), Val(WG); ndrange = WG * count)
+    kernel!(N.factor, nzval, S.amap, S.amap_ptr, S.amap_src, S.group_nodes, bm, S.front_ptr, Val(WG);
+            ndrange = WG * count * bm.nact)
     return N
 end
 
@@ -147,16 +162,17 @@ end
     return nothing
 end
 
-@kernel function _extend_add_kernel!(factor, stack, nodes, first, front_ptr, front_nrows, front_ncols, cb_ptr,
+@kernel function _extend_add_kernel!(factor, stack, nodes, bm, front_ptr, front_nrows, front_ncols, cb_ptr,
                                      child_ptr, child_list, relind_ptr, relind, maxchild, ::Val{WG}) where {WG}
     li = @index(Local, Linear)
-    g = @index(Group, Linear)
+    G = @index(Group, Linear)
     # children one after the other (fixed order, a barrier between them): rows
     # of one child go to distinct destinations, rows of two children may not
     for k in 1:maxchild
-        @inbounds s = nodes[first + g - 1]
-        _extend_add_child!(factor, stack, s, k, li, front_ptr, front_nrows, front_ncols, cb_ptr, child_ptr,
-                           child_list, relind_ptr, relind, Val(WG))
+        @inbounds s = nodes[bm.first + _bm_node(bm, G) - 1]
+        mb = _bm_gmember(bm, G)
+        _extend_add_child!(factor, _mview(stack, mb, bm.nbatch), s, k, li, member_panels(front_ptr, mb, bm.nbatch),
+                           front_nrows, front_ncols, cb_ptr, child_ptr, child_list, relind_ptr, relind, Val(WG))
         @synchronize
     end
 end
@@ -174,9 +190,10 @@ deterministic. Asynchronous.
 function extend_add!(N::Numeric, S::Symbolic, first::Integer, count::Integer, maxchild::Integer)
     (count > 0 && maxchild > 0) || return N
     WG = ASSEMBLY_WORKGROUP
+    bm = batch_map(N; first)
     kernel! = _extend_add_kernel!(KernelAbstractions.get_backend(N.factor), WG)
-    kernel!(N.factor, N.stack, S.group_nodes, Int(first), S.front_ptr, S.front_nrows, S.front_ncols, S.cb_ptr,
-            S.child_ptr, S.child_list, S.relind_ptr, S.relind, Int(maxchild), Val(WG); ndrange = WG * count)
+    kernel!(N.factor, N.stack, S.group_nodes, bm, S.front_ptr, S.front_nrows, S.front_ncols, S.cb_ptr,
+            S.child_ptr, S.child_list, S.relind_ptr, S.relind, Int(maxchild), Val(WG); ndrange = WG * count * bm.nact)
     return N
 end
 
@@ -191,17 +208,45 @@ end
     end
 end
 
+# work item q of block b: the `m×m` block b of `work` (member `members[j0 + b + 1]`) into its member's stack
+@kernel function _pack_add_batch_kernel!(stack, c0, work, m, members, j0, nb)
+    q0 = @index(Global, Linear)
+    b = (q0 - 1) ÷ (m * m)
+    q = q0 - b * m * m
+    @inbounds begin
+        j = (q - 1) ÷ m + 1
+        i = q - (j - 1) * m
+        if i >= j
+            k = Int(members[j0 + b + 1])
+            v = work[b * m * m + q]
+            i == j && (v = eltype(stack)(real(v)))       # gemm with F21ᴴ: keep the herk real diagonal
+            _mview(stack, k, nb)[c0 + _packed(i, j, m) - 1] += v
+        end
+    end
+end
+
 """
     pack_add!(stack, c0, work, m) -> stack
+    pack_add!(stack, c0, work, m, members, j0, count, nbatch) -> stack
 
 Add the lower triangle of the column-major `m×m` matrix `work[1:m^2]` to the
 packed contribution block `stack[c0:(c0 + m(m+1)/2 - 1)]` (the regime-C step
-after the vendor `syrk`/`herk` into the workspace). One launch, one work item
-per entry. Asynchronous.
+after the vendor `syrk`/`herk` into the workspace). Batched form: the `count`
+blocks `work[(b-1)m² + 1 : b m²]` go to the stacks of batch members
+`members[j0 + b]` (device vector) of an `nbatch`-member update stack. One
+launch, one work item per entry. Asynchronous.
 """
 function pack_add!(stack::AbstractVector, c0::Integer, work::AbstractVector, m::Integer)
     m > 0 || return stack
     kernel! = _pack_add_kernel!(KernelAbstractions.get_backend(stack), ASSEMBLY_WORKGROUP)
     kernel!(stack, Int(c0), work, Int(m); ndrange = m * m)
+    return stack
+end
+
+function pack_add!(stack::AbstractVector, c0::Integer, work::AbstractVector, m::Integer, members::AbstractVector{Int32},
+                   j0::Integer, count::Integer, nbatch::Integer)
+    m > 0 && count > 0 || return stack
+    kernel! = _pack_add_batch_kernel!(KernelAbstractions.get_backend(stack), ASSEMBLY_WORKGROUP)
+    kernel!(stack, Int(c0), work, Int(m), members, Int(j0), Int(nbatch); ndrange = m * m * count)
     return stack
 end

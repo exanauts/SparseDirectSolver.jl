@@ -436,3 +436,32 @@ function madnlp_inertia_loop_device(backend, A::SparseMatrixCSC{T}, nh, nj, opts
     end
     return (false, iterations, solver, δw)
 end
+
+"""
+    batch_csr(members, view, INT = Int) -> (rowptr, colval, nzval)
+
+Host CSR arrays of the uniform batch `members` (same pattern, see
+`batch_members`): the shared one-based pattern of the `view` triangle and the
+values of every member one after the other (`length(nzval) = nnz · nbatch`), as
+CUDSS.jl's strided uniform-batch storage (T17).
+"""
+function batch_csr(members::AbstractVector{<:SparseMatrixCSC{T}}, view, ::Type{INT} = Int) where {T, INT}
+    Cs = [SparseDirectSolver.CSR(SparseMatrixCSC{T, INT}(triangle_view(A, view))) for A in members]
+    all(C -> C.rowptr == Cs[1].rowptr && C.colval == Cs[1].colval, Cs) ||
+        error("batch_csr: the members do not share a sparsity pattern")
+    return Cs[1].rowptr, Cs[1].colval, reduce(vcat, (C.nzval for C in Cs))
+end
+
+"""
+    batch_relres(members, X, B) -> Vector
+
+`relres` of every member `k` of a uniform batch: `X`, `B` are host arrays of
+`n × nrhs × nbatch` entries in any shape (strided vector, `n × (nrhs nbatch)`
+matrix, 3-D array), member `k` owning the `k`-th block of `n · nrhs` entries.
+"""
+function batch_relres(members, X::AbstractArray, B::AbstractArray)
+    n, nb = size(members[1], 1), length(members)
+    Xr = reshape(Array(X), n, :, nb)
+    Br = reshape(Array(B), n, :, nb)
+    return [relres(members[k], Xr[:, :, k], Br[:, :, k]) for k in 1:nb]
+end

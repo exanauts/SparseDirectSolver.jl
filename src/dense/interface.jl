@@ -25,6 +25,7 @@ const DENSE_OPS = (
     laswp = (generic = nothing, vendor = nothing),
     gemm_strided_batched = (generic = nothing, vendor = :vendor_gemm_strided_batched),
     trsm_strided_batched = (generic = nothing, vendor = :vendor_trsm_batched),
+    potrf_batched = (generic = nothing, vendor = :vendor_potrf_batched),
 )
 
 # DENSE_OPS as a concretely typed table (`:none` = no such path), for `select_impl`
@@ -74,7 +75,8 @@ end
     dense_impls(op::Symbol, backend, T) -> Vector{Symbol}
 
 The implementations of dense op `op` (`:gemm`, `:syrk`, `:herk`, `:trsm`,
-`:potrf`, `:getrf`, `:laswp`, `:gemm_strided_batched`, `:trsm_strided_batched`)
+`:potrf`, `:getrf`, `:laswp`, `:gemm_strided_batched`, `:trsm_strided_batched`,
+`:potrf_batched`)
 available for element type `T` on `backend` according to
 [`capabilities`](@ref), in `:auto` preference order (`:vendor`, `:generic`,
 `:ka`). `:ka` is always present.
@@ -380,6 +382,38 @@ function trsm_strided_batched!(side, uplo, trans, diag, α, A::AbstractArray{<:A
         ka_trsm_strided_batched!(sd, ul, tr, dg, α, A, B)
     end
     return B
+end
+
+"""
+    potrf_batched_info!(uplo, A, info, offset = 0; impl = :auto) -> info
+
+Uniform strided batch of [`potrf_info!`](@ref): Cholesky of the `uplo`
+triangle of every member `A[:, :, b]` of the 3-D array `A` in place, its
+status (0, or the first non-positive pivot column) into `info[offset + b]`.
+Implementations: `:vendor` (`vendor_potrf_batched!`, validated on the device
+as `potrf_info!`) and `:ka` ([`ka_potrf!`](@ref), one workgroup per member).
+Asynchronous.
+"""
+function potrf_batched_info!(uplo, A::AbstractArray{<:Any, 3}, info::AbstractVector{Int32}, offset::Integer = 0;
+                             impl::Symbol = :auto)
+    ul = _uplo_char(uplo)
+    size(A, 1) == size(A, 2) || throw(DimensionMismatch("potrf: members are $(size(A, 1))×$(size(A, 2)), not square"))
+    0 <= offset && offset + size(A, 3) <= length(info) ||
+        throw(DimensionMismatch("info has length $(length(info)) < offset $offset + batch count $(size(A, 3))"))
+    size(A, 3) == 0 && return info
+    return _potrf_batched_impl!(select_impl(:potrf_batched, A, impl), A, info, offset, ul)
+end
+
+# `potrf_batched_info!` with an already resolved implementation `p` (no capability lookup)
+function _potrf_batched_impl!(p::Symbol, A::AbstractArray{<:Any, 3}, info::AbstractVector{Int32}, offset::Integer,
+                              ul::Char = 'L')
+    if p === :vendor
+        vendor_potrf_batched!(ul, A, view(info, (offset + 1):(offset + size(A, 3))))
+        ka_chol_check_info!(info, offset, A)
+    else
+        ka_potrf!(ul, A, info; offset)
+    end
+    return info
 end
 
 """
