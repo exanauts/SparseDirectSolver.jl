@@ -10,7 +10,7 @@ Performance issues carry the GitHub label `performance` ([list](https://github.c
 | --- | --- | --- | --- |
 | #81 (PR) | regime-A subtrees ran a whole KKT tree on one workgroup; flop limit `subtree_parallelism` | 0 | merged |
 | #82 | KKT refactorization and solve are level-bound after #81: 54–59 launches per refactorization, 62–85 per solve | 5, 6 | open |
-| #75 | device LDLᵀ: serial pivot search, one workgroup per regime-B/C front, no vendor `sytrf` | 1, 2 | open, triaged; step 1 (cooperative pivot search) in a PR from `perf/exp1-pivot-search` |
+| #75 | device LDLᵀ: serial pivot search, one workgroup per regime-B/C front, no vendor `sytrf` | 1, 2 | open, triaged; step 1 (cooperative pivot search) and step 2 (regime B in local memory) in PRs from `perf/exp1-pivot-search`, `perf/exp1-regime-b-local` |
 | #60 | regime-A follow-ups: CUDA timings (partly answered by experiment 0) and per-backend local-memory caps | 7 | open, triaged |
 | #25 | T25 performance pass (task) | 5, 6, 7 | open |
 
@@ -146,6 +146,40 @@ LDLᵀ refactorization, `main` → step 1:
 | kkt_pglib_opf_case14_ieee_k2_15 | 0.97 | 1.03 | 3.2× |  |
 
 On the K2 dumps the inertia and `nperturbed` are those of `main` on all nine. On the T15 matrix `kkt_matrix(3000, 1000, 1e-8)` (fallback scans on most steps of its two large root fronts) CUDA goes from 33.9 s to 8.3 s; the KA CPU backend stays at 7.0 s against 2.6 s for `ref_ldlt!` (it runs the work items of a workgroup one after another, so a parallel search saves nothing there). The medium matrices gain 16–34%; the smallest KKT dumps (case14, w ≤ 16) lose up to 17% to the reductions' barriers; the two matrices with very large regime-C fronts (apache2, lap3d_40) are within ±5%, still one workgroup per front.
+
+### Step 2: regime B in local memory
+
+Staging only F₁₁ in `@localmem` (as `front_cholesky_kernel!`) gained nothing (lap2d_300 190 → 192 ms): the rows below F₁₁ are updated in global memory at every step and the contribution-block update was two thirds of regime B. The step became: `front_ldlt_kernel!` takes the width class `W` of its launch group and keeps the packed `W×W` F₁₁ in local memory from `W = 32` (classes 8 and 16 keep the panel in global memory: the staging phases cost more than they save on KKT fronts); the pivot columns stay unscaled (`L D`) until the end of the front, where `_lt_finalize!` applies the reference's divisions and 2×2 transforms with the pivot recomputed from D, so a step has no scale phase; the update reduces the next column as it writes it (pass 1), and work items own the rows below F₁₁ when there are at least `WG` of them (one division per row); four barriers per step. Contribution blocks with `m ≥ 64` are updated in 16×16 tiles with `W₂₁ = L₂₁D` and `L₂₁` staged 16 columns at a time in the F₁₁ buffer. Regime-C fronts run the same kernel with the panel in global memory and gain from the same changes.
+
+LDLᵀ refactorization, `main` → step 1 → step 2:
+
+| matrix | main ms | step 1 ms | step 2 ms | step 2 / cuDSS | step 2 / SDS Cholesky |
+| --- | --- | --- | --- | --- | --- |
+| lap2d_300 | 228 | 192 | 116 | 22.5× | 3.68× |
+| lap3d_40 | 14,777* | 14,494* | 8,753* | 150× | 39.1× |
+| HB/bcsstk17 | 206 | 167 | 115 | 34.2× | 4.14× |
+| Boeing/bcsstk38 | 137 | 106 | 72.9 | 22× | 3.22× |
+| GHS_psdef/apache2 | 92,576* | 97,296* | 50,736* | 104× | 49.3× |
+| kkt_pglib_opf_case118_ieee_condensed_1 | 1.77 | 1.82 | 1.91 | 4.89× | 2.09× |
+| kkt_pglib_opf_case118_ieee_condensed_10 | 1.72 | 1.79 | 1.87 | 5.35× | 2.12× |
+| kkt_pglib_opf_case118_ieee_condensed_20 | 1.87 | 1.82 | 1.88 | 5.36× | 2.15× |
+| kkt_pglib_opf_case118_ieee_k2_1 | 1.69 | 1.69 | 1.8 | 4.97× |  |
+| kkt_pglib_opf_case118_ieee_k2_10 | 1.62 | 1.68 | 1.76 | 4.97× |  |
+| kkt_pglib_opf_case118_ieee_k2_20 | 1.6 | 1.66 | 1.74 | 4.36× |  |
+| kkt_pglib_opf_case1354_pegase_condensed_1 | 10.9 | 7.2 | 7.51 | 11× | 2.56× |
+| kkt_pglib_opf_case1354_pegase_condensed_10 | 10.9 | 7.3 | 7.56 | 11.8× | 2.59× |
+| kkt_pglib_opf_case1354_pegase_condensed_20 | 11 | 7.32 | 7.56 | 10.7× | 2.59× |
+| kkt_pglib_opf_case1354_pegase_k2_1 | 8.31 | 6.6 | 6.95 | 8.51× |  |
+| kkt_pglib_opf_case1354_pegase_k2_10 | 7.15 | 6.05 | 6.27 | 7.58× |  |
+| kkt_pglib_opf_case1354_pegase_k2_20 | 9.1 | 6.71 | 6.84 | 8.48× |  |
+| kkt_pglib_opf_case14_ieee_condensed_1 | 0.446 | 0.503 | 0.484 | 2.51× | 1.33× |
+| kkt_pglib_opf_case14_ieee_condensed_10 | 0.443 | 0.52 | 0.517 | 2.26× | 1.52× |
+| kkt_pglib_opf_case14_ieee_condensed_11 | 0.448 | 0.463 | 0.515 | 1.77× | 1.57× |
+| kkt_pglib_opf_case14_ieee_k2_1 | 0.669 | 0.697 | 0.728 | 2.6× |  |
+| kkt_pglib_opf_case14_ieee_k2_10 | 0.722 | 0.708 | 0.727 | 3.06× |  |
+| kkt_pglib_opf_case14_ieee_k2_15 | 0.97 | 1.03 | 1.07 | 3.33× |  |
+
+K2 dumps: inertia and `nperturbed` unchanged on all nine. T15 matrix on CUDA: 8.3 → 5.6 s. Experiment-1 criterion still not met (lap2d 3.7×, bcsstk17 4.1×, case1354 condensed 2.6× the Cholesky time); KKT dumps within +3–6% of step 1.
 
 ## Recommendations: Prioritized Experiment Plan
 
