@@ -73,7 +73,7 @@ function check_schedule(S::SDS.Symbolic)
         nodes = sc.subtree_nodes[sc.subtree_ptr[t]:(sc.subtree_ptr[t + 1] - 1)]
         ok &= nodes[end] == sc.subtree_root[t] && all(v -> sc.subtree[v] == t, nodes)
         ok &= simulated_subtree_peak(sc, sp, nodes) == sc.subtree_peak[t]
-        cap(c) = SDS.subtree_capacity(sc.budgets[c], sc.elsize) * sc.elsize
+        cap(c) = SDS.subtree_capacity(sc.budgets[c], sc.elsize, SDS.subtree_local_reserve(S.structure)) * sc.elsize
         ok &= sc.subtree_peak[t] <= cap(sc.subtree_class[t]) <= sc.budgets[sc.subtree_class[t]]
         ok &= sc.subtree_class[t] == 1 || sc.subtree_peak[t] > cap(sc.subtree_class[t] - 1)
         # local layout: every front inside the peak, contribution blocks below their parent's front

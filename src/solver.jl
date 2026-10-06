@@ -376,7 +376,7 @@ function _symbolic!(solver::DirectSolver{T, INT}) where {T, INT}
     P = SymmetricPattern(solver.host_rowptr, solver.host_colval, A.nrows, solver.structure;
                          view = _stored_view(solver), index = A.index)
     sp = supernode_partition(factor_pattern(P, ord), ord.perm, opts)
-    sc = build_schedule(sp, opts, T)
+    sc = build_schedule(sp, opts, T; reserve = subtree_local_reserve(solver.structure))
     layout = build_layout(sp, sc)
     Sh = Symbolic(sp, sc, layout, solver.host_rowptr, solver.host_colval, A.nrows, solver.structure;
                   view = _stored_view(solver), index = A.index)
