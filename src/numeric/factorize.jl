@@ -230,7 +230,7 @@ allocated on the device; the panels are bitwise reproducible for a fixed
 """
 function factorize!(N::Numeric{T}, S::Symbolic, nzval::AbstractVector; impl::Symbol = :auto,
                     opts::Options = Options()) where {T}
-    _is_ldlt_structure(S.structure) && return factorize_ldlt!(N, S, nzval; opts)
+    _is_ldlt_structure(S.structure) && return factorize_ldlt!(N, S, nzval; impl, opts)
     _check_numeric(N, S, nzval)
     p = _front_impls(N, S, impl)
     plan = N.plan

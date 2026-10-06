@@ -63,6 +63,7 @@ include("numeric/front.jl")
 include("numeric/subtree.jl")
 include("numeric/factorize.jl")
 include("numeric/ldlt.jl")
+include("numeric/ldlt_c.jl")
 include("numeric/extract.jl")
 
 # solve phase on the device (PLAN §2.5)

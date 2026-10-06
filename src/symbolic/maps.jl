@@ -246,7 +246,7 @@ function symbolic_analysis(A::CSR, structure, view = VIEW_FULL; opts::Options = 
     ord = compute_ordering(P, opts; T, pp.pairs, pp.candidates)
     sp = supernode_partition(factor_pattern(P, ord), ord.perm, opts)
     sc = build_schedule(sp, opts, T; reserve = subtree_local_reserve(structure))
-    layout = build_layout(sp, sc)
+    layout = build_layout(sp, sc; ldlt = _is_ldlt_structure(_structure(structure)))
     return Symbolic(sp, sc, layout, rowptr, colval, A.nrows, structure; view, index = A.index)
 end
 
