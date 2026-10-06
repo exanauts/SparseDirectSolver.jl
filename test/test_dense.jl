@@ -11,9 +11,11 @@ dense_tri(A, uplo::Char, diag::Char) =
 dense_part(C, uplo::Char) = uplo == 'L' ? tril(C) : triu(C)
 
 @testset "capability audit ($(backend_name(backend)))" for backend in BACKENDS
-    SDS.print_capabilities(stdout, backend)
-    table = sprint(io -> SDS.print_capabilities(io, backend))
-    @test occursin("generic_mul", table) && occursin("ComplexF64", table)
+    if RUN_SHARED   # the table covers every element type
+        SDS.print_capabilities(stdout, backend)
+        table = sprint(io -> SDS.print_capabilities(io, backend))
+        @test occursin("generic_mul", table) && occursin("ComplexF64", table)
+    end
     for T in ELTYPES
         caps = SDS.capabilities(backend, T)
         @test caps isa SDS.DenseCapabilities
@@ -255,7 +257,7 @@ end
     @test to_host(C) ≈ to_host(A) * to_host(A)
 end
 
-@testset "dense interface errors" begin
+RUN_SHARED && @testset "dense interface errors" begin
     A = zeros(4, 4)
     @test_throws InvalidValueError SDS.gemm!(A, A, A; impl = :bogus)
     @test_throws InvalidValueError SDS.gemm!(A, A, A; transA = :X)

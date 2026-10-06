@@ -409,7 +409,7 @@ function _factorize!(solver::DirectSolver, p::Phase)
     end
     tic = time_ns()
     try
-        _numeric_phase!(N, S, solver.A.nzval, solver.options)
+        _numeric_phase!(solver)
     catch err
         if err isa InterruptedError
             # the panels are partly overwritten: back to "analyzed", a "factorization" must follow
@@ -446,9 +446,31 @@ _info_value(solver::DirectSolver) = solver.nbatch == 1 ? solver.info[1] : copy(s
 
 _elapsed(tic) = string(round((time_ns() - tic) / 1.0e6; digits = 3), " ms")
 
-# function barrier: concrete storage types for the numeric phase
-_numeric_phase!(N::Numeric, S::Symbolic, nzval::AbstractVector, opts::Options) = factorize!(N, S, nzval; opts)
-_numeric_phase!(N::Numeric, S::Symbolic, nzval::AbstractMatrix, opts::Options) = factorize!(N, S, vec(nzval); opts)
+# The numeric phase of the structure, behind a barrier: the structure is a run-time value, and a static call
+# would compile the Cholesky and the LDLᵀ/LDLᴴ paths with every solver, on the CPU backend all their kernels (most
+# of the test suite's compile time). The barrier takes the mutable handle only: the dynamic call boxes nothing
+# (an immutable `Numeric` or `Symbolic` argument would be copied to the heap on every call).
+function _numeric_phase!(solver::DirectSolver)
+    if _is_ldlt_structure(solver.structure)
+        Base.inferencebarrier(_numeric_phase_ldlt!)(solver)
+    else
+        Base.inferencebarrier(_numeric_phase_cholesky!)(solver)
+    end
+    return nothing
+end
+
+function _numeric_phase_cholesky!(solver::DirectSolver)
+    factorize_cholesky!(solver.numeric, solver.symbolic, _flat(solver.A.nzval); opts = solver.options)
+    return nothing
+end
+
+function _numeric_phase_ldlt!(solver::DirectSolver)
+    factorize_ldlt!(solver.numeric, solver.symbolic, _flat(solver.A.nzval); opts = solver.options)
+    return nothing
+end
+
+_flat(nzval::AbstractVector) = nzval
+_flat(nzval::AbstractMatrix) = vec(nzval)
 
 # user data of a right-hand side / solution: (array, transposed); an `n × nrhs × nbatch` array is the
 # `n × (nrhs nbatch)` matrix with the same memory (uniform batch)

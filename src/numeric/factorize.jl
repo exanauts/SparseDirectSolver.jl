@@ -228,9 +228,19 @@ the factor is incomplete. Structure `"SPD"` (real) or `"HPD"`. Nothing is
 allocated on the device; the panels are bitwise reproducible for a fixed
 `impl` and backend (regimes A and B are deterministic by construction).
 """
-function factorize!(N::Numeric{T}, S::Symbolic, nzval::AbstractVector; impl::Symbol = :auto,
-                    opts::Options = Options()) where {T}
+function factorize!(N::Numeric, S::Symbolic, nzval::AbstractVector; impl::Symbol = :auto, opts::Options = Options())
     _is_ldlt_structure(S.structure) && return factorize_ldlt!(N, S, nzval; impl, opts)
+    return factorize_cholesky!(N, S, nzval; impl, opts)
+end
+
+"""
+    factorize_cholesky!(numeric, symbolic, nzval; impl = :auto, opts = Options()) -> info::Int
+
+The Cholesky path of [`factorize!`](@ref) (structures `"SPD"` and `"HPD"`),
+callable without compiling the LDLᵀ/LDLᴴ path ([`factorize_ldlt!`](@ref)).
+"""
+function factorize_cholesky!(N::Numeric{T}, S::Symbolic, nzval::AbstractVector; impl::Symbol = :auto,
+                             opts::Options = Options()) where {T}
     _check_numeric(N, S, nzval)
     p = _front_impls(N, S, impl)
     plan = N.plan
