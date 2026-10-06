@@ -517,3 +517,41 @@ function ir_solve(backend, solver, b; steps = nothing, tol = nothing)
     execute!("solve", solver, xd, bd; asynchronous = false)
     return to_host(xd)
 end
+
+# --- LU (T19) ---
+
+"""
+    lu_setup(backend, A, INT = Int32; opts = Options()) -> (S, Nr, Sd, Nd, nz)
+
+Host analysis `S` of the general matrix `A` (structure `"G"`, view `'F'`) with
+its reference LU factor `Nr` (`ref_lu!`), the analysis adapted to `backend`
+with `INT` maps, device storage `Nd` and the values `nz` on `backend` (T19).
+"""
+function lu_setup(backend, A::SparseMatrixCSC{T}, ::Type{INT} = Int32; opts = Options()) where {T, INT}
+    C = SparseDirectSolver.CSR(A)
+    S = SparseDirectSolver.symbolic_analysis(C, "G", 'F'; opts)
+    Nr = SparseDirectSolver.allocate_numeric(S, T)
+    SparseDirectSolver.ref_lu!(Nr, S, C.nzval; opts) == 0 || error("lu_setup: the reference factorization failed")
+    Sd = SparseDirectSolver.adapt(backend, S, INT)
+    Nd = SparseDirectSolver.allocate_numeric(Sd, T, backend)
+    return S, Nr, Sd, Nd, to_device(backend, C.nzval)
+end
+
+"""
+    upanel_error(Nh, Nr)
+
+`max |Uᵀ_device - Uᵀ_ref| / max |Uᵀ_ref|` of the `Uᵀ` panels (`ufactor`) of a
+host copy `Nh` of a device LU factor and the reference `Nr`; compare with
+[`panel_tol`](@ref) (T19).
+"""
+upanel_error(Nh, Nr) = maximum(abs, Nh.ufactor - Nr.ufactor) / maximum(abs, Nr.ufactor)
+
+"""
+    lu_error(A, S, N)
+
+`‖A[p, q] - L D U‖_F / ‖A‖_F` of the LU factor in `N` (`extract_lu`, T19).
+"""
+function lu_error(A, S, N)
+    L, D, U, p, q = SparseDirectSolver.extract_lu(S, N)
+    return norm(A[p, q] - L * Diagonal(D) * U) / norm(A)
+end

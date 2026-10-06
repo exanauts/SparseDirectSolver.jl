@@ -145,10 +145,11 @@ function check_schedule(S::SDS.Symbolic)
     for T in ELTYPES, INT in INTTYPES
         est = SDS.memory_estimates(S, T, INT)
         @test length(est) == 16 && eltype(est) == Int64
-        actual = (L.factor_len + L.d_len + L.stack_len) * sizeof(T) + SDS.device_map_bytes(S, INT)
+        two = S.structure == SDS.STRUCTURE_GENERAL ? 2 : 1          # LU: the L and Uᵀ structures (T19)
+        actual = (two * L.factor_len + L.d_len + two * L.stack_len) * sizeof(T) + SDS.device_map_bytes(S, INT)
         @test est[2] >= actual
         @test est[1] + est[9] == est[2]
-        @test est[7] == L.factor_len * sizeof(T) && est[9] == L.stack_len * sizeof(T)
+        @test est[7] == two * L.factor_len * sizeof(T) && est[9] == two * L.stack_len * sizeof(T)
         @test all(==(0), est[13:16])
     end
     return nothing
@@ -281,8 +282,12 @@ end
     @test all(==(SDS.REGIME_C), S2.schedule.regime)
     @test SDS.nlaunches(S2.schedule) == (1 + 4 * 4) + (1 + 1)   # potrf, trsm, syrk, pack_add!
     check_schedule(S2)
-    # "G" maps are not implemented yet
-    @test thrown(() -> SDS.symbolic_analysis(SDS.CSR(A), "G", 'F')) isa NotSupportedError
+    # "G" (LU, T19): the same tree, every packed entry twice (L and Uᵀ), so the regime-A peak doubles
+    SG = SDS.symbolic_analysis(SDS.CSR(A), "G", 'F'; opts)
+    @test SG.schedule.elsize == 2 * sizeof(Float64)
+    @test SG.schedule.subtree_peak == 2 .* sc.subtree_peak
+    @test count(<(0), SG.amap) == (nnz(A) - size(A, 1)) ÷ 2         # one of each symmetric pair goes to Uᵀ
+    check_schedule(SG)
 end
 
 @testset "reconstruction through amap: $T $structure '$view' index '$index'" for T in ELTYPES,

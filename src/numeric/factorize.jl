@@ -66,8 +66,9 @@ function cholesky_stats!(N::Numeric, S::Symbolic)
 end
 
 function _check_numeric(N::Numeric{T}, S::Symbolic, nzval::AbstractVector) where {T}
-    _is_ldlt_structure(S.structure) ? _check_ldlt_eltype(T) : _check_reference_cholesky(S, T)
-    sizeof(T) <= S.elsize ||
+    lu = S.structure == STRUCTURE_GENERAL
+    _is_ldlt_structure(S.structure) || lu ? _check_ldlt_eltype(T) : _check_reference_cholesky(S, T)
+    (lu ? 2 : 1) * sizeof(T) <= S.elsize ||
         throw(InvalidValueError("the analysis was built for $(S.elsize)-byte elements, the numeric storage has " *
                                 "$(sizeof(T))-byte $T"))
     nb = N.nbatch
@@ -79,6 +80,8 @@ function _check_numeric(N::Numeric{T}, S::Symbolic, nzval::AbstractVector) where
         throw(InvalidValueError("the numeric storage was not allocated for this analysis"))
     length(N.work) == nb * S.layout.work_len && length(N.piv) == nb * S.n && length(N.psign) == S.n ||
         throw(InvalidValueError("the numeric storage was not allocated for this analysis"))
+    lu && (length(N.ufactor) != length(N.factor) || length(N.ustack) != length(N.stack)) &&
+        throw(InvalidValueError("the numeric storage was not allocated for structure \"G\""))
     backend = KernelAbstractions.get_backend(N.factor)
     for x in (nzval, S.amap, N.info)
         typeof(KernelAbstractions.get_backend(x)) == typeof(backend) ||
@@ -194,7 +197,7 @@ _check_ldlt_eltype(::Type{T}) where {T} = T <: LinearAlgebra.BlasFloat ||
     factorize!(numeric, symbolic, nzval; impl = :auto, opts = Options()) -> info::Int
 
 Structures `"S"`/`"H"`: [`factorize_ldlt!`](@ref) with the pivoting options
-`opts` (`impl` is not used). Structures `"SPD"`/`"HPD"`: multifrontal Cholesky `P A Pᵀ = L Lᴴ` on the device: `nzval` are the stored
+`opts` (`impl` is not used); structure `"G"`: [`factorize_lu!`](@ref) likewise. Structures `"SPD"`/`"HPD"`: multifrontal Cholesky `P A Pᵀ = L Lᴴ` on the device: `nzval` are the stored
 values of A (same pattern, view and index base as the analysis) on the backend
 of `numeric`, and `symbolic` has its maps on that backend
 (`adapt(backend, symbolic, INT)`). For every launch group of the schedule,
@@ -230,6 +233,7 @@ allocated on the device; the panels are bitwise reproducible for a fixed
 """
 function factorize!(N::Numeric, S::Symbolic, nzval::AbstractVector; impl::Symbol = :auto, opts::Options = Options())
     _is_ldlt_structure(S.structure) && return factorize_ldlt!(N, S, nzval; impl, opts)
+    S.structure == STRUCTURE_GENERAL && return factorize_lu!(N, S, nzval; opts)
     return factorize_cholesky!(N, S, nzval; impl, opts)
 end
 
@@ -286,11 +290,11 @@ _original_column(S::Symbolic, k::Integer) = k == 0 ? 0 : S.partition.perm[k]
 Write the `info` of the last [`factorize!`](@ref) of every active batch member
 `k` into `info[k]` (the original column of the member's first non-positive
 pivot, 0 = success; inactive members keep their entries). Host data only: the
-statuses were read by `factorize!` (Cholesky) or are 0 (LDLᵀ/LDLᴴ).
+statuses were read by `factorize!` (Cholesky) or are 0 (LDLᵀ/LDLᴴ, LU).
 """
 function member_info!(info::AbstractVector{<:Integer}, N::Numeric, S::Symbolic)
     plan = N.plan
-    chol = !_is_ldlt_structure(S.structure)
+    chol = !_is_ldlt_structure(S.structure) && S.structure != STRUCTURE_GENERAL
     for j in 1:plan.nact[]
         k = Int(plan.members_host[j])
         info[k] = chol ? _original_column(S, plan.info_host[k]) : 0

@@ -1,5 +1,5 @@
 # Julia-native layer (PLAN §1.5, §3.1) on top of the handle layer: `cholesky`,
-# `cholesky!`, `ldlt`, `ldlt!`, `ldiv!`, `\`, `logabsdet`, `diag`, `nnz`. Methods take the
+# `cholesky!`, `ldlt`, `ldlt!`, `lu`, `lu!`, `ldiv!`, `\`, `logabsdet`, `diag`, `nnz`. Methods take the
 # in-package `CSR`; the CUDA extension adds `CuSparseMatrixCSR` and its
 # `Symmetric`/`Hermitian` wrappers, as CUDSS.jl does. A `SparseMatrixCSC` is not
 # accepted by `cholesky` (that method belongs to CHOLMOD): wrap it with `CSR(A)`.
@@ -11,7 +11,7 @@
 # or strided vectors).
 #
 # PLAN §3.1 turns iterative refinement on in this layer: the solvers created
-# by `cholesky`/`ldlt` start with `ir_n_steps = 2` (the handle layer keeps the
+# by `cholesky`/`ldlt`/`lu` start with `ir_n_steps = 2` (the handle layer keeps the
 # cuDSS default 0); `ir_tol` (default 0: no early exit, no synchronization per
 # step) stops it early when the user sets it. Both stay settable on the solver.
 
@@ -21,7 +21,7 @@ function _linear_algebra_defaults!(solver::DirectSolver)
     return solver
 end
 
-"Refinement steps of the solvers created by `cholesky` and `ldlt` (PLAN §3.1; the handle layer uses 0)."
+"Refinement steps of the solvers created by `cholesky`, `ldlt` and `lu` (PLAN §3.1; the handle layer uses 0)."
 const LINEAR_ALGEBRA_IR_STEPS = 2
 
 """
@@ -69,6 +69,41 @@ function LinearAlgebra.ldlt(A::CSR{T}; view::Char = 'F', check::Bool = false) wh
     solver = _linear_algebra_defaults!(DirectSolver(A, T <: Real ? "S" : "H", view))
     execute!("analysis", solver, nothing, nothing)
     execute!("factorization", solver, nothing, nothing; asynchronous = false)
+    _check_info(solver, check)
+    return solver
+end
+
+"""
+    lu(A::CSR; check = false) -> DirectSolver
+
+`L D U` factorization (structure `"G"`) of the general sparse matrix `A` on its
+backend (≅ CUDSS.jl's `lu`): a [`DirectSolver`](@ref) after `"analysis"` and
+`"factorization"` (synchronized, `ir_n_steps = 2` as [`cholesky`](@ref)), on the
+symmetric pattern of `A + Aᵀ` with row pivoting inside the fully-summed block of
+each front and static perturbation of tiny pivots (read
+`getparam(solver, "npivots")`). The factorization does not fail (`"info"` stays
+0), so `check` has no effect. `ldiv!`/`\` solve with `A`; `setparam!(solver,
+"solve_mode", 1)` (or `2`) solves with `Aᵀ` (`Aᴴ`).
+"""
+function LinearAlgebra.lu(A::CSR{T}; check::Bool = false) where {T}
+    solver = _linear_algebra_defaults!(DirectSolver(A, "G", 'F'))
+    execute!("analysis", solver, nothing, nothing)
+    execute!("factorization", solver, nothing, nothing; asynchronous = false)
+    _check_info(solver, check)
+    return solver
+end
+
+"""
+    lu!(solver::DirectSolver, A; check = false) -> solver
+
+Factorize the new values `A` reusing the analysis of `solver`, as
+[`cholesky!`](@ref) (`"factorization"` the first time after an analysis,
+`"refactorization"` afterwards, synchronized).
+"""
+function LinearAlgebra.lu!(solver::DirectSolver, A; check::Bool = false)
+    update!(solver, A)
+    phase = solver.fresh_factorization ? "factorization" : "refactorization"
+    execute!(phase, solver, nothing, nothing; asynchronous = false)
     _check_info(solver, check)
     return solver
 end
@@ -166,6 +201,8 @@ determinants of the 2×2 blocks; `sign` is `±1` (real or Hermitian) or `det D /
 the determinant of `A + E`. Raises [`FactorizationError`](@ref) when the
 factorization failed (`"info" ≠ 0`) and [`NotSupportedError`](@ref) for a
 uniform batch (read the members' diagonals with `getparam(solver, "diag")`).
+LU (`"G"`): `det A = ± det D`, the sign of the local row interchanges times the
+product of the pivots (`sign` is `±1` for real `T`, a unit complex number otherwise).
 """
 function LinearAlgebra.logabsdet(solver::DirectSolver{T}) where {T}
     solver.nbatch == 1 ||
@@ -173,6 +210,7 @@ function LinearAlgebra.logabsdet(solver::DirectSolver{T}) where {T}
     solver.stage >= STAGE_FACTORIZED && solver.info[1] == 0 ||
         throw(FactorizationError(solver.info[1], "logabsdet needs a successful factorization"))
     _is_ldlt_structure(solver.structure) && return _logabsdet_ldlt(solver)
+    solver.structure == STRUCTURE_GENERAL && return _logabsdet_lu(solver)
     d = Array(getparam(solver, "diag"))
     return 2 * sum(x -> log(abs(x)), d; init = zero(real(T))), one(T)
 end
@@ -196,6 +234,31 @@ function _logabsdet_ldlt(solver::DirectSolver{T}) where {T}
         end
         la += log(abs(x))
         sgn *= herm ? T(sign(real(x))) : x / abs(x)
+    end
+    return la, sgn
+end
+
+function _logabsdet_lu(solver::DirectSolver{T}) where {T}
+    n = size(solver, 1)
+    d = Array(view(solver.numeric.d, 1:n))
+    piv = Array(view(solver.numeric.piv, 1:n))
+    la, sgn = zero(real(T)), one(T)
+    for x in d
+        la += log(abs(x))
+        sgn *= T <: Real ? T(sign(x)) : x / abs(x)
+    end
+    # parity of the local row interchanges (P A Pᵀ: the symmetric permutation cancels)
+    seen = falses(n)
+    for k in 1:n
+        seen[k] && continue
+        len = 0
+        j = k
+        while !seen[j]
+            seen[j] = true
+            j = Int(piv[j])
+            len += 1
+        end
+        iseven(len) && (sgn = -sgn)
     end
     return la, sgn
 end

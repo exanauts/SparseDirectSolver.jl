@@ -60,13 +60,14 @@ right-hand side and the solution (as for `solve_mode`, see
 [`solve_conjugated`](@ref)).
 
 Implemented at this point: structures `"SPD"` (real `T`), `"HPD"`, `"S"`
-(LDLᵀ; complex symmetric for complex `T`) and `"H"` (LDLᴴ), single matrices
+(LDLᵀ; complex symmetric for complex `T`), `"H"` (LDLᴴ) and `"G"` (LU on the
+symmetric pattern of `A + Aᵀ` with row pivoting inside the fully-summed block
+of each front, `P_r P A Pᵀ = L D U`; view `'F'` only), single matrices
 and uniform batches (see below), the phases `"reordering"`, `"symbolic_factorization"`,
 `"analysis"`, `"factorization"`, `"refactorization"`, `"solve"`,
 `"solve_fwd_perm"`, `"solve_fwd"`, `"solve_diag"`, `"solve_bwd"`,
-`"solve_bwd_perm"` and `"solve_refinement"` ([`execute!`](@ref)). Structure
-`"G"` and the Schur phases raise [`NotSupportedError`](@ref) when they are
-executed.
+`"solve_bwd_perm"` and `"solve_refinement"` ([`execute!`](@ref)). The Schur
+phases raise [`NotSupportedError`](@ref) when they are executed.
 
 Uniform batch (PLAN §1.6, §3.5, ≅ CUDSS.jl's uniform batch): `nbatch`
 matrices with the pattern of `rowptr`/`colval` and values `nzval`, either a
@@ -321,9 +322,6 @@ end
 # options that no phase implements yet: refuse them instead of silently ignoring them
 function _check_analysis_supported(solver::DirectSolver{T}) where {T}
     s = solver.structure
-    s == STRUCTURE_GENERAL &&
-        throw(NotSupportedError("structure \"G\" (LU) is not implemented yet (T19); use \"S\", \"H\", \"SPD\" or " *
-                                "\"HPD\""))
     T <: Complex && s == STRUCTURE_SPD &&
         throw(InvalidValueError("a complex positive definite matrix needs structure \"HPD\""))
     opts = solver.options
@@ -376,7 +374,8 @@ function _symbolic!(solver::DirectSolver{T, INT}) where {T, INT}
     P = SymmetricPattern(solver.host_rowptr, solver.host_colval, A.nrows, solver.structure;
                          view = _stored_view(solver), index = A.index)
     sp = supernode_partition(factor_pattern(P, ord), ord.perm, opts)
-    sc = build_schedule(sp, opts, T; reserve = subtree_local_reserve(solver.structure))
+    sc = build_schedule(sp, opts, T; reserve = subtree_local_reserve(solver.structure),
+                        elsize = schedule_elsize(solver.structure, T))
     layout = build_layout(sp, sc; ldlt = _is_ldlt_structure(solver.structure))
     Sh = Symbolic(sp, sc, layout, solver.host_rowptr, solver.host_colval, A.nrows, solver.structure;
                   view = _stored_view(solver), index = A.index)
@@ -447,12 +446,14 @@ _info_value(solver::DirectSolver) = solver.nbatch == 1 ? solver.info[1] : copy(s
 _elapsed(tic) = string(round((time_ns() - tic) / 1.0e6; digits = 3), " ms")
 
 # The numeric phase of the structure, behind a barrier: the structure is a run-time value, and a static call
-# would compile the Cholesky and the LDLᵀ/LDLᴴ paths with every solver, on the CPU backend all their kernels (most
+# would compile the Cholesky, LDLᵀ/LDLᴴ and LU paths with every solver, on the CPU backend all their kernels (most
 # of the test suite's compile time). The barrier takes the mutable handle only: the dynamic call boxes nothing
 # (an immutable `Numeric` or `Symbolic` argument would be copied to the heap on every call).
 function _numeric_phase!(solver::DirectSolver)
     if _is_ldlt_structure(solver.structure)
         Base.inferencebarrier(_numeric_phase_ldlt!)(solver)
+    elseif solver.structure == STRUCTURE_GENERAL
+        Base.inferencebarrier(_numeric_phase_lu!)(solver)
     else
         Base.inferencebarrier(_numeric_phase_cholesky!)(solver)
     end
@@ -466,6 +467,11 @@ end
 
 function _numeric_phase_ldlt!(solver::DirectSolver)
     factorize_ldlt!(solver.numeric, solver.symbolic, _flat(solver.A.nzval); opts = solver.options)
+    return nothing
+end
+
+function _numeric_phase_lu!(solver::DirectSolver)
+    factorize_lu!(solver.numeric, solver.symbolic, _flat(solver.A.nzval); opts = solver.options)
     return nothing
 end
 
@@ -512,7 +518,8 @@ function _refinement!(solver::DirectSolver{T, INT}, nrhs::Int) where {T, INT}
     if W === nothing
         F = full_pattern_map(solver.host_rowptr, solver.host_colval, solver.A.nrows, solver.structure;
                              view = _stored_view(solver), index = solver.A.index)
-        W = allocate_refinement(refinement_map(F), T, INT, solver.backend, max(nrhs, max_rhs(solver.workspace)))
+        W = allocate_refinement(refinement_map(F; transpose = solver.structure == STRUCTURE_GENERAL), T, INT,
+                                solver.backend, max(nrhs, max_rhs(solver.workspace)); n = solver.A.nrows)
     elseif max_rhs(W) < nrhs
         W = _grow_refinement(W, nrhs)
     end
@@ -555,6 +562,7 @@ function _solve_phase!(solver::DirectSolver, p::Phase, X::AbstractVecOrMat, B::A
     bm = batch_map(N; nrhs)
     det = opts.deterministic_mode == 1
     cj = solve_conjugated(solver.structure, eltype(ws), solver.A.transposed, opts.solve_mode)
+    tm = solve_transposed(solver.structure, solver.A.transposed, opts.solve_mode)   # LU: solve with Mᵀ
     refine = opts.ir_n_steps > 0 && (p == PHASE_SOLVE || p == PHASE_SOLVE_REFINEMENT)
     if p == PHASE_SOLVE_REFINEMENT && refine && Base.mightalias(X, B)
         throw(InvalidValueError("\"solve_refinement\" needs the original right-hand side: X and B must not alias"))
@@ -567,36 +575,36 @@ function _solve_phase!(solver::DirectSolver, p::Phase, X::AbstractVecOrMat, B::A
             Bs, bt = W.Bc, false
         end
         permute_rhs!(ws.Y, B, S.perm; transposed, conjugate = cj, bm)
-        forward_sweep!(ws, S, N; nrhs, deterministic = det)
+        forward_sweep!(ws, S, N; nrhs, deterministic = det, transpose = tm)
         diagonal_sweep!(ws, S, N; nrhs)
-        backward_sweep!(ws, S, N; nrhs)
+        backward_sweep!(ws, S, N; nrhs, transpose = tm)
         unpermute_solution!(X, ws.Y, S.perm; transposed, conjugate = cj, bm)
-        refine ? _refine_phase!(solver, W, ws, X, Bs, transposed, bt, cj, det) : (solver.ir_steps = 0)
+        refine ? _refine_phase!(solver, W, ws, X, Bs, transposed, bt, cj, det, tm) : (solver.ir_steps = 0)
     elseif p == PHASE_SOLVE_FWD_PERM
         permute_rhs!(ws.Y, B, S.perm; transposed, conjugate = cj, bm)
     elseif p == PHASE_SOLVE_FWD
-        forward_sweep!(ws, S, N; nrhs, deterministic = det)
+        forward_sweep!(ws, S, N; nrhs, deterministic = det, transpose = tm)
     elseif p == PHASE_SOLVE_DIAG
         diagonal_sweep!(ws, S, N; nrhs)
     elseif p == PHASE_SOLVE_BWD
-        backward_sweep!(ws, S, N; nrhs)
+        backward_sweep!(ws, S, N; nrhs, transpose = tm)
     elseif p == PHASE_SOLVE_BWD_PERM
         unpermute_solution!(X, ws.Y, S.perm; transposed, conjugate = cj, bm)
     else  # PHASE_SOLVE_REFINEMENT
-        refine ? _refine_phase!(solver, W, ws, X, B, transposed, transposed, cj, det) : (solver.ir_steps = 0)
+        refine ? _refine_phase!(solver, W, ws, X, B, transposed, transposed, cj, det, tm) : (solver.ir_steps = 0)
     end
     return nothing
 end
 
 function _refine_phase!(solver::DirectSolver, W::RefinementWorkspace, ws::SolveWorkspace, X, B, xt::Bool, bt::Bool,
-                        cj::Bool, det::Bool)
+                        cj::Bool, det::Bool, tm::Bool)
     opts = solver.options
     done = Ref(0)   # the corrections applied, also when the refinement is interrupted
     try
         driver = opts.ir_mode == IR_FGMRES ? fgmres_refine! : refine!
         driver(X, B, W, ws, solver.symbolic, solver.numeric, vec(solver.A.nzval); nsteps = opts.ir_n_steps,
                tol = opts.ir_tol, transposed = xt, b_transposed = bt, conjugate = cj, deterministic = det,
-               interrupt = opts.user_host_interrupt, progress = done)
+               interrupt = opts.user_host_interrupt, progress = done, transpose_matrix = tm)
     finally
         solver.ir_steps = done[]
     end
@@ -729,10 +737,10 @@ The data parameters computed by the solver:
 | `"nsuperpanels"` | `Int`: supernodes after amalgamation | analysis |
 | `"memory_estimates"` | `Vector{Int64}` (16 entries, see [`memory_estimates`](@ref)) | analysis |
 | `"perm_reorder_row"`, `"perm_reorder_col"` | `Vector{Int}`: the fill-reducing permutation, 1-based (`perm[k]` = original index of the `k`-th pivot) | reordering |
-| `"perm_row"`, `"perm_col"` | `Vector{Int}`: the final permutation of the factor (= the reordering for Cholesky) | analysis |
-| `"diag"` | vector of `T` on the solver's backend: the diagonal of `L` (Cholesky) or of `D` (LDLᵀ/LDLᴴ; for a 2×2 block its two diagonal entries) in factor order | factorization |
-| `"npivots"` | `INT`: perturbed pivots (LDLᵀ/LDLᴴ; `0` for Cholesky) | factorization |
-| `"inertia"` | `Tuple{INT, INT}`: `(npos, nneg)` of D (after perturbation, so the inertia of `A + E`; read it with `"npivots"`); `(0, 0)` for complex symmetric `"S"`; Cholesky: `(number of positive pivots, 0)` | factorization |
+| `"perm_row"`, `"perm_col"` | `Vector{Int}`: the final permutation of the factor (= the reordering for Cholesky and LDLᵀ/LDLᴴ); LU (`"G"`) after a factorization: `perm_row[k]` is the original row of factor row `k` (the reordering composed with the local row interchanges of batch member 1), `perm_col` the reordering, so `A[perm_row, perm_col] = L D U` | analysis |
+| `"diag"` | vector of `T` on the solver's backend: the diagonal of `L` (Cholesky), of `D` (LDLᵀ/LDLᴴ; for a 2×2 block its two diagonal entries) or of `D` in `L D U` (LU, = the diagonal of `U` in `L U`) in factor order | factorization |
+| `"npivots"` | `INT`: perturbed pivots (LDLᵀ/LDLᴴ, LU; `0` for Cholesky) | factorization |
+| `"inertia"` | `Tuple{INT, INT}`: `(npos, nneg)` of D (after perturbation, so the inertia of `A + E`; read it with `"npivots"`); `(0, 0)` for complex symmetric `"S"` and for `"G"`; Cholesky: `(number of positive pivots, 0)` | factorization |
 | `"pivot_stats"` | `NamedTuple` `(npos, nneg, nzero, nperturbed, n2x2)` of `Int64` (PLAN §1.7) | factorization |
 
 Uniform batch (`nbatch > 1`): `"info"`, `"npivots"`, `"inertia"` and
@@ -775,6 +783,10 @@ function getparam(solver::DirectSolver, name::AbstractString)
     name == "flops" && return sp.flops
     name == "nsuperpanels" && return nsuperpanels(sp)
     name == "memory_estimates" && return _memory_estimates(solver)
+    if name == "perm_row" && solver.structure == STRUCTURE_GENERAL && solver.stage >= STAGE_FACTORIZED
+        piv = Array(view(solver.numeric.piv, 1:Sh.n))    # local row order of member 1
+        return sp.perm[piv]
+    end
     return copy(sp.perm)   # perm_row, perm_col
 end
 
@@ -824,7 +836,7 @@ end
 # per member for a batch
 function _pivot_output(solver::DirectSolver{T, INT}, name) where {T, INT}
     S, N = solver.symbolic, solver.numeric
-    if !_is_ldlt_structure(S.structure)
+    if !_is_ldlt_structure(S.structure) && S.structure != STRUCTURE_GENERAL
         _set_members!(solver)
         reduce_stats!(N, S)
     end
@@ -834,13 +846,13 @@ function _pivot_output(solver::DirectSolver{T, INT}, name) where {T, INT}
     return [out(pivot_totals(totals, solver.nbatch, k)) for k in 1:solver.nbatch]
 end
 
-# diagonal of L (Cholesky) or D (LDLᵀ/LDLᴴ) in factor order, on the solver's backend, the members of a batch one
+# diagonal of L (Cholesky) or D (LDLᵀ/LDLᴴ, LU) in factor order, on the solver's backend, the members of a batch one
 # after the other (Cholesky: one launch, one work item per (supernode, member))
 function _factor_diag(solver::DirectSolver{T}) where {T}
     S, N = solver.symbolic, solver.numeric
     n, nb = S.n, solver.nbatch
     d = KernelAbstractions.zeros(solver.backend, T, n * nb)
-    if _is_ldlt_structure(S.structure)
+    if _is_ldlt_structure(S.structure) || S.structure == STRUCTURE_GENERAL
         for k in 1:nb
             copyto!(d, (k - 1) * n + 1, N.d, (k - 1) * 2n + 1, n)
         end

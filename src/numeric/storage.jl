@@ -130,7 +130,13 @@ Numeric storage of a factorization (PLAN §3.2), laid out by the
 * `plan`: the host [`NumericPlan`](@ref);
 * `members` (`nbatch` `Int32`): the active batch members of the last phase
   (first `plan.nact[]` entries, see [`BatchMap`](@ref));
-* `nbatch`: the number of matrices of the uniform batch (PLAN §3.5).
+* `nbatch`: the number of matrices of the uniform batch (PLAN §3.5);
+* `ufactor`, `ustack` (structure `"G"` only, empty otherwise): the `Uᵀ`
+  structure of LU (`src/numeric/lu.jl`), laid out exactly as `factor` and
+  `stack`: the panel of `s` holds `U[1:w, :]ᵀ` (unit diagonal stored), the
+  packed contribution block the transposed strict upper triangle of the `m×m`
+  block (its diagonal stays zero). For LU, `factor` holds the unit-lower `L`,
+  `d` the diagonal `D` of `L D U` and `piv` the local row pivot order.
 
 A uniform batch of `nbatch` members multiplies every length above by
 `nbatch`, in the layouts of `src/numeric/batch.jl`: interleaved per front for
@@ -154,6 +160,8 @@ struct Numeric{T, VT <: AbstractVector{T}, VS <: AbstractVector{Int64}, VI <: Ab
     plan::NumericPlan
     members::VI
     nbatch::Int
+    ufactor::VT
+    ustack::VT
 end
 
 # `pivot_kind` codes of LDLᵀ/LDLᴴ factor columns
@@ -172,7 +180,8 @@ Base.show(io::IO, N::Numeric{T, VT}) where {T, VT} =
     allocate_numeric(symbolic, T, backend = CPU(); nbatch = 1) -> Numeric{T}
 
 Allocate (zero-filled) the factor panels, D, update stack, regime-C workspace, per-front
-statistics and their totals, status vector, pivot order, pivot kinds, pivot sign requests and `aux` of `symbolic`'s [`Layout`](@ref) for element type
+statistics and their totals, status vector, pivot order, pivot kinds, pivot sign requests, `aux` (and for
+`"G"` the `Uᵀ` panels and update stack) of `symbolic`'s [`Layout`](@ref) for element type
 `T` on the KernelAbstractions `backend`, for a uniform batch of `nbatch`
 matrices (every length times `nbatch`, all members active), and build its [`NumericPlan`](@ref).
 This is the only allocation of the numeric phase.
@@ -198,11 +207,15 @@ function allocate_numeric(S::Symbolic{INT}, ::Type{T}, backend::KernelAbstractio
     aux = KernelAbstractions.zeros(backend, T, nb)
     members = KernelAbstractions.allocate(backend, Int32, nb)
     copyto!(members, Int32.(1:nb))
+    lu = S.structure == STRUCTURE_GENERAL
+    ufactor = KernelAbstractions.zeros(backend, T, lu ? nb * L.factor_len : 0)
+    ustack = KernelAbstractions.zeros(backend, T, lu ? nb * L.stack_len : 0)
     plan = NumericPlan(S, nb)
     nb > 1 && _vendor_batch_pointers!(plan.vendor_ptrs, factor, S, nb)
     return Numeric{T, typeof(factor), typeof(stats), typeof(info), typeof(pivot_kind)}(factor, d, stack, work, stats,
                                                                                          info, piv, pivot_kind, totals,
-                                                                                         psign, aux, plan, members, nb)
+                                                                                         psign, aux, plan, members, nb,
+                                                                                         ufactor, ustack)
 end
 
 # member pointers of the F11 and F21 blocks of the `nb` panels of every regime-C front, when the backend has batched
@@ -210,6 +223,7 @@ end
 function _vendor_batch_pointers!(ptrs::Vector{Any}, factor::AbstractVector{T}, S::Symbolic, nb::Int) where {T}
     sc, L = S.schedule, S.layout
     _is_ldlt_structure(S.structure) && return ptrs           # LDLᵀ/LDLᴴ: KA kernels in every regime
+    S.structure == STRUCTURE_GENERAL && return ptrs           # LU: likewise
     sc.vendor_c || return ptrs
     caps = capabilities(KernelAbstractions.get_backend(factor), T)
     caps.vendor_potrf_batched || caps.vendor_trsm_batched || return ptrs

@@ -123,6 +123,14 @@ LinearAlgebra.ldlt(A::Symmetric{T, <:CuSparseMatrixCSR{T}}; check::Bool = false)
 LinearAlgebra.ldlt(A::Hermitian{T, <:CuSparseMatrixCSR{T}}; check::Bool = false) where {T} =
     ldlt(CSR(A.data); view = A.uplo, check)
 
+"""
+    lu(A::CuSparseMatrixCSR; check = false) -> DirectSolver
+
+`L D U` factorization (structure `"G"`) of `A` on the GPU (≅ CUDSS.jl's `lu`).
+See `lu(::CSR)`.
+"""
+LinearAlgebra.lu(A::CuSparseMatrixCSR; check::Bool = false) = lu(CSR(A); check)
+
 # ---------------------------------------------------------------------------
 # vendor dense bindings (see `src/dense/vendor.jl` for the contracts)
 

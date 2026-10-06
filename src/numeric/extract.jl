@@ -5,7 +5,7 @@
     host_numeric(numeric) -> Numeric{T, Vector{T}}
 
 Host copy of `numeric` (panels, D, update stack, workspace, statistics and totals, status, pivot order, kinds and sign
-requests, `aux`; the
+requests, `aux`, the `Uᵀ` panels and stack of LU; the
 plan is shared), usable by [`ref_solve!`](@ref) and [`extract_L`](@ref).
 A host `numeric` is returned as is.
 """
@@ -16,7 +16,8 @@ function host_numeric(N::Numeric{T}) where {T}
     return Numeric{T, Vector{T}, Vector{Int64}, Vector{Int32}, Vector{Int8}}(factor, d, stack, work, stats, info, piv,
                                                                              pivot_kind, Array(N.totals),
                                                                              Array(N.psign), Array(N.aux), N.plan,
-                                                                             Array(N.members), N.nbatch)
+                                                                             Array(N.members), N.nbatch,
+                                                                             Array(N.ufactor), Array(N.ustack))
 end
 
 """
@@ -48,10 +49,12 @@ function member_numeric(N::Numeric{T}, S::Symbolic, k::Integer) where {T}
     L = S.layout
     ns = nsupernodes(S)
     factor = zeros(T, L.factor_len)
+    ufactor = zeros(T, isempty(H.ufactor) ? 0 : L.factor_len)
     for s in 1:ns
         len = L.panel_ptr[s + 1] - L.panel_ptr[s]
         p0 = panel_offset(L.panel_ptr, s, k, nb)
         copyto!(factor, L.panel_ptr[s], H.factor, p0, len)
+        isempty(ufactor) || copyto!(ufactor, L.panel_ptr[s], H.ufactor, p0, len)
     end
     mv(A) = A[((k - 1) * (length(A) ÷ nb) + 1):(k * (length(A) ÷ nb))]
     info = H.info[k:nb:end]
@@ -59,5 +62,6 @@ function member_numeric(N::Numeric{T}, S::Symbolic, k::Integer) where {T}
                                                                              mv(H.stats), info, mv(H.piv),
                                                                              mv(H.pivot_kind), mv(H.totals),
                                                                              copy(H.psign), mv(H.aux),
-                                                                             NumericPlan(S), Int32[1], 1)
+                                                                             NumericPlan(S), Int32[1], 1, ufactor,
+                                                                             isempty(H.ustack) ? T[] : mv(H.ustack))
 end

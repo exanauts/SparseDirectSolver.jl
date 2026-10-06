@@ -8,9 +8,12 @@
 # a refactorization refines towards the new matrix with the old factor).
 #
 # `op(A)` is `A`, `Aᵀ` or `Aᴴ` (`solve_mode`) of the user matrix, which is the
-# stored CSR matrix `M` or, for a CSC input, `Mᵀ`. `M` is symmetric or
-# Hermitian, so every `op(A)` is `M` or `conj(M)`; `conj(M) x = b` is solved as
-# `x = conj(M⁻¹ conj(b))` ([`solve_conjugated`](@ref)).
+# stored CSR matrix `M` or, for a CSC input, `Mᵀ`. For symmetric or Hermitian
+# `M` every `op(A)` is `M` or `conj(M)`; `conj(M) x = b` is solved as
+# `x = conj(M⁻¹ conj(b))` ([`solve_conjugated`](@ref)). For a general `M`
+# (`"G"`, LU) `op(A)` is `M`, `Mᵀ` or `conj(Mᵀ)` ([`solve_transposed`](@ref)):
+# the refinement map then also holds the rows of `Mᵀ` (`transpose_matrix`
+# selects them) and the sweeps solve with the transposed factors.
 #
 # User arrays come in the layouts of `src/solve/permute.jl` (vector, matrix,
 # strided vector, row-major when transposed); the residual `R` is a column-major
@@ -30,7 +33,8 @@ sides:
 
 * `rowptr`, `colval`, `src` (`INT` vectors): the full matrix `M` as a CSR over
   the contributions of the user's `nzval` (`src[c] > 0`: `nzval[src[c]]`,
-  `src[c] < 0`: `conj(nzval[-src[c]])`), from [`refinement_map`](@ref);
+  `src[c] < 0`: `conj(nzval[-src[c]])`), from [`refinement_map`](@ref); for
+  `"G"` the rows `n+1:2n` of `rowptr` are the rows of `Mᵀ`;
 * `R` (`n × nrhs`): the residual, then the correction;
 * `Bc` (`n × nrhs`): a copy of the right-hand side when `X` and `B` alias;
 * `norms` (`2 nrhs`, real): `‖Rₖ‖₂²` and `‖Bₖ‖₂²` per right-hand side, and
@@ -52,16 +56,17 @@ end
 max_rhs(W::RefinementWorkspace) = size(W.R, 2)
 
 """
-    refinement_map(F::FullPatternMap) -> (rowptr, colval, src)
+    refinement_map(F::FullPatternMap; transpose = false) -> (rowptr, colval, src)
 
 Host CSR of the full matrix of `F` over its contributions (duplicates are not
 merged; their products are summed by the SpMV): row `i` holds the entries
 `rowptr[i]:rowptr[i+1]-1`, column `colval[c]`, value `nzval[src[c]]`, conjugated
-when `src[c] < 0`. 1-based.
+when `src[c] < 0`. 1-based. With `transpose = true` (structure `"G"`) the rows
+of `Mᵀ` follow as rows `n+1:2n` (`rowptr` has `2n + 1` entries).
 """
-function refinement_map(F::FullPatternMap)
+function refinement_map(F::FullPatternMap; transpose::Bool = false)
     n = F.n
-    rowptr = Vector{Int}(undef, n + 1)
+    rowptr = Vector{Int}(undef, (transpose ? 2n : n) + 1)
     rowptr[1] = 1
     colval = Int[]
     src = Int[]
@@ -72,20 +77,34 @@ function refinement_map(F::FullPatternMap)
         end
         rowptr[i + 1] = length(colval) + 1
     end
+    if transpose
+        # the entries of M by column: row j of Mᵀ holds the entries (i, j) of M, rows i in order
+        cols = [Tuple{Int, Int}[] for _ in 1:n]
+        for i in 1:n, e in F.rowptr[i]:(F.rowptr[i + 1] - 1), s in F.srcptr[e]:(F.srcptr[e + 1] - 1)
+            push!(cols[F.colval[e]], (i, F.conjflag[s] ? -F.src[s] : F.src[s]))
+        end
+        for j in 1:n
+            for (i, v) in cols[j]
+                push!(colval, i)
+                push!(src, v)
+            end
+            rowptr[n + j + 1] = length(colval) + 1
+        end
+    end
     return rowptr, colval, src
 end
 
 """
-    allocate_refinement(map, T, INT, backend, nrhs) -> RefinementWorkspace
+    allocate_refinement(map, T, INT, backend, nrhs; n = rows of map) -> RefinementWorkspace
 
 Move the host [`refinement_map`](@ref) `map` to `backend` as `INT` vectors
 (overflow-checked) and allocate the residual storage for `nrhs` right-hand
-sides of element type `T`.
+sides of element type `T` and `n` rows (pass `n` for a `"G"` map, which holds `2n` rows).
 """
 function allocate_refinement(map::NTuple{3, Vector{Int}}, ::Type{T}, ::Type{INT},
-                             backend::KernelAbstractions.Backend, nrhs::Integer) where {T, INT}
+                             backend::KernelAbstractions.Backend, nrhs::Integer;
+                             n::Integer = length(map[1]) - 1) where {T, INT}
     rowptr, colval, src = map
-    n = length(rowptr) - 1
     dev(v) = (v_ = _to_index_type(INT, v); d = KernelAbstractions.allocate(backend, INT, length(v_)); copyto!(d, v_); d)
     R = KernelAbstractions.zeros(backend, T, n, nrhs)
     Bc = KernelAbstractions.zeros(backend, T, n, nrhs)
@@ -113,8 +132,9 @@ end
 
 # compact column r (user column `_bm_ucol(bm, r)` of the `nrhs` user columns, values of member
 # `_bm_cmember(bm, r)`)
-@kernel function _residual_kernel!(R, rowptr, colval, src, nzval_all, X, B, n, nrhs, ncols, bm, ::Val{XT}, ::Val{BT},
-                                   ::Val{CJ}) where {XT, BT, CJ}
+# (`roff = n`: the rows of Mᵀ of a "G" map)
+@kernel function _residual_kernel!(R, rowptr, colval, src, nzval_all, X, B, n, nrhs, ncols, bm, roff, ::Val{XT},
+                                   ::Val{BT}, ::Val{CJ}) where {XT, BT, CJ}
     q = @index(Global, Linear)
     i = (q - 1) % n + 1
     r = (q - 1) ÷ n + 1
@@ -122,7 +142,7 @@ end
         nzval = _mview(nzval_all, _bm_cmember(bm, r), bm.nbatch)
         u = _bm_ucol(bm, r)
         acc = zero(eltype(R))
-        for c in Int(rowptr[i]):(Int(rowptr[i + 1]) - 1)
+        for c in Int(rowptr[roff + i]):(Int(rowptr[roff + i + 1]) - 1)
             s = Int(src[c])
             v = nzval[abs(s)]
             v = xor(s < 0, CJ) ? conj(v) : v
@@ -194,9 +214,10 @@ _user_map(::Nothing, nrhs) = single_batch(; nrhs)
 
 """
     residual!(W, nzval, X, B; nrhs, transposed = false, b_transposed = transposed, conjugate = false,
-              bm = nothing) -> W.R
+              bm = nothing, transpose_matrix = false) -> W.R
 
-`W.R[:, 1:nrhs] = B - M X` (`conj(M)` when `conjugate`) with the full matrix
+`W.R[:, 1:nrhs] = B - M X` (`conj(M)` when `conjugate`; `Mᵀ` when
+`transpose_matrix`, which needs a `"G"` map) with the full matrix
 `M` of the map of `W` and the user values `nzval`; `X`, `B` in the layouts of
 [`rhs_count`](@ref) (row-major when `transposed`/`b_transposed`) with `nrhs`
 right-hand sides. Uniform batch ([`BatchMap`](@ref) `bm`): `nzval` holds the
@@ -207,18 +228,19 @@ Asynchronous.
 """
 function residual!(W::RefinementWorkspace, nzval::AbstractVector, X::AbstractVecOrMat, B::AbstractVecOrMat;
                    nrhs::Integer, transposed::Bool = false, b_transposed::Bool = transposed,
-                   conjugate::Bool = false, bm::Union{Nothing, BatchMap} = nothing)
+                   conjugate::Bool = false, bm::Union{Nothing, BatchMap} = nothing, transpose_matrix::Bool = false)
     n = size(W.R, 1)
     bm = _user_map(bm, nrhs)
     ncols = bm.nrhs * bm.nact
     n * ncols > 0 || return W.R
+    roff = _map_row_offset(W, transpose_matrix)
     kernel! = _residual_kernel!(KernelAbstractions.get_backend(W.R), PERMUTE_WORKGROUP)
     _with_flags(transposed, b_transposed) do xt, bt
         if conjugate
-            kernel!(W.R, W.rowptr, W.colval, W.src, nzval, X, B, n, Int(nrhs), ncols, bm, xt, bt, Val(true);
+            kernel!(W.R, W.rowptr, W.colval, W.src, nzval, X, B, n, Int(nrhs), ncols, bm, roff, xt, bt, Val(true);
                     ndrange = n * ncols)
         else
-            kernel!(W.R, W.rowptr, W.colval, W.src, nzval, X, B, n, Int(nrhs), ncols, bm, xt, bt, Val(false);
+            kernel!(W.R, W.rowptr, W.colval, W.src, nzval, X, B, n, Int(nrhs), ncols, bm, roff, xt, bt, Val(false);
                     ndrange = n * ncols)
         end
     end
@@ -247,6 +269,15 @@ function residual_norms!(W::RefinementWorkspace, B::AbstractVecOrMat; nrhs::Inte
     end
     copyto!(W.norms_host, 1, W.norms, 1, 2 * ncols)
     return W.norms_host
+end
+
+# first row of the map of `op(A)`: the rows of Mᵀ start at n (a "G" map)
+function _map_row_offset(W::RefinementWorkspace, transpose_matrix::Bool)
+    transpose_matrix || return 0
+    n = size(W.R, 1)
+    length(W.rowptr) == 2n + 1 ||
+        throw(InvalidValueError("the refinement map has no rows of Mᵀ (only structure \"G\" solves with Aᵀ)"))
+    return n
 end
 
 # largest relative residual ‖Rₖ‖/‖Bₖ‖ over the right-hand sides (‖Rₖ‖ when Bₖ = 0)
@@ -302,10 +333,11 @@ end
 """
     refine!(X, B, W, ws, symbolic, numeric, nzval; nsteps, tol = 0, transposed = false,
             b_transposed = transposed, conjugate = false, deterministic = false,
-            interrupt = nothing, progress = Ref(0)) -> steps
+            interrupt = nothing, progress = Ref(0), transpose_matrix = false) -> steps
 
 Plain iterative refinement of the solution `X` of `op(A) X = B` (`op(A) = M`,
-or `conj(M)` when `conjugate`), at most `nsteps` steps of
+or `conj(M)` when `conjugate`; `Mᵀ` or `conj(Mᵀ)` with `transpose_matrix`, LU
+only), at most `nsteps` steps of
 
     R = B - op(A) X            (residual!)
     stop if tol > 0 and maxₖ ‖Rₖ‖₂ / ‖Bₖ‖₂ ≤ tol   (residual_norms!, one host synchronization)
@@ -322,7 +354,7 @@ function refine!(X::AbstractVecOrMat, B::AbstractVecOrMat, W::RefinementWorkspac
                  N::Numeric, nzval::AbstractVector; nsteps::Integer, tol::Real = 0, transposed::Bool = false,
                  b_transposed::Bool = transposed, conjugate::Bool = false, deterministic::Bool = false,
                  interrupt::Union{Nothing, Threads.Atomic{Bool}} = nothing,
-                 progress::Base.RefValue{Int} = Ref(0))
+                 progress::Base.RefValue{Int} = Ref(0), transpose_matrix::Bool = false)
     nu = rhs_count(X, S.n; transposed)                        # user columns: nrhs per member × nbatch
     nu % N.nbatch == 0 || throw(DimensionMismatch("$nu right-hand sides for a batch of $(N.nbatch) members"))
     nrhs = nu ÷ N.nbatch
@@ -334,7 +366,7 @@ function refine!(X::AbstractVecOrMat, B::AbstractVecOrMat, W::RefinementWorkspac
     progress[] = 0
     for _ in 1:nsteps
         _poll_interrupt(interrupt)
-        residual!(W, nzval, X, B; nrhs = nu, transposed, b_transposed, conjugate, bm)
+        residual!(W, nzval, X, B; nrhs = nu, transposed, b_transposed, conjugate, bm, transpose_matrix)
         if tol > 0
             norms = residual_norms!(W, B; nrhs = nu, transposed = b_transposed, bm)
             rel = _max_relative_residual(norms, ncols)
@@ -342,9 +374,9 @@ function refine!(X::AbstractVecOrMat, B::AbstractVecOrMat, W::RefinementWorkspac
             rel <= tol && break
         end
         permute_rhs!(ws.Y, W.R, S.perm; conjugate)
-        forward_sweep!(ws, S, N; nrhs, deterministic)
+        forward_sweep!(ws, S, N; nrhs, deterministic, transpose = transpose_matrix)
         diagonal_sweep!(ws, S, N; nrhs)
-        backward_sweep!(ws, S, N; nrhs)
+        backward_sweep!(ws, S, N; nrhs, transpose = transpose_matrix)
         add_correction!(X, ws.Y, S.perm; nrhs = nu, transposed, conjugate, bm)
         steps += 1
         progress[] = steps
@@ -383,10 +415,11 @@ Whether the Krylov.jl extension is loaded (`ir_mode = "fgmres"` works).
 fgmres_available() = FGMRES_PROVIDER[] !== nothing
 
 """
-    RefinementOperator(W, nzval, n, ncols, bm, conjugate)
+    RefinementOperator(W, nzval, n, ncols, bm, conjugate, roff = 0)
 
 `op(A)` (the full matrix `M` of the [`RefinementWorkspace`](@ref) `W` with
-the values `nzval`, `conj(M)` when `conjugate`) acting on the `n × ncols`
+the values `nzval`, `conj(M)` when `conjugate`; `roff = n`: `Mᵀ` from the
+rows of a `"G"` map) acting on the `n × ncols`
 compact columns stacked into vectors of length `n ncols` (column `r` uses
 the values of the member of compact column `r` of the [`BatchMap`](@ref)
 `bm`). Supports `size`, `eltype` and `mul!(y, op, x)` (one launch,
@@ -399,13 +432,17 @@ struct RefinementOperator{T, RW <: RefinementWorkspace{T}, V <: AbstractVector, 
     ncols::Int
     bm::BM
     conjugate::Bool
+    roff::Int
 end
+
+RefinementOperator(W::RefinementWorkspace, nzval::AbstractVector, n::Integer, ncols::Integer, bm::BatchMap,
+                   conjugate::Bool) = RefinementOperator(W, nzval, Int(n), Int(ncols), bm, conjugate, 0)
 
 Base.size(op::RefinementOperator) = (op.n * op.ncols, op.n * op.ncols)
 Base.size(op::RefinementOperator, d::Integer) = d <= 2 ? op.n * op.ncols : 1
 Base.eltype(::RefinementOperator{T}) where {T} = T
 
-@kernel function _spmv_kernel!(y, rowptr, colval, src, nzval_all, x, n, ncols, bm, ::Val{CJ}) where {CJ}
+@kernel function _spmv_kernel!(y, rowptr, colval, src, nzval_all, x, n, ncols, bm, roff, ::Val{CJ}) where {CJ}
     q = @index(Global, Linear)
     i = (q - 1) % n + 1
     r = (q - 1) ÷ n + 1
@@ -413,7 +450,7 @@ Base.eltype(::RefinementOperator{T}) where {T} = T
         nzval = _mview(nzval_all, _bm_cmember(bm, r), bm.nbatch)
         off = (r - 1) * n
         acc = zero(eltype(y))
-        for c in Int(rowptr[i]):(Int(rowptr[i + 1]) - 1)
+        for c in Int(rowptr[roff + i]):(Int(rowptr[roff + i + 1]) - 1)
             s = Int(src[c])
             v = nzval[abs(s)]
             v = xor(s < 0, CJ) ? conj(v) : v
@@ -431,19 +468,19 @@ function LinearAlgebra.mul!(y::AbstractVector, op::RefinementOperator, x::Abstra
     W = op.W
     kernel! = _spmv_kernel!(KernelAbstractions.get_backend(W.R), PERMUTE_WORKGROUP)
     if op.conjugate
-        kernel!(y, W.rowptr, W.colval, W.src, op.nzval, x, op.n, op.ncols, op.bm, Val(true); ndrange = m)
+        kernel!(y, W.rowptr, W.colval, W.src, op.nzval, x, op.n, op.ncols, op.bm, op.roff, Val(true); ndrange = m)
     else
-        kernel!(y, W.rowptr, W.colval, W.src, op.nzval, x, op.n, op.ncols, op.bm, Val(false); ndrange = m)
+        kernel!(y, W.rowptr, W.colval, W.src, op.nzval, x, op.n, op.ncols, op.bm, op.roff, Val(false); ndrange = m)
     end
     return y
 end
 
 """
-    FactorPreconditioner(ws, S, N, nrhs, ncols, conjugate, deterministic, interrupt)
+    FactorPreconditioner(ws, S, N, nrhs, ncols, conjugate, deterministic, interrupt, transpose = false)
 
 `op(A)⁻¹` through the factorization in `N` (permutation, forward, diagonal
 and backward sweeps in the solve workspace `ws`; `conj(M⁻¹ conj(x))` when
-`conjugate`) on the stacked compact columns (`nrhs` per active member,
+`conjugate`; the sweeps of `Mᵀ` when `transpose`, LU only) on the stacked compact columns (`nrhs` per active member,
 `ncols` in all) of the [`RefinementOperator`](@ref). `mul!(y, P, x)` polls
 `interrupt` first ([`InterruptedError`](@ref)); asynchronous otherwise. The
 right preconditioner of FGMRES-IR.
@@ -457,7 +494,12 @@ struct FactorPreconditioner{T, WS <: SolveWorkspace{T}, SY <: Symbolic, NU <: Nu
     conjugate::Bool
     deterministic::Bool
     interrupt::Union{Nothing, Threads.Atomic{Bool}}
+    transpose::Bool
 end
+
+FactorPreconditioner(ws::SolveWorkspace, S::Symbolic, N::Numeric, nrhs::Integer, ncols::Integer, conjugate::Bool,
+                     deterministic::Bool, interrupt) =
+    FactorPreconditioner(ws, S, N, Int(nrhs), Int(ncols), conjugate, deterministic, interrupt, false)
 
 Base.size(P::FactorPreconditioner) = (P.S.n * P.ncols, P.S.n * P.ncols)
 Base.size(P::FactorPreconditioner, d::Integer) = d <= 2 ? P.S.n * P.ncols : 1
@@ -467,9 +509,9 @@ function LinearAlgebra.mul!(y::AbstractVector, P::FactorPreconditioner, x::Abstr
     _poll_interrupt(P.interrupt)
     perm = P.S.perm
     permute_rhs!(P.ws.Y, x, perm; conjugate = P.conjugate)
-    forward_sweep!(P.ws, P.S, P.N; nrhs = P.nrhs, deterministic = P.deterministic)
+    forward_sweep!(P.ws, P.S, P.N; nrhs = P.nrhs, deterministic = P.deterministic, transpose = P.transpose)
     diagonal_sweep!(P.ws, P.S, P.N; nrhs = P.nrhs)
-    backward_sweep!(P.ws, P.S, P.N; nrhs = P.nrhs)
+    backward_sweep!(P.ws, P.S, P.N; nrhs = P.nrhs, transpose = P.transpose)
     unpermute_solution!(y, P.ws.Y, perm; conjugate = P.conjugate)
     return y
 end
@@ -487,7 +529,7 @@ end
 """
     fgmres_refine!(X, B, W, ws, symbolic, numeric, nzval; nsteps, tol = 0, transposed = false,
                    b_transposed = transposed, conjugate = false, deterministic = false,
-                   interrupt = nothing, progress = Ref(0)) -> iterations
+                   interrupt = nothing, progress = Ref(0), transpose_matrix = false) -> iterations
 
 FGMRES-IR (`ir_mode = "fgmres"`, needs Krylov.jl) of the solution `X` of
 `op(A) X = B`, with the arguments of [`refine!`](@ref):
@@ -511,7 +553,7 @@ function fgmres_refine!(X::AbstractVecOrMat, B::AbstractVecOrMat, W::RefinementW
                         S::Symbolic, N::Numeric, nzval::AbstractVector; nsteps::Integer, tol::Real = 0,
                         transposed::Bool = false, b_transposed::Bool = transposed, conjugate::Bool = false,
                         deterministic::Bool = false, interrupt::Union{Nothing, Threads.Atomic{Bool}} = nothing,
-                        progress::Base.RefValue{Int} = Ref(0))
+                        progress::Base.RefValue{Int} = Ref(0), transpose_matrix::Bool = false)
     provider = FGMRES_PROVIDER[]
     provider === nothing &&
         throw(NotSupportedError("ir_mode = \"fgmres\" needs Krylov.jl: load it with `using Krylov`"))
@@ -525,7 +567,7 @@ function fgmres_refine!(X::AbstractVecOrMat, B::AbstractVecOrMat, W::RefinementW
     nsteps > 0 && S.n * ncols > 0 || return 0
     bm = batch_map(N; nrhs)
     _poll_interrupt(interrupt)
-    residual!(W, nzval, X, B; nrhs = nu, transposed, b_transposed, conjugate, bm)
+    residual!(W, nzval, X, B; nrhs = nu, transposed, b_transposed, conjugate, bm, transpose_matrix)
     R = real(eltype(W.R))
     atol = zero(R)
     if tol > 0
@@ -535,8 +577,8 @@ function fgmres_refine!(X::AbstractVecOrMat, B::AbstractVecOrMat, W::RefinementW
         rel <= tol && return 0
         atol = R(tol) * _min_rhs_norm(norms, ncols)
     end
-    A = RefinementOperator(W, nzval, S.n, ncols, bm, conjugate)
-    P = FactorPreconditioner(ws, S, N, nrhs, ncols, conjugate, deterministic, interrupt)
+    A = RefinementOperator(W, nzval, S.n, ncols, bm, conjugate, _map_row_offset(W, transpose_matrix))
+    P = FactorPreconditioner(ws, S, N, nrhs, ncols, conjugate, deterministic, interrupt, transpose_matrix)
     D, iters = provider(W.krylov, A, P, W.R, S.n * ncols; atol, itmax = Int(nsteps))
     permute_rhs!(ws.Y, D, S.perm)
     add_correction!(X, ws.Y, S.perm; nrhs = nu, transposed, bm)
@@ -551,10 +593,23 @@ Whether `op(A)` (`solve_mode` 0: `A`, 1: `Aᵀ`, 2: `Aᴴ`) of the user matrix i
 the conjugate of the stored, factorized matrix `M` (`A = M`, or `A = Mᵀ` for a
 CSC input). Real `T`: never. Complex symmetric `"S"` (`M = Mᵀ`): for `Aᴴ`.
 Hermitian `"H"`/`"HPD"` (`Mᵀ = conj(M)`): for `Aᵀ` of a CSR input, and for `A`
-and `Aᴴ` of a CSC input.
+and `Aᴴ` of a CSC input. General `"G"`: for `Aᴴ` (`op(A) = conj(Mᵀ)` or
+`conj(M)`, see [`solve_transposed`](@ref)).
 """
 function solve_conjugated(structure::Structure, ::Type{T}, csc_input::Bool, solve_mode::Integer) where {T}
     T <: Complex || return false
     _is_hermitian(structure) && return xor(csc_input, solve_mode == 1)
     return solve_mode == 2
 end
+
+"""
+    solve_transposed(structure, csc_input::Bool, solve_mode) -> Bool
+
+Whether the solve of `op(A)` (`solve_mode` 0: `A`, 1: `Aᵀ`, 2: `Aᴴ`) uses the
+transpose `Mᵀ` of the stored, factorized matrix `M` (`A = M`, or `A = Mᵀ` for
+a CSC input), conjugated or not ([`solve_conjugated`](@ref)). Only for
+structure `"G"` (LU): `Mᵀ` for `Aᵀ`/`Aᴴ` of a CSR input and for `A` of a CSC
+input. Symmetric and Hermitian structures never need it.
+"""
+solve_transposed(structure::Structure, csc_input::Bool, solve_mode::Integer) =
+    structure == STRUCTURE_GENERAL && xor(solve_mode != 0, csc_input)

@@ -45,6 +45,14 @@
 # rows `1:w` of its gather-list buffer in `U` (unused otherwise). Complex
 # symmetric `"S"` (`CONJ = false`) solves with `Lᵀ` instead of `Lᴴ`.
 #
+# LU (`"G"`, `src/numeric/lu.jl`): the factor is two unit-lower structures, `L`
+# (`numeric.factor`, rows in local pivot order) and `Uᵀ` (`numeric.ufactor`),
+# and the kernels take the panel buffer as an argument. `A x = b`: forward
+# sweep with `L`, reordering by the local row order (`LDL = true`), diagonal,
+# backward sweep with `(Uᵀ)ᵀ = U` (`CONJ = false`) without reordering.
+# `Aᵀ x = b` (`transpose`): forward with `Uᵀ` without reordering, diagonal,
+# backward with `Lᵀ`, restoring the order.
+#
 # As in the numeric kernels, per-node values sit in a `@localmem` control array
 # written by work item 1 before a barrier, so every loop containing a barrier
 # has a workgroup-uniform trip count that the KA CPU backend can evaluate.
@@ -609,11 +617,14 @@ end
 _ncols(N::Numeric, nrhs::Integer) = Int(nrhs) * N.plan.nact[]
 
 function _check_solve(ws::SolveWorkspace{T}, S::Symbolic, N::Numeric{T}, nrhs::Integer) where {T}
-    _is_ldlt_structure(S.structure) ? _check_ldlt_eltype(T) : _check_reference_cholesky(S, T)
+    _is_ldlt_structure(S.structure) || S.structure == STRUCTURE_GENERAL ? _check_ldlt_eltype(T) :
+        _check_reference_cholesky(S, T)
     length(N.factor) == N.nbatch * S.layout.factor_len ||
         throw(InvalidValueError("the numeric storage was not allocated for this analysis"))
     size(ws.Y, 1) == S.n && size(ws.U, 1) == length(S.partition.rowval) && size(ws.tmp, 1) == ws.plan.maxm ||
         throw(InvalidValueError("the solve workspace was not allocated for this analysis"))
+    S.structure == STRUCTURE_GENERAL && length(N.ufactor) != length(N.factor) &&
+        throw(InvalidValueError("the numeric storage was not allocated for structure \"G\""))
     0 <= _ncols(N, nrhs) <= max_rhs(ws) ||
         throw(InvalidValueError("$nrhs right-hand sides for $(N.plan.nact[]) batch members, the solve workspace " *
                                 "holds $(max_rhs(ws))"))
@@ -636,58 +647,72 @@ function _solve_impls(N::Numeric, S::Symbolic, impl::Symbol)
 end
 
 function _launch_fwd!(ws::SolveWorkspace, S::Symbolic, N::Numeric, first::Int, count::Int, nrhs::Int, sub::Val,
-                      det::Val, ldl::Val)
+                      det::Val, ldl::Val, factor::AbstractVector = N.factor)
     WG = SOLVE_WORKGROUP
     solve_fwd_kernel!(KernelAbstractions.get_backend(ws.Y), WG)(
-        ws.Y, ws.U, N.factor, N.piv, S.group_nodes, batch_map(N; first, nrhs), count, S.subtree_ptr, S.subtree_nodes,
+        ws.Y, ws.U, factor, N.piv, S.group_nodes, batch_map(N; first, nrhs), count, S.subtree_ptr, S.subtree_nodes,
         S.super_ptr, S.rowptr, S.rowval, S.front_ptr, S.front_nrows, S.front_ncols, S.child_ptr, S.child_list,
         S.relind_ptr, S.relind, sub, det, ldl, Val(WG); ndrange = WG * count * _ncols(N, nrhs))
     return nothing
 end
 
 function _launch_bwd!(ws::SolveWorkspace, S::Symbolic, N::Numeric, first::Int, count::Int, nrhs::Int, sub::Val,
-                      ldl::Val, cj::Val)
+                      ldl::Val, cj::Val, factor::AbstractVector = N.factor)
     WG = SOLVE_WORKGROUP
     solve_bwd_kernel!(KernelAbstractions.get_backend(ws.Y), WG)(
-        ws.Y, ws.U, N.factor, N.piv, S.group_nodes, batch_map(N; first, nrhs), count, S.subtree_ptr, S.subtree_nodes,
+        ws.Y, ws.U, factor, N.piv, S.group_nodes, batch_map(N; first, nrhs), count, S.subtree_ptr, S.subtree_nodes,
         S.super_ptr, S.rowptr, S.rowval, S.front_ptr, S.front_nrows, S.front_ncols, S.child_ptr, sub, ldl, cj, Val(WG);
         ndrange = WG * count * _ncols(N, nrhs))
     return nothing
 end
 
-# solve kind of the analysis: Cholesky, LDLᵀ/LDLᴴ with Lᴴ (Hermitian or real), LDLᵀ complex symmetric
+# solve kind of the analysis: Cholesky, LDLᵀ/LDLᴴ with Lᴴ (Hermitian or real), LDLᵀ complex symmetric,
+# LU of A and LU of Aᵀ
 const _SV_CHOLESKY = 0
 const _SV_LDL_HERM = 1
 const _SV_LDL_SYM = 2
+const _SV_LU = 3
+const _SV_LU_T = 4
 
-_solve_kind(S::Symbolic, ::Type{T}) where {T} =
+_solve_kind(S::Symbolic, ::Type{T}, transpose::Bool = false) where {T} =
+    S.structure == STRUCTURE_GENERAL ? (transpose ? _SV_LU_T : _SV_LU) :
     !_is_ldlt_structure(S.structure) ? _SV_CHOLESKY :
     (T <: Complex && S.structure == STRUCTURE_SYMMETRIC) ? _SV_LDL_SYM : _SV_LDL_HERM
+
+# the panel buffer a sweep reads and whether it applies the local pivot order: LU solves `A x = b` with `L`
+# (reordered) forward and `U` backward, `Aᵀ x = b` with `Uᵀ` forward and `Lᵀ` (order restored) backward
+_sweep_factor(N::Numeric, kind::Int, forward::Bool) =
+    (kind == _SV_LU && !forward) || (kind == _SV_LU_T && forward) ? N.ufactor : N.factor
+_sweep_reorders(kind::Int, forward::Bool) =
+    kind == _SV_LU ? forward : kind == _SV_LU_T ? !forward : kind != _SV_CHOLESKY
 
 # the flags as compile-time constants through explicit branches (closures over runtime flags allocate)
 function _launch_sweep!(ws::SolveWorkspace, S::Symbolic, N::Numeric, first::Int, count::Int, nrhs::Int,
                         sub::Bool, det::Bool, forward::Bool, kind::Int)
+    fac = _sweep_factor(N, kind, forward)
     if kind == _SV_CHOLESKY
-        _launch_sweep!(ws, S, N, first, count, nrhs, sub, det, forward, Val(false), Val(true))
+        _launch_sweep!(ws, S, N, first, count, nrhs, sub, det, forward, Val(false), Val(true), fac)
     elseif kind == _SV_LDL_HERM
-        _launch_sweep!(ws, S, N, first, count, nrhs, sub, det, forward, Val(true), Val(true))
+        _launch_sweep!(ws, S, N, first, count, nrhs, sub, det, forward, Val(true), Val(true), fac)
+    elseif _sweep_reorders(kind, forward)
+        _launch_sweep!(ws, S, N, first, count, nrhs, sub, det, forward, Val(true), Val(false), fac)
     else
-        _launch_sweep!(ws, S, N, first, count, nrhs, sub, det, forward, Val(true), Val(false))
+        _launch_sweep!(ws, S, N, first, count, nrhs, sub, det, forward, Val(false), Val(false), fac)
     end
     return nothing
 end
 
 function _launch_sweep!(ws::SolveWorkspace, S::Symbolic, N::Numeric, first::Int, count::Int, nrhs::Int,
-                        sub::Bool, det::Bool, forward::Bool, ldl::Val, cj::Val)
+                        sub::Bool, det::Bool, forward::Bool, ldl::Val, cj::Val, fac::AbstractVector)
     if !forward
-        sub ? _launch_bwd!(ws, S, N, first, count, nrhs, Val(true), ldl, cj) :
-              _launch_bwd!(ws, S, N, first, count, nrhs, Val(false), ldl, cj)
+        sub ? _launch_bwd!(ws, S, N, first, count, nrhs, Val(true), ldl, cj, fac) :
+              _launch_bwd!(ws, S, N, first, count, nrhs, Val(false), ldl, cj, fac)
     elseif sub
-        det ? _launch_fwd!(ws, S, N, first, count, nrhs, Val(true), Val(true), ldl) :
-              _launch_fwd!(ws, S, N, first, count, nrhs, Val(true), Val(false), ldl)
+        det ? _launch_fwd!(ws, S, N, first, count, nrhs, Val(true), Val(true), ldl, fac) :
+              _launch_fwd!(ws, S, N, first, count, nrhs, Val(true), Val(false), ldl, fac)
     else
-        det ? _launch_fwd!(ws, S, N, first, count, nrhs, Val(false), Val(true), ldl) :
-              _launch_fwd!(ws, S, N, first, count, nrhs, Val(false), Val(false), ldl)
+        det ? _launch_fwd!(ws, S, N, first, count, nrhs, Val(false), Val(true), ldl, fac) :
+              _launch_fwd!(ws, S, N, first, count, nrhs, Val(false), Val(false), ldl, fac)
     end
     return nothing
 end
@@ -708,25 +733,27 @@ end
 
 # the blocks L11, L21 of the panel of front `s` of the batch member in slot `j`, the front's rows of the member's
 # columns of Y and the m rows of its columns of tmp (the single-matrix path)
-function _dense_front(ws::SolveWorkspace, S::Symbolic, N::Numeric, s::Int, nrhs::Int, j::Int)
+function _dense_front(ws::SolveWorkspace, S::Symbolic, N::Numeric, s::Int, nrhs::Int, j::Int,
+                      factor::AbstractVector = N.factor)
     sc = S.schedule
     f, w = sc.rows[s], sc.width[s]
     m = f - w
     p0 = panel_offset(S.layout.panel_ptr, s, N.plan.members_host[j], N.nbatch)
     c0 = S.partition.super_ptr[s]
     cols = ((j - 1) * nrhs + 1):(j * nrhs)
-    P = reshape(view(N.factor, p0:(p0 + f * w - 1)), f, w)
+    P = reshape(view(factor, p0:(p0 + f * w - 1)), f, w)
     return view(P, 1:w, 1:w), view(P, (w + 1):f, 1:w), view(ws.Y, c0:(c0 + w - 1), cols), view(ws.tmp, 1:m, cols)
 end
 
 # the same for the `count` consecutive members in the slots `j0:(j0 + count - 1)`, as `×count` strided batches
-function _dense_front_batch(ws::SolveWorkspace, S::Symbolic, N::Numeric, s::Int, nrhs::Int, j0::Int, count::Int)
+function _dense_front_batch(ws::SolveWorkspace, S::Symbolic, N::Numeric, s::Int, nrhs::Int, j0::Int, count::Int,
+                            factor::AbstractVector = N.factor)
     sc = S.schedule
     f, w = sc.rows[s], sc.width[s]
     m = f - w
     p0 = panel_offset(S.layout.panel_ptr, s, N.plan.members_host[j0], N.nbatch)
     c0 = S.partition.super_ptr[s]
-    P = reshape(view(N.factor, p0:(p0 + f * w * count - 1)), f, w, count)
+    P = reshape(view(factor, p0:(p0 + f * w * count - 1)), f, w, count)
     Y3 = _column_batch(ws.Y, (j0 - 1) * nrhs, nrhs, count)
     T3 = _column_batch(ws.tmp, (j0 - 1) * nrhs, nrhs, count)
     return view(P, 1:w, 1:w, :), view(P, (w + 1):f, 1:w, :), view(Y3, c0:(c0 + w - 1), :, :), view(T3, 1:m, :, :)
@@ -742,10 +769,10 @@ end
 # the dense calls of front `s` for each run of consecutive active members: one strided-batched call per run, or
 # (single matrix, `impl = :generic`) one call per member
 function _dense_runs!(ws::SolveWorkspace, S::Symbolic, N::Numeric, s::Int, nrhs::Int, p::NamedTuple, forward::Bool,
-                      tr::Char)
+                      tr::Char, fac::AbstractVector = N.factor)
     m = S.schedule.rows[s] - S.schedule.width[s]
     if N.nbatch == 1
-        _dense_call!(p, forward, tr, m, _dense_front(ws, S, N, s, nrhs, 1)...)
+        _dense_call!(p, forward, tr, m, _dense_front(ws, S, N, s, nrhs, 1, fac)...)
         return nothing
     end
     runs = N.plan.runs
@@ -753,10 +780,10 @@ function _dense_runs!(ws::SolveWorkspace, S::Symbolic, N::Numeric, s::Int, nrhs:
         j0, j1 = runs[r], runs[r + 1] - 1
         if p.btrsm === :none
             for j in j0:j1
-                _dense_call!(p, forward, tr, m, _dense_front(ws, S, N, s, nrhs, j)...)
+                _dense_call!(p, forward, tr, m, _dense_front(ws, S, N, s, nrhs, j, fac)...)
             end
         else
-            _dense_call_batch!(p, forward, tr, m, _dense_front_batch(ws, S, N, s, nrhs, j0, j1 - j0 + 1)...)
+            _dense_call_batch!(p, forward, tr, m, _dense_front_batch(ws, S, N, s, nrhs, j0, j1 - j0 + 1, fac)...)
         end
     end
     return nothing
@@ -803,8 +830,8 @@ function _fwd_dense!(ws::SolveWorkspace{T}, S::Symbolic, N::Numeric, s::Int, nrh
     sc = S.schedule
     w = sc.width[s]
     m = sc.rows[s] - w
-    kind == _SV_CHOLESKY || _piv_dense!(ws, S, N, s, nrhs, true)
-    _dense_runs!(ws, S, N, s, nrhs, p, true, 'N')
+    _sweep_reorders(kind, true) && _piv_dense!(ws, S, N, s, nrhs, true)
+    _dense_runs!(ws, S, N, s, nrhs, p, true, 'N', _sweep_factor(N, kind, true))
     m > 0 || return nothing
     ncols = _ncols(N, nrhs)
     rp = S.partition.rowptr[s] + w
@@ -822,15 +849,15 @@ function _bwd_dense!(ws::SolveWorkspace{T}, S::Symbolic, N::Numeric, s::Int, nrh
     sc = S.schedule
     w = sc.width[s]
     m = sc.rows[s] - w
-    tr = kind == _SV_LDL_SYM ? 'T' : 'C'
+    tr = kind == _SV_LDL_HERM || kind == _SV_CHOLESKY ? 'C' : 'T'
     if m > 0
         ncols = _ncols(N, nrhs)
         rp = S.partition.rowptr[s] + w
         kernel! = _sv_gather_kernel!(KernelAbstractions.get_backend(ws.Y), SOLVE_WORKGROUP)
         kernel!(ws.tmp, ws.Y, S.rowval, rp, m, ncols; ndrange = m * ncols)
     end
-    _dense_runs!(ws, S, N, s, nrhs, p, false, tr)
-    kind == _SV_CHOLESKY || _piv_dense!(ws, S, N, s, nrhs, false)
+    _dense_runs!(ws, S, N, s, nrhs, p, false, tr, _sweep_factor(N, kind, false))
+    _sweep_reorders(kind, false) && _piv_dense!(ws, S, N, s, nrhs, false)
     return nothing
 end
 
@@ -849,15 +876,17 @@ per-front buffers `ws.U` and an owner-pull of the children (one extra launch
 per regime-C step). Uniform batch: `nrhs` right-hand sides per active member
 of `numeric` (`nrhs × nact` columns of `ws.Y`, each solved with its member's
 factor; regime-C-path fronts use strided-batched `trsm`/`gemm` over runs of
-consecutive members). Asynchronous; allocates nothing on the device.
+consecutive members). LU (`"G"`): `L Z = Y` with the local row order, or
+`Uᵀ Z = Y` with `transpose = true` (the solve of `Aᵀ`). Asynchronous; allocates
+nothing on the device.
 """
 function forward_sweep!(ws::SolveWorkspace, S::Symbolic, N::Numeric; nrhs::Integer = max_rhs(ws) ÷ N.plan.nact[],
-                        deterministic::Bool = false, impl::Symbol = :auto)
+                        deterministic::Bool = false, impl::Symbol = :auto, transpose::Bool = false)
     _check_solve(ws, S, N, nrhs)
     nrhs > 0 || return ws
     det = deterministic || !ws.atomic
     p = _solve_impls(N, S, impl)
-    kind = _solve_kind(S, eltype(ws))
+    kind = _solve_kind(S, eltype(ws), transpose)
     plan = ws.plan
     nodes = S.schedule.group_nodes
     for k in eachindex(plan.kind)
@@ -888,10 +917,11 @@ columns of `ws.Y`: the identity for Cholesky (`"SPD"`/`"HPD"`); for
 LDLᵀ/LDLᴴ one launch, one work item per (factor column, right-hand side),
 dividing by the 1×1 pivots of `numeric.d` and solving the 2×2 blocks
 (`d[k]`, `d[n + k]`, `d[k + 1]`; Hermitian or complex symmetric as the
-structure). Uniform batch: `nrhs` per active member, each with its member's D.
-Asynchronous.
+structure; LU: the pivots of `L D U`, `transpose` is accepted for symmetry).
+Uniform batch: `nrhs` per active member, each with its member's D. Asynchronous.
 """
-function diagonal_sweep!(ws::SolveWorkspace, S::Symbolic, N::Numeric; nrhs::Integer = max_rhs(ws) ÷ N.plan.nact[])
+function diagonal_sweep!(ws::SolveWorkspace, S::Symbolic, N::Numeric; nrhs::Integer = max_rhs(ws) ÷ N.plan.nact[],
+                         transpose::Bool = false)
     _check_solve(ws, S, N, nrhs)
     kind = _solve_kind(S, eltype(ws))
     (kind == _SV_CHOLESKY || nrhs == 0 || S.n == 0) && return ws
@@ -914,14 +944,16 @@ first `nrhs` columns of `ws.Y`, the forward plan in reverse: per step the regime
 `gemm` with `L21ᴴ`, `trsm` with `L11ᴴ`) and one launch over the regime-B
 fronts, then one launch over all regime-A subtrees (supernodes in reverse
 processing order). Gather-based and conflict-free: no atomics, deterministic.
-Uniform batch as in [`forward_sweep!`](@ref). Asynchronous.
+Uniform batch as in [`forward_sweep!`](@ref). LU (`"G"`): `U X = W`, or
+`Lᵀ X = W` followed by the inverse local row order with `transpose = true`.
+Asynchronous.
 """
 function backward_sweep!(ws::SolveWorkspace, S::Symbolic, N::Numeric; nrhs::Integer = max_rhs(ws) ÷ N.plan.nact[],
-                         impl::Symbol = :auto)
+                         impl::Symbol = :auto, transpose::Bool = false)
     _check_solve(ws, S, N, nrhs)
     nrhs > 0 || return ws
     p = _solve_impls(N, S, impl)
-    kind = _solve_kind(S, eltype(ws))
+    kind = _solve_kind(S, eltype(ws), transpose)
     plan = ws.plan
     nodes = S.schedule.group_nodes
     for k in reverse(eachindex(plan.kind))
@@ -949,10 +981,12 @@ layouts of [`rhs_count`](@ref) (vector, `n × nrhs` matrix, strided vector;
 row-major with `transposed = true`), with at most `max_rhs(ws)` right-hand
 sides; `X === B` is allowed. Uniform batch: `B` and `X` hold the right-hand
 sides of all `numeric.nbatch` members (member after member), only the active
-members are solved. Asynchronous; allocates nothing on the device.
+members are solved. LU (`"G"`): `transpose = true` solves `Aᵀ X = B`.
+Asynchronous; allocates nothing on the device.
 """
 function sweep_solve!(X::AbstractVecOrMat, ws::SolveWorkspace, S::Symbolic, N::Numeric, B::AbstractVecOrMat;
-                      transposed::Bool = false, deterministic::Bool = false, impl::Symbol = :auto)
+                      transposed::Bool = false, deterministic::Bool = false, impl::Symbol = :auto,
+                      transpose::Bool = false)
     ncols = rhs_count(B, S.n; transposed)
     rhs_count(X, S.n; transposed) == ncols ||
         throw(DimensionMismatch("X has $(rhs_count(X, S.n; transposed)) right-hand sides, B has $ncols"))
@@ -962,9 +996,9 @@ function sweep_solve!(X::AbstractVecOrMat, ws::SolveWorkspace, S::Symbolic, N::N
     _check_solve(ws, S, N, nrhs)
     bm = batch_map(N; nrhs)
     permute_rhs!(ws.Y, B, S.perm; transposed, bm)
-    forward_sweep!(ws, S, N; nrhs, deterministic, impl)
+    forward_sweep!(ws, S, N; nrhs, deterministic, impl, transpose)
     diagonal_sweep!(ws, S, N; nrhs)
-    backward_sweep!(ws, S, N; nrhs, impl)
+    backward_sweep!(ws, S, N; nrhs, impl, transpose)
     unpermute_solution!(X, ws.Y, S.perm; transposed, bm)
     return X
 end
