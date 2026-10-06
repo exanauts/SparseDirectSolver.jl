@@ -172,7 +172,14 @@ if AMDGPU_LOADED
                                                (n, n))
 end
 
-let gpus = String[]
+"""
+    print_backends()
+
+Print the backends under test and why GPU backends are missing (once per run, by
+`runtests.jl`).
+"""
+function print_backends()
+    gpus = String[]
     CUDA_FUNCTIONAL && push!(gpus, "CUDA ($(CUDA.name(CUDA.device())))")
     AMDGPU_FUNCTIONAL && push!(gpus, "ROCm ($(AMDGPU.device()))")
     CUDA_LOADED && !CUDA_FUNCTIONAL && push!(gpus, "CUDA installed but not functional: skipped")
@@ -181,6 +188,7 @@ let gpus = String[]
     TEST_CPU || push!(gpus, "CPU backend disabled by SDS_TEST_CPU=0")
     println("Backends under test: ", join(backend_name.(BACKENDS), ", "),
             isempty(gpus) ? "" : "  [" * join(gpus, "; ") * "]")
+    return nothing
 end
 
 """

@@ -125,9 +125,9 @@ reviewing agent must pass. The moving parts:
 * Linux (WSL2). One NVIDIA RTX 4080 (16 GB); CUDA.jl is functional.
 * **No AMDGPU, oneAPI or Metal hardware here.** Local tests run on the
   KernelAbstractions CPU backend and on CUDA only. GitHub CI
-  (`.github/workflows/ci.yml`, modelled on `../ExaPF.jl`) runs the CPU suite on
-  GitHub runners and the GPU suite on the exanauts self-hosted runners labelled
-  `cuda` and `amdgpu`. oneAPI and Metal extension files are written by analogy
+  (`.github/workflows/ci.yml`, modelled on `../ExaPF.jl`) runs the CPU suite and
+  the GPU suite on the exanauts self-hosted runners (CPU suite: the `kkt`
+  machine; GPU suite: the runners labelled `cuda` and `amdgpu`). oneAPI and Metal extension files are written by analogy
   (task T23) and only precompile-checked.
 * CUDA.jl 6.x is split into packages: `CUDACore` (`CuArray`, `CUDABackend`),
   `cuSPARSE` (`CuSparseMatrixCSR`, `CuSparseMatrixCSC`), `cuBLAS`, `cuSOLVER`.
@@ -151,6 +151,10 @@ SDS_TEST_CPU=0 julia --project=. -e 'using Pkg; Pkg.test()'
 SDS_TEST_ONLY="test_symbolic_etree,test_options" julia --project=. -e 'using Pkg; Pkg.test()'
 SDS_TEST_SKIP="test_aqua" julia --project=. -e 'using Pkg; Pkg.test()'
 
+# the same with ParallelTestRunner arguments (prefix match, `!` excludes), and the number of workers
+julia --project=. -e 'using Pkg; Pkg.test(; test_args = ["test_symbolic", "!test_symbolic_etree"])'
+PTR_NUM_JOBS=4 julia --project=. -e 'using Pkg; Pkg.test()'
+
 # instantiate / update after editing Project.toml
 julia --project=. -e 'using Pkg; Pkg.instantiate()'
 
@@ -169,6 +173,14 @@ julia --project=bench/report bench/compare_report.jl
 CUDA jobs run with `SDS_TEST_CPU=0 SDS_TEST_SKIP=test_aqua`, since the CPU-only
 jobs already cover the CPU backend and Aqua. A task's "passes on CPU and CUDA"
 still means the default run (both backends) on the owner's machine.
+
+The test files run in parallel through ParallelTestRunner.jl: each `test_*.jl` is
+evaluated in its own module on a pool of worker processes, after the packages,
+`test/utils.jl`, `test/matrices.jl`, `test/backends.jl` and `Random.seed!(666)`
+(`init_code` in `test/runtests.jl`). A test file therefore cannot use definitions
+from another test file; shared code belongs in the helpers. Balance matters: the
+slowest file bounds the wall time, so split a test file that grows far beyond the
+others.
 
 ## Code conventions
 
