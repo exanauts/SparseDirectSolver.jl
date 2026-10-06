@@ -7,8 +7,8 @@
 const FGMRES_STALL_PARAMS = (("pivot_pairs", "none"), ("pivot_epsilon", 1.0))
 fgmres_stall_matrix() = kkt_matrix(Float64, 150, 5, 0.0)
 
-@testset "FGMRES-IR where plain IR stalls ($(backend_name(backend)), $INT)" for backend in BACKENDS,
-                                                                                 INT in INTTYPES
+RUN_SHARED && @testset "FGMRES-IR where plain IR stalls ($(backend_name(backend)), $INT)" for backend in BACKENDS,
+                                                                                               INT in INTTYPES
     Random.seed!(666)
     K = fgmres_stall_matrix()
     b = K * rand(size(K, 1))
@@ -72,7 +72,8 @@ end
     end
 end
 
-@testset "FGMRES-IR: uniform batch ($(backend_name(backend)), $T)" for backend in BACKENDS, T in (Float64, ComplexF32)
+@testset "FGMRES-IR: uniform batch ($(backend_name(backend)), $T)" for backend in BACKENDS,
+                                                                       T in filter(in((Float64, ComplexF32)), ELTYPES)
     n, nb, nrhs = 120, 3, 2
     members = batch_members(random_symindef(T, n, 0.03), nb)
     solver = DirectSolver(api_batch_matrix(backend, members, 'L'), sym_structure(T), 'L')
@@ -95,7 +96,7 @@ end
     @test iszero(Xh[:, :, 1]) && iszero(Xh[:, :, 3])
 end
 
-@testset "FGMRES-IR: interrupt and missing Krylov ($(backend_name(backend)))" for backend in BACKENDS
+RUN_SHARED && @testset "FGMRES-IR: interrupt and missing Krylov ($(backend_name(backend)))" for backend in BACKENDS
     Random.seed!(666)
     K = fgmres_stall_matrix()
     b = K * rand(size(K, 1))

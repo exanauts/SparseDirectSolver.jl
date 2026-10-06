@@ -4,9 +4,22 @@
 using LinearAlgebra
 using SparseArrays
 
-const ELTYPES = (Float32, Float64, ComplexF32, ComplexF64)
-const REAL_ELTYPES = (Float32, Float64)
-const COMPLEX_ELTYPES = (ComplexF32, ComplexF64)
+# The element types under test. `runtests.jl` runs a long test file once per element type, each part in its own
+# worker: the part sets `Main.SDS_TEST_PART[] = (eltypes, shared)` before these helpers are included (`nothing`:
+# all element types, one part).
+const TEST_PART = isdefined(Main, :SDS_TEST_PART) ? Main.SDS_TEST_PART[] : nothing
+const ELTYPES = TEST_PART === nothing ? (Float32, Float64, ComplexF32, ComplexF64) : TEST_PART[1]
+const REAL_ELTYPES = filter(T -> T <: Real, ELTYPES)
+const COMPLEX_ELTYPES = filter(T -> T <: Complex, ELTYPES)
+
+"""
+    RUN_SHARED
+
+`true` when this run of a test file runs the testsets that do not loop over the
+element types (`RUN_SHARED && @testset …`): in the one part of a test file split
+by element type that owns them, and always in an unsplit test file.
+"""
+const RUN_SHARED = TEST_PART === nothing || TEST_PART[2]
 const INTTYPES = (Int32, Int64)
 
 """

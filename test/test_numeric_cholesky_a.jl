@@ -30,7 +30,7 @@ function subtree_move_rounds(S, v)
     return cld(m * (m + 1) ÷ 2, d)
 end
 
-@testset "plan: regime-A groups" begin
+RUN_SHARED && @testset "plan: regime-A groups" begin
     for (name, A, opts) in numeric_a_matrices(Float64)
         S, _, _, _, Nd, _ = numeric_setup(CPU(), A; opts)
         sc, plan = S.schedule, Nd.plan

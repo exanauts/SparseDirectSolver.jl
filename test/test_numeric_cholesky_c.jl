@@ -15,7 +15,7 @@ numeric_c_setup(backend, A, INT = Int32; opts = NUMERIC_C_OPTS, kw...) = numeric
 
 numeric_c_allocated(N, S, nz) = @allocated SDS.factorize!(N, S, nz)
 
-@testset "storage and plan" begin
+RUN_SHARED && @testset "storage and plan" begin
     A = laplacian2d(Float64, 20, 20)
     S, _, _, _, Nd, _ = numeric_c_setup(CPU(), A)
     @test Nd isa SDS.Numeric{Float64, Vector{Float64}, Vector{Int64}, Vector{Int32}}

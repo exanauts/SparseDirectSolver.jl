@@ -15,7 +15,7 @@ function Base.CoreLogging.handle_message(L::InterruptAtStepLogger, level, messag
     return nothing
 end
 
-@testset "refinement on a badly scaled SPD matrix ($(backend_name(backend)))" for backend in BACKENDS
+RUN_SHARED && @testset "refinement on a badly scaled SPD matrix ($(backend_name(backend)))" for backend in BACKENDS
     T = Float64
     A = badly_scaled_spd(T, 300, 0.02)       # rows scaled by up to 10^(±8)
     b = A * rand(T, 300)
@@ -37,6 +37,7 @@ end
     @test getparam(solver.options, "ir_n_steps") == 10
 end
 
+RUN_SHARED &&
 @testset "refinement with static pivot perturbation ($(backend_name(backend)), $INT)" for backend in BACKENDS,
                                                                                            INT in INTTYPES
     # KKT matrix without 2×2 pairs: the zero (2,2) block is perturbed (pivot_epsilon), and refinement
@@ -255,7 +256,7 @@ end
     @test getparam(DirectSolver(api_matrix(backend, tril(A), Int32), spd_structure(T), 'L'), "ir_n_steps") == 0
 end
 
-@testset "logging" begin
+RUN_SHARED && @testset "logging" begin
     backend = first(BACKENDS)
     A = random_spd(Float64, 80, 0.05)
     b = rand(80)

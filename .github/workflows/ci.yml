@@ -18,8 +18,8 @@ jobs:
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       SDS_TEST_GPU: '0'
-      # ParallelTestRunner workers (test/runtests.jl); the four kkt runners share the machine
-      PTR_NUM_JOBS: '8'
+      # ParallelTestRunner workers (test/runtests.jl): kkt has 192 threads and 2 TB, shared by its four runners
+      PTR_NUM_JOBS: '32'
     runs-on: [self-hosted, linux, X64, kkt]
     strategy:
       fail-fast: false
@@ -52,7 +52,7 @@ jobs:
       SDS_TEST_CPU: '0'
       SDS_TEST_SKIP: 'test_aqua'
       # ParallelTestRunner workers, each with its own CUDA context on the runner's GPU
-      PTR_NUM_JOBS: '4'
+      PTR_NUM_JOBS: '12'
     strategy:
       fail-fast: false
       matrix:

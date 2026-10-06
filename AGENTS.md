@@ -177,10 +177,13 @@ still means the default run (both backends) on the owner's machine.
 The test files run in parallel through ParallelTestRunner.jl: each `test_*.jl` is
 evaluated in its own module on a pool of worker processes, after the packages,
 `test/utils.jl`, `test/matrices.jl`, `test/backends.jl` and `Random.seed!(666)`
-(`init_code` in `test/runtests.jl`). A test file therefore cannot use definitions
-from another test file; shared code belongs in the helpers. Balance matters: the
-slowest file bounds the wall time, so split a test file that grows far beyond the
-others.
+(`test/runtests.jl`). A test file therefore cannot use definitions from another
+test file; shared code belongs in the helpers. A worker's cold compilation, not the
+tests, sets the wall time, so the long files (`SPLIT_FILES` in `test/runtests.jl`)
+run once per element type (`test_api[Float64]`, …): `ELTYPES`, `REAL_ELTYPES` and
+`COMPLEX_ELTYPES` are then that part's subset, and a testset that does not loop over
+the element types runs in the `Float64` part only (`RUN_SHARED && @testset …`). In
+a split file, write every testset either over `ELTYPES` or behind `RUN_SHARED`.
 
 ## Code conventions
 

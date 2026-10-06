@@ -15,7 +15,7 @@ nregime(S, r) = count(==(r), S.schedule.regime)
 
 solve_allocated(x, ws, S, N, b; kwargs...) = @allocated SDS.sweep_solve!(x, ws, S, N, b; kwargs...)
 
-@testset "solve plan and workspace" begin
+RUN_SHARED && @testset "solve plan and workspace" begin
     for (name, A) in solve_matrices(Float64)
         C = SDS.CSR(tril(A))
         S = SDS.symbolic_analysis(C, "SPD", 'L'; opts = SOLVE_OPTS)

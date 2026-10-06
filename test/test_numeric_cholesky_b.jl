@@ -17,7 +17,7 @@ numeric_b_allocated(N, S, nz) = @allocated SDS.factorize!(N, S, nz)
 
 nregime(S, r) = count(==(r), S.schedule.regime)
 
-@testset "plan: regime-B groups" begin
+RUN_SHARED && @testset "plan: regime-B groups" begin
     for opts in (NUMERIC_B_OPTS, NUMERIC_BC_OPTS, Options(subtree_budgets = Int[], regime_c_width = 128))
         A = laplacian3d(Float64, 10, 10, 10)
         S, _, _, _, Nd, _ = numeric_setup(CPU(), A; opts)
