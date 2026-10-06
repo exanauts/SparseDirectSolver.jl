@@ -286,7 +286,7 @@ updates its two packed contribution blocks (`cb_ptr[s] > 0`) with
     if li == 1
         @inbounds s = nodes[bm.first + _bm_node(bm, G) - 1]
         _lt_front_setup!(ctl, s, super_ptr, member_panels(front_ptr, _bm_gmember(bm, G), bm.nbatch), front_nrows,
-                         front_ncols)
+                         front_ncols, cb_ptr)
     end
     @synchronize
     @inbounds s = nodes[bm.first + _bm_node(bm, G) - 1]
