@@ -166,6 +166,11 @@ in the analysis when [`pairs_enabled`](@ref):
   graph compressed by the pairs is re-ordered, until a round adds no pair (at
   most [`PIVOT_PAIRS_MAX_ROUNDS`](@ref)). Each algorithm keeps its own pairs.
 
+Both come from the values of the matrix at analysis: an all-zero `nzval` gives
+no pairs and an undefined one arbitrary pairs, so the analysis must run after the
+first assembly of the values (MadNLP: after the first KKT assembly), for
+`"default"` and `"all"` alike.
+
 AMD, MMD and ND then order the graph compressed by the pairs
 ([`compressed_pattern`](@ref): a pair is one vertex with the union adjacency),
 and the order is expanded with each partner right before its candidate

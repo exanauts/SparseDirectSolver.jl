@@ -366,7 +366,7 @@ function refine!(X::AbstractVecOrMat, B::AbstractVecOrMat, W::RefinementWorkspac
     max_rhs(W) >= ncols && max_rhs(ws) >= ncols ||
         throw(DimensionMismatch("the refinement workspace holds $(max_rhs(W)) right-hand sides, need $ncols"))
     bm = batch_map(N; nrhs)
-    pin, sin, pout, sout = solve_io(S, scaling, transpose_matrix)
+    pin, scin, pout, sout = solve_io(S, scaling, transpose_matrix)
     steps = 0
     progress[] = 0
     for _ in 1:nsteps
@@ -378,7 +378,7 @@ function refine!(X::AbstractVecOrMat, B::AbstractVecOrMat, W::RefinementWorkspac
             _log(LOG_DEBUG, () -> "refinement: step $steps, relative residual $rel")
             rel <= tol && break
         end
-        permute_rhs!(ws.Y, W.R, pin; conjugate, scale = sin)
+        permute_rhs!(ws.Y, W.R, pin; conjugate, scale = scin)
         forward_sweep!(ws, S, N; nrhs, deterministic, transpose = transpose_matrix)
         diagonal_sweep!(ws, S, N; nrhs)
         backward_sweep!(ws, S, N; nrhs, transpose = transpose_matrix)
@@ -444,7 +444,8 @@ RefinementOperator(W::RefinementWorkspace, nzval::AbstractVector, n::Integer, nc
                    conjugate::Bool) = RefinementOperator(W, nzval, Int(n), Int(ncols), bm, conjugate, 0)
 
 Base.size(op::RefinementOperator) = (op.n * op.ncols, op.n * op.ncols)
-Base.size(op::RefinementOperator, d::Integer) = d <= 2 ? op.n * op.ncols : 1
+Base.size(op::RefinementOperator, d::Integer) =
+    d < 1 ? throw(BoundsError(size(op), d)) : d <= 2 ? op.n * op.ncols : 1
 Base.eltype(::RefinementOperator{T}) where {T} = T
 
 @kernel function _spmv_kernel!(y, rowptr, colval, src, nzval_all, x, n, ncols, bm, roff, ::Val{CJ}) where {CJ}
@@ -492,7 +493,7 @@ permutations and scalings of a [`SolveScaling`](@ref) `scaling` ([`solve_io`](@r
 `interrupt` first ([`InterruptedError`](@ref)); asynchronous otherwise. The
 right preconditioner of FGMRES-IR.
 """
-struct FactorPreconditioner{T, WS <: SolveWorkspace{T}, SY <: Symbolic, NU <: Numeric}
+struct FactorPreconditioner{T, WS <: SolveWorkspace{T}, SY <: Symbolic, NU <: Numeric, SC}
     ws::WS
     S::SY
     N::NU
@@ -502,7 +503,7 @@ struct FactorPreconditioner{T, WS <: SolveWorkspace{T}, SY <: Symbolic, NU <: Nu
     deterministic::Bool
     interrupt::Union{Nothing, Threads.Atomic{Bool}}
     transpose::Bool
-    scaling::Any
+    scaling::SC          # a SolveScaling, or nothing
 end
 
 FactorPreconditioner(ws::SolveWorkspace, S::Symbolic, N::Numeric, nrhs::Integer, ncols::Integer, conjugate::Bool,
@@ -510,13 +511,14 @@ FactorPreconditioner(ws::SolveWorkspace, S::Symbolic, N::Numeric, nrhs::Integer,
     FactorPreconditioner(ws, S, N, Int(nrhs), Int(ncols), conjugate, deterministic, interrupt, transpose, scaling)
 
 Base.size(P::FactorPreconditioner) = (P.S.n * P.ncols, P.S.n * P.ncols)
-Base.size(P::FactorPreconditioner, d::Integer) = d <= 2 ? P.S.n * P.ncols : 1
+Base.size(P::FactorPreconditioner, d::Integer) =
+    d < 1 ? throw(BoundsError(size(P), d)) : d <= 2 ? P.S.n * P.ncols : 1
 Base.eltype(::FactorPreconditioner{T}) where {T} = T
 
 function LinearAlgebra.mul!(y::AbstractVector, P::FactorPreconditioner, x::AbstractVector)
     _poll_interrupt(P.interrupt)
-    pin, sin, pout, sout = solve_io(P.S, P.scaling, P.transpose)
-    permute_rhs!(P.ws.Y, x, pin; conjugate = P.conjugate, scale = sin)
+    pin, scin, pout, sout = solve_io(P.S, P.scaling, P.transpose)
+    permute_rhs!(P.ws.Y, x, pin; conjugate = P.conjugate, scale = scin)
     forward_sweep!(P.ws, P.S, P.N; nrhs = P.nrhs, deterministic = P.deterministic, transpose = P.transpose)
     diagonal_sweep!(P.ws, P.S, P.N; nrhs = P.nrhs)
     backward_sweep!(P.ws, P.S, P.N; nrhs = P.nrhs, transpose = P.transpose)

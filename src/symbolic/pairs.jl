@@ -339,7 +339,10 @@ end
 The 2×2 pivot pair input of [`compute_ordering`](@ref) for the analysis:
 nothing when [`pairs_enabled`](@ref) is false; [`pivot_candidates`](@ref) for
 `pivot_pairs = "default"` (pairs for the structurally zero pivots); the fixed [`pivot_pairs`](@ref) for
-`"all"`. Reads `nzval` on the host once.
+`"all"`. Reads `nzval` on the host once. Pairs are decided from the values present at `"analysis"` (the first batch
+member): an all-zero `nzval` gives no pairs and an undefined one arbitrary pairs,
+so run `"analysis"` after the first assembly of the matrix (MadNLP: after the
+first KKT assembly); `"all"` reads the values as well.
 """
 function analysis_pairs(P::SymmetricPattern, rowptr, colval, nzval, n::Integer, structure, opts::Options;
                         view = VIEW_FULL, index = INDEX_ONE)

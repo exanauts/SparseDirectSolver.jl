@@ -96,10 +96,18 @@ end
 Zero-copy reinterpretation of the CSC matrix `A` (`m × n`) as the CSR matrix of
 `transpose(A)` (`n × m`): `A.colptr` becomes `rowptr`, `A.rowval` becomes
 `colval`, the arrays are shared and `transposed = true` records that the caller
-means `A`. This is how MadNLP passes `colPtr`/`rowVal` (PLAN §1.1).
+means `A`. This is how MadNLP passes `colPtr`/`rowVal` (PLAN §1.1). A solver
+on such a matrix reads it with the view flipped (`'L'` ↔ `'U'`; for `"G"` the
+view is ignored). Raises [`InvalidValueError`](@ref) when `A.rowval` or
+`A.nzval` is longer than `nnz(A)` (a `SparseMatrixCSC` may keep spare capacity,
+which the shared CSR arrays cannot describe).
 """
 function csr_of_transpose(A::SparseMatrixCSC)
     m, n = size(A)
+    nz = Int(A.colptr[end]) - 1
+    (length(A.rowval) == nz && length(A.nzval) == nz) ||
+        throw(InvalidValueError("csr_of_transpose: rowval/nzval have $(length(A.rowval))/$(length(A.nzval)) entries, " *
+                                "nnz(A) = $nz; `resize!` the buffers to nnz(A) first"))
     return CSR(A.colptr, A.rowval, A.nzval, n, m; index = INDEX_ONE, transposed = true)
 end
 

@@ -197,7 +197,8 @@ statistics and their totals, status vector, pivot order, pivot kinds, pivot sign
 `"G"` the `Uᵀ` panels and update stack) of `symbolic`'s [`Layout`](@ref) for element type
 `T` on the KernelAbstractions `backend`, for a uniform batch of `nbatch`
 matrices (every length times `nbatch`, all members active), and build its [`NumericPlan`](@ref).
-This is the only allocation of the numeric phase.
+This is the only allocation of the numeric phase. Raises [`InvalidValueError`](@ref) when the
+panels or the regime-C workspace of the batch do not fit the index type `INT` of `symbolic`.
 """
 function allocate_numeric(S::Symbolic{INT}, ::Type{T}, backend::KernelAbstractions.Backend = KernelAbstractions.CPU();
                           nbatch::Integer = 1) where {INT, T}
@@ -207,6 +208,9 @@ function allocate_numeric(S::Symbolic{INT}, ::Type{T}, backend::KernelAbstractio
     S.n < typemax(Int32) || throw(InvalidValueError("n = $(S.n) does not fit the Int32 status vector"))
     nb * L.factor_len < typemax(INT) && nb * (nsupernodes(S) + 1) < typemax(Int32) ||
         throw(InvalidValueError("a batch of $nb factors of $(L.factor_len) entries does not fit the index type $INT"))
+    nb * L.work_len < typemax(INT) ||
+        throw(InvalidValueError("a batch of $nb regime-C workspaces of $(L.work_len) entries does not fit the " *
+                                "index type $INT; use Int64 indices"))
     factor = KernelAbstractions.zeros(backend, T, nb * L.factor_len)
     d = KernelAbstractions.zeros(backend, T, nb * L.d_len)
     stack = KernelAbstractions.zeros(backend, T, nb * L.stack_len)

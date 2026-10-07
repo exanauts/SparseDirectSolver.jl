@@ -32,7 +32,7 @@ others build the pattern from a CSR pattern, following PLAN §2.3 step 1:
 * `structure` `"S"`, `"H"`, `"SPD"`, `"HPD"` (or a [`Structure`](@ref)): only the
   triangle selected by `view` is read (`'L'`: `col ≤ row`, `'U'`: `col ≥ row`;
   `'F'` reads the lower triangle, as cuDSS does) and mirrored;
-* `"G"`: the pattern of `A + Aᵀ`; `view` must be `'F'`;
+* `"G"`: the pattern of `A + Aᵀ`; the view is ignored (every stored entry is read, as in cuDSS);
 * duplicates are dropped, `index` (`'O'`/`'Z'`) is the base of `rowptr`/`colval`,
   non-square matrices and out-of-range column indices raise [`InvalidValueError`](@ref).
 """
@@ -106,11 +106,9 @@ _is_hermitian(s::Structure) = s == STRUCTURE_HERMITIAN || s == STRUCTURE_HPD
 # Which stored entries (r, c) are read, and whether the mirrored entry is generated.
 # For symmetric structures 'F' reads the lower triangle, as in cuDSS (PLAN §1.1).
 function _entry_filter(structure::Structure, view::MatrixView)
-    if structure == STRUCTURE_GENERAL
-        view == VIEW_FULL ||
-            throw(InvalidValueError("structure \"G\" needs view 'F', got '$(convert(Char, view))'"))
-        return (r, c) -> true
-    end
+    # "G" ignores the view and reads every stored entry, as in cuDSS ("If the
+    # accompanying matrix type is CUDSS_MTYPE_GENERAL, the matrix view is ignored").
+    structure == STRUCTURE_GENERAL && return (r, c) -> true
     view == VIEW_UPPER && return (r, c) -> c >= r
     return (r, c) -> c <= r
 end

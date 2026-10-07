@@ -867,7 +867,8 @@ function _bwd_dense!(ws::SolveWorkspace{T}, S::Symbolic, N::Numeric, s::Int, nrh
 end
 
 """
-    forward_sweep!(ws, symbolic, numeric; nrhs = max_rhs(ws), deterministic = false, impl = :auto) -> ws
+    forward_sweep!(ws, symbolic, numeric; nrhs = max_rhs(ws), deterministic = false, impl = :auto,
+                   transpose = false) -> ws
 
 Forward sweep `L Z = Y` in place on the first `nrhs` columns of `ws.Y` (the
 permuted right-hand side, [`permute_rhs!`](@ref)), with the factor of
@@ -950,7 +951,7 @@ function diagonal_sweep!(ws::SolveWorkspace, S::Symbolic, N::Numeric; nrhs::Inte
 end
 
 """
-    backward_sweep!(ws, symbolic, numeric; nrhs = max_rhs(ws), impl = :auto) -> ws
+    backward_sweep!(ws, symbolic, numeric; nrhs = max_rhs(ws), impl = :auto, transpose = false) -> ws
 
 Backward sweep `Lᴴ X = W` (`Lᵀ` for complex symmetric LDLᵀ) in place on the
 first `nrhs` columns of `ws.Y`, the forward plan in reverse: per step the regime-C-path fronts (gather kernel,
@@ -985,7 +986,8 @@ function backward_sweep!(ws::SolveWorkspace, S::Symbolic, N::Numeric; nrhs::Inte
 end
 
 """
-    sweep_solve!(X, ws, symbolic, numeric, B; transposed = false, deterministic = false, impl = :auto) -> X
+    sweep_solve!(X, ws, symbolic, numeric, B; transposed = false, deterministic = false, impl = :auto,
+                 transpose = false) -> X
 
 Solve `A X = B` with the factor `P A Pᵀ = L Lᴴ` (or the LDLᵀ/LDLᴴ factor with
 its local pivot orders) of [`factorize!`](@ref):

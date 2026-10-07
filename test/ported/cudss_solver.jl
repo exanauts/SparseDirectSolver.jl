@@ -7,9 +7,10 @@
 #   be rejected at analysis); the matrix is SPD/HPD, so `"inertia"` is `(n, 0)`
 #   for real "S" and "H" (complex symmetric "S": `(0, 0)`, no inertia) and
 #   `"diag"` is real positive except for complex "S" (and has a positive real
-#   part for "G", whose complex `D` is not exactly real); "G" reads the full
-#   matrix: views 'L'/'U' are rejected at analysis (`InvalidValueError`; cuDSS
-#   ignores the view of a general matrix);
+#   part for "G", whose complex `D` is not exactly real); "G" ignores the view
+#   and reads every stored entry, as cuDSS does (#84): it is given the full
+#   matrix with each view, and analysis, factorization and solve give the same
+#   solution for 'L', 'U' and 'F';
 # * `matching_alg = "algo6"` is set before the analysis, as in CUDSS.jl (T21):
 #   `"perm_matching"` is checked to be a permutation and `"scale_row"`/`"scale_col"`
 #   to be positive; the inertia stays `(n, 0)` under matching (cuDSS 0.8 reports
@@ -186,13 +187,29 @@ end
     @testset "structure = $structure" for structure in (T <: Real ? ("G", "S", "H", "SPD", "HPD") :
                                                        ("G", "S", "H", "HPD"))
         @testset "view = $view" for view in ('L', 'U', 'F')
-            A_gpu = api_matrix(backend, triangle_view(A_cpu, view), INT)
-            if structure == "G" && view != 'F'
-                @test_throws InvalidValueError execute!("analysis", DirectSolver(A_gpu, structure, view), nothing,
-                                                        nothing)
-                continue
-            end
+            A_gpu = api_matrix(backend, structure == "G" ? A_cpu : triangle_view(A_cpu, view), INT)
             ported_solver(backend, T, INT, A_gpu, structure, view, n)
+        end
+        if structure == "G"
+            @testset "\"G\" ignores the view" begin
+                b_cpu = rand(T, n)
+                xs = map(('L', 'U', 'F')) do view
+                    solver = DirectSolver(api_matrix(backend, A_cpu, INT), "G", view)
+                    # the atomic forward sweep (default) adds in launch order on GPUs; bitwise
+                    # equality needs the deterministic solve (#36)
+                    setparam!(solver, "deterministic_mode", 1)
+                    x_gpu = to_device(backend, zeros(T, n))
+                    b_gpu = to_device(backend, b_cpu)
+                    for phase in ("analysis", "factorization", "solve")
+                        execute!(phase, solver, x_gpu, b_gpu)
+                    end
+                    @test getparam(solver, "info") == 0
+                    Array(x_gpu)
+                end
+                @test xs[1] == xs[3]
+                @test xs[2] == xs[3]
+                @test relres(A_cpu, xs[3], b_cpu) <= tol(T)
+            end
         end
     end
     if T <: Complex

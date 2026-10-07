@@ -355,7 +355,8 @@ end
                 x = Int64(ctl[_LT_STAT + q])
                 stats[base + q] = b == 1 ? x : stats[base + q] + x
             end
-            stats[base + STAT_INFO] = 0
+            fi = Int64(ctl[_ST_STATUS])                   # the first failed column over the blocks
+            stats[base + STAT_INFO] = b == 1 || stats[base + STAT_INFO] == 0 ? fi : stats[base + STAT_INFO]
         end
     end
     return nothing

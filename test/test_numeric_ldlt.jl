@@ -82,6 +82,41 @@ end
     end
 end
 
+@testset "pivot_epsilon = 0: a zero pivot fails ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
+    Random.seed!(666)
+    n, j = 60, 23
+    F = SDS.FRONT_STATS_FIELDS
+    # an exactly zero pivot is tiny whatever ε; with ε = 0 it stays zero and info is its original column (#65)
+    for (rname, rkw) in (("default", (;)), ("regime-C root", (factorization_alg = "algo2", subtree_budgets = Int[]))),
+        stored_zero in (false, true)
+        A = singular_block_matrix(T, n, j; stored_zero)
+        opts = Options(; pivot_epsilon = 0.0, rkw...)
+        S, Nr, info_ref, C = reference_ldlt(A; opts)
+        @test info_ref == j
+        Sd = SDS.adapt(backend, S, Int32)
+        Nd = SDS.allocate_numeric(Sd, T, backend)
+        @test SDS.factorize!(Nd, Sd, to_device(backend, C.nzval); opts) == j
+        Nh = SDS.host_numeric(Nd)
+        @test Nh.pivot_kind == Nr.pivot_kind && Nh.piv == Nr.piv
+        @test d_error(Nh, Nr) <= panel_tol(T)
+        k = findfirst(==(SDS.PIVOT_KIND_PERTURBED), Nh.pivot_kind)
+        @test k !== nothing && iszero(Nh.d[k]) && iszero(Nr.d[k])
+        @test to_host(Nd.stats)[F:F:end] == Nr.stats[F:F:end]
+        @test count(!iszero, Nr.stats[F:F:end]) == 1
+        st = SDS.pivot_totals(Nd)
+        @test st.nzero == 1 && st.nperturbed == 1
+    end
+    # the public API reports it in "info"; ε > 0 again completes
+    solver = DirectSolver(api_matrix(backend, tril(singular_block_matrix(T, n, j))), sym_structure(T), 'L')
+    setparam!(solver, "pivot_epsilon", 0.0)
+    execute!("analysis", solver, nothing, nothing)
+    execute!("factorization", solver, nothing, nothing)
+    @test getparam(solver, "info") == j
+    setparam!(solver, "pivot_epsilon", nothing)
+    execute!("refactorization", solver, nothing, nothing)
+    @test getparam(solver, "info") == 0
+end
+
 @testset "perturbation and pivot_sign ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
     n, j = 60, 23
     R = real(T)
