@@ -38,8 +38,10 @@ schur_ldlt(structure) = structure in ("S", "H")
     sc = solver.host_symbolic.schedule
     @test sc.schur == SDS.nsupernodes(solver.host_symbolic) && sc.regime[sc.schur] == SDS.REGIME_C
     @test solver.host_symbolic.partition.perm[(n - ns + 1):n] == s
-    # a regime-A subtree root hands its contribution block to the Schur root
-    rname == "A" && @test any(t -> solver.host_symbolic.partition.snparent[t] == sc.schur, sc.subtree_root)
+    rname == "A" && @test count(==(SDS.REGIME_A), sc.regime) > length(sc.regime) ÷ 2
+    # Laplacian: a regime-A subtree root hands its contribution block to the Schur root
+    rname == "A" && structure in ("SPD", "HPD") &&
+        @test any(t -> solver.host_symbolic.partition.snparent[t] == sc.schur, sc.subtree_root)
     rname == "B/C" && @test any(==(SDS.REGIME_B), sc.regime) && count(==(SDS.REGIME_C), sc.regime) > 1
     Sref = schur_reference(A, flags)
     P = schur_pattern_reference(A, flags)
