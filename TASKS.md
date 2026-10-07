@@ -2536,6 +2536,10 @@ uniform-batch LU tests pass; `random_general` residuals `≤ tol(T)`.
   LU ports). The first full `test_numeric_lu` run found one bug (the refinement workspace took `n` from the
   `2n`-row `"G"` map) and the schedule memory-estimate check needed the two-structure count; both fixed before
   the final run. CUDA/AMDGPU: pending CI on the PR.
+  After the `growth_tol` fix (owner's machine, Julia 1.13.1, CUDA.jl 6.4.2, RTX 4080):
+  `SDS_TEST_ONLY=test_numeric_lu` 1816 pass / 0 fail on the KA CPU backend; with `SDS_TEST_CPU=0` (CUDA only)
+  1788 pass / 0 fail, including the 12 checks that failed before (9 Float32 'weak diagonal', 3 Float64
+  'weak diagonal, pivot_type N').
 - Measurements (ubuntu-latest KA CPU backend, Float64, `pivot_threshold = 1`, best of 3; "device" is
   `factorize!` on the CPU backend, so only equality and launch counts are meaningful, GPU numbers are owed):
 
