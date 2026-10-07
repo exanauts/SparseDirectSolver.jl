@@ -148,7 +148,10 @@ Regime assignment and launch order of the supernodes of a
   classes first, then step by step: B bins in increasing bin id, then C);
 * `wclasses`, `fclasses`, `budgets`, `regime_c_width`, `regime_c_rows`,
   `memory_budget`, `elsize` (bytes per packed entry, `sizeof(T)`; `2 sizeof(T)` for LU), `vendor_c` (whether regime C uses vendor
-  calls; `factorization_alg = "algo1"` turns them off).
+  calls; `factorization_alg = "algo1"` turns them off);
+* `schur`: the Schur complement root (`schur_mode = 1`, PLAN §3.6), a regime-C
+  front alone in the last step that the numeric phase assembles but does not
+  factor, or `0`.
 """
 struct Schedule
     width::Vector{Int}
@@ -179,6 +182,7 @@ struct Schedule
     memory_budget::Int64
     elsize::Int
     vendor_c::Bool
+    schur::Int
 end
 
 """
@@ -240,7 +244,7 @@ function nlaunches(sc::Schedule)
             total += 1
             for k in g.first:g.last
                 s = sc.group_nodes[k]
-                total += _c_front_launches(sc.rows[s], sc.width[s])
+                s == sc.schur || (total += _c_front_launches(sc.rows[s], sc.width[s]))   # Schur root: assembly only
             end
         else
             total += 1
@@ -299,9 +303,17 @@ blocks are two packed triangles, see `src/numeric/lu.jl`):
 4. schedule levels of the B/C fronts, split into chunks whose produced
    (packed) contribution-block bytes stay `≤ opts.memory_budget` (a single front larger
    than the budget gets its own chunk; a negative budget means no chunking).
+
+`schur` (a root supernode, `0` = none): the Schur complement root of
+`schur_mode = 1` (PLAN §3.6), forced into regime C and onto a schedule level
+of its own above every other front, so that it is the only front of the last
+launch group (assembled, never factored, see [`assemble_schur!`](@ref)).
 """
 function build_schedule(sp::SupernodePartition, opts::Options = Options(), ::Type{T} = Float64;
-                        elsize::Integer = sizeof(T), reserve::Integer = SUBTREE_LOCAL_RESERVE) where {T}
+                        elsize::Integer = sizeof(T), reserve::Integer = SUBTREE_LOCAL_RESERVE,
+                        schur::Integer = 0) where {T}
+    0 <= schur <= nsupernodes(sp) && (schur == 0 || sp.snparent[schur] == 0) ||
+        throw(InvalidValueError("build_schedule: the Schur front $schur must be a root supernode"))
     ns = nsupernodes(sp)
     elsize = Int(elsize)
     cw, cr = opts.regime_c_width, opts.regime_c_rows
@@ -326,7 +338,7 @@ function build_schedule(sp::SupernodePartition, opts::Options = Options(), ::Typ
     end
     par = opts.subtree_parallelism
     maxwork = par <= 0 ? typemax(Int64) : total ÷ par
-    big = [width[s] > cw || rows[s] > cr for s in 1:ns]
+    big = [width[s] > cw || rows[s] > cr || s == schur for s in 1:ns]
     # 2. regime A: serial stack peak (entries) with children ordered by decreasing peak - cb (Liu)
     peak = zeros(Int, ns)
     eligible = falses(ns)
@@ -394,6 +406,8 @@ function build_schedule(sp::SupernodePartition, opts::Options = Options(), ::Typ
         regime[s] == REGIME_A && continue
         slevel[s] = 1 + maximum((slevel[c] for c in children[s]); init = 0)
     end
+    # the Schur root gets a schedule level (and so a step and a launch group) of its own
+    schur > 0 && (slevel[schur] = 1 + maximum((slevel[s] for s in 1:ns if s != schur); init = 0))
     nslevels = maximum(slevel; init = 0)
     bylevel = [Int[] for _ in 1:nslevels]
     for s in 1:ns
@@ -455,5 +469,5 @@ function build_schedule(sp::SupernodePartition, opts::Options = Options(), ::Typ
     return Schedule(width, rows, level, maximum(level; init = 0), regime, slevel, nslevels, step, length(step_level), step_level,
                     step_chunk, bin, subtree, subtree_ptr, subtree_nodes, subtree_root, subtree_peak, subtree_class,
                     groups, group_nodes, wclasses, fclasses, budgets, cw, cr, membudget, elsize,
-                    alg != FACTORIZATION_VERY_SPARSE)
+                    alg != FACTORIZATION_VERY_SPARSE, Int(schur))
 end

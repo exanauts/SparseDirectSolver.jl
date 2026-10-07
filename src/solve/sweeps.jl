@@ -64,6 +64,7 @@ const SOLVE_WORKGROUP = 64
 const SOLVE_SUBTREES = 1    # regime A: subtree ids
 const SOLVE_FRONTS = 2      # regime B: one workgroup per front
 const SOLVE_DENSE = 3       # regime-C path: dense calls per front
+const SOLVE_SCHUR = 4       # the Schur root (schur_mode = 1): not factored, only its children's updates are pulled
 
 """
     SolvePlan
@@ -72,8 +73,10 @@ Host launch plan of the sweeps, in forward order (the backward sweep runs it
 in reverse): launch `k` has kind `kind[k]` (`SOLVE_SUBTREES`: the subtree ids
 `group_nodes[first[k]:last[k]]`, all regime-A subtrees in one launch;
 `SOLVE_FRONTS`: the regime-B fronts of one step; `SOLVE_DENSE`: the
-regime-C-path fronts of one step, solved one after the other with dense calls).
-`maxm` is the largest `m = f - w` of a regime-C-path front.
+regime-C-path fronts of one step, solved one after the other with dense calls;
+`SOLVE_SCHUR`: the unfactored Schur root of `schur_mode = 1`, skipped by the
+sweeps except for the owner-pull of its children's updates in the
+deterministic forward sweep). `maxm` is the largest `m = f - w` of a regime-C-path front.
 """
 struct SolvePlan
     kind::Vector{Int}
@@ -89,6 +92,8 @@ function SolvePlan(S::Symbolic)
     for g in sc.groups
         if g.regime == REGIME_A
             k = SOLVE_SUBTREES
+        elseif sc.schur > 0 && sc.group_nodes[g.first] == sc.schur
+            k = SOLVE_SCHUR
         else
             k = takes_c_path(sc, sc.group_nodes[g.first]) ? SOLVE_DENSE : SOLVE_FRONTS
             if k == SOLVE_DENSE
@@ -891,7 +896,13 @@ function forward_sweep!(ws::SolveWorkspace, S::Symbolic, N::Numeric; nrhs::Integ
     nodes = S.schedule.group_nodes
     for k in eachindex(plan.kind)
         a, b = plan.first[k], plan.last[k]
-        if plan.kind[k] == SOLVE_DENSE
+        if plan.kind[k] == SOLVE_SCHUR
+            # the Schur block stays as the children left it: Y₂ − L₂₁ Y₁ (the condensed right-hand side)
+            det && _sv_pull_kernel!(KernelAbstractions.get_backend(ws.Y), SOLVE_WORKGROUP)(
+                ws.Y, ws.U, S.group_nodes, a, b - a + 1, S.rowptr, S.super_ptr, S.front_ptr, S.front_nrows,
+                S.front_ncols, S.child_ptr, S.child_list, S.relind_ptr, S.relind, Val(SOLVE_WORKGROUP);
+                ndrange = SOLVE_WORKGROUP * (b - a + 1) * _ncols(N, nrhs))
+        elseif plan.kind[k] == SOLVE_DENSE
             if det
                 WG = SOLVE_WORKGROUP
                 _sv_pull_kernel!(KernelAbstractions.get_backend(ws.Y), WG)(
@@ -958,6 +969,7 @@ function backward_sweep!(ws::SolveWorkspace, S::Symbolic, N::Numeric; nrhs::Inte
     nodes = S.schedule.group_nodes
     for k in reverse(eachindex(plan.kind))
         a, b = plan.first[k], plan.last[k]
+        plan.kind[k] == SOLVE_SCHUR && continue      # the Schur block of Y holds its solution already
         if plan.kind[k] == SOLVE_DENSE
             for q in b:-1:a
                 _bwd_dense!(ws, S, N, nodes[q], Int(nrhs), p, kind)

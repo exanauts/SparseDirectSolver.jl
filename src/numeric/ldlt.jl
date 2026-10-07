@@ -1470,6 +1470,7 @@ function factorize_ldlt!(N::Numeric{T}, S::Symbolic, nzval::AbstractVector; impl
     else                                                       # other block sizes: tests only (dynamic dispatch)
         _factorize_ldlt_herm!(N, S, nzval, opts, prm, gimpl, Val(Int(nb)), Val(herm))
     end
+    assemble_schur!(N, S, nzval)
     reduce_stats!(N, S)
     return 0
 end

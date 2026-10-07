@@ -28,6 +28,10 @@ consecutive members ([`member_runs!`](@ref), the strided batches of regime C).
 `potrf`/`trsm`, else `nothing`): the device vectors of member pointers
 `(F11, F21)` of its `nbatch` panels, built once at allocation
 ([`vendor_batch_pointers`](@ref)).
+Schur complement mode (PLAN §3.6): the launch group of the Schur root
+(`schedule.schur`) is not one of the B/C groups; `schur_first` is its position
+in `group_nodes` (`0` = no Schur root) and `schur_maxchild` its number of
+children ([`assemble_schur!`](@ref)).
 """
 struct NumericPlan
     step_first::Vector{Int}
@@ -45,6 +49,8 @@ struct NumericPlan
     nact::Base.RefValue{Int}
     runs::Vector{Int}
     vendor_ptrs::Vector{Any}
+    schur_first::Int
+    schur_maxchild::Int
 end
 
 function NumericPlan(S, nb::Integer = 1)
@@ -60,6 +66,7 @@ function NumericPlan(S, nb::Integer = 1)
     maxchild = zeros(Int, sc.nsteps)
     gfirst, glast, gmaxchild, gwidth = Int[], Int[], Int[], Int[]
     sfirst, slast, slocal = Int[], Int[], Int[]
+    schur_first = 0
     nf = length(sc.fclasses)
     for grp in sc.groups
         if grp.regime == REGIME_A
@@ -67,6 +74,11 @@ function NumericPlan(S, nb::Integer = 1)
             push!(sfirst, grp.first)
             push!(slast, grp.last)
             push!(slocal, subtree_local_bytes(sc.budgets[grp.class]))
+            continue
+        end
+        if sc.schur > 0 && sc.group_nodes[grp.first] == sc.schur
+            grp.first == grp.last || throw(InvalidValueError("schedule: the Schur root must be alone in its group"))
+            schur_first = grp.first
             continue
         end
         W = grp.regime == REGIME_B ? sc.wclasses[(grp.class - 1) ÷ nf + 1] : 0
@@ -86,7 +98,8 @@ function NumericPlan(S, nb::Integer = 1)
         end
     end
     return NumericPlan(first, last, maxchild, gfirst, glast, gmaxchild, gwidth, sfirst, slast, slocal, zeros(Int32, nb),
-                       Int32.(1:nb), Ref(Int(nb)), [1, nb + 1], Any[nothing for _ in 1:ns])
+                       Int32.(1:nb), Ref(Int(nb)), [1, nb + 1], Any[nothing for _ in 1:ns], schur_first,
+                       sc.schur > 0 ? nchild[sc.schur] : 0)
 end
 
 """

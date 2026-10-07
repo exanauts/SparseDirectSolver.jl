@@ -360,3 +360,42 @@ function supernode_partition(P::SymmetricPattern, perm::AbstractVector{<:Integer
     amalgamated && (cp = amalgamate(cp, parent, counts, opts.amalgamation))
     return SupernodePartition(P, perm, parent, counts, cp; amalgamated)
 end
+
+"""
+    schur_supernode_partition(P::SymmetricPattern, perm, ns, opts::Options = Options()) -> SupernodePartition
+
+[`supernode_partition`](@ref) for Schur complement mode (PLAN §3.6): the last
+`ns` columns of `perm` (the Schur block, [`compute_schur_ordering`](@ref)) form
+one dense root supernode, the last one, with its columns in the order of
+`perm`; its etree is the chain of those columns and its column counts are the
+dense ones (`ns, ns - 1, …, 1`). The other columns are partitioned as usual
+(fundamental supernodes and [`amalgamate`](@ref) on their elimination forest,
+so nothing is merged into the Schur root); a supernode whose last column has
+its etree parent in the Schur block becomes a child of the Schur root.
+"""
+function schur_supernode_partition(P::SymmetricPattern, perm::AbstractVector{<:Integer}, ns::Integer,
+                                   opts::Options = Options())
+    n = P.n
+    1 <= ns <= n || throw(InvalidValueError("schur_supernode_partition: ns = $ns, expected 1:$n"))
+    m = n - ns
+    parent = etree(P, perm)
+    post = postorder(parent)
+    counts = colcounts(P, perm, parent, post)
+    subparent = [parent[j] > m ? 0 : parent[j] for j in 1:m]
+    for j in (m + 1):n                          # the Schur block: a dense chain
+        parent[j] = j < n ? j + 1 : 0
+        counts[j] = n - j + 1
+    end
+    subcounts = counts[1:m]
+    cp = fundamental_supernodes(subparent, postorder(subparent), subcounts)
+    amalgamated = opts.use_superpanels != 0
+    amalgamated && m > 0 && (cp = amalgamate(cp, subparent, subcounts, opts.amalgamation))
+    nsub = nsupernodes(cp)
+    snparent = copy(cp.snparent)
+    for s in 1:nsub
+        snparent[s] == 0 && parent[cp.order[cp.super_ptr[s + 1] - 1]] > m && (snparent[s] = nsub + 1)
+    end
+    push!(snparent, 0)
+    sp = ColumnPartition([cp.order; (m + 1):n], [cp.super_ptr; n + 1], snparent)
+    return SupernodePartition(P, perm, parent, counts, sp; amalgamated)
+end
