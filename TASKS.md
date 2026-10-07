@@ -2888,6 +2888,7 @@ Baseline: `kkt_matrix(Float64, 3000, 1000, 1e-8)`, default analysis, 13.5 s
 device / 12.9 s reference on the KA CPU backend (T15 report); the Report
 gives the same numbers after, plus CUDA. Closes #75.
 Delivered for #75 (perf PRs from `perf/exp1-pivot-search`, `perf/exp1-regime-b-local`, `perf/exp2-regime-c-blas`; numbers in PERFORMANCE.md "Experiments 1–2 results"): (1) cooperative pivot search, cheaper exact fallback in the reference; (3) regime B with F₁₁ in local memory, no scale phase, tiled contribution-block update; (2) regime C (and wide tall regime-B bins) as blocked pivot steps plus GEMMs through the dense interface, concurrent per launch group. Open: the fallback-heavy kkt(3000,1000,1e-8) (CUDA 2.5 s, KA CPU 3.3 s vs reference 2.6 s) and LDLᵀ/Cholesky 1.3–2.6×.
+#96: matching pairs cost 2× nnz(L); re-measure after the T25 level merging whether the extra fronts matter; otherwise accepted.
 
 Partitioned-inverse solve (`solve_alg = "algo1"`), CUDA sync-free forward
 sweep behind a capability check, CUDA graph capture of refactorize+solve,
