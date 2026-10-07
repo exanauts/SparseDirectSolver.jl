@@ -129,7 +129,7 @@ defaults below. Keyword arguments are applied through [`setparam!`](@ref), so
 | `factor_precision` | `nothing` | factors in the input precision |
 | `amalgamation` | `(max_width = 32, zero_fraction = 0.25, min_width = 8)` | |
 | `schedule` | `SCHEDULE_AUTO` | |
-| `pivot_pairs` | `PIVOT_PAIRS_DEFAULT` | 2×2 pivot pairs in the analysis of `"S"`/`"H"` (structurally zero pivots; `"all"`: every candidate; with matching: the candidates' cycles of the matching) |
+| `pivot_pairs` | `PIVOT_PAIRS_DEFAULT` | 2×2 pivot pairs in the analysis of `"S"`/`"H"` (structurally zero pivots; `"all"`: every candidate; with matching `"algo5"`/`"algo6"`: from the cycles of the matching) |
 | `pivot_pair_tolerance` | `1e-6` ([`PIVOT_PAIR_TOLERANCE`](@ref)) | relative diagonal size below which a row is a 2×2 candidate |
 | `regime_c_width` | `64` | fronts wider than this go to regime C (vendor dense calls) |
 | `regime_c_rows` | `512` | fronts with more rows than this go to regime C |
@@ -540,8 +540,8 @@ Accepted values:
   (every such row, see [`pivot_pairs`](@ref); about 2× `nnz(L)` on KKT systems)
   or `"none"`;
   ignored for the other structures, with `user_perm` and with the natural ordering;
-  with `matching_alg ≠ "default"` the pairs come from the cycles of the
-  symmetric matching instead ([`matching_pairs`](@ref));
+  with `matching_alg = "algo5"`/`"algo6"` the pairs come from the cycles of the
+  scaled symmetric matching instead ([`matching_pairs`](@ref));
 * `"pivot_pair_tolerance"` (beyond cuDSS): a finite real `≥ 0`, the relative
   diagonal size `τ` below which a row is a 2×2 candidate (`|aᵢᵢ| ≤ τ maxⱼ≠ᵢ |aᵢⱼ|`,
   on the scaled matrix with matching; default [`PIVOT_PAIR_TOLERANCE`](@ref));

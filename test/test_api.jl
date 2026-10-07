@@ -155,11 +155,17 @@ end
     backend isa CPU ||
         @test thrown(() -> execute!("solve", solver, rand(T, 40), rand(T, 40))) isa InvalidValueError
     # options and structures that are not implemented yet
-    for (name, value) in (("matching_alg", "algo1"), ("schedule", "syncfree"))
+    for (name, value) in (("schedule", "syncfree"),)
         s2 = DirectSolver(api_matrix(backend, tril(A)), spd_structure(T), 'L')
         setparam!(s2, name, value)
         @test thrown(() -> execute!("analysis", s2, x, b)) isa NotSupportedError
     end
+    # matching (T21) is not supported together with the Schur complement mode
+    s2 = DirectSolver(api_matrix(backend, tril(A)), spd_structure(T), 'L')
+    setparam!(s2, "matching_alg", "algo1")
+    setparam!(s2, "schur_mode", 1)
+    setparam!(s2, "user_schur_indices", [i > n - 3 ? 1 : 0 for i in 1:n])
+    @test thrown(() -> execute!("analysis", s2, x, b)) isa NotSupportedError
     # Schur complement mode (T20) needs user_schur_indices
     s2 = DirectSolver(api_matrix(backend, tril(A)), spd_structure(T), 'L')
     setparam!(s2, "schur_mode", 1)
@@ -232,8 +238,11 @@ end
     for name in ("lu_nnz", "perm_row", "diag", "nsuperpanels", "memory_estimates")
         @test thrown(() -> setparam!(solver, name, 1)) isa ArgumentError
     end
-    for name in ("perm_matching", "scale_row", "scale_col", "nd_partition_tree", "hybrid_device_memory_min")
+    for name in ("nd_partition_tree", "hybrid_device_memory_min")
         @test thrown(() -> getparam(solver, name)) isa NotSupportedError
+    end
+    for name in ("perm_matching", "scale_row", "scale_col")      # T21: need an analysis with matching
+        @test thrown(() -> getparam(solver, name)) isa InvalidValueError
     end
     for name in ("schur_shape", "schur_matrix")                 # T20: need an analysis with schur_mode = 1
         @test thrown(() -> getparam(solver, name)) isa InvalidValueError

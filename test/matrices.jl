@@ -198,6 +198,25 @@ end
 random_general(n::Integer, density::Real; kwargs...) = random_general(Float64, n, density; kwargs...)
 
 """
+    badly_scaled_general(T, n, density; exponent = 1, rng)
+
+`Dr G[p, :] Dc` with `G = random_general(T, n, density)` (row diagonally
+dominant), a random row permutation `p` and diagonal `Dr`, `Dc` with entries
+`10^k`, `k` uniform in `-exponent:exponent`: unsymmetric and badly scaled, its
+diagonal mostly structurally zero, so LU without matching perturbs pivots; the
+matching (T21) recovers the dominant diagonal of `G` (the column permutation
+`p⁻¹`) and the scalings undo `Dr`, `Dc`.
+"""
+function badly_scaled_general(::Type{T}, n::Integer, density::Real; exponent::Integer = 1,
+                              rng::AbstractRNG = Random.default_rng()) where {T}
+    G = random_general(T, n, density; rng)
+    p = randperm(rng, n)
+    Dr = Diagonal([real(T)(10)^rand(rng, -exponent:exponent) for _ in 1:n])
+    Dc = Diagonal([real(T)(10)^rand(rng, -exponent:exponent) for _ in 1:n])
+    return sparse(Dr * G[p, :] * Dc)
+end
+
+"""
     weak_diagonal_general(T, n, density; every = 5, scale = 0.1, rng)
 
 [`random_general`](@ref) with every `every`-th diagonal entry multiplied by

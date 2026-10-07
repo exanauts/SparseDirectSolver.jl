@@ -11,7 +11,7 @@
 #   `dᵢ = sqrt(rᵢ cᵢ)` from the matching of the full matrix (Duff & Pralet
 #   2005), which keeps the symmetry and, by Sylvester's law, the inertia; the
 #   cycles of the matching permutation give the 2×2 pivot pairs of `"S"`/`"H"`
-#   ([`matching_pairs`](@ref)).
+#   ([`matching_pairs`](@ref), job 5 only: the other jobs have no scaling).
 #
 # Host only, plain `Int`/`Float64` arrays.
 

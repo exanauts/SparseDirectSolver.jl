@@ -166,8 +166,9 @@ Matching and scaling (PLAN §1.3, M9, `"matching_alg"` = `"algo1"`–`"algo6"`
 before the analysis; [`compute_matching`](@ref), from the first batch member's
 values): `"G"` factors `M = (Dr A Dc)[:, q]`, whose diagonal holds the matched
 entries (job 5: `|mᵢᵢ| = 1 ≥ |mᵢⱼ|`), and the symmetric structures factor
-`D A D` (same inertia as `A`; for `"S"`/`"H"` the 2×2 pivot pairs come from the
-cycles of the matching, [`matching_pairs`](@ref)). The solve phases apply the
+`D A D` (same inertia as `A`; for `"S"`/`"H"` with `"algo5"`/`"algo6"` the 2×2
+pivot pairs come from the cycles of the matching, [`matching_pairs`](@ref); jobs
+1–4 have no scaling and keep the pairs of `"pivot_pairs"` without matching). The solve phases apply the
 permutation and the scalings (`"solve_fwd_perm"`: `Dr`, `"solve_bwd_perm"`:
 `Dc Q`, as in cuDSS) and refinement measures the residual of `A` itself;
 `"diag"` and the pivot statistics are those of the scaled matrix. Not with the
@@ -470,8 +471,9 @@ function _reorder!(solver::DirectSolver{T}) where {T}
         solver.ordering = compute_schur_ordering(P, solver.options, flags; T)
         rowptr, colval = schur_pattern(P, flags)
         solver.schur = SchurState(flags, findall(flags), rowptr, colval, nothing, VIEW_FULL)
-    elseif m !== nothing && m.symmetric
-        # 2×2 pivot pairs ("S"/"H") from the cycles of the symmetric matching (issue #67)
+    elseif m !== nothing && m.symmetric && matching_job(m.alg) == 5
+        # 2×2 pivot pairs ("S"/"H") from the cycles of the scaled symmetric matching (issue #67); jobs 1–4 (no
+        # scaling; job 1 ignores the values) keep the pairs of the analysis without matching
         pairs = pairs_enabled(solver.structure, solver.options) ?
                 matching_pairs(m, solver.host_rowptr, solver.host_colval, _first_member(A), A.nrows, solver.structure,
                                solver.options; view = _stored_view(solver), index = A.index) : Tuple{Int, Int}[]
