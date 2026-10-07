@@ -2575,6 +2575,12 @@ uniform-batch LU tests pass; `random_general` residuals `≤ tol(T)`.
     work item 1 (`O(f)` per column, cheaper than the LDLᵀ fallback scan).
   - `perm_row` reports batch member 1 for a uniform batch (each member has its own local row order).
   - CUDA path exercised only by CI.
+  - Device arithmetic fuses multiply-adds (GPUCompiler `-nvptx-fma-level=1`), so device-vs-reference equality is
+    bitwise on the CPU backend only. On `weak_diagonal_general` with `pivot_threshold = 0.01` (growth ≈ 3e2) CUDA
+    deviated by up to 900 eps from `ref_lu!` (at least as accurate against a Float64 oracle). The elementwise
+    panel checks now use `growth_tol(T, Nr)` (`panel_tol` scaled by `max(|L|, |Uᵀ|) / min |d|`), the pivot
+    sequence stays exact, and the device testset also checks `lu_error ≤ tol(T)`. `test_numeric_ldlt.jl` has the
+    same latent fragility (see #86) and should move to `growth_tol` when touched.
   - The GitHub App token expired before the last push: the final commit is local and published by the
     workflow's "Publish the branch" step (which also opens the PR).
 - Suggested plan changes:

@@ -57,9 +57,11 @@ end
             # the same pivot sequence: local row orders and kinds equal, D, L and Uᵀ to rounding
             @test Nh.piv == Nr.piv
             @test Nh.pivot_kind == Nr.pivot_kind
-            @test d_error(Nh, Nr) <= panel_tol(T)
-            @test panel_error(Nh, Nr) <= panel_tol(T)
-            @test upanel_error(Nh, Nr) <= panel_tol(T)
+            @test d_error(Nh, Nr) <= growth_tol(T, Nr)
+            @test panel_error(Nh, Nr) <= growth_tol(T, Nr)
+            @test upanel_error(Nh, Nr) <= growth_tol(T, Nr)
+            # the backward error of the device factor: A[p, q] = L D U
+            @test lu_error(A, S, Nh) <= tol(T)
             @test Nh.stats == Nr.stats
             @test SDS.pivot_totals(Nd) == SDS.pivot_stats(Nr) && Nh.totals == Nr.totals
             # device solves with A (L, D, U) and Aᵀ (Uᵀ, D, Lᵀ)
@@ -82,7 +84,8 @@ end
     SDS.factorize!(Nd, Sd, nz; opts)
     Nh = SDS.host_numeric(Nd)
     @test Nh.piv == Nr.piv && Nh.pivot_kind == Nr.pivot_kind
-    @test d_error(Nh, Nr) <= panel_tol(T) && panel_error(Nh, Nr) <= panel_tol(T) && upanel_error(Nh, Nr) <= panel_tol(T)
+    gt = growth_tol(T, Nr)
+    @test d_error(Nh, Nr) <= gt && panel_error(Nh, Nr) <= gt && upanel_error(Nh, Nr) <= gt
     ws = SDS.allocate_solve(Sd, T, backend, 2)
     b = rand(T, 400, 2)
     @test relres(A, device_solve(backend, ws, Sd, Nd, b), b) <= tol(T)
@@ -235,7 +238,7 @@ end
     for k in 1:nb
         _, Nr, _, _, _ = lu_setup(CPU(), members[k]; opts = solver.options)
         Nk = SDS.member_numeric(solver.numeric, solver.symbolic, k)
-        @test Nk.piv == Nr.piv && d_error(Nk, Nr) <= panel_tol(T) && upanel_error(Nk, Nr) <= panel_tol(T)
+        @test Nk.piv == Nr.piv && d_error(Nk, Nr) <= growth_tol(T, Nr) && upanel_error(Nk, Nr) <= growth_tol(T, Nr)
     end
     # ubatch_index: only member 2 is refactorized
     before = [SDS.member_numeric(solver.numeric, solver.symbolic, k) for k in 1:nb]

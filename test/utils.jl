@@ -160,9 +160,36 @@ end
     panel_tol(T)
 
 Elementwise tolerance of device panels against the reference panels, relative
-to `max |L|`: `100·eps(real(T))` (TASKS.md T09).
+to `max |L|`: `100·eps(real(T))` (TASKS.md T09). This is an exact-order
+comparison; use [`growth_tol`](@ref) on generators with element growth (weak
+pivots, static pivoting).
 """
 panel_tol(::Type{T}) where {T} = 100 * eps(real(T))
+
+"""
+    factor_growth(Nr)
+
+Element growth `max(max |L|, max |Uᵀ|) / min |d[1:n]|` of the reference factor
+`Nr` (`ufactor` is empty for the symmetric structures, then only `L` counts).
+"""
+function factor_growth(Nr)
+    n = length(Nr.piv)
+    big = max(maximum(abs, Nr.factor; init = zero(real(eltype(Nr.factor)))),
+              maximum(abs, Nr.ufactor; init = zero(real(eltype(Nr.ufactor)))))
+    return big / minimum(abs, @view Nr.d[1:n])
+end
+
+"""
+    growth_tol(T, Nr)
+
+Elementwise tolerance of device LU/LDLᵀ panels against the reference panels on
+matrices with element growth: [`panel_tol`](@ref) scaled by the growth
+[`factor_growth`](@ref) of the reference factor, at least `panel_tol(T)`. Two
+roundings of the same elimination (the device may fuse multiply-adds, the host
+does not) differ by O(eps · growth), not O(eps). The pivot sequence is still
+compared exactly.
+"""
+growth_tol(::Type{T}, Nr) where {T} = panel_tol(T) * max(one(real(T)), real(T)(factor_growth(Nr)))
 
 """
     ka_cpu_alloc_budget(launches, localmem_bytes) -> Int

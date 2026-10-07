@@ -218,7 +218,11 @@ a split file, write every testset either over `ELTYPES` or behind `RUN_SHARED`.
   tolerances inside individual test files.
 * Every numeric test loops over `BACKENDS` and over `ELTYPES` unless the task
   says otherwise. Seed with `Random.seed!(666)`. Tolerance is `tol(T) =
-  sqrt(eps(real(T)))` on well-conditioned generators.
+  sqrt(eps(real(T)))` on well-conditioned generators. Elementwise
+  device-vs-reference panel checks use `panel_tol(T)` only on well-conditioned
+  generators; on generators with element growth (weak pivots, static pivoting)
+  use `growth_tol(T, Nr)`, since GPUs fuse multiply-adds and the two roundings
+  differ by O(eps · growth). The pivot sequence is always compared exactly.
 * Tests must not need the network. SuiteSparse downloads belong to `bench/`.
 * A task is done only when its listed tests pass on both the CPU backend and
   CUDA on this machine, and the Report records the counts.
