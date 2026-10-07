@@ -8,11 +8,16 @@
 # * Regime A: `subtree_ldlt_kernel!`, one workgroup per subtree, the serial
 #   stack of packed fronts and contribution blocks in `@localmem` (as the
 #   Cholesky kernel of `src/numeric/subtree.jl`).
-# * Regimes B and C: `front_ldlt_kernel!`, one workgroup per front of a launch
+# * Regime B: `front_ldlt_kernel!`, one workgroup per front of a launch
 #   group, fused assembly (zero, scatter A, owner-pull extend-add), then the
-#   pivoted factorization of the panel (regime B: `F₁₁` staged in `@localmem`,
-#   the rows below it in global memory; regime C: all in global memory) and the
-#   update of the front's packed contribution block on the update stack.
+#   pivoted factorization of the panel and the update of the front's packed
+#   contribution block on the update stack. The kernel's `Val(W)`: `W > 0` (width
+#   classes above `_LT_GLOBAL_MAX_W`) stages `F₁₁` as a `W×W` triangle in
+#   `@localmem`, the rows below it in global memory; `W = 0` (the narrow classes
+#   `≤ _LT_GLOBAL_MAX_W`) keeps the whole panel in global memory.
+# * Regime C, and the wide regime-B bins of `ldlt_blocked_path`: the blocked
+#   path of `src/numeric/ldlt_c.jl` (panel kernel plus GEMMs). In the launch plan,
+#   `group_width[k] = 0` marks a group on that path (not the kernel's `W = 0`).
 #
 # Per pivot step (a loop over the `w` columns of the front with a uniform trip
 # count; a 2×2 pivot leaves the last iterations idle): the workgroup chooses the
@@ -392,11 +397,13 @@ end
             x = _fget(F, c, c)
             dk = H ? T(real(x)) : x
             kind = PIVOT_KIND_1X1
-            if !(abs(dk) >= ε)                        # tiny (or NaN): perturb
+            if !(abs(dk) >= ε) || iszero(dk)          # tiny (or NaN, or exactly zero): perturb
                 iszero(dk) && (ctl[_LT_STAT + STAT_NZERO] += one(IT))
                 dk = _perturbation_sign(dk, Int(psign[perm[piv[c0 + c - 1]]]), H) * ε
                 kind = PIVOT_KIND_PERTURBED
                 ctl[_LT_STAT + STAT_NPERTURBED] += one(IT)
+                # ε = 0 leaves the pivot zero: the front fails at this assembled local column
+                iszero(dk) && ctl[_ST_STATUS] == 0 && (ctl[_ST_STATUS] = (Int(piv[c0 + c - 1]) - c0 + 1) % IT)
             end
             d[g] = dk
             d[n + g] = zero(T)
@@ -573,6 +580,7 @@ end
         for q in 1:5
             ctl[_LT_STAT + q] = zero(IT)
         end
+        ctl[_ST_STATUS] = zero(IT)
     end
     return nothing
 end
@@ -925,8 +933,8 @@ end
         for q in 1:5
             stats[base + q] = Int64(ctl[_LT_STAT + q])
         end
-        stats[base + STAT_INFO] = 0
-        info[s] = Int32(0)
+        stats[base + STAT_INFO] = Int64(ctl[_ST_STATUS])
+        info[s] = Int32(ctl[_ST_STATUS])
     end
     return nothing
 end
@@ -965,14 +973,15 @@ end
                                     front_ncols, cb_ptr, child_ptr, child_list, relind_ptr, relind, maxchild, prm,
                                     Val(W), Val(WG); ndrange = WG * count * bm.nact)
 
-LDLᵀ/LDLᴴ kernel of regimes B and C: workgroup `G` takes front
+LDLᵀ/LDLᴴ kernel of regime B: workgroup `G` takes front
 `s = nodes[bm.first + g - 1]` of batch member `k` (`g`, `k` from the
 [`BatchMap`](@ref) `bm`; the per-member arrays are the member's), zeroes and assembles it (A through the `amap`, then
 the `maxchild` children's packed contribution blocks in `child_list` order),
 factors its `w` fully-summed columns in place with in-block
-Bunch–Kaufman pivoting (`W = 0`, regime C: in the panel; regime B, width
-class `W ≥ w`: `F₁₁` staged as a packed `W×W` lower triangle in `@localmem`,
-the rows below it in the panel; the pivot search is a workgroup reduction), threshold acceptance and perturbation (`prm`, a
+Bunch–Kaufman pivoting (`W = 0`, the narrow width classes `≤ _LT_GLOBAL_MAX_W`:
+in the panel in global memory; width class `W ≥ w` above that: `F₁₁` staged
+as a packed `W×W` lower triangle in `@localmem`, the rows below it in the panel;
+the pivot search is a workgroup reduction), threshold acceptance and perturbation (`prm`, a
 `_LDLTDevice{R, HERM}`; `HERM`: Hermitian or real symmetric, else complex symmetric),
 writes D, the local pivot order `piv`, the pivot kinds and the front's
 statistics, updates its packed contribution block on the update stack
@@ -1296,11 +1305,12 @@ function abs_max!(aux::AbstractVector, nzval::AbstractVector, bm::BatchMap = sin
     return aux
 end
 
-@kernel function _reduce_stats_kernel!(totals, stats, ns, bm, ::Val{WG}, ::Val{NF},
+@kernel function _reduce_stats_kernel!(totals, info_all, stats, super_ptr, ns, bm, ::Val{WG}, ::Val{NF},
                                        ::Val{LOG2WG}) where {WG, NF, LOG2WG}
     li = @index(Local, Linear)
     G = @index(Group, Linear)
     acc = @localmem Int64 (WG * NF,)
+    best = @localmem Int64 (WG,)
     @inbounds begin
         st = _mview(stats, _bm_gmember(bm, G), bm.nbatch)
         for q in 1:NF
@@ -1311,6 +1321,12 @@ end
             end
             acc[(q - 1) * WG + li] = a
         end
+        m = typemax(Int64)
+        for s in li:WG:ns
+            fi = st[s * NF]
+            fi > 0 && (m = min(m, Int64(super_ptr[s]) + fi - 1))
+        end
+        best[li] = m
     end
     @synchronize
     for lev in 1:LOG2WG
@@ -1320,12 +1336,17 @@ end
                 for q in 1:NF
                     acc[(q - 1) * WG + li] += acc[(q - 1) * WG + li + h]
                 end
+                best[li] = min(best[li], best[li + h])
             end
         end
         @synchronize
     end
     if li <= NF
         @inbounds _mview(totals, _bm_gmember(bm, G), bm.nbatch)[li] = acc[(li - 1) * WG + 1]
+    end
+    if li == 1
+        @inbounds _iview(info_all, _bm_gmember(bm, G), bm.nbatch)[ns + 1] =
+            best[1] == typemax(Int64) ? Int32(0) : Int32(best[1])
     end
 end
 
@@ -1334,15 +1355,18 @@ end
 
 Sum the per-front statistics `numeric.stats` into `numeric.totals`
 (`npos, nneg, nzero, nperturbed, n2x2`, and the number of fronts with a failed
-pivot) of every active batch member: one workgroup per member, `@localmem`
+pivot) of every active batch member, and the smallest failed factor column
+(`super_ptr[s] + info - 1` over the fronts with a nonzero `info` statistic,
+0 = none) into `numeric.info[ns + 1]`: one workgroup per member, `@localmem`
 tree reduction, no atomics. Asynchronous; [`pivot_totals`](@ref) reads the
 result.
 """
 function reduce_stats!(N::Numeric, S::Symbolic)
     WG = STATS_WORKGROUP
     bm = batch_map(N)
-    _reduce_stats_kernel!(KernelAbstractions.get_backend(N.stats), WG)(N.totals, N.stats, nsupernodes(S), bm,
-                                                                       Val(WG), Val(FRONT_STATS_FIELDS),
+    _reduce_stats_kernel!(KernelAbstractions.get_backend(N.stats), WG)(N.totals, N.info, N.stats, S.super_ptr,
+                                                                       nsupernodes(S), bm, Val(WG),
+                                                                       Val(FRONT_STATS_FIELDS),
                                                                        Val(_ilog2(WG)); ndrange = WG * bm.nact)
     return N
 end
@@ -1427,7 +1451,7 @@ function _factorize_ldlt_herm!(N::Numeric{T}, S::Symbolic, nzval, opts, prm, gim
 end
 
 """
-    factorize_ldlt!(numeric, symbolic, nzval; opts = Options()) -> 0
+    factorize_ldlt!(numeric, symbolic, nzval; impl = :auto, opts = Options(), nb = LDLT_C_NB) -> info::Int
 
 Multifrontal `P A Pᵀ = L D Lᴴ` (structure `"H"`, or `"S"` with real `T`) or
 `L D Lᵀ` (complex symmetric `"S"`) on the device, with the in-front pivoting
@@ -1435,15 +1459,28 @@ and the static perturbation of the reference [`ref_ldlt!`](@ref) (same pivot
 choice, same storage): `opts.pivot_type`, `pivot_threshold`, `pivot_epsilon`,
 `pivot_epsilon_alg` and `pivot_sign` (copied to `numeric.psign`; a length
 other than `n` raises [`InvalidValueError`](@ref)). Regime-A groups are one
-[`subtree_ldlt_kernel!`](@ref) launch per budget class; every regime-B and
-regime-C launch group is one [`front_ldlt_kernel!`](@ref) launch (fused
-assembly and factorization, one workgroup per front, `F₁₁` in local memory for
-regime-B width classes; no vendor calls, see the T15 report); then [`reduce_stats!`](@ref). `opts.user_host_interrupt` is polled
+[`subtree_ldlt_kernel!`](@ref) launch per budget class; a regime-B launch
+group is one [`front_ldlt_kernel!`](@ref) launch (fused assembly and
+factorization, one workgroup per front, `F₁₁` in local memory above the narrow
+width classes); regime-C groups and the wide regime-B bins of
+[`ldlt_blocked_path`](@ref) take the blocked path of `src/numeric/ldlt_c.jl`
+(`panel_ldlt_kernel!` per block of `nb` pivot columns, then GEMMs through the
+dense interface: `impl = :auto` means vendor GEMMs when the analysis chose
+vendor calls for regime C, else `:ka`; other values as in
+[`select_impl`](@ref); `nb < LDLT_C_NB` is for tests). Then
+[`reduce_stats!`](@ref). `opts.user_host_interrupt` is polled
 before every launch group ([`InterruptedError`](@ref)). With `pivot_epsilon_alg = "algo1"`
 [`abs_max!`](@ref) computes the scale first. Fills `numeric.factor`
-(unit-lower panels), `d`, `piv`, `pivot_kind`, `stats` and `totals`. The
-factorization always completes (`info = 0`); the phase allocates nothing on
-the device, never synchronizes with the host, and is deterministic.
+(unit-lower panels), `d`, `piv`, `pivot_kind`, `stats` and `totals`.
+
+Returns `info`: an exactly zero 1×1 pivot is always perturbed, and with an
+effective `ε = 0` it stays zero; the factorization then fails there (the
+following divisions are left to IEEE arithmetic) and `info` is the original
+column of the failed pivot with the smallest factor column, as for
+[`ref_ldlt!`](@ref). With `ε > 0` the factorization always completes
+(`info = 0`). The phase allocates nothing on the device and is deterministic;
+it synchronizes with the host only to read `info` when the factorization can
+fail (`pivot_epsilon = 0`, or `pivot_epsilon_alg = "algo1"`), otherwise never.
 """
 function factorize_ldlt!(N::Numeric{T}, S::Symbolic, nzval::AbstractVector; impl::Symbol = :auto,
                          opts::Options = Options(), nb::Integer = LDLT_C_NB) where {T}
@@ -1472,5 +1509,5 @@ function factorize_ldlt!(N::Numeric{T}, S::Symbolic, nzval::AbstractVector; impl
     end
     assemble_schur!(N, S, nzval)
     reduce_stats!(N, S)
-    return 0
+    return _numeric_info!(N, S, iszero(prm.eps) || prm.scaled)
 end

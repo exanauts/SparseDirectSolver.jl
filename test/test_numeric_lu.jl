@@ -93,6 +93,37 @@ end
     @test lu_error(A, S, Nh) <= tol(T)
 end
 
+@testset "pivot_epsilon = 0: a zero pivot fails ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
+    Random.seed!(666)
+    n, j = 60, 23
+    F = SDS.FRONT_STATS_FIELDS
+    # an exactly zero pivot is tiny whatever ε; with ε = 0 it stays zero and info is its original column (#65)
+    for (rname, rkw) in (("default", (;)), ("regime-C root", (factorization_alg = "algo2", subtree_budgets = Int[]))),
+        stored_zero in (false, true)
+        A = singular_block_matrix(T, n, j; stored_zero)
+        opts = Options(; pivot_epsilon = 0.0, rkw...)
+        C = SDS.CSR(A)
+        S = SDS.symbolic_analysis(C, "G", 'F'; opts)
+        Nr = SDS.allocate_numeric(S, T)
+        @test SDS.ref_lu!(Nr, S, C.nzval; opts) == j
+        Sd = SDS.adapt(backend, S, Int32)
+        Nd = SDS.allocate_numeric(Sd, T, backend)
+        @test SDS.factorize!(Nd, Sd, to_device(backend, C.nzval); opts) == j
+        Nh = SDS.host_numeric(Nd)
+        @test Nh.pivot_kind == Nr.pivot_kind && Nh.piv == Nr.piv
+        @test d_error(Nh, Nr) <= panel_tol(T)
+        @test to_host(Nd.stats)[F:F:end] == Nr.stats[F:F:end]
+        @test count(!iszero, Nr.stats[F:F:end]) == 1
+        st = SDS.pivot_totals(Nd)
+        @test st.nzero == 1 && st.nperturbed == 1
+    end
+    solver = DirectSolver(api_matrix(backend, singular_block_matrix(T, n, j)), "G", 'F')
+    setparam!(solver, "pivot_epsilon", 0.0)
+    execute!("analysis", solver, nothing, nothing)
+    execute!("factorization", solver, nothing, nothing)
+    @test getparam(solver, "info") == j
+end
+
 @testset "perturbation ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
     n, j = 60, 23
     R = real(T)
@@ -327,9 +358,15 @@ end
         execute!("solve", cs, x, b)
         @test relres(M, to_host(x), to_host(b)) <= tol(T)
     end
-    # views other than 'F' are refused for "G"
-    @test thrown(() -> execute!("analysis", DirectSolver(api_matrix(backend, A, INT), "G", 'L'), nothing, nothing)) isa
-          InvalidValueError
+    # "G" ignores the view (cuDSS, #84): 'L' and 'U' read the full matrix, as 'F'
+    for view in ('L', 'U')
+        vs = DirectSolver(api_matrix(backend, A, INT), "G", view)
+        setparam!(vs, "pivot_threshold", 1.0)
+        for phase in ("analysis", "factorization", "solve")
+            execute!(phase, vs, x, b)
+        end
+        @test getparam(vs, "info") == 0 && relres(A, to_host(x), to_host(b)) <= tol(T)
+    end
     # the LinearAlgebra layer
     F = lu(SDS.CSR(SparseMatrixCSC{T, INT}(A)))
     @test F.structure == SDS.STRUCTURE_GENERAL && getparam(F, "ir_n_steps") == 2

@@ -181,6 +181,12 @@ end
         for index in ('O', 'Z')
             PG = SDS.SymmetricPattern(SDS.CSR(G; index), "G")
             @test SparseMatrixCSC(PG) == offdiag_pattern(Gp + Gp')
+            # "G" ignores the view (cuDSS, #84): every stored entry is read
+            @test SDS.SymmetricPattern(SDS.CSR(G; index), "G"; view = 'L') == PG
+            @test SDS.SymmetricPattern(SDS.CSR(G; index), "G"; view = 'U') == PG
+            FL = SDS.full_pattern_map(SDS.CSR(G; index), "G"; view = 'L')
+            FF = SDS.full_pattern_map(SDS.CSR(G; index), "G"; view = 'F')
+            @test all(getfield(FL, f) == getfield(FF, f) for f in fieldnames(SDS.FullPatternMap))
         end
     end
 
@@ -197,7 +203,6 @@ end
     R = sprand(4, 5, 0.5)
     @test thrown(() -> SDS.SymmetricPattern(SDS.CSR(R), "G")) isa InvalidValueError
     @test thrown(() -> SDS.full_pattern_map(SDS.CSR(R), "G")) isa InvalidValueError
-    @test thrown(() -> SDS.SymmetricPattern(SDS.CSR(laplacian2d(3, 3)), "G"; view = 'L')) isa InvalidValueError
     @test thrown(() -> SDS.SymmetricPattern([1, 2, 3], [1, 4], 2, "S")) isa InvalidValueError
     @test thrown(() -> SDS.SymmetricPattern([1, 2, 3], [1, 0], 2, "S")) isa InvalidValueError
     @test thrown(() -> SDS.SymmetricPattern([1, 2], [1, 1], 2, "S")) isa InvalidValueError

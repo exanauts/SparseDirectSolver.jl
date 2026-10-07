@@ -199,7 +199,10 @@ _check_ldlt_eltype(::Type{T}) where {T} = T <: LinearAlgebra.BlasFloat ||
     factorize!(numeric, symbolic, nzval; impl = :auto, opts = Options()) -> info::Int
 
 Structures `"S"`/`"H"`: [`factorize_ldlt!`](@ref) with the pivoting options
-`opts` (`impl` is not used); structure `"G"`: [`factorize_lu!`](@ref) likewise. Structures `"SPD"`/`"HPD"`: multifrontal Cholesky `P A Pᵀ = L Lᴴ` on the device: `nzval` are the stored
+`opts` (`impl` selects its regime-C GEMMs); structure `"G"`:
+[`factorize_lu!`](@ref) (`impl` is not used). Both return `info` (nonzero only
+for a zero pivot with `pivot_epsilon = 0`). Structures `"SPD"`/`"HPD"`:
+multifrontal Cholesky `P A Pᵀ = L Lᴴ` on the device: `nzval` are the stored
 values of A (same pattern, view and index base as the analysis) on the backend
 of `numeric`, and `symbolic` has its maps on that backend
 (`adapt(backend, symbolic, INT)`). For every launch group of the schedule,
@@ -274,8 +277,21 @@ function factorize_cholesky!(N::Numeric{T}, S::Symbolic, nzval::AbstractVector; 
     end
     assemble_schur!(N, S, nzval)
     cholesky_stats!(N, S)
+    return _numeric_info!(N, S, true)
+end
+
+# the reduced `info` of the active members into `plan.info_host` (`read`: copied from the device, the phase's only
+# host synchronization; else 0, a factorization that cannot fail) and the first nonzero one as an original column
+function _numeric_info!(N::Numeric, S::Symbolic, read::Bool)
+    plan = N.plan
     nb = N.nbatch
-    copyto!(plan.info_host, 1, N.info, nsupernodes(S) * nb + 1, nb)  # the phase's only host synchronization
+    if read
+        copyto!(plan.info_host, 1, N.info, nsupernodes(S) * nb + 1, nb)
+    else
+        for j in 1:plan.nact[]
+            plan.info_host[plan.members_host[j]] = 0
+        end
+    end
     nb == 1 && return _original_column(S, plan.info_host[1])
     for j in 1:plan.nact[]
         k = Int(plan.members_host[j])
@@ -291,16 +307,16 @@ _original_column(S::Symbolic, k::Integer) = k == 0 ? 0 : S.partition.perm[k]
     member_info!(info, numeric, symbolic) -> info
 
 Write the `info` of the last [`factorize!`](@ref) of every active batch member
-`k` into `info[k]` (the original column of the member's first non-positive
-pivot, 0 = success; inactive members keep their entries). Host data only: the
-statuses were read by `factorize!` (Cholesky) or are 0 (LDLᵀ/LDLᴴ, LU).
+`k` into `info[k]` (the original column of the member's first failed pivot:
+non-positive for Cholesky, zero with `pivot_epsilon = 0` for LDLᵀ/LDLᴴ and LU;
+0 = success; inactive members keep their entries). Host data only: the
+statuses were read by `factorize!`.
 """
 function member_info!(info::AbstractVector{<:Integer}, N::Numeric, S::Symbolic)
     plan = N.plan
-    chol = !_is_ldlt_structure(S.structure) && S.structure != STRUCTURE_GENERAL
     for j in 1:plan.nact[]
         k = Int(plan.members_host[j])
-        info[k] = chol ? _original_column(S, plan.info_host[k]) : 0
+        info[k] = _original_column(S, plan.info_host[k])
     end
     return info
 end

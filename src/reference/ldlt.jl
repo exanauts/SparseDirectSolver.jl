@@ -109,8 +109,14 @@ Fills `numeric.factor` (unit-lower panels), `numeric.d`, `numeric.piv`,
 nperturbed, n2x2, info`; `nzero` counts pivots that were exactly zero before
 their perturbation; `npos`/`nneg` count the signs of D after perturbation, a 2×2
 block with negative determinant counting one of each, and stay `0` for complex
-symmetric matrices, which have no inertia). Returns `info = 0`: with static
-perturbation the factorization always completes.
+symmetric matrices, which have no inertia). An exactly zero 1×1 pivot is
+always tiny; with `ε = 0` its perturbation leaves it zero and the
+factorization fails there: the front's `info` statistic is the failed local
+column (assembled order, the first in pivot order), the following divisions
+are left to IEEE arithmetic (the factor is unusable), and the return value is
+the original column of the failed pivot with the smallest factor column, as for
+the Cholesky oracle. Otherwise returns `info = 0`: with static perturbation
+`ε > 0` the factorization always completes.
 """
 function ref_ldlt!(N::Numeric{T, Vector{T}}, S::Symbolic, nzval::AbstractVector; opts::Options = Options()) where {T}
     length(nzval) == S.nnz ||
@@ -172,7 +178,7 @@ function ref_ldlt!(N::Numeric{T, Vector{T}}, S::Symbolic, nzval::AbstractVector;
             N.d[g] = dd[k]
             N.d[n + g] = ee[k]
         end
-        for q in 1:5
+        for q in 1:FRONT_STATS_FIELDS
             N.stats[(s - 1) * FRONT_STATS_FIELDS + q] = st[q]
         end
         if m > 0
@@ -192,7 +198,19 @@ function ref_ldlt!(N::Numeric{T, Vector{T}}, S::Symbolic, nzval::AbstractVector;
         end
     end
     _host_totals!(N)
-    return 0
+    return _host_info(N, S)
+end
+
+# the original column of the failed pivot with the smallest factor column (`super_ptr[s] + info - 1`,
+# `info` = the failed assembled local column of front `s`; 0 = none), as the device reduction
+function _host_info(N::Numeric, S::Symbolic)
+    sp = S.partition
+    best = 0
+    for s in 1:nsupernodes(sp)
+        fi = Int(N.stats[s * FRONT_STATS_FIELDS])
+        fi > 0 && (best = best == 0 ? sp.super_ptr[s] + fi - 1 : min(best, sp.super_ptr[s] + fi - 1))
+    end
+    return best == 0 ? 0 : sp.perm[best]
 end
 
 # the totals of the per-front statistics (host storage; `reduce_stats!` on the device)
@@ -369,7 +387,7 @@ function _ldlt_front!(F::Matrix{T}, w::Int, prm::_LDLTParams, signof) where {T}
     kind = zeros(Int8, w)
     dd = zeros(T, w)
     ee = zeros(T, w)
-    st = zeros(Int, 5)
+    st = zeros(Int, FRONT_STATS_FIELDS)                 # npos, nneg, nzero, nperturbed, n2x2, info
     k = 1
     while k <= w
         c, r = _choose_pivot(F, k, w, prm)
@@ -377,11 +395,13 @@ function _ldlt_front!(F::Matrix{T}, w::Int, prm::_LDLTParams, signof) where {T}
             _swap_front!(F, k, c, w, lp)
             d = prm.herm ? T(real(F[k, k])) : F[k, k]
             kind[k] = PIVOT_KIND_1X1
-            if !(abs(d) >= prm.eps)                   # tiny (or NaN): perturb
+            if !(abs(d) >= prm.eps) || iszero(d)      # tiny (or NaN, or exactly zero): perturb
                 iszero(d) && (st[STAT_NZERO] += 1)
                 d = _perturbation_sign(d, signof(lp[k]), prm.herm) * prm.eps
                 kind[k] = PIVOT_KIND_PERTURBED
                 st[STAT_NPERTURBED] += 1
+                # ε = 0 leaves the pivot zero: the factorization fails at this (assembled) column
+                iszero(d) && st[STAT_INFO] == 0 && (st[STAT_INFO] = lp[k])
             end
             F[k, k] = d
             dd[k] = d

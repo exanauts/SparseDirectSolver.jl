@@ -24,7 +24,7 @@ const ASSEMBLY_WORKGROUP = 256
         end
         c = cb_ptr[s]
         if c > 0
-            m = front_nrows[s] - front_ncols[s]
+            m = Int(front_nrows[s]) - Int(front_ncols[s])  # packed sizes in Int: m(m+1)/2 overflows Int32 first
             for q in (c + li - 1):WG:(c + m * (m + 1) ÷ 2 - 1)
                 stack[q] = z
             end
@@ -133,9 +133,9 @@ end
             c = child_list[kc]
             cb = cb_ptr[c]
             if cb > 0
-                mc = front_nrows[c] - front_ncols[c]
-                fp = front_nrows[s]
-                wp = front_ncols[s]
+                mc = Int(front_nrows[c]) - Int(front_ncols[c])   # packed offsets in Int (`_packed` of a block that
+                fp = Int(front_nrows[s])                         # fits INT can overflow INT for m > 46340)
+                wp = Int(front_ncols[s])
                 mp = fp - wp
                 pp = front_ptr[s]
                 cp = cb_ptr[s]

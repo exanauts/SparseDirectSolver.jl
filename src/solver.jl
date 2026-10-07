@@ -109,7 +109,9 @@ Sparse direct solver handle (≅ `CudssSolver`), PLAN §3.1–§3.2.
     DirectSolver(A::CuSparseMatrixCSC, structure, view; index = 'O')   # CUDA extension
 
 `structure` is `"G"`, `"S"`, `"H"`, `"SPD"` or `"HPD"` and `view` is `'L'`,
-`'U'` or `'F'` (the triangle of the matrix that is read), as in CUDSS.jl;
+`'U'` or `'F'` (the triangle of the matrix that is read; `'F'` reads the lower
+triangle of a symmetric or Hermitian structure, and for `"G"` the view is ignored
+and every stored entry is read, as in cuDSS), as in CUDSS.jl;
 `index` (`'O'`/`'Z'`) is the base of the row pointers and column indices. The
 CSR arrays are wrapped without copies and live on a KernelAbstractions backend
 (the solver's `backend`), except for a `SparseMatrixCSC`, which is converted to
@@ -123,7 +125,7 @@ right-hand side and the solution (as for `solve_mode`, see
 Implemented at this point: structures `"SPD"` (real `T`), `"HPD"`, `"S"`
 (LDLᵀ; complex symmetric for complex `T`), `"H"` (LDLᴴ) and `"G"` (LU on the
 symmetric pattern of `A + Aᵀ` with row pivoting inside the fully-summed block
-of each front, `P_r P A Pᵀ = L D U`; view `'F'` only), single matrices
+of each front, `P_r P A Pᵀ = L D U`; any view, ignored), single matrices
 and uniform batches (see below), the phases `"reordering"`, `"symbolic_factorization"`,
 `"analysis"`, `"factorization"`, `"refactorization"`, `"solve"`,
 `"solve_fwd_perm"`, `"solve_fwd"`, `"solve_diag"`, `"solve_bwd"`,
@@ -254,7 +256,8 @@ DirectSolver(A::SparseMatrixCSC, structure, view; index = INDEX_ONE) =
     DirectSolver(CSR(A; index), structure, view)
 
 Base.size(solver::DirectSolver) = (solver.A.nrows, solver.A.nrows)
-Base.size(solver::DirectSolver, d::Integer) = d <= 2 ? solver.A.nrows : 1
+Base.size(solver::DirectSolver, d::Integer) =
+    d < 1 ? throw(BoundsError(size(solver), d)) : d <= 2 ? solver.A.nrows : 1
 
 const _STAGE_NAMES = ("created", "reordered", "analyzed", "factorized")
 
@@ -343,8 +346,9 @@ Execute `phase` on `solver` (≅ `cudss(phase, solver, x, b)`), PLAN §1.2:
 * `"analysis"`: both;
 * `"factorization"`: numeric factorization with the current values of the
   matrix (needs the analysis); sets `"info"` (`0` or, for `"SPD"`/`"HPD"`, the
-  original column of the first non-positive pivot; LDLᵀ/LDLᴴ perturbs tiny
-  pivots instead and always reports `0`, see `"npivots"`) and clears
+  original column of the first non-positive pivot; LDLᵀ/LDLᴴ and LU perturb tiny
+  pivots instead and report `0`, see `"npivots"`, except for an exactly zero
+  pivot with `pivot_epsilon = 0`, whose original column they report) and clears
   `fresh_factorization`;
 * `"refactorization"`: the same with the analysis and storage reused, `"info"`
   reset first (needs a previous `"factorization"`);
@@ -882,7 +886,9 @@ flags 0/1, or `nothing`) select the members of the next phases; the index and
 the mask are checked against the batch size when a phase runs.
 `"pivot_sign"` (PLAN §1.7: a vector of `n` entries in `(-1, 0, 1)`, host or
 device, or `nothing`) is checked against the size of the matrix; the next
-`"factorization"`/`"refactorization"` copies it to the device. Setting
+`"factorization"`/`"refactorization"` copies it to the device; it steers the
+perturbation of LDLᵀ/LDLᴴ only and is ignored for `"G"` (LU perturbs with the
+sign of the pivot) and the Cholesky structures. Setting
 `"ir_n_steps"` (the number of refinement steps requested) makes
 [`getparam`](@ref) report that value again until the next solve.
 `"schur_matrix"` (Schur complement mode, after `"reordering"`/`"analysis"`)
@@ -936,7 +942,7 @@ The data parameters computed by the solver:
 
 | name | value | available after |
 | --- | --- | --- |
-| `"info"` | `Int`: `0`, or the original column (1-based) of the first non-positive pivot | always |
+| `"info"` | `Int`: `0`, or the original column (1-based) of the first failed pivot (Cholesky: non-positive; LDLᵀ/LDLᴴ and LU: exactly zero with `pivot_epsilon = 0`, the other tiny pivots are perturbed) | always |
 | `"ubatch_mask"` | the `"ubatch_mask"` set (or `nothing`) | always |
 | `"ir_n_steps"` | `Int`: refinement steps performed by the last `"solve"`/`"solve_refinement"` (≤ the configured `ir_n_steps`, fewer when `ir_tol` stopped early); the configured value before the first solve and after `setparam!(solver, "ir_n_steps", k)` | always |
 | `"lu_nnz"` | `Int64`: nonzeros of `L` (diagonal included, amalgamation zeros excluded) | analysis |
@@ -944,20 +950,23 @@ The data parameters computed by the solver:
 | `"nsuperpanels"` | `Int`: supernodes after amalgamation | analysis |
 | `"memory_estimates"` | `Vector{Int64}` (16 entries, see [`memory_estimates`](@ref)) | analysis |
 | `"perm_reorder_row"`, `"perm_reorder_col"` | `Vector{Int}`: the fill-reducing permutation, 1-based (`perm[k]` = original index of the `k`-th pivot) | reordering |
-| `"perm_row"`, `"perm_col"` | `Vector{Int}`: the final permutation of the factor (= the reordering for Cholesky and LDLᵀ/LDLᴴ); LU (`"G"`) after a factorization: `perm_row[k]` is the original row of factor row `k` (the reordering composed with the local row interchanges of batch member 1), `perm_col` the reordering (with matching: composed with the matching, `perm_matching[reordering]`), so `A[perm_row, perm_col] = L D U` (with matching `Dr A[perm_row, perm_col] Dc = L D U`, the scalings in that order) | analysis |
+| `"perm_row"`, `"perm_col"` | `Vector{Int}`: the final permutation of the factor (= the reordering for Cholesky and LDLᵀ/LDLᴴ); LU (`"G"`) after a factorization: `perm_row[k]` is the original row of factor row `k` (the reordering composed with the local row interchanges of batch member 1), `perm_col` the reordering (with matching: composed with the matching, `perm_matching[reordering]`), so `A[perm_row, perm_col] = L D U` (with matching `Dr[perm_row] A[perm_row, perm_col] Dc[perm_col] = L D U`, the scalings `Dr`, `Dc` of `"scale_row"`/`"scale_col"` as diagonal matrices in the original numbering). For a CSC input (`CuSparseMatrixCSC`, [`csr_of_transpose`](@ref)) `A` is the stored CSR matrix, the transpose of the matrix given | analysis |
 | `"perm_matching"` | `Vector{Int}`: the matching permutation ([`Matching`](@ref)): row `i` is matched to column `perm_matching[i]` (`"G"`: `A[:, perm_matching]` has the matched entries on its diagonal; symmetric structures: only its cycles are used, for the 2×2 pivot pairs) | reordering (`matching_alg ≠ "default"`) |
 | `"scale_row"`, `"scale_col"` | `Vector{real(T)}`: the row and column scaling factors `Dr`, `Dc` of the factored matrix, in the original numbering (ones for `"algo1"`–`"algo4"`; equal for the symmetric structures) | reordering (`matching_alg ≠ "default"`) |
 | `"diag"` | vector of `T` on the solver's backend: the diagonal of `L` (Cholesky), of `D` (LDLᵀ/LDLᴴ; for a 2×2 block its two diagonal entries) or of `D` in `L D U` (LU, = the diagonal of `U` in `L U`) in factor order; Schur complement mode: `1` on the (unfactored) Schur block | factorization |
-| `"npivots"` | `INT`: perturbed pivots (LDLᵀ/LDLᴴ, LU; `0` for Cholesky) | factorization |
-| `"inertia"` | `Tuple{INT, INT}`: `(npos, nneg)` of D (after perturbation, so the inertia of `A + E`; read it with `"npivots"`); `(0, 0)` for complex symmetric `"S"` and for `"G"`; Cholesky: `(number of positive pivots, 0)` | factorization |
-| `"pivot_stats"` | `NamedTuple` `(npos, nneg, nzero, nperturbed, n2x2)` of `Int64` (PLAN §1.7); in Schur complement mode `"npivots"`, `"inertia"` and `"pivot_stats"` count the factored block `A₁₁` only | factorization |
+| `"npivots"` | `INT`: perturbed pivots (LDLᵀ/LDLᴴ, LU; `0` for Cholesky); valid when `"info"` is `0` (after a failed front the counts of the fronts above it are stale) | factorization |
+| `"inertia"` | `Tuple{INT, INT}`: `(npos, nneg)` of D (after perturbation, so the inertia of `A + E`; read it with `"npivots"`); `(0, 0)` for complex symmetric `"S"` and for `"G"`; Cholesky: `(number of positive pivots, 0)`; valid when `"info"` is `0`, as `"npivots"` | factorization |
+| `"pivot_stats"` | `NamedTuple` `(npos, nneg, nzero, nperturbed, n2x2)` of `Int64` (PLAN §1.7); in Schur complement mode `"npivots"`, `"inertia"` and `"pivot_stats"` count the factored block `A₁₁` only; valid when `"info"` is `0`, as `"npivots"` | factorization |
 | `"schur_shape"` | `(nrows, ncols, nnz)` of `Int64`: the size `ns` of the Schur complement and the nonzeros of its symbolic pattern ([`schur_pattern`](@ref)); for the symmetric structures one triangle with the diagonal (as the sparse export of one triangle) | analysis (`schur_mode = 1`) |
 | `"schur_matrix"` | the Schur complement `S = A₂₂ − A₂₁ A₁₁⁻¹ A₁₂` of the rows and columns of `"user_schur_indices"` (in their increasing order), written into the destination registered with [`setparam!`](@ref) and returned; without one, a new dense `ns × ns` matrix on the solver's backend. Symmetric structures: a dense destination gets the full matrix, a sparse one the triangle of its view | factorization (`schur_mode = 1`) |
 
 Uniform batch (`nbatch > 1`): `"info"`, `"npivots"`, `"inertia"` and
 `"pivot_stats"` are vectors with one entry per batch member, `"diag"` is the
 `n · nbatch` vector of the members' diagonals one after the other; the
-analysis outputs are shared by the members. `"perm_row"` of an LU batch is
+analysis outputs are shared by the members. A factorization restricted by
+`"ubatch_index"`/`"ubatch_mask"` updates the active members only: the others
+keep the `"info"`, `"npivots"`, `"inertia"` and `"pivot_stats"` of their last
+factorization. `"perm_row"` of an LU batch is
 batch member 1's row order, by design: cuDSS returns the vector outputs of a
 uniform batch (`"diag"`) for member 1 only and does not implement
 `"perm_row"` at all (cuDSS 0.8). `"diag"` is the deliberate exception and
@@ -1024,7 +1033,20 @@ function getparam(solver::DirectSolver, name::AbstractString)
     return copy(sp.perm)   # perm_row, perm_col
 end
 
-_memory_estimates(solver::DirectSolver{T, INT}) where {T, INT} = memory_estimates(solver.host_symbolic, T, INT)
+# the estimates of the analysis plus, with matching, its device buffers: the scaled values (every member), the
+# entry weights, the two scale vectors and, for "G", the column permutation
+function _memory_estimates(solver::DirectSolver{T, INT}) where {T, INT}
+    est = memory_estimates(solver.host_symbolic, T, INT)
+    m = solver.host_matching
+    m === nothing && return est
+    n = solver.A.nrows
+    extra = Int64(length(solver.A.nzval)) * sizeof(T) + Int64(nnz(solver.A) + 2 * n) * sizeof(real(T)) +
+            (m.symmetric ? 0 : Int64(n) * sizeof(INT))
+    for k in (1, 2, 5)
+        est[k] += extra
+    end
+    return est
+end
 
 """
     getparam!(buffer, solver::DirectSolver, name::String) -> buffer

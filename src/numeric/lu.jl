@@ -121,11 +121,12 @@ end
         ε = _lu_eps(p, aux)
         dk = _fget(Fl, k, k)
         kind = PIVOT_KIND_1X1
-        if !(abs(dk) >= ε)                                # tiny (or NaN): perturb
+        if !(abs(dk) >= ε) || iszero(dk)                  # tiny (or NaN, or exactly zero): perturb
             iszero(dk) && (ctl[_LT_STAT + STAT_NZERO] += one(IT))
             dk = _perturbation_sign(dk, 0, !(T <: Complex)) * ε
             kind = PIVOT_KIND_PERTURBED
             ctl[_LT_STAT + STAT_NPERTURBED] += one(IT)
+            iszero(dk) && ctl[_ST_STATUS] == 0 && (ctl[_ST_STATUS] = k % IT)   # ε = 0: the front fails here
         end
         _fset!(Fl, k, k, dk)
         d[g] = dk
@@ -534,7 +535,7 @@ function _launch_subtrees_lu!(N::Numeric{T}, S::Symbolic, nzval, first, count, p
 end
 
 """
-    factorize_lu!(numeric, symbolic, nzval; opts = Options()) -> 0
+    factorize_lu!(numeric, symbolic, nzval; opts = Options()) -> info::Int
 
 Multifrontal `P_r P A Pᵀ = L D U` of a general matrix (structure `"G"`) on the
 device, with the in-front row pivoting and the static perturbation of the
@@ -548,9 +549,13 @@ workgroup per front; no vendor calls); then [`reduce_stats!`](@ref).
 ([`InterruptedError`](@ref)). With `pivot_epsilon_alg = "algo1"`
 [`abs_max!`](@ref) computes the scale first. Fills `numeric.factor` (`L`),
 `numeric.ufactor` (`Uᵀ`), `d`, `piv` (local row order), `pivot_kind`, `stats`
-and `totals`. The factorization always completes (`info = 0`); the phase
-allocates nothing on the device, never synchronizes with the host, and is
-deterministic. Uniform batch as [`factorize!`](@ref).
+and `totals`. Returns `info` as [`factorize_ldlt!`](@ref): an exactly zero
+pivot stays zero with an effective `ε = 0` and the factorization fails there
+(`info` = the original column, as [`ref_lu!`](@ref)); with `ε > 0` it always
+completes (`info = 0`). The phase allocates nothing on the device, is
+deterministic, and synchronizes with the host only to read `info` when the
+factorization can fail (`pivot_epsilon = 0`, or `pivot_epsilon_alg = "algo1"`).
+Uniform batch as [`factorize!`](@ref).
 """
 function factorize_lu!(N::Numeric{T}, S::Symbolic, nzval::AbstractVector; opts::Options = Options()) where {T}
     _check_numeric(N, S, nzval)
@@ -572,5 +577,5 @@ function factorize_lu!(N::Numeric{T}, S::Symbolic, nzval::AbstractVector; opts::
     end
     assemble_schur!(N, S, nzval)
     reduce_stats!(N, S)
-    return 0
+    return _numeric_info!(N, S, iszero(prm.eps) || prm.scaled)
 end

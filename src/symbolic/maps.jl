@@ -312,7 +312,10 @@ element type `T` and device indices `INT` (default: the index type of
 | 12 | largest regime-A local memory in use (per workgroup, [`subtree_local_bytes`](@ref) of its class) |
 | 13–16 | 0 (reserved) |
 
-Slots 1–6 follow cuDSS's `CUDSS_DATA_MEMORY_ESTIMATES`.
+Slots 1–6 follow cuDSS's `CUDSS_DATA_MEMORY_ESTIMATES`. `getparam(solver, "memory_estimates")`
+adds to slots 1, 2 and 5 the device buffers of the matching when there is one (`matching_alg`): the
+scaled values (`nnz · nbatch` of `T`), the entry weights (`nnz`) and the two scale vectors (`n`
+each) of `real(T)`, and for `"G"` the column permutation (`n` of `INT`).
 """
 function memory_estimates(S::Symbolic{INT0}, ::Type{T}, ::Type{INT} = INT0) where {INT0, T, INT}
     est = zeros(Int64, 16)

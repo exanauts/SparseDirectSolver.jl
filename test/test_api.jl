@@ -29,6 +29,7 @@ end
         @test solver isa AbstractDirectSolver{T, INT}
         @test solver isa LinearAlgebra.Factorization{T}
         @test size(solver) == (60, 60) && size(solver, 1) == 60
+        @test size(solver, 3) == 1 && thrown(() -> size(solver, 0)) isa BoundsError
         @test solver.fresh_factorization
         @test solver.backend == backend
         @test getparam(solver, "info") == 0
@@ -177,8 +178,11 @@ end
     setparam!(solver, "solve_alg", "algo1")
     @test thrown(() -> execute!("solve", solver, x, b)) isa NotSupportedError
     setparam!(solver, "solve_alg", "default")
-    s3 = DirectSolver(api_matrix(backend, tril(A)), "G", 'L')      # LU (T19) reads the full matrix: view 'F' only
-    @test thrown(() -> execute!("analysis", s3, x, b)) isa InvalidValueError
+    s3 = DirectSolver(api_matrix(backend, A), "G", 'L')            # "G" ignores the view (cuDSS, #84)
+    for phase in ("analysis", "factorization", "solve")
+        execute!(phase, s3, x, b)
+    end
+    @test getparam(s3, "info") == 0 && relres(A, to_host(x), to_host(b)) <= tol(T)
     if T <: Complex
         s4 = DirectSolver(api_matrix(backend, tril(A)), "SPD", 'L')
         @test thrown(() -> execute!("analysis", s4, x, b)) isa InvalidValueError
@@ -206,6 +210,20 @@ end
     est = getparam(solver, "memory_estimates")
     @test est isa Vector{Int64} && length(est) == 16 && est == SDS.memory_estimates(S, T, INT)
     @test est[1] > 0 && est[2] >= est[1]
+    # with matching, its device buffers count in slots 1, 2 and 5 (#97): scaled values, weights, two scale vectors,
+    # and for "G" the column permutation
+    for structure in ("G", "S")
+        ms = DirectSolver(api_matrix(backend, structure == "G" ? A : tril(A), INT), structure,
+                          structure == "G" ? 'F' : 'L')
+        setparam!(ms, "matching_alg", "algo5")
+        execute!("analysis", ms, nothing, nothing)
+        nzm = nnz(structure == "G" ? A : tril(A))
+        extra = nzm * sizeof(T) + (nzm + 2 * n) * sizeof(real(T)) + (structure == "G" ? n * sizeof(INT) : 0)
+        mref = SDS.memory_estimates(ms.host_symbolic, T, INT)
+        mm = getparam(ms, "memory_estimates")
+        @test mm[[1, 2, 5]] == mref[[1, 2, 5]] .+ extra
+        @test mm[[3, 4, 6:16...]] == mref[[3, 4, 6:16...]]
+    end
     # diag: the diagonal of the Cholesky factor of A[perm, perm]
     dref = diag(cholesky(Hermitian(Matrix(A[perm, perm]), :L)).L)
     d = getparam(solver, "diag")

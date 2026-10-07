@@ -109,7 +109,7 @@ defaults below. Keyword arguments are applied through [`setparam!`](@ref), so
 | `ir_n_steps` | `0` | no refinement (cuDSS parity) |
 | `ir_tol` | `0.0` | no early exit |
 | `pivot_type` | `PIVOT_AUTO` | Bunch–Kaufman for `S`/`H`, none for `SPD`/`HPD` |
-| `pivot_threshold` | `0.01` | pivot acceptance threshold |
+| `pivot_threshold` | `0.01` | pivot acceptance threshold; with `pivot_pairs = "default"` also the partner threshold of the 2×2 pairs chosen at analysis (a value set after `"analysis"` changes the in-front test, not the pairs already chosen) |
 | `pivot_epsilon` | `nothing` | [`default_pivot_epsilon`](@ref)`(T)` |
 | `pivot_epsilon_alg` | `PIVOT_EPSILON_DEFAULT` | |
 | `max_lu_nnz` | `-1` | no limit (any negative value) |
@@ -129,7 +129,7 @@ defaults below. Keyword arguments are applied through [`setparam!`](@ref), so
 | `factor_precision` | `nothing` | factors in the input precision |
 | `amalgamation` | `(max_width = 32, zero_fraction = 0.25, min_width = 8)` | |
 | `schedule` | `SCHEDULE_AUTO` | |
-| `pivot_pairs` | `PIVOT_PAIRS_DEFAULT` | 2×2 pivot pairs in the analysis of `"S"`/`"H"` (structurally zero pivots; `"all"`: every candidate; with matching `"algo5"`/`"algo6"`: from the cycles of the matching) |
+| `pivot_pairs` | `PIVOT_PAIRS_DEFAULT` | 2×2 pivot pairs in the analysis of `"S"`/`"H"` (structurally zero pivots; `"all"`: every candidate; with matching `"algo5"`/`"algo6"`: from the cycles of the matching); decided from the values present at analysis: an all-zero `nzval` gives no pairs, an undefined one arbitrary pairs |
 | `pivot_pair_tolerance` | `1e-6` ([`PIVOT_PAIR_TOLERANCE`](@ref)) | relative diagonal size below which a row is a 2×2 candidate |
 | `regime_c_width` | `64` | fronts wider than this go to regime C (vendor dense calls) |
 | `regime_c_rows` | `512` | fronts with more rows than this go to regime C |
@@ -541,7 +541,16 @@ Accepted values:
   or `"none"`;
   ignored for the other structures, with `user_perm` and with the natural ordering;
   with `matching_alg = "algo5"`/`"algo6"` the pairs come from the cycles of the
-  scaled symmetric matching instead ([`matching_pairs`](@ref));
+  scaled symmetric matching instead ([`matching_pairs`](@ref)).
+  Pairs are decided from the values present at `"analysis"` (the first batch
+  member): an all-zero `nzval` gives no pairs and an undefined one arbitrary pairs,
+  so run `"analysis"` after the first assembly of the matrix (MadNLP: after the
+  first KKT assembly); `"all"` reads the values as well (its candidates and
+  partners come from them);
+* `"pivot_threshold"` also shapes the ordering with `pivot_pairs = "default"`:
+  partners are accepted at analysis down to `pivot_threshold · maxₖ |aᵢₖ|`
+  ([`zero_pivot_pairs!`](@ref)); a value set after `"analysis"` changes the
+  in-front pivot test but not the pairs already chosen;
 * `"pivot_pair_tolerance"` (beyond cuDSS): a finite real `≥ 0`, the relative
   diagonal size `τ` below which a row is a 2×2 candidate (`|aᵢᵢ| ≤ τ maxⱼ≠ᵢ |aᵢⱼ|`,
   on the scaled matrix with matching; default [`PIVOT_PAIR_TOLERANCE`](@ref));

@@ -50,7 +50,7 @@ function _lu_params(S::Symbolic, ::Type{T}, opts::Options, nz::AbstractVector) w
 end
 
 """
-    ref_lu!(numeric::Numeric{T, Vector{T}}, symbolic, nzval; opts = Options()) -> 0
+    ref_lu!(numeric::Numeric{T, Vector{T}}, symbolic, nzval; opts = Options()) -> info
 
 Reference multifrontal `L D U` of the general matrix whose stored values are
 `nzval` (structure `"G"`, same CSR pattern and index base as the analysis)
@@ -75,8 +75,11 @@ Fills `numeric.factor` (unit-lower `L` panels), `numeric.ufactor` (unit-lower
 `Uᵀ` panels), `numeric.d`, `numeric.piv` (local row order), `numeric.pivot_kind`
 (`PIVOT_KIND_1X1` or `PIVOT_KIND_PERTURBED`) and the per-front `numeric.stats`
 (`nzero`, `nperturbed`; `npos`, `nneg` and `n2x2` stay 0: a general matrix has
-no inertia). Returns 0: with static perturbation the factorization always
-completes.
+no inertia). An exactly zero pivot is always tiny; with `ε = 0` it stays zero
+and the factorization fails there: the front's `info` statistic is the failed
+local column and the return value the original column of the failed pivot with
+the smallest factor column (as [`ref_ldlt!`](@ref)). Otherwise returns 0: with
+static perturbation `ε > 0` the factorization always completes.
 """
 function ref_lu!(N::Numeric{T, Vector{T}}, S::Symbolic, nzval::AbstractVector; opts::Options = Options()) where {T}
     length(nzval) == S.nnz ||
@@ -133,7 +136,7 @@ function ref_lu!(N::Numeric{T, Vector{T}}, S::Symbolic, nzval::AbstractVector; o
             N.pivot_kind[g] = kind[k]
             N.d[g] = dd[k]
         end
-        for q in 1:5
+        for q in 1:FRONT_STATS_FIELDS
             N.stats[(s - 1) * FRONT_STATS_FIELDS + q] = st[q]
         end
         if m > 0
@@ -158,7 +161,7 @@ function ref_lu!(N::Numeric{T, Vector{T}}, S::Symbolic, nzval::AbstractVector; o
         end
     end
     _host_totals!(N)
-    return 0
+    return _host_info(N, S)
 end
 
 ref_lu!(N::Numeric, S::Symbolic, A::CSR; kwargs...) = ref_lu!(N, S, vec(A.nzval); kwargs...)
@@ -173,7 +176,7 @@ function _lu_front!(F::AbstractMatrix{T}, w::Int, prm::_LUParams) where {T}
     lp = collect(1:w)
     kind = fill(PIVOT_KIND_1X1, w)
     dd = zeros(T, w)
-    st = zeros(Int64, 5)
+    st = zeros(Int64, FRONT_STATS_FIELDS)                # nzero, nperturbed (and the zeros), info
     for k in 1:w
         r = prm.pivot ? _lu_choose_row(F, k, w, prm.u) : k
         if r != k
@@ -183,11 +186,12 @@ function _lu_front!(F::AbstractMatrix{T}, w::Int, prm::_LUParams) where {T}
             lp[k], lp[r] = lp[r], lp[k]
         end
         d = F[k, k]
-        if !(abs(d) >= prm.eps)                          # tiny (or NaN): perturb
+        if !(abs(d) >= prm.eps) || iszero(d)             # tiny (or NaN, or exactly zero): perturb
             iszero(d) && (st[STAT_NZERO] += 1)
             d = _perturbation_sign(d, 0, !(T <: Complex)) * prm.eps
             kind[k] = PIVOT_KIND_PERTURBED
             st[STAT_NPERTURBED] += 1
+            iszero(d) && st[STAT_INFO] == 0 && (st[STAT_INFO] = k)       # ε = 0: failed column
         end
         F[k, k] = d
         dd[k] = d

@@ -43,6 +43,11 @@ end
     @test SparseMatrixCSC(B) == transpose(A)   # plain transpose, also for complex T
     @test logical_matrix(B) == A
     @test occursin("transposed", sprint(show, B))
+    # spare capacity in rowval/nzval (allowed by SparseMatrixCSC) is refused, not read as entries (#31)
+    for Ag in (SparseMatrixCSC(size(A)..., copy(A.colptr), [A.rowval; INT(1)], copy(A.nzval)),
+               SparseMatrixCSC(size(A)..., copy(A.colptr), copy(A.rowval), [A.nzval; zero(T)]))
+        @test thrown(() -> csr_of_transpose(Ag)) isa InvalidValueError
+    end
 end
 
 @testset "nbatch ($T)" for T in ELTYPES

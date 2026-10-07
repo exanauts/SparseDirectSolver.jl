@@ -2718,6 +2718,8 @@ for no gain; the matching-based pairs of #67 must do better there. Decide in
 the Report whether the a posteriori pivoting of M13 (T27) must move before
 the MadNLP integration; the cuDSS evidence says matching is enough. Closes
 #71.
+#86: compare the device and the reference on the K2 dumps after scaling (inertia, nperturbed, piv); close #86 if
+scaling removed the divergence, else as documented.
 
 Host MC64-style matching (job 5 first), `perm_matching`, `scale_row/col`,
 composition with the ordering; test: on a badly scaled unsymmetric matrix the

@@ -182,10 +182,15 @@ ldlt_c_work_len(f::Integer, w::Integer, cb::Bool, nb::Integer = LDLT_C_NB) =
     (cb ? (Int(f) - Int(w))^2 : 0) + 2 * Int(f) * (nb + 1) + 3 * Int(f)
 
 """
-Smallest width class and row class of a regime-B bin that the LDLᵀ/LDLᴴ factorization runs on the blocked
-regime-C path ([`ldlt_blocked_path`](@ref)) instead of the fused front kernel.
+Smallest width class of a regime-B bin that the LDLᵀ/LDLᴴ factorization runs on the blocked regime-C path
+([`ldlt_blocked_path`](@ref)) instead of the fused front kernel (together with [`LDLT_BLOCKED_MIN_FCLASS`](@ref)).
 """
 const LDLT_BLOCKED_MIN_WCLASS = 32
+
+"""
+Smallest row class of a regime-B bin that the LDLᵀ/LDLᴴ factorization runs on the blocked regime-C path
+([`ldlt_blocked_path`](@ref)) instead of the fused front kernel (together with [`LDLT_BLOCKED_MIN_WCLASS`](@ref)).
+"""
 const LDLT_BLOCKED_MIN_FCLASS = 256
 
 """
