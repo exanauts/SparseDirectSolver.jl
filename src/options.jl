@@ -524,6 +524,8 @@ Accepted values:
 * algorithms (`"reordering_alg"`, `"factorization_alg"`, `"solve_alg"`,
   `"matching_alg"`, `"pivot_epsilon_alg"`): `"default"`, `"algoN"` or the integer `N`;
 * `"pivot_type"`: `'A'`, `'N'`, `'D'`, `'L'`, `'B'` (`'C'`/`'R'` raise `NotSupportedError`);
+  LDLᵀ/LDLᴴ: `'A'`, `'B'`, `'L'` Bunch–Kaufman, `'D'` 1×1 only, `'N'` none; LU (`"G"`, [`lu_pivoting`](@ref)):
+  `'A'`, `'B'`, `'L'` in-block threshold row pivoting, `'N'`, `'D'` diagonal pivots;
 * integer and flag parameters: an `Integer` in the documented range;
 * `"ir_tol"`, `"pivot_threshold"`, `"pivot_epsilon"`: a finite real `≥ 0`
   (`nothing` resets `"pivot_epsilon"` to [`default_pivot_epsilon`](@ref));

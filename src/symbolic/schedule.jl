@@ -147,7 +147,7 @@ Regime assignment and launch order of the supernodes of a
 * `groups` and `group_nodes`: the launch groups in execution order (regime A
   classes first, then step by step: B bins in increasing bin id, then C);
 * `wclasses`, `fclasses`, `budgets`, `regime_c_width`, `regime_c_rows`,
-  `memory_budget`, `elsize = sizeof(T)`, `vendor_c` (whether regime C uses vendor
+  `memory_budget`, `elsize` (bytes per packed entry, `sizeof(T)`; `2 sizeof(T)` for LU), `vendor_c` (whether regime C uses vendor
   calls; `factorization_alg = "algo1"` turns them off).
 """
 struct Schedule
@@ -262,11 +262,22 @@ function front_flops(f::Integer, w::Integer)
 end
 
 """
+    schedule_elsize(structure, T) -> Int
+
+Bytes per packed entry of the schedule's local-memory and update-stack
+budgets: `sizeof(T)`, or `2 sizeof(T)` for structure `"G"` (LU fronts and
+contribution blocks are two packed triangles, `L` and `Uᵀ`).
+"""
+schedule_elsize(structure, ::Type{T}) where {T} = (_structure(structure) == STRUCTURE_GENERAL ? 2 : 1) * sizeof(T)
+
+"""
     build_schedule(sp::SupernodePartition, opts::Options = Options(), ::Type{T} = Float64;
-                   reserve = SUBTREE_LOCAL_RESERVE) -> Schedule
+                   elsize = sizeof(T), reserve = SUBTREE_LOCAL_RESERVE) -> Schedule
 
 Regime assignment, binning, levels and launch groups (PLAN §2.3 step 5) for
-the supernodes of `sp`, with byte budgets for the element type `T`:
+the supernodes of `sp`, with byte budgets for the element type `T` (`elsize`
+bytes per packed entry: `2 sizeof(T)` for LU, whose fronts and contribution
+blocks are two packed triangles, see `src/numeric/lu.jl`):
 
 1. regime C: fronts with `w > opts.regime_c_width` or `f > opts.regime_c_rows`
    (every non-A front with `factorization_alg = "algo2"`);
@@ -290,9 +301,9 @@ the supernodes of `sp`, with byte budgets for the element type `T`:
    than the budget gets its own chunk; a negative budget means no chunking).
 """
 function build_schedule(sp::SupernodePartition, opts::Options = Options(), ::Type{T} = Float64;
-                        reserve::Integer = SUBTREE_LOCAL_RESERVE) where {T}
+                        elsize::Integer = sizeof(T), reserve::Integer = SUBTREE_LOCAL_RESERVE) where {T}
     ns = nsupernodes(sp)
-    elsize = sizeof(T)
+    elsize = Int(elsize)
     cw, cr = opts.regime_c_width, opts.regime_c_rows
     budgets = sort(opts.subtree_budgets)
     capacity = [subtree_capacity(b, elsize, reserve) for b in budgets]

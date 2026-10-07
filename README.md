@@ -25,6 +25,11 @@ CUDA:
   with a user-chosen sign per row (`pivot_sign`, which cuDSS cannot do), and
   `inertia`, `npivots` and `pivot_stats` read back from the device; the same
   pivot sequence as the CPU reference LDLᵀ, which serves as its oracle;
+* GPU LU (`"G"`, `L D U` on the symmetric pattern of `A + Aᵀ`) with row
+  interchanges inside the fully-summed block of each front (threshold partial
+  pivoting, `pivot_threshold`), static perturbation of tiny pivots, `perm_row`
+  and `perm_col`, solves with `A`, `Aᵀ` and `Aᴴ`, and uniform batches; the same
+  pivot sequence as the CPU reference LU;
 * GPU triangular solves with multiple right-hand sides, forward, diagonal and
   backward sub-phases, permutations, `solve_mode` (transposed and conjugated
   systems), and iterative refinement (`ir_n_steps`, `ir_tol`), allocation-free
@@ -33,11 +38,11 @@ CUDA:
   polled between launch groups;
 * the public API: `DirectSolver`, `execute!` with cuDSS phase strings, named
   phase wrappers, `update!`, `setparam!`/`getparam`, and the `LinearAlgebra`
-  layer (`cholesky`, `cholesky!`, `ldlt`, `ldlt!`, `ldiv!`, `\`, `logabsdet`),
+  layer (`cholesky`, `cholesky!`, `ldlt`, `ldlt!`, `lu`, `lu!`, `ldiv!`, `\`, `logabsdet`),
   checked by the test suite of CUDSS.jl ported to this package; phase logging
   through `SDS_LOG_LEVEL`.
 
-Not there yet: LU (`"G"`), batches, Schur complements, matching and scaling
+Not there yet: non-uniform batches, Schur complements, matching and scaling
 (badly scaled MadNLP K2 systems still need them, see the refinement table in
 `TASKS.md`), mixed precision, and the AMDGPU, oneAPI and
 Metal extensions. Unsupported structures, phases and parameters raise
@@ -78,7 +83,7 @@ dissection ordering; without it the ordering is AMD.
 
 The handle API mirrors CUDSS.jl: a `DirectSolver` is created from a CSR matrix
 living on a KernelAbstractions backend, with a structure string (`"SPD"`,
-`"HPD"`, `"S"`, `"H"`; `"G"` is reserved for the LU milestone) and the
+`"HPD"`, `"S"`, `"H"`, or `"G"` for LU, which reads the full matrix, view `'F'`) and the
 triangle that is read (`'L'`, `'U'` or `'F'`). Phases are run with `execute!`.
 
 ```julia

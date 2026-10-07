@@ -2467,12 +2467,130 @@ FGMRES-IR reaches `relres ≤ 1e-12` within 20 iterations on CPU and CUDA.
   - Given the K2 table, consider recommending `ir_mode = "fgmres"` with `ir_n_steps ≈ 10`, `ir_tol ≈ 1e-12` for
     MadNLP's K2 systems, independent of T21.
 
-### T19 — General LU (`"G"`): CPU reference + GPU   `[ ]`
+### T19 — General LU (`"G"`): CPU reference + GPU   `[!]`
 
 Symmetric-pattern multifrontal LU with `U` panels, in-block threshold partial
 pivoting (A/B) and `getrf!` + `laswp!` + post-check (C), `perm_row/col`,
 `solve_mode` 1/2, `lu`/`lu!`; ported CUDSS.jl unsymmetric tests and the
 uniform-batch LU tests pass; `random_general` residuals `≤ tol(T)`.
+
+#### Report
+
+- Status: [!] (done on the KA CPU backend; regime C runs the fused KA kernel, no vendor `getrf`/`laswp`, see
+  deviations; CUDA from CI)
+- What was built:
+  - Storage (PLAN §2.3 step 8): an LU front is two lower-triangular structures with the Cholesky layout, `L`
+    (lower triangle with the diagonal: `numeric.factor`, `stack`) and `Uᵀ` (strict upper triangle transposed:
+    new `Numeric` fields `ufactor`, `ustack`, same offsets, empty for the other structures). `F[i, j]` is
+    `L[i, j]` for `i ≥ j`, `Uᵀ[j, i]` otherwise. Panels, update-stack blocks, regime-A local layout, extend-add
+    maps, batch interleaving and the solve gather lists are reused unchanged on both structures. `d` = D of
+    `L D U` (unit `L` and `U`), `piv` = local row order, `pivot_kind` 1×1 / perturbed.
+  - Symbolic: `assembly_map` for `"G"` (upper-triangle entries of `P A Pᵀ` → `Uᵀ` structure, encoded as
+    negative offsets; `_group_amap` sorts L before Uᵀ entries of an offset so runs are one structure);
+    `schedule_elsize(structure, T)` and `build_schedule(…; elsize)`: `2 sizeof(T)` per packed entry for LU (two
+    triangles in local memory and on the stack); `memory_estimates` slots 7/9 doubled for `"G"`.
+  - `src/reference/lu.jl` (new): `ref_lu!` (full `f×f` front on the host, in-block threshold partial pivoting:
+    keep the diagonal if `|F[k,k]| ≥ u maxᵢ≥ₖ|F[i,k]|` over all rows of the front, else the first fully-summed
+    row with the largest entry, taken even below the threshold; `|d| < ε` → `sign(d) ε`, GESP style;
+    `F₂₂ −= (L₂₁ D) U₁₂`), `lu_pivoting(pivot_type)` (`'A'`/`'B'`/`'L'` pivot, `'N'`/`'D'` diagonal),
+    `extract_lu` (`A[p, q] = L D U` with `p = perm[piv]`, `q = perm`), `ref_solve_lu!` (`A` or `Aᵀ`);
+    `ref_solve!` dispatches to it.
+  - `src/numeric/lu.jl` (new): `front_lu_kernel!` (regimes B and C: one workgroup per front, fused
+    zero/scatter/extend-add on both structures, per pivot step: choose row (work item 1), swap rows `k`, `r`
+    over all columns, pivot/perturb, rank-1 update of the fully-summed columns and rows, scale; then the two
+    packed contribution blocks, unit diagonals), `subtree_lu_kernel!` (regime A: both structures in two
+    `@localmem` buffers, 32 kernel arguments), `factorize_lu!` (driver, `abs_max!` for the scaled ε,
+    `reduce_stats!`, interrupt polling; no allocation, no host sync, deterministic). `factorize!` dispatches
+    `"G"` to it.
+  - Solve (`src/solve/sweeps.jl`): the sweep kernels take the panel buffer; kinds `_SV_LU` (forward `L` with the
+    local row order, diagonal, backward `U = (Uᵀ)ᵀ` without reordering) and `_SV_LU_T` (forward `Uᵀ`, diagonal,
+    backward `Lᵀ` restoring the order), also on the regime-C dense path (`'T'` calls on the chosen buffer);
+    `forward_sweep!`/`backward_sweep!`/`sweep_solve!` gain `transpose`. `solve_transposed(structure, csc, mode)`:
+    `Mᵀ` for `Aᵀ`/`Aᴴ` of CSR input and `A` of CSC input; `solve_conjugated` unchanged (`Aᴴ` conjugates).
+  - Refinement: the `"G"` map also holds the rows of `Mᵀ` (`refinement_map(F; transpose = true)`, `2n + 1` row
+    pointers), selected by `transpose_matrix` in `residual!`, `refine!`, `fgmres_refine!`
+    (`RefinementOperator.roff`, `FactorPreconditioner.transpose`); `allocate_refinement(…; n)`.
+  - API: `"G"` accepted (view `'F'`); `getparam` `"perm_row"` = `perm[piv]` after a factorization (member 1),
+    `"perm_col"` = `perm`, `"diag"` = D, `"npivots"`, `"pivot_stats"`, `"inertia"` = `(0, 0)`;
+    `solve_mode` 0/1/2 incl. sub-phases and refinement; `lu(::CSR; check)`, `lu!(solver, A; check)` (refinement
+    on, 2 steps, as `ldlt`), `logabsdet` (parity of the local row order × Π d), uniform batches through the
+    existing batch machinery; CUDA extension `lu(::CuSparseMatrixCSR)`. README and `pivot_type` docs.
+  - Tests: `test/test_numeric_lu.jl` (new): reference (`A[p,q] = LDU`, `A`/`Aᵀ` solves), device vs reference
+    under three regime mixes on five cases (`piv`, kinds, stats, totals `==`; D, `L`, `Uᵀ` within
+    `panel_tol`), solves `nrhs ∈ {1,5}`, atomic/deterministic, `A` and `Aᵀ`; regime-A groups with Int64 maps;
+    perturbation (zero row/column, default and regime-C root, `pivot_epsilon`, scaled); determinism and
+    allocation budgets; sweeps one at a time against `extract_lu` and every dense implementation; uniform
+    batch (3 members × 2 rhs, `solve_mode = 1`, per-member reference equality, `ubatch_index`); public API
+    for `INT ∈ INTTYPES` (perm_row/col vs `extract_lu`, `solve_mode` 0/1/2 with sub-phases `==` `"solve"`,
+    IR and FGMRES-IR, `logabsdet`, CSC input, view refusal, `lu`/`lu!`). Ported: `cudss_execution`
+    "Unsymmetric -- Non-Hermitian", `cudss_generic` `lu`/`lu!`/`ldiv!`/`\`, `cudss_solver` with `"G"`,
+    `cudss_uniform_batch` `uniform_batch_lu` (both APIs, strided or not). Helpers: `weak_diagonal_general`
+    (test/matrices.jl), `lu_setup`, `upanel_error`, `lu_error` (test/utils.jl).
+  - Test adaptations required by the feature: `test_api.jl` no longer expects `"G"` to raise
+    `NotSupportedError` (asserts the view-'L' refusal instead); `test_symbolic_schedule.jl` checks the `"G"`
+    analysis (elsize, doubled regime-A peak, half the off-diagonal entries in `Uᵀ`) and its memory-estimate
+    check counts two structures for `"G"`. No assertion was loosened.
+- Tests: `SDS_TEST_GPU=0 julia --project=. -e 'using Pkg; Pkg.test()'` (Julia 1.13.1, ubuntu-latest, KA CPU
+  backend): 65224 pass / 0 fail / 1 broken (the T16 `@test_broken`), 18.5 min; `test_numeric_lu` 1756 pass
+  (≈ 9.5 min standalone, mostly kernel compilation; 28 s inside the full run), `test_ported` 9464 pass (with the
+  LU ports). The first full `test_numeric_lu` run found one bug (the refinement workspace took `n` from the
+  `2n`-row `"G"` map) and the schedule memory-estimate check needed the two-structure count; both fixed before
+  the final run. CUDA/AMDGPU: pending CI on the PR.
+  After the `growth_tol` fix (owner's machine, Julia 1.13.1, CUDA.jl 6.4.2, RTX 4080):
+  `SDS_TEST_ONLY=test_numeric_lu` 1816 pass / 0 fail on the KA CPU backend; with `SDS_TEST_CPU=0` (CUDA only)
+  1788 pass / 0 fail, including the 12 checks that failed before (9 Float32 'weak diagonal', 3 Float64
+  'weak diagonal, pivot_type N').
+- Measurements (ubuntu-latest KA CPU backend, Float64, `pivot_threshold = 1`, best of 3; "device" is
+  `factorize!` on the CPU backend, so only equality and launch counts are meaningful, GPU numbers are owed):
+
+  ```text
+  matrix                              fronts A/B/C  launches  ref_lu!   device    solve A  solve Aᵀ  swaps  same piv
+  random_general(2000,0.002)           181/46/23       127     413 ms    567 ms   1.04 ms  1.08 ms      0    yes
+  weak_diagonal_general(3000,0.002)    175/84/32       160    2.26 s    6.41 s    2.44 ms  2.30 ms    515    yes
+  laplacian2d(100,100) + 0.5 triu      2881/451/1       57     25 ms     60 ms    4.66 ms  4.55 ms   1630    yes
+  ```
+
+  Residuals: `relres(Aᵀ)` 2.2e-16 and 1.8e-13 on the first two; the third matrix is numerically singular
+  (cond₂ ≈ 2.8e18; UMFPACK's `Aᵀ` solve gives relres 16, ours 6.1; on the 30×30 version, cond₁ 2e8, the
+  reference factor has backward error 7e-14 and relres 6e-10). The device/reference gap on the second matrix
+  is the per-front serial structure of one workgroup per front on the KA CPU backend (wide fronts with a
+  pivot loop of `w` steps and 5 barriers each).
+- Deviations from PLAN.md / this task:
+  - **No vendor `getrf!` + `laswp!` + post-check in regime C.** As for LDLᵀ in T15, regime-B and regime-C groups
+    run the fused KA `front_lu_kernel!` (one workgroup per front). `getrf` picks its own pivots over the whole
+    `F₁₁` (no threshold against the rows of `F₂₁`, its own tie-breaking), so the device factor would not equal the
+    reference, and the split `L`/`Uᵀ` storage would need a dense copy of `F₁₁`/`F₁₂` per front. Vendor BLAS-3 for
+    `L₂₁`, `U₁₂` and the contribution block is the same follow-up as #75 (T25).
+  - `U` is stored transposed in a second buffer with the `L` layout (`ufactor`, `ustack`) instead of separate
+    `w×f` U panels: every map, the layout, the regime-A local layout and the sweeps are reused, and the solves
+    with `A` and `Aᵀ` are the existing sweeps with another buffer and pivot-order flags. Memory: the factor and
+    the update stack are twice the Cholesky size (as for any LU); regime-A budgets count `2 sizeof(T)` per entry.
+  - `pivot_type`: `'C'`/`'R'` stay `NotSupportedError` (PLAN §3.3), so the ported tests assert that, as the
+    symmetric ports do; `'N'` and `'D'` mean diagonal pivots. `pivot_sign` is ignored by LU (no inertia);
+    `"inertia"` is `(0, 0)`.
+  - Static pivoting limits accuracy when no fully-summed row can replace a small pivot: on
+    `weak_diagonal_general` with scale `1e-3` (cond ≈ 7e4) the reference reaches only relres 1e-8 (Float64) and
+    0.7 (Float32) with up to 130 row interchanges, `max|L|` ≈ 3e5; with scale 0.1 (the test matrix) it is at
+    rounding level. This is PLAN R9 (matching, T21; APTP/delayed pivots, T27).
+  - `"G"` keeps T05's view rule (`'F'` only); cuDSS accepts `'L'`/`'U'` for `"G"` (#84).
+- Open issues / follow-ups:
+  - #84 (found-by-agent): views `'L'`/`'U'` with `"G"`.
+  - Regime-C performance (vendor BLAS-3, parallel pivot search) with #75 in T25. The pivot search is serial on
+    work item 1 (`O(f)` per column, cheaper than the LDLᵀ fallback scan).
+  - `perm_row` reports batch member 1 for a uniform batch (each member has its own local row order).
+  - CUDA path exercised only by CI.
+  - Device arithmetic fuses multiply-adds (GPUCompiler `-nvptx-fma-level=1`), so device-vs-reference equality is
+    bitwise on the CPU backend only. On `weak_diagonal_general` with `pivot_threshold = 0.01` (growth ≈ 3e2) CUDA
+    deviated by up to 900 eps from `ref_lu!` (at least as accurate against a Float64 oracle). The elementwise
+    panel checks now use `growth_tol(T, Nr)` (`panel_tol` scaled by `max(|L|, |Uᵀ|) / min |d|`), the pivot
+    sequence stays exact, and the device testset also checks `lu_error ≤ tol(T)`. `test_numeric_ldlt.jl` has the
+    same latent fragility (see #86) and should move to `growth_tol` when touched.
+  - The GitHub App token expired before the last push: the final commit is local and published by the
+    workflow's "Publish the branch" step (which also opens the PR).
+- Suggested plan changes:
+  - PLAN §2.3 step 8 / §3.2: LU stores `Uᵀ` in a second buffer with the `L` layout (`ufactor`, `ustack`).
+  - PLAN §2.4 / §3.3: regime C of `"G"` uses the KA in-front kernel (same pivot sequence as the oracle); vendor
+    calls only for the BLAS-3 parts (T25).
 
 ### T20 — Schur complement mode   `[ ]`
 

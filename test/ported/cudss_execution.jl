@@ -1,5 +1,5 @@
-# Port of `cudss_execution()`, testsets "SPD -- HPD" (T13) and "Symmetric -- Hermitian"
-# (T15) (CUDSS.jl test/test_cudss.jl).
+# Port of `cudss_execution()`, testsets "SPD -- HPD" (T13), "Symmetric -- Hermitian"
+# (T15) and "Unsymmetric -- Non-Hermitian" (T19) (CUDSS.jl test/test_cudss.jl).
 #
 # Changes: global pivoting `pivot_type = 'C'/'R'` (with `reordering_alg =
 # "algo2"` in CUDSS.jl) is not planned (PLAN §3.3): setting it raises
@@ -7,6 +7,9 @@
 # "Symmetric -- Hermitian": the matrix is `random_symindef(T, n, 0.01)`
 # (symmetric/Hermitian indefinite) instead of `sprand + I` symmetrized, and
 # CUDSS.jl's shift `A + Diagonal(d)` with `d = rand(R, n)` is kept.
+# "Unsymmetric -- Non-Hermitian": the matrix is `random_general(T, n, 0.02)`
+# (diagonally dominant) instead of `sprand(T, n, n, 0.02) + I`; the shift
+# `A + Diagonal(d)` with `d = rand(T, n)` is kept.
 
 function ported_execution_spd(backend, ::Type{T}, ::Type{INT}, view, pivot) where {T, INT}
     n, p = 100, 5
@@ -88,6 +91,51 @@ function ported_execution_sym(backend, ::Type{T}, ::Type{INT}, view, pivot) wher
 
     @test relres(A_cpu2, to_host(X_gpu), C_cpu) <= tol(T)
     return nothing
+end
+
+function ported_execution_lu(backend, ::Type{T}, ::Type{INT}, pivot) where {T, INT}
+    n = 100
+    A_cpu = random_general(T, n, 0.02)
+    x_cpu = zeros(T, n)
+    b_cpu = rand(T, n)
+
+    A_gpu = api_matrix(backend, A_cpu, INT)
+    x_gpu = to_device(backend, x_cpu)
+    b_gpu = to_device(backend, b_cpu)
+
+    solver = DirectSolver(A_gpu, "G", 'F')
+    if pivot in ('C', 'R')
+        @test_throws NotSupportedError setparam!(solver, "pivot_type", pivot)
+    else
+        setparam!(solver, "pivot_type", pivot)
+        @test getparam(solver, "pivot_type") == pivot
+    end
+
+    execute!("analysis", solver, x_gpu, b_gpu)
+    execute!("factorization", solver, x_gpu, b_gpu)
+    execute!("solve", solver, x_gpu, b_gpu)
+
+    @test relres(A_cpu, to_host(x_gpu), b_cpu) <= tol(T)
+
+    # In-place LU
+    A_cpu2 = A_cpu + Diagonal(rand(T, n))
+    update!(solver, api_matrix(backend, A_cpu2, INT))
+
+    c_cpu = rand(T, n)
+    c_gpu = to_device(backend, c_cpu)
+
+    execute!("refactorization", solver, x_gpu, c_gpu)
+    execute!("solve", solver, x_gpu, c_gpu)
+
+    @test relres(A_cpu2, to_host(x_gpu), c_cpu) <= tol(T)
+    return nothing
+end
+
+@testset "Unsymmetric -- Non-Hermitian ($(backend_name(backend)), $T, $INT)" for backend in BACKENDS, T in ELTYPES,
+                                                                                 INT in INTTYPES
+    @testset "Pivoting = $pivot" for pivot in ('C', 'R', 'N')
+        ported_execution_lu(backend, T, INT, pivot)
+    end
 end
 
 @testset "Symmetric -- Hermitian ($(backend_name(backend)), $T, $INT)" for backend in BACKENDS, T in ELTYPES,

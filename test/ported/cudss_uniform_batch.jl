@@ -1,11 +1,11 @@
-# Port of CUDSS.jl test/test_uniform_batch_cudss.jl (T17): `uniform_batch_ldlt()`
-# and `uniform_batch_cholesky()`, each with the cuDSS API (`DirectSolver` +
+# Port of CUDSS.jl test/test_uniform_batch_cudss.jl (T17, T19): `uniform_batch_lu()`,
+# `uniform_batch_ldlt()` and `uniform_batch_cholesky()`, each with the cuDSS API (`DirectSolver` +
 # `"ubatch_size"` + `MatrixDescriptor(T, n[, nrhs]; nbatch)`) and the generic
 # API (`ldlt`/`cholesky` on a matrix whose values are longer than its pattern),
 # strided and non-strided storage, views 'L', 'U', 'F'.
 #
-# Changes: `uniform_batch_lu()` is skipped (structure "G" is T19). The data are
-# CUDSS.jl's, written once as `nnz × nbatch` matrices (the strided storage is
+# Changes: the data are CUDSS.jl's (the LU batch is `ubatch_example` of
+# `test/matrices.jl`, the 3×3 example of the docs), written once as `nnz × nbatch` matrices (the strided storage is
 # their `vec`, exactly CUDSS.jl's strided vectors). Matrices come from
 # `api_csr` (a `CSR` on the CPU backend); CUDSS.jl's `As_gpu.nzVal = …` is a new
 # matrix on the same pattern. Residuals are checked per member with
@@ -120,6 +120,60 @@ function ported_ubatch(backend, ::Type{T}, ::Type{INT}, uplo, generic::Bool, str
     @test maximum(batch_relres(ported_ubatch_members(rowptr, colval, new_nz, uplo), to_host(Xs_gpu), new_B)) <=
           tol(T)
     return nothing
+end
+
+# `uniform_batch_lu()`: A(λ) = [1+λ 0 3; 4 5+λ 0; 2 6 2+λ], λ ∈ (1, 10, -20), then λ ∈ (-2, -10, 30)
+function ported_ubatch_lu(backend, ::Type{T}, ::Type{INT}, generic::Bool, strided::Bool) where {T, INT}
+    ex = ubatch_example(T)
+    n, nbatch = ex.n, ex.nbatch
+    rowptr, colval = Vector{INT}(ex.rowptr), Vector{INT}(ex.colval)
+    nz = reshape(ex.nzval, :, nbatch)
+    new_nz = reshape(T[v for λ in (-2, -10, 30) for v in (1 + λ, 3, 4, 5 + λ, 2, 6, 2 + λ)], :, nbatch)
+    members(z) = [host_csc(rowptr, colval, z[:, k], n, n) for k in 1:nbatch]
+    B = reshape(ex.b, n, nbatch)
+    shape = strided ? (n * nbatch,) : (n, nbatch)
+    nz_dev(x) = to_device(backend, strided ? vec(x) : x)
+    b_gpu = to_device(backend, reshape(B, shape))
+    x_gpu = to_device(backend, zeros(T, shape))
+
+    if generic
+        solver = lu(api_csr(backend, rowptr, colval, vec(nz), n))
+        @test solver.nbatch == nbatch
+        ldiv!(x_gpu, solver, b_gpu)
+    else
+        solver = DirectSolver(to_device(backend, rowptr), to_device(backend, colval), nz_dev(nz), "G", 'F')
+        setparam!(solver, "ubatch_size", nbatch)
+        b_desc = MatrixDescriptor(T, n; nbatch)
+        x_desc = MatrixDescriptor(T, n; nbatch)
+        update!(b_desc, b_gpu)
+        update!(x_desc, x_gpu)
+        execute!("analysis", solver, x_desc, b_desc)
+        execute!("factorization", solver, x_desc, b_desc; asynchronous = false)
+        execute!("solve", solver, x_desc, b_desc; asynchronous = false)
+    end
+    @test maximum(batch_relres(members(nz), to_host(x_gpu), B)) <= tol(T)
+
+    # refactorize all matrices of the uniform batch
+    if generic
+        lu!(solver, api_csr(backend, rowptr, colval, vec(new_nz), n))
+        x_gpu .= b_gpu
+        ldiv!(solver, x_gpu)
+    else
+        update!(solver, to_device(backend, rowptr), to_device(backend, colval), nz_dev(new_nz))
+        execute!("refactorization", solver, x_desc, b_desc; asynchronous = false)
+        execute!("solve", solver, x_desc, b_desc; asynchronous = false)
+    end
+    @test maximum(batch_relres(members(new_nz), to_host(x_gpu), B)) <= tol(T)
+    return nothing
+end
+
+@testset "uniform batch LU ($(backend_name(backend)), $T, $INT)" for backend in BACKENDS, T in ELTYPES,
+                                                                     INT in INTTYPES
+    for generic in (false, true), strided in (false, true)
+        @testset "$(generic ? "Generic" : "cuDSS") API, strided = $strided" begin
+            ported_ubatch_lu(backend, T, INT, generic, strided)
+        end
+    end
 end
 
 for (name, cholesky_case) in (("LDLᵀ and LDLᴴ", false), ("Cholesky", true))

@@ -167,8 +167,8 @@ end
     setparam!(solver, "solve_alg", "algo1")
     @test thrown(() -> execute!("solve", solver, x, b)) isa NotSupportedError
     setparam!(solver, "solve_alg", "default")
-    s3 = DirectSolver(api_matrix(backend, A), "G", 'F')      # LU: T19
-    @test thrown(() -> execute!("analysis", s3, x, b)) isa NotSupportedError
+    s3 = DirectSolver(api_matrix(backend, tril(A)), "G", 'L')      # LU (T19) reads the full matrix: view 'F' only
+    @test thrown(() -> execute!("analysis", s3, x, b)) isa InvalidValueError
     if T <: Complex
         s4 = DirectSolver(api_matrix(backend, tril(A)), "SPD", 'L')
         @test thrown(() -> execute!("analysis", s4, x, b)) isa InvalidValueError

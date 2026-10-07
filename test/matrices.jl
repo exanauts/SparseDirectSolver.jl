@@ -198,6 +198,22 @@ end
 random_general(n::Integer, density::Real; kwargs...) = random_general(Float64, n, density; kwargs...)
 
 """
+    weak_diagonal_general(T, n, density; every = 5, scale = 0.1, rng)
+
+[`random_general`](@ref) with every `every`-th diagonal entry multiplied by
+`scale`: those rows are no longer diagonally dominant, so the in-front row
+pivoting of LU (T19) interchanges rows where the fully-summed block allows it.
+"""
+function weak_diagonal_general(::Type{T}, n::Integer, density::Real; every::Integer = 5, scale::Real = 0.1,
+                               rng::AbstractRNG = Random.default_rng()) where {T}
+    A = random_general(T, n, density; rng)
+    for i in 1:every:n
+        A[i, i] *= scale
+    end
+    return A
+end
+
+"""
     singular_block_matrix(T, n, j; stored_zero = false)
 
 Symmetric (Hermitian for complex `T`) `n × n` matrix whose row and column `j`

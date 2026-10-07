@@ -45,8 +45,9 @@ Device maps (`DEVICE_MAPS`; supernodal numbering, 1-based, element offsets):
 * `amap` (length `nnz`): for every entry `p` of the user's `nzval`, the
   factor-buffer offset it is added to; `0` when the view ignores the entry, and
   `-offset` when the conjugate is added (a `"H"`/`"HPD"` entry that lands in the
-  upper triangle of `P A Pᵀ` and is mirrored). Duplicated entries map to the same
-  offset and are summed;
+  upper triangle of `P A Pᵀ` and is mirrored; for `"G"`: an upper-triangle entry
+  that goes to the `Uᵀ` structure). Duplicated entries map to the same offset and
+  are summed;
 * `amap_ptr`, `amap_src`: the same map grouped by supernode for owner-pull
   assembly: supernode `s` receives the entries `amap_src[amap_ptr[s]:(amap_ptr[s+1]-1)]`
   (positions in `nzval`, sorted by destination, then by position);
@@ -137,19 +138,19 @@ The `amap` of [`Symbolic`](@ref): for every stored entry `p` of the user's CSR
 pattern (`rowptr`, `colval`, base `index`), its offset in the factor buffer of
 `layout`, `-offset` when its conjugate is stored instead, `0` when `view` ignores
 it. Entry `(r, c)` lands at `(i, j) = (iperm[r], iperm[c])` of `P A Pᵀ`, or at
-`(j, i)` when `i < j`. Only symmetric structures are supported (`"G"` needs
-U panels, T19).
+`(j, i)` when `i < j`. Structure `"G"` (LU, two lower-triangular structures
+`L` and `Uᵀ` with the same layout, see `src/numeric/lu.jl`): an entry with
+`i ≥ j` goes to offset `off` of the `L` structure, an entry with `i < j` to the
+offset of `(j, i)` in the `Uᵀ` structure, encoded as `-off`.
 """
 function assembly_map(sp::SupernodePartition, layout::Layout, rowptr::AbstractVector{<:Integer},
                       colval::AbstractVector{<:Integer}, n::Integer, structure; view = VIEW_FULL, index = INDEX_ONE)
     s_ = _structure(structure)
     v = _matrix_view(view)
-    s_ == STRUCTURE_GENERAL &&
-        throw(NotSupportedError("assembly maps for structure \"G\" (LU panels) are not implemented yet (T19)"))
     n == sp.n || throw(InvalidValueError("matrix size $n does not match the analysis size $(sp.n)"))
     rp, cv = _host_pattern(rowptr, colval, n, index)
     keep = _entry_filter(s_, v)
-    herm = _is_hermitian(s_)
+    neg = _is_hermitian(s_) || s_ == STRUCTURE_GENERAL     # mirrored entries: conjugate, or the Uᵀ structure
     amap = zeros(Int, length(cv))
     for r in 1:n, p in rp[r]:(rp[r + 1] - 1)
         c = cv[p]
@@ -164,16 +165,17 @@ function assembly_map(sp::SupernodePartition, layout::Layout, rowptr::AbstractVe
             throw(InvalidValueError("entry ($r, $c) is outside the symbolic factor (pattern changed?)"))
         f = length(rows)
         off = layout.panel_ptr[s] + (j - sp.super_ptr[s]) * f + pos - 1
-        amap[p] = flip && herm ? -off : off
+        amap[p] = flip && neg ? -off : off
     end
     return amap
 end
 
-# owner-pull grouping of amap by supernode
-function _group_amap(amap::Vector{Int}, layout::Layout, ns::Int)
+# owner-pull grouping of amap by supernode; for "G" the L entries of a destination come before its Uᵀ
+# entries (`signed`), so every run of equal offsets is one destination of one structure
+function _group_amap(amap::Vector{Int}, layout::Layout, ns::Int, signed::Bool = false)
     owner(off) = searchsortedlast(layout.panel_ptr, off)
     order = [p for p in eachindex(amap) if amap[p] != 0]
-    sort!(order; by = p -> (abs(amap[p]), p))
+    sort!(order; by = p -> signed ? (abs(amap[p]), amap[p] < 0, p) : (abs(amap[p]), false, p))
     amap_ptr = zeros(Int, ns + 1)
     amap_ptr[1] = 1
     for p in order
@@ -194,7 +196,7 @@ function Symbolic(sp::SupernodePartition, sc::Schedule, layout::Layout, rowptr::
                   colval::AbstractVector{<:Integer}, n::Integer, structure; view = VIEW_FULL, index = INDEX_ONE)
     ns = nsupernodes(sp)
     amap = assembly_map(sp, layout, rowptr, colval, n, structure; view, index)
-    amap_ptr, amap_src = _group_amap(amap, layout, ns)
+    amap_ptr, amap_src = _group_amap(amap, layout, ns, _structure(structure) == STRUCTURE_GENERAL)
     child_ptr = zeros(Int, ns + 1)
     child_ptr[1] = 1
     for s in 1:ns
@@ -245,7 +247,8 @@ function symbolic_analysis(A::CSR, structure, view = VIEW_FULL; opts::Options = 
     pp = analysis_pairs(P, rowptr, colval, A.nzval, A.nrows, structure, opts; view, index = A.index)
     ord = compute_ordering(P, opts; T, pp.pairs, pp.candidates)
     sp = supernode_partition(factor_pattern(P, ord), ord.perm, opts)
-    sc = build_schedule(sp, opts, T; reserve = subtree_local_reserve(structure))
+    sc = build_schedule(sp, opts, T; reserve = subtree_local_reserve(structure),
+                        elsize = schedule_elsize(structure, T))
     layout = build_layout(sp, sc; ldlt = _is_ldlt_structure(_structure(structure)))
     return Symbolic(sp, sc, layout, rowptr, colval, A.nrows, structure; view, index = A.index)
 end
@@ -301,9 +304,9 @@ element type `T` and device indices `INT` (default: the index type of
 | 4 | peak host memory (= slot 3) |
 | 5 | minimum device memory of the hybrid memory mode (= slot 2 until M12) |
 | 6 | maximum host memory of the hybrid memory mode (0 until M12) |
-| 7 | factor panels (`Layout.factor_len` entries of `T`) |
+| 7 | factor panels (`Layout.factor_len` entries of `T`; twice that for `"G"`: `L` and `Uᵀ`) |
 | 8 | D (`2n` entries of `T`) |
-| 9 | update stack (`Layout.stack_len` entries of `T`) |
+| 9 | update stack (`Layout.stack_len` entries of `T`; twice that for `"G"`) |
 | 10 | device maps (`INT`) |
 | 11 | per-front statistics (6 `Int64` per supernode) and their totals (6 `Int64`), status (`ns + 1` `Int32`), pivot order (`n` `Int32`), pivot kinds and sign requests (`n` `Int8` each), `aux` (one `T`) |
 | 12 | largest regime-A local memory in use (per workgroup, [`subtree_local_bytes`](@ref) of its class) |
@@ -315,9 +318,10 @@ function memory_estimates(S::Symbolic{INT0}, ::Type{T}, ::Type{INT} = INT0) wher
     est = zeros(Int64, 16)
     L = S.layout
     sc = S.schedule
-    est[7] = Int64(L.factor_len) * sizeof(T)
+    two = S.structure == STRUCTURE_GENERAL ? 2 : 1        # LU: the L and Uᵀ structures
+    est[7] = two * Int64(L.factor_len) * sizeof(T)
     est[8] = Int64(L.d_len) * sizeof(T)
-    est[9] = Int64(L.stack_len) * sizeof(T)
+    est[9] = two * Int64(L.stack_len) * sizeof(T)
     est[10] = device_map_bytes(S, INT)
     est[11] = Int64(nsupernodes(S) + 1) * FRONT_STATS_FIELDS * sizeof(Int64) +
               Int64(nsupernodes(S) + 1) * sizeof(Int32) + Int64(S.n) * (sizeof(Int32) + 2 * sizeof(Int8)) + sizeof(T)
