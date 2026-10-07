@@ -83,10 +83,14 @@ schur_ldlt(structure) = structure in ("S", "H")
         Bs_ref = B[s, :] - Matrix(A[s, r]) * (Matrix(A[r, r]) \ B[r, :])
         @test norm(Bs - (B isa AbstractVector ? vec(Bs_ref) : Bs_ref)) <= tol(T) * norm(Bs_ref)
         @test relres(A, X, B) <= tol(T)
-        # the LU diagonal is part of "solve_bwd_schur": "solve_diag" is the identity for "G" (and Cholesky)
+        # the LU diagonal is part of "solve_bwd_schur": "solve_diag" is the identity for "G" (and Cholesky);
+        # compared bitwise, so both solves take the deterministic forward sweep (the atomic one reorders sums)
         if !schur_ldlt(structure)
+            setparam!(solver, "deterministic_mode", 1)
+            X1, _ = schur_solve(backend, solver, Sh, B; diag = false)
             X2, _ = schur_solve(backend, solver, Sh, B; diag = true)
-            @test X2 == X
+            setparam!(solver, "deterministic_mode", 0)
+            @test X2 == X1
         end
     end
     # the deterministic forward sweep pulls the children's updates into the Schur block
