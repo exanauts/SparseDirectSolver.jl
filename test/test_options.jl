@@ -48,6 +48,7 @@ const PORTED_CONFIG_VALUES = Dict{String, Tuple{Any, Any}}(
     "amalgamation" => ((max_width = 16, zero_fraction = 0.1, min_width = 4), 0.25),
     "schedule" => ("subtree+level", :auto),
     "pivot_pairs" => ("none", :none),
+    "pivot_pair_tolerance" => (1.0e-4, "small"),
 )
 
 const DEFERRED_CONFIG = ("hybrid_memory_mode", "hybrid_device_memory_limit", "hybrid_execute_mode")
@@ -59,7 +60,7 @@ const USER_DATA = ("user_perm", "user_schur_indices", "user_nd_partition_tree", 
     @test CONFIG_PARAMETERS == CUDSS_JL_CONFIG_PARAMETERS
     @test DATA_PARAMETERS == CUDSS_JL_DATA_PARAMETERS
     @test EXTRA_PARAMETERS == ("pivot_sign", "pivot_stats", "ir_mode", "factor_precision",
-                               "amalgamation", "schedule", "pivot_pairs")
+                               "amalgamation", "schedule", "pivot_pairs", "pivot_pair_tolerance")
     @test CUDSS08_DATA_PARAMETERS == ("ir_n_steps", "ubatch_mask", "flops")
     # every listed name is known to setparam!/getparam
     for name in (CONFIG_PARAMETERS..., DATA_PARAMETERS..., CUDSS08_DATA_PARAMETERS..., EXTRA_PARAMETERS...)

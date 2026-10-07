@@ -10,11 +10,13 @@
 #   part for "G", whose complex `D` is not exactly real); "G" reads the full
 #   matrix: views 'L'/'U' are rejected at analysis (`InvalidValueError`; cuDSS
 #   ignores the view of a general matrix);
-# * `matching_alg = "algo6"` before the analysis is skipped: matching is T21 and
-#   the analysis raises `NotSupportedError` for it (checked);
+# * `matching_alg = "algo6"` is set before the analysis, as in CUDSS.jl (T21):
+#   `"perm_matching"` is checked to be a permutation and `"scale_row"`/`"scale_col"`
+#   to be positive; the inertia stays `(n, 0)` under matching (cuDSS 0.8 reports
+#   `(0, 0)`, see `cudss_inertia_matching.jl`); a second solver without matching
+#   checks that the matching outputs raise `InvalidValueError` there;
 # * cuDSS's set-buffer-then-get protocol for vector data is
-#   `getparam!(buffer, solver, name)`; the matching outputs (`"perm_matching"`,
-#   `"scale_row"`, `"scale_col"`) and `"hybrid_device_memory_min"` are not
+#   `getparam!(buffer, solver, name)`; `"hybrid_device_memory_min"` is not
 #   implemented yet (`NotSupportedError`);
 # * configuration values that the package does not accept raise errors instead
 #   of being passed to the library: `factorization_alg`/`pivot_epsilon_alg`
@@ -30,7 +32,7 @@ const PORTED_ACCEPTED_ALGOS = Dict(
     "pivot_epsilon_alg" => ("default", "algo1", "algo2"),
 )
 
-const PORTED_NOT_IMPLEMENTED_DATA = ("perm_matching", "scale_row", "scale_col", "hybrid_device_memory_min")
+const PORTED_NOT_IMPLEMENTED_DATA = ("hybrid_device_memory_min",)
 
 function ported_solver_data_parameters(backend, solver, structure, n, memory_estimates, buffer_int::Vector{INT},
                                        buffer_R, buffer_T) where {INT}
@@ -51,9 +53,13 @@ function ported_solver_data_parameters(backend, solver, structure, n, memory_est
                 getparam!(buffer_int, solver, parameter)
                 @test isperm(buffer_int)
             end
-            if parameter ∈ ("perm_matching", "scale_row", "scale_col")
-                @test_throws NotSupportedError getparam!(parameter == "perm_matching" ? buffer_int : buffer_R, solver,
-                                                         parameter)
+            if parameter == "perm_matching"
+                getparam!(buffer_int, solver, parameter)
+                @test isperm(buffer_int)
+            end
+            if parameter ∈ ("scale_row", "scale_col")
+                getparam!(buffer_R, solver, parameter)
+                @test all(x -> isfinite(x) && x > 0, buffer_R)
             end
             if parameter == "diag"
                 getparam!(buffer_T, solver, parameter)
@@ -154,11 +160,12 @@ function ported_solver(backend, ::Type{T}, ::Type{INT}, A_gpu, structure, view, 
     b_cpu = rand(T, n)
     b_gpu = to_device(backend, b_cpu)
 
-    # matching (T21) is refused by the analysis instead of being enabled
-    matching = DirectSolver(A_gpu, structure, view)
-    setparam!(matching, "matching_alg", "algo6")
-    @test_throws NotSupportedError execute!("analysis", matching, x_gpu, b_gpu)
+    # without matching, the matching outputs are refused
+    plain = DirectSolver(A_gpu, structure, view)
+    execute!("analysis", plain, x_gpu, b_gpu)
+    @test_throws InvalidValueError getparam(plain, "perm_matching")
 
+    setparam!(solver, "matching_alg", "algo6")  # enable matching (AUTO) for "perm_matching" / "scale_row" / "scale_col"
     execute!("analysis", solver, x_gpu, b_gpu)
     execute!("factorization", solver, x_gpu, b_gpu)
 

@@ -41,15 +41,18 @@ CUDA:
   assembled but not factored; `schur_shape` (exact symbolic pattern) and
   `schur_matrix` (dense, or CSR of one triangle or the full matrix), and the
   `solve_fwd_schur`/`solve_diag`/`solve_bwd_schur` phases of cuDSS;
+* matching and scaling (`matching_alg` `"algo1"`–`"algo6"`, MC64 jobs 1–5 on
+  the host): `"G"` factors the row/column-scaled matrix with the matched
+  entries on the diagonal, the symmetric structures a symmetrically scaled
+  matrix (inertia preserved) with 2×2 pivot pairs from the matching;
+  `perm_matching`, `scale_row`, `scale_col`;
 * the public API: `DirectSolver`, `execute!` with cuDSS phase strings, named
   phase wrappers, `update!`, `setparam!`/`getparam`, and the `LinearAlgebra`
   layer (`cholesky`, `cholesky!`, `ldlt`, `ldlt!`, `lu`, `lu!`, `ldiv!`, `\`, `logabsdet`),
   checked by the test suite of CUDSS.jl ported to this package; phase logging
   through `SDS_LOG_LEVEL`.
 
-Not there yet: non-uniform batches, matching and scaling
-(badly scaled MadNLP K2 systems still need them, see the refinement table in
-`TASKS.md`), mixed precision, and the AMDGPU, oneAPI and
+Not there yet: non-uniform batches, mixed precision, and the AMDGPU, oneAPI and
 Metal extensions. Unsupported structures, phases and parameters raise
 `NotSupportedError` rather than falling back silently.
 

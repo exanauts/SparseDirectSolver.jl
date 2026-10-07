@@ -9,8 +9,13 @@
 #
 #   julia --project=. bench/pivot_pairs.jl [--only=substring,...] [--generators=true|false]
 #
-# The pivot statistics of the dumps say little about accuracy: the K2 systems are
-# not scaled, so max|L| reaches 1e15 in every mode (matching and scaling are T21).
+# The pivot statistics of the dumps say little about accuracy without scaling: the
+# K2 systems are not scaled, so max|L| reaches 1e15 in every mode (issue #71). The
+# rows "algo5/<pairs>" (T21) run the public solver (KA CPU backend) with
+# `matching_alg = "algo5"`: symmetric MC64 scaling `D A D` and the 2×2 pairs of the
+# matching cycles; max|L| and the error are those of the scaled matrix
+# `‖(DAD)[p,p] − LDLᵀ‖_F/‖DAD‖_F`, `relres` is `‖b − A x‖/‖b‖` of one solve
+# without refinement (`b = A·1`), and `relres+5` after 5 refinement steps.
 
 using LinearAlgebra
 using Random
@@ -53,6 +58,31 @@ function measure(A::SparseMatrixCSC{T}, mode) where {T}
             nperturbed = st.nperturbed, n2x2 = st.n2x2, maxL = Float64(maximum(abs, L)), err, t)
 end
 
+# the public solver with matching (T21): scaled factor quality and the residual of A
+function measure_matching(A::SparseMatrixCSC{T}, mode) where {T}
+    structure = T <: Complex ? "H" : "S"
+    solver = DirectSolver(SDS.CSR(tril(A)), structure, 'L')
+    setparam!(solver, "matching_alg", "algo5")
+    setparam!(solver, "pivot_pairs", mode)
+    t = @elapsed analyze!(solver)
+    factorize!(solver)
+    st = getparam(solver, "pivot_stats")
+    L, D, p = SDS.extract_ldlt(solver.host_symbolic, solver.numeric)
+    d = getparam(solver, "scale_row")
+    As = Diagonal(d) * A * Diagonal(d)
+    err = norm(As[p, p] - L * D * L') / norm(As)
+    b = A * ones(T, size(A, 1))
+    x = zeros(T, size(A, 1))
+    solve!(solver, x, b)
+    rel0 = norm(b - A * x) / norm(b)
+    setparam!(solver, "ir_n_steps", 5)
+    solve!(solver, x, b)
+    rel5 = norm(b - A * x) / norm(b)
+    return (; npairs = length(solver.ordering.pairs), nnz_L = solver.host_symbolic.partition.nnz_L,
+            nsn = SDS.nsupernodes(solver.host_symbolic), nzero = st.nzero, nperturbed = st.nperturbed, n2x2 = st.n2x2,
+            maxL = Float64(maximum(abs, L)), err, rel0, rel5, t)
+end
+
 function report(name, A)
     rows = [mode => measure(A, mode) for mode in MODES]
     base = last(rows[1]).nnz_L
@@ -63,6 +93,16 @@ function report(name, A)
         println("| ", mode, " | ", r.npairs, " | ", r.nnz_L, " | ", round(r.nnz_L / base; digits = 3), " | ", r.nsn, " | ",
                 r.nzero, " | ", r.nperturbed, " | ", r.n2x2, " | ", round(r.maxL; sigdigits = 2), " | ",
                 round(r.err; sigdigits = 2), " | ", round(r.t; digits = 3), " |")
+    end
+    println("\n| matching/pivot_pairs | pairs | nnz(L) | ratio | supernodes | zero | perturbed | 2×2 | max abs L | error | ",
+            "relres | relres+5 | analysis s |")
+    println("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
+    for mode in ("none", "default", "all")
+        r = measure_matching(A, mode)
+        println("| algo5/", mode, " | ", r.npairs, " | ", r.nnz_L, " | ", round(r.nnz_L / base; digits = 3), " | ", r.nsn,
+                " | ", r.nzero, " | ", r.nperturbed, " | ", r.n2x2, " | ", round(r.maxL; sigdigits = 2), " | ",
+                round(r.err; sigdigits = 2), " | ", round(r.rel0; sigdigits = 2), " | ", round(r.rel5; sigdigits = 2),
+                " | ", round(r.t; digits = 3), " |")
     end
 end
 

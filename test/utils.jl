@@ -673,3 +673,21 @@ function schur_solve(backend, solver, S::AbstractMatrix, B::AbstractVecOrMat; di
     execute!("solve_bwd_schur", solver, Yd, Xd)
     return to_host(Yd), Bs
 end
+
+# ---------------------------------------------------------------------------
+# matching (T21)
+
+"""
+    all_permutations(n) -> Vector{Vector{Int}}
+
+Every permutation of `1:n` (brute-force reference of the matching tests; `n ≤ 8`).
+"""
+function all_permutations(n::Integer)
+    n <= 8 || error("all_permutations: n = $n is too large for a brute-force enumeration")
+    n == 0 && return [Int[]]
+    out = Vector{Int}[]
+    for p in all_permutations(n - 1), k in 1:n
+        push!(out, insert!(copy(p), k, n))
+    end
+    return out
+end

@@ -2695,7 +2695,7 @@ Constrained ordering, unfactorized root front, `schur_shape`, dense and CSR
   - PLAN §3.6: "the Schur root is a regime-C front alone in the last step, assembled by `assemble_schur!`; its pattern
     is symbolic on `A + Aᵀ`; LU's diagonal belongs to `solve_bwd_schur`".
 
-### T21 — Matching and scaling   `[ ]`
+### T21 — Matching and scaling   `[!]`
 
 **Owner note (issue #67)**: the 2×2 pivot pairs of #64 (`src/symbolic/pairs.jl`,
 `pivot_pairs`) use a fixed candidate tolerance `PIVOT_PAIR_TOLERANCE = 1e-6`
@@ -2723,6 +2723,109 @@ Host MC64-style matching (job 5 first), `perm_matching`, `scale_row/col`,
 composition with the ordering; test: on a badly scaled unsymmetric matrix the
 LU with matching has `nperturbed == 0` where the LU without has `> 0`;
 inertia with matching enabled equals the eigenvalue count (the cuDSS defect).
+
+#### Report
+
+- Status: [!] (done on the KA CPU backend; CUDA/AMDGPU from CI; deviations below)
+- What was built:
+  - `src/matching/mc64.jl` (new, host): `min_cost_matching` (sparse Hungarian / successive shortest augmenting
+    paths with Dijkstra and a binary heap, dual variables), `mc64` (jobs 1: maximum cardinality; 2/3: bottleneck by
+    bisection over the distinct values; 4: maximum sum; 5: maximum product with the scalings
+    `rᵢ = exp(uᵢ)/maxⱼ|aᵢⱼ|`, `cⱼ = exp(vⱼ)`, so `|rᵢ aᵢⱼ cⱼ| ≤ 1`, `= 1` on the matching; `"algo6"` → job 5),
+    `Matching` (`perm`, `matched`, `rscale`, `cscale`, `symmetric`), `compute_matching` (`"G"`: on the stored rows;
+    symmetric structures: on the full matrix, then the Duff–Pralet symmetric scaling `dᵢ = sqrt(rᵢ cᵢ)`, unmatched
+    indices of a structurally singular matrix `dᵢ = 1/maxⱼ|aᵢⱼ|dⱼ`), `matching_pairs` (issue #67: cycles of the
+    matching permutation; 2-cycles are pairs, longer cycles split into consecutive pairs, the better alternative by
+    the product of scaled entries for even lengths, the index with the largest scaled diagonal left out for odd
+    ones; `"default"` keeps a pair only when it contains a 2×2 candidate of the scaled matrix, `"all"` every pair),
+    `matched_colval`, `entry_scaling`.
+  - `"G"` factors `M = (Dr A Dc)[:, q]`: the analysis runs on the stored CSR pattern with relabeled column indices
+    (`DirectSolver.analysis_colval`; no value moves), so ordering, supernodes, maps and LU kernels are unchanged.
+    Symmetric structures factor `D A D` (inertia preserved by Sylvester's law). The numeric phase factors scaled
+    values: `scale_values!` (one launch per factorization into a buffer allocated at analysis, every batch
+    member, the scaling from member 1).
+  - Solve (`src/solve/permute.jl`, `src/solve/refinement.jl`): `permute_rhs!`, `unpermute_solution!` and
+    `add_correction!` take an optional real `scale` vector; `SolveScaling` (`rperm`, `cperm = q[perm]`, `rscale`,
+    `cscale`) and `solve_io` choose input/output permutation and scaling (swapped for the transposed solves of
+    `solve_mode` 1/2 and CSC input). `"solve_fwd_perm"` applies `Dr`, `"solve_bwd_perm"` `Dc Q` (as cuDSS documents);
+    refinement (plain and FGMRES) keeps the residual of the original `A`.
+  - API (`src/solver.jl`): `MatchingState` (device), `DirectSolver` gains `host_matching`, `analysis_colval`,
+    `matching` (type parameter `MS`); `getparam` `"perm_matching"` (`Vector{Int}`), `"scale_row"`, `"scale_col"`
+    (`Vector{real(T)}`, original numbering), all after `"reordering"`, `InvalidValueError` without matching;
+    `"perm_col"` of `"G"` is `perm_matching[reordering]`. Matching with `schur_mode = 1` raises `NotSupportedError`.
+  - Options: new parameter `"pivot_pair_tolerance"` (EXTRA_PARAMETERS, default `PIVOT_PAIR_TOLERANCE = 1e-6`),
+    used by `pivot_candidates(…; tolerance)` and `matching_pairs` (issue #67).
+  - `bench/pivot_pairs.jl`: rows `algo5/none|default|all` (public solver with matching: scaled max|L| and factor
+    error, perturbed pivots, nnz(L), relres before and after 5 refinement steps). README feature list.
+  - Tests: `test/test_matching.jl` (new, split per element type): MC64 jobs vs brute force over all permutations
+    (n = 6, 12 trials: bottleneck, sum, product exact; job-5 scaling bound and unit matched entries), structurally
+    singular input, `matched_colval`/`entry_scaling`, symmetric scaling bound on KKT and `badly_scaled_spd`,
+    matching pairs (disjoint, matrix entries, candidates are the dual rows, `pivot_pair_tolerance = 0` → none);
+    per backend × T: `badly_scaled_general` LU with `nperturbed > 0` without matching and `== 0` with `"algo5"`,
+    `relres ≤ tol(T)`, `perm_matching`/scales/`perm_col`, sub-phases bitwise equal to `"solve"`, `solve_mode` 1/2
+    with and without refinement, plain and FGMRES refinement, 3 RHS, refactorization with new values, every job
+    `"algo1"`–`"algo6"`, CSC input with modes 0/1/2, a 10^±8-scaled matrix (Float64); inertia with matching
+    (`"algo1"`, `"algo5"`, views `'L'`/`'F'`) equals the eigenvalue count on `random_symindef` and `kkt_matrix`
+    (and `npivots == 0`, `relres ≤ tol(T)`), complex symmetric `"S"`, badly scaled SPD/HPD; a uniform batch of three
+    LU members. `test/ported/cudss_inertia_matching.jl` (port of CUDSS.jl's `cudss_inertia_matching`, a plain `@test`
+    here, every job); `test/ported/cudss_solver.jl` now sets `matching_alg = "algo6"` as CUDSS.jl does and checks
+    `perm_matching`/`scale_row`/`scale_col`. Generator `badly_scaled_general` (test/matrices.jl), helper
+    `all_permutations` (test/utils.jl). Test adaptations: `test_api.jl` expected `NotSupportedError` for matching and
+    the matching outputs; now `NotSupportedError` only with `schur_mode = 1`, `InvalidValueError` for the outputs
+    without matching; `test_options.jl` lists the new parameter.
+- Tests: `SDS_TEST_GPU=0 julia --project=. -e 'using Pkg; Pkg.test()'` (Julia 1.13.1, ubuntu-latest, KA CPU
+  backend): 69370 pass / 0 fail / 1 broken (the T16 `@test_broken`), 20.1 min. `test_matching` parts: Float64 502, Float32 91, ComplexF32 92, ComplexF64 94 pass;
+  `test_ported` 2860/2860/2382/2382 pass. CUDA/AMDGPU: pending CI on the PR.
+- Measurements (issue #71, `julia --project=. bench/pivot_pairs.jl --generators=false`, CPU reference of the public
+  solver; K2 dumps regenerated on the runner with `bench/dump_madnlp_kkt.jl` in a scratch environment; MadNLP
+  converged case14 at iteration 15, so `k2_15` is the converged iterate). Matching = `"algo5"` with `pivot_pairs =
+  "default"` (`"all"` gives the same pairs on these matrices); unscaled = `pivot_pairs = "default"` without matching
+  (the numbers of #71); relres = `‖b − A x‖/‖b‖`, `b = A·1`, one solve without refinement, `+5` after 5 IR steps:
+
+  | dump | unscaled: perturbed / max abs L / error / nnz(L) ratio | matching: perturbed / max abs L / error / nnz(L) ratio | relres | relres+5 | cuDSS algo5 (T04): npivots / relres |
+  | --- | --- | --- | ---: | ---: | --- |
+  | case118 k2_1 | 5 / 1.4e15 / 1.8e-3 / 1.28 | 0 / 9.7 / 1.5e-16 / 2.19 | 5.6e-14 | 9.8e-16 | 0 / 5.4e-13 |
+  | case118 k2_10 | 3 / 2.1e14 / 1.7e-5 / 1.25 | 0 / 5.1 / 1.3e-16 / 2.12 | 4.4e-16 | 2.9e-17 | |
+  | case118 k2_20 | 3 / 2.1e14 / 2.8e-7 / 1.25 | 0 / 3.3 / 1.1e-16 / 2.09 | 2.2e-17 | 5.7e-19 | |
+  | case1354 k2_1 | 33 / 3.6e15 / 2.9e-2 / 1.28 | 5 / 1.0e13 / 3.3e-6 / 2.18 | 3.9e-6 | 7.4e-16 | 14 / 7.7e-3 |
+  | case1354 k2_10 | 48 / 8.2e15 / 2.0e-3 / 1.30 | 5 / 1.0e13 / 2.9e-6 / 2.17 | 5.2e-8 | 1.3e-15 | |
+  | case1354 k2_20 | 31 / 4.4e15 / 2.0e-3 / 1.31 | 6 / 1.0e13 / 3.7e-6 / 2.15 | 3.2e-7 | 1.2e-15 | |
+  | case14 k2_15 | 9 / 4.9e14 / 5.1e-12 / 1.91 | 0 / 1.7 / 9.0e-17 / 2.06 | 1.5e-16 | 5.9e-26 | |
+
+  (error = `‖A[p,p] − LDLᵀ‖_F/‖A‖_F`, of the scaled matrix with matching.) Scaling alone without pairs
+  (`algo5/none`) is not enough: 101–2152 perturbed pivots, relres up to 85. With the matching pairs the solver beats
+  the cuDSS `"algo5"` bar on both cases (fewer perturbed pivots, relres 5.6e-14 vs 5.4e-13 and 3.9e-6 vs 7.7e-3
+  before refinement), at 2.1–2.2× nnz(L) (issue #96). On the converged case14 iterate the matching pairs do better
+  in accuracy (0 perturbed pivots instead of 9, max|L| 1.7 instead of 4.9e14) but not in fill (2.06× vs 1.91×).
+  **Decision on M13**: the a posteriori pivoting of T27 does not need to move before the MadNLP integration;
+  matching + scaling (with refinement to 1e-15) is enough on these dumps, as the cuDSS evidence suggested.
+- Deviations from PLAN.md / this task:
+  - Matching is computed on the host at `"reordering"` from the first batch member's values and reused by every
+    refactorization (as the pairs of #64 and as cuDSS does); refactorizing with very different values keeps the old
+    scaling.
+  - `"G"`: the matching permutes columns (`A[:, q]`, CSR column relabeling) rather than rows; `"perm_matching"` is
+    that column permutation (CUDSS.jl: "Matching (column) permutation Q such that A[:,Q] is reordered").
+  - Symmetric structures never permute with the matching (that would break symmetry and the inertia, which is the
+    cuDSS defect); they use the symmetric scaling and, for `"S"`/`"H"` with jobs 5/6 only, the matching pairs.
+    Jobs 1–4 have no scaling and their (structural or unscaled) cycles gave poor pairs on KKT matrices (`"algo1"`:
+    24 perturbed pivots on `kkt_matrix(60, 30, 1e-8)`), so with jobs 1–4 the `"pivot_pairs"` search of the analysis
+    without matching is kept. SPD/HPD get the symmetric scaling too.
+  - `"diag"`, `"npivots"`, `"inertia"`, `"pivot_stats"` are those of the scaled matrix (the inertia equals that of `A`).
+  - Not supported: matching with `schur_mode = 1` (`NotSupportedError`; `S` would be the Schur complement of the
+    scaled matrix).
+  - Jobs 2/3 use bisection with repeated cardinality matchings (O(log nnz) matchings): correct, not tuned for large
+    matrices.
+  - `"pivot_pair_tolerance"` is a parameter string (EXTRA_PARAMETERS, like `"amalgamation"`), not an `Options`
+    tuning keyword.
+- Open issues / follow-ups:
+  - #96: matching pairs cost 2.1–2.2× nnz(L) on the K2 dumps (default pairs without matching: 1.25–1.31×).
+  - The matching outputs and `memory_estimates` do not count the scaled-values buffer (`nnz · nbatch` entries of
+    `T`) and the scale vectors.
+  - CUDA path (the scale argument of the permutation kernels, `scale_values!`) exercised only by CI.
+- Suggested plan changes:
+  - PLAN §1.3 `matching_alg`: "`G`: `M = (Dr A Dc)[:, Q]`; symmetric structures: symmetric scaling only, job-5
+    matching cycles give the 2×2 pairs; jobs 1–4 keep the default pairs".
+  - PLAN §5 M13: keep a posteriori pivoting after the MadNLP integration (T21 measurement above).
 
 ### T22 — Non-uniform batch (`BatchedDirectSolver`)   `[ ]`
 

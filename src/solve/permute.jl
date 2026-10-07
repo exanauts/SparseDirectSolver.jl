@@ -60,24 +60,31 @@ function rhs_count(B::AbstractVecOrMat, n::Integer; transposed::Bool = false)
     return nrhs
 end
 
+# the matching scaling of a solve (`nothing`: none): `v sᵢ` for a real scale vector `s`
+@inline _scaled(v, ::Nothing, i) = v
+@inline _scaled(v, s::AbstractVector, i) = @inbounds v * s[i]
+
 # work item q: entry k of compact column r (user column `_bm_ucol(bm, r)` of the `nrhs` user columns)
-@kernel function _permute_rhs_kernel!(Y, B, perm, n, nrhs, ncols, bm, ::Val{TR}, ::Val{CJ}) where {TR, CJ}
+@kernel function _permute_rhs_kernel!(Y, B, perm, scale, n, nrhs, ncols, bm, ::Val{TR}, ::Val{CJ}) where {TR, CJ}
     q = @index(Global, Linear)
     k = (q - 1) % n + 1
     r = (q - 1) ÷ n + 1
     @inbounds if r <= ncols
-        v = _rhs_get(B, perm[k], _bm_ucol(bm, r), n, nrhs, Val(TR))
-        Y[k, r] = CJ ? conj(v) : v
+        i = perm[k]
+        v = _rhs_get(B, i, _bm_ucol(bm, r), n, nrhs, Val(TR))
+        Y[k, r] = _scaled(CJ ? conj(v) : v, scale, i)
     end
 end
 
-@kernel function _unpermute_solution_kernel!(X, Y, perm, n, nrhs, ncols, bm, ::Val{TR}, ::Val{CJ}) where {TR, CJ}
+@kernel function _unpermute_solution_kernel!(X, Y, perm, scale, n, nrhs, ncols, bm, ::Val{TR},
+                                             ::Val{CJ}) where {TR, CJ}
     q = @index(Global, Linear)
     k = (q - 1) % n + 1
     r = (q - 1) ÷ n + 1
     @inbounds if r <= ncols
-        v = Y[k, r]
-        _rhs_set!(X, CJ ? conj(v) : v, perm[k], _bm_ucol(bm, r), n, nrhs, Val(TR))
+        i = perm[k]
+        v = _scaled(Y[k, r], scale, i)
+        _rhs_set!(X, CJ ? conj(v) : v, i, _bm_ucol(bm, r), n, nrhs, Val(TR))
     end
 end
 
@@ -95,10 +102,11 @@ function _check_permute(Y, B, perm, transposed, bm)
 end
 
 """
-    permute_rhs!(Y, B, perm; transposed = false, conjugate = false, bm = nothing) -> Y
+    permute_rhs!(Y, B, perm; transposed = false, conjugate = false, bm = nothing, scale = nothing) -> Y
 
 `Y[k, r] = B[perm[k], r]` (conjugated when `conjugate`, for the solves with
-`conj(A)` of `solve_mode`) for the `nrhs` right-hand sides of the user array
+`conj(A)` of `solve_mode`; times `scale[perm[k]]` when a real `scale` vector is
+given, the row or column scaling of matching, [`SolveScaling`](@ref)) for the `nrhs` right-hand sides of the user array
 `B` ([`rhs_count`](@ref): vector, matrix, strided vector; row-major when
 `transposed`) into the first `nrhs` columns of the `n × ≥ nrhs` device matrix
 `Y`. With a [`BatchMap`](@ref) `bm` (uniform batch), `B` holds `bm.nrhs`
@@ -107,31 +115,69 @@ active members are copied, member slot `j` to the columns
 `(j - 1) bm.nrhs + 1 : j bm.nrhs` of `Y`. One launch; asynchronous.
 """
 function permute_rhs!(Y::AbstractMatrix, B::AbstractVecOrMat, perm::AbstractVector; transposed::Bool = false,
-                      conjugate::Bool = false, bm::Union{Nothing, BatchMap} = nothing)
+                      conjugate::Bool = false, bm::Union{Nothing, BatchMap} = nothing,
+                      scale::Union{Nothing, AbstractVector} = nothing)
     n, nrhs, ncols, bm = _check_permute(Y, B, perm, transposed, bm)
     n * ncols > 0 || return Y
     kernel! = _permute_rhs_kernel!(KernelAbstractions.get_backend(Y), PERMUTE_WORKGROUP)
     _with_flags(transposed, conjugate) do tr, cj
-        kernel!(Y, B, perm, n, nrhs, ncols, bm, tr, cj; ndrange = n * ncols)
+        kernel!(Y, B, perm, scale, n, nrhs, ncols, bm, tr, cj; ndrange = n * ncols)
     end
     return Y
 end
 
 """
-    unpermute_solution!(X, Y, perm; transposed = false, conjugate = false, bm = nothing) -> X
+    unpermute_solution!(X, Y, perm; transposed = false, conjugate = false, bm = nothing, scale = nothing) -> X
 
-`X[perm[k], r] = Y[k, r]` (conjugated when `conjugate`): the inverse of [`permute_rhs!`](@ref), from the
+`X[perm[k], r] = Y[k, r]` (conjugated when `conjugate`; times `scale[perm[k]]`
+when a `scale` vector is given): the inverse of [`permute_rhs!`](@ref), from the
 first `nrhs` columns of `Y` into the user array `X` (same layouts; with a
 [`BatchMap`](@ref) `bm`, only the columns of the active members of `X` are
 written). One launch; asynchronous.
 """
 function unpermute_solution!(X::AbstractVecOrMat, Y::AbstractMatrix, perm::AbstractVector; transposed::Bool = false,
-                             conjugate::Bool = false, bm::Union{Nothing, BatchMap} = nothing)
+                             conjugate::Bool = false, bm::Union{Nothing, BatchMap} = nothing,
+                             scale::Union{Nothing, AbstractVector} = nothing)
     n, nrhs, ncols, bm = _check_permute(Y, X, perm, transposed, bm)
     n * ncols > 0 || return X
     kernel! = _unpermute_solution_kernel!(KernelAbstractions.get_backend(Y), PERMUTE_WORKGROUP)
     _with_flags(transposed, conjugate) do tr, cj
-        kernel!(X, Y, perm, n, nrhs, ncols, bm, tr, cj; ndrange = n * ncols)
+        kernel!(X, Y, perm, scale, n, nrhs, ncols, bm, tr, cj; ndrange = n * ncols)
     end
     return X
 end
+
+"""
+    SolveScaling{VI, VR}
+
+Device permutations and scalings of the solve with matching (`matching_alg ≠
+"default"`, [`Matching`](@ref)): the factored matrix is `M = Dr A Dc Q`
+(`"G"`; `Q` the matching column permutation) or `D A D` (symmetric
+structures), so `A x = b` is solved as `M y = Dr b`, `x = Dc Q y`:
+
+* `rperm`: factor row `k` is original row `rperm[k]` (the symbolic `perm`);
+* `cperm`: factor column `k` is original column `cperm[k]` (`q[perm[k]]` for
+  `"G"`, `perm` otherwise);
+* `rscale`, `cscale`: the row and column scalings `Dr`, `Dc` (original
+  numbering, `real(T)` vectors).
+"""
+struct SolveScaling{VI <: AbstractVector, VR <: AbstractVector}
+    rperm::VI
+    cperm::VI
+    rscale::VR
+    cscale::VR
+end
+
+"""
+    solve_io(S::Symbolic, scaling, transpose::Bool) -> (inperm, inscale, outperm, outscale)
+
+The permutations and scalings of the right-hand side ([`permute_rhs!`](@ref))
+and of the solution ([`unpermute_solution!`](@ref), [`add_correction!`](@ref))
+of a solve with the factored matrix `M` (with `Mᵀ` when `transpose`): `S.perm`
+both ways and no scaling without matching (`scaling === nothing`); with a
+[`SolveScaling`](@ref) `(rperm, rscale, cperm, cscale)` for `M` and
+`(cperm, cscale, rperm, rscale)` for `Mᵀ = Qᵀ Dc Aᵀ Dr`.
+"""
+solve_io(S, ::Nothing, transpose::Bool) = (S.perm, nothing, S.perm, nothing)
+solve_io(S, sc::SolveScaling, transpose::Bool) =
+    transpose ? (sc.cperm, sc.cscale, sc.rperm, sc.rscale) : (sc.rperm, sc.rscale, sc.cperm, sc.cscale)
