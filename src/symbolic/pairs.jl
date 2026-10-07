@@ -14,8 +14,9 @@
 """
     PIVOT_PAIR_TOLERANCE
 
-Relative tolerance of the 2×2 candidate test of [`pivot_pairs`](@ref): row `i`
-is a candidate when `|aᵢᵢ| ≤ PIVOT_PAIR_TOLERANCE · maxⱼ≠ᵢ |aᵢⱼ|` (`1e-6`).
+Default relative tolerance of the 2×2 candidate test of [`pivot_pairs`](@ref):
+row `i` is a candidate when `|aᵢᵢ| ≤ τ · maxⱼ≠ᵢ |aᵢⱼ|`, `τ =` the parameter
+`"pivot_pair_tolerance"` (default `1e-6`).
 """
 const PIVOT_PAIR_TOLERANCE = 1.0e-6
 
@@ -57,11 +58,13 @@ end
 The 2×2 pivot candidates ([`PairCandidates`](@ref)) of the CSR matrix
 (`rowptr`, `colval`, `nzval`; the first batch member when `nzval` is a matrix)
 whose symmetric pattern is `P`, read with the view and index rules of
-[`SymmetricPattern`](@ref) (duplicates summed). The only read of the values at
-analysis.
+[`SymmetricPattern`](@ref) (duplicates summed), with the candidate tolerance
+`τ = tolerance` (the analysis passes `opts.pivot_pair_tolerance`). The only
+read of the values at analysis.
 """
 function pivot_candidates(P::SymmetricPattern, rowptr::AbstractVector{<:Integer}, colval::AbstractVector{<:Integer},
-                          nzval::AbstractArray, n::Integer, structure; view = VIEW_FULL, index = INDEX_ONE)
+                          nzval::AbstractArray, n::Integer, structure; view = VIEW_FULL, index = INDEX_ONE,
+                          tolerance::Real = PIVOT_PAIR_TOLERANCE)
     P.n == n || throw(InvalidValueError("the pattern has size $(P.n), the matrix $n"))
     s = _structure(structure)
     rp, cv = _host_pattern(rowptr, colval, n, index)
@@ -90,13 +93,13 @@ function pivot_candidates(P::SymmetricPattern, rowptr::AbstractVector{<:Integer}
     candidate = falses(n)
     for i in 1:n
         amax[i] = maximum(p -> w[p], P.colptr[i]:(P.colptr[i + 1] - 1); init = zero(R))
-        candidate[i] = !dpresent[i] || abs(dval[i]) <= PIVOT_PAIR_TOLERANCE * amax[i]
+        candidate[i] = !dpresent[i] || abs(dval[i]) <= tolerance * amax[i]
     end
     return PairCandidates{R}(candidate, w, amax)
 end
 
-pivot_candidates(P::SymmetricPattern, A::CSR, structure; view = VIEW_FULL) =
-    pivot_candidates(P, A.rowptr, A.colval, A.nzval, A.nrows, structure; view, index = A.index)
+pivot_candidates(P::SymmetricPattern, A::CSR, structure; view = VIEW_FULL, tolerance::Real = PIVOT_PAIR_TOLERANCE) =
+    pivot_candidates(P, A.rowptr, A.colval, A.nzval, A.nrows, structure; view, index = A.index, tolerance)
 
 """
     pivot_pairs(P::SymmetricPattern, rowptr, colval, nzval, n, structure; view = 'F', index = 'O')
@@ -342,7 +345,8 @@ function analysis_pairs(P::SymmetricPattern, rowptr, colval, nzval, n::Integer, 
                         view = VIEW_FULL, index = INDEX_ONE)
     none = Tuple{Int, Int}[]
     pairs_enabled(structure, opts) || return (pairs = none, candidates = nothing)
-    cands = pivot_candidates(P, rowptr, colval, nzval, n, structure; view, index)
+    cands = pivot_candidates(P, rowptr, colval, nzval, n, structure; view, index,
+                             tolerance = opts.pivot_pair_tolerance)
     opts.pivot_pairs == PIVOT_PAIRS_ALL && return (pairs = pivot_pairs(P, cands), candidates = nothing)
     return (pairs = none, candidates = cands)
 end

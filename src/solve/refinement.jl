@@ -187,14 +187,14 @@ end
     end
 end
 
-@kernel function _add_correction_kernel!(X, Y, perm, n, nrhs, ncols, bm, ::Val{TR}, ::Val{CJ}) where {TR, CJ}
+@kernel function _add_correction_kernel!(X, Y, perm, scale, n, nrhs, ncols, bm, ::Val{TR}, ::Val{CJ}) where {TR, CJ}
     q = @index(Global, Linear)
     k = (q - 1) % n + 1
     r = (q - 1) ÷ n + 1
     @inbounds if r <= ncols
         i = Int(perm[k])
         u = _bm_ucol(bm, r)
-        y = Y[k, r]
+        y = _scaled(Y[k, r], scale, i)
         _rhs_set!(X, _rhs_get(X, i, u, n, nrhs, Val(TR)) + (CJ ? conj(y) : y), i, u, n, nrhs, Val(TR))
     end
 end
@@ -309,23 +309,25 @@ function copy_rhs!(C::AbstractMatrix, B::AbstractVecOrMat; nrhs::Integer, transp
 end
 
 """
-    add_correction!(X, Y, perm; nrhs, transposed = false, conjugate = false, bm = nothing) -> X
+    add_correction!(X, Y, perm; nrhs, transposed = false, conjugate = false, bm = nothing, scale = nothing) -> X
 
-`X[perm[k], r] += Y[k, r]` (`conj(Y[k, r])` when `conjugate`): the solution of
+`X[perm[k], r] += Y[k, r]` (`conj(Y[k, r])` when `conjugate`; `Y[k, r]` times
+`scale[perm[k]]` first with a matching scale vector): the solution of
 the correction system, in factor order in the workspace `Y`, added to the user
 array `X` of `nrhs` right-hand sides (uniform batch: the compact columns of `Y`
 to the active members' columns of `X`, [`BatchMap`](@ref) `bm`). One launch,
 conflict-free (`perm` is a permutation).
 """
 function add_correction!(X::AbstractVecOrMat, Y::AbstractMatrix, perm::AbstractVector; nrhs::Integer,
-                         transposed::Bool = false, conjugate::Bool = false, bm::Union{Nothing, BatchMap} = nothing)
+                         transposed::Bool = false, conjugate::Bool = false, bm::Union{Nothing, BatchMap} = nothing,
+                         scale::Union{Nothing, AbstractVector} = nothing)
     n = length(perm)
     bm = _user_map(bm, nrhs)
     ncols = bm.nrhs * bm.nact
     n * ncols > 0 || return X
     kernel! = _add_correction_kernel!(KernelAbstractions.get_backend(Y), PERMUTE_WORKGROUP)
     _with_flags(transposed, conjugate) do tr, cj
-        kernel!(X, Y, perm, n, Int(nrhs), ncols, bm, tr, cj; ndrange = n * ncols)
+        kernel!(X, Y, perm, scale, n, Int(nrhs), ncols, bm, tr, cj; ndrange = n * ncols)
     end
     return X
 end
@@ -333,7 +335,7 @@ end
 """
     refine!(X, B, W, ws, symbolic, numeric, nzval; nsteps, tol = 0, transposed = false,
             b_transposed = transposed, conjugate = false, deterministic = false,
-            interrupt = nothing, progress = Ref(0), transpose_matrix = false) -> steps
+            interrupt = nothing, progress = Ref(0), transpose_matrix = false, scaling = nothing) -> steps
 
 Plain iterative refinement of the solution `X` of `op(A) X = B` (`op(A) = M`,
 or `conj(M)` when `conjugate`; `Mᵀ` or `conj(Mᵀ)` with `transpose_matrix`, LU
@@ -344,7 +346,9 @@ only), at most `nsteps` steps of
     X += op(A)⁻¹ R             (permute, forward / diagonal / backward sweeps, add_correction!)
 
 with the factor in `numeric`, the solve workspace `ws` and the refinement
-workspace `W`. `tol = 0` (the default of `ir_tol`) never stops early and never
+workspace `W` (with the permutations and scalings of matching when `scaling`
+is a [`SolveScaling`](@ref), [`solve_io`](@ref); the residual is always the one
+of the original matrix values `nzval`). `tol = 0` (the default of `ir_tol`) never stops early and never
 synchronizes. `interrupt` (a `Threads.Atomic{Bool}` or `nothing`) is polled
 before every step ([`InterruptedError`](@ref); `X` then holds the last
 completed iterate). Returns the number of corrections applied, which is also
@@ -354,7 +358,7 @@ function refine!(X::AbstractVecOrMat, B::AbstractVecOrMat, W::RefinementWorkspac
                  N::Numeric, nzval::AbstractVector; nsteps::Integer, tol::Real = 0, transposed::Bool = false,
                  b_transposed::Bool = transposed, conjugate::Bool = false, deterministic::Bool = false,
                  interrupt::Union{Nothing, Threads.Atomic{Bool}} = nothing,
-                 progress::Base.RefValue{Int} = Ref(0), transpose_matrix::Bool = false)
+                 progress::Base.RefValue{Int} = Ref(0), transpose_matrix::Bool = false, scaling = nothing)
     nu = rhs_count(X, S.n; transposed)                        # user columns: nrhs per member × nbatch
     nu % N.nbatch == 0 || throw(DimensionMismatch("$nu right-hand sides for a batch of $(N.nbatch) members"))
     nrhs = nu ÷ N.nbatch
@@ -362,6 +366,7 @@ function refine!(X::AbstractVecOrMat, B::AbstractVecOrMat, W::RefinementWorkspac
     max_rhs(W) >= ncols && max_rhs(ws) >= ncols ||
         throw(DimensionMismatch("the refinement workspace holds $(max_rhs(W)) right-hand sides, need $ncols"))
     bm = batch_map(N; nrhs)
+    pin, sin, pout, sout = solve_io(S, scaling, transpose_matrix)
     steps = 0
     progress[] = 0
     for _ in 1:nsteps
@@ -373,11 +378,11 @@ function refine!(X::AbstractVecOrMat, B::AbstractVecOrMat, W::RefinementWorkspac
             _log(LOG_DEBUG, () -> "refinement: step $steps, relative residual $rel")
             rel <= tol && break
         end
-        permute_rhs!(ws.Y, W.R, S.perm; conjugate)
+        permute_rhs!(ws.Y, W.R, pin; conjugate, scale = sin)
         forward_sweep!(ws, S, N; nrhs, deterministic, transpose = transpose_matrix)
         diagonal_sweep!(ws, S, N; nrhs)
         backward_sweep!(ws, S, N; nrhs, transpose = transpose_matrix)
-        add_correction!(X, ws.Y, S.perm; nrhs = nu, transposed, conjugate, bm)
+        add_correction!(X, ws.Y, pout; nrhs = nu, transposed, conjugate, bm, scale = sout)
         steps += 1
         progress[] = steps
     end
@@ -476,12 +481,14 @@ function LinearAlgebra.mul!(y::AbstractVector, op::RefinementOperator, x::Abstra
 end
 
 """
-    FactorPreconditioner(ws, S, N, nrhs, ncols, conjugate, deterministic, interrupt, transpose = false)
+    FactorPreconditioner(ws, S, N, nrhs, ncols, conjugate, deterministic, interrupt, transpose = false,
+                         scaling = nothing)
 
 `op(A)⁻¹` through the factorization in `N` (permutation, forward, diagonal
 and backward sweeps in the solve workspace `ws`; `conj(M⁻¹ conj(x))` when
 `conjugate`; the sweeps of `Mᵀ` when `transpose`, LU only) on the stacked compact columns (`nrhs` per active member,
-`ncols` in all) of the [`RefinementOperator`](@ref). `mul!(y, P, x)` polls
+`ncols` in all) of the [`RefinementOperator`](@ref); with the matching
+permutations and scalings of a [`SolveScaling`](@ref) `scaling` ([`solve_io`](@ref)). `mul!(y, P, x)` polls
 `interrupt` first ([`InterruptedError`](@ref)); asynchronous otherwise. The
 right preconditioner of FGMRES-IR.
 """
@@ -495,11 +502,12 @@ struct FactorPreconditioner{T, WS <: SolveWorkspace{T}, SY <: Symbolic, NU <: Nu
     deterministic::Bool
     interrupt::Union{Nothing, Threads.Atomic{Bool}}
     transpose::Bool
+    scaling::Any
 end
 
 FactorPreconditioner(ws::SolveWorkspace, S::Symbolic, N::Numeric, nrhs::Integer, ncols::Integer, conjugate::Bool,
-                     deterministic::Bool, interrupt) =
-    FactorPreconditioner(ws, S, N, Int(nrhs), Int(ncols), conjugate, deterministic, interrupt, false)
+                     deterministic::Bool, interrupt, transpose::Bool = false, scaling = nothing) =
+    FactorPreconditioner(ws, S, N, Int(nrhs), Int(ncols), conjugate, deterministic, interrupt, transpose, scaling)
 
 Base.size(P::FactorPreconditioner) = (P.S.n * P.ncols, P.S.n * P.ncols)
 Base.size(P::FactorPreconditioner, d::Integer) = d <= 2 ? P.S.n * P.ncols : 1
@@ -507,12 +515,12 @@ Base.eltype(::FactorPreconditioner{T}) where {T} = T
 
 function LinearAlgebra.mul!(y::AbstractVector, P::FactorPreconditioner, x::AbstractVector)
     _poll_interrupt(P.interrupt)
-    perm = P.S.perm
-    permute_rhs!(P.ws.Y, x, perm; conjugate = P.conjugate)
+    pin, sin, pout, sout = solve_io(P.S, P.scaling, P.transpose)
+    permute_rhs!(P.ws.Y, x, pin; conjugate = P.conjugate, scale = sin)
     forward_sweep!(P.ws, P.S, P.N; nrhs = P.nrhs, deterministic = P.deterministic, transpose = P.transpose)
     diagonal_sweep!(P.ws, P.S, P.N; nrhs = P.nrhs)
     backward_sweep!(P.ws, P.S, P.N; nrhs = P.nrhs, transpose = P.transpose)
-    unpermute_solution!(y, P.ws.Y, perm; conjugate = P.conjugate)
+    unpermute_solution!(y, P.ws.Y, pout; conjugate = P.conjugate, scale = sout)
     return y
 end
 
@@ -529,7 +537,8 @@ end
 """
     fgmres_refine!(X, B, W, ws, symbolic, numeric, nzval; nsteps, tol = 0, transposed = false,
                    b_transposed = transposed, conjugate = false, deterministic = false,
-                   interrupt = nothing, progress = Ref(0), transpose_matrix = false) -> iterations
+                   interrupt = nothing, progress = Ref(0), transpose_matrix = false, scaling = nothing)
+        -> iterations
 
 FGMRES-IR (`ir_mode = "fgmres"`, needs Krylov.jl) of the solution `X` of
 `op(A) X = B`, with the arguments of [`refine!`](@ref):
@@ -553,7 +562,8 @@ function fgmres_refine!(X::AbstractVecOrMat, B::AbstractVecOrMat, W::RefinementW
                         S::Symbolic, N::Numeric, nzval::AbstractVector; nsteps::Integer, tol::Real = 0,
                         transposed::Bool = false, b_transposed::Bool = transposed, conjugate::Bool = false,
                         deterministic::Bool = false, interrupt::Union{Nothing, Threads.Atomic{Bool}} = nothing,
-                        progress::Base.RefValue{Int} = Ref(0), transpose_matrix::Bool = false)
+                        progress::Base.RefValue{Int} = Ref(0), transpose_matrix::Bool = false,
+                        scaling = nothing)
     provider = FGMRES_PROVIDER[]
     provider === nothing &&
         throw(NotSupportedError("ir_mode = \"fgmres\" needs Krylov.jl: load it with `using Krylov`"))
@@ -578,9 +588,9 @@ function fgmres_refine!(X::AbstractVecOrMat, B::AbstractVecOrMat, W::RefinementW
         atol = R(tol) * _min_rhs_norm(norms, ncols)
     end
     A = RefinementOperator(W, nzval, S.n, ncols, bm, conjugate, _map_row_offset(W, transpose_matrix))
-    P = FactorPreconditioner(ws, S, N, nrhs, ncols, conjugate, deterministic, interrupt, transpose_matrix)
+    P = FactorPreconditioner(ws, S, N, nrhs, ncols, conjugate, deterministic, interrupt, transpose_matrix, scaling)
     D, iters = provider(W.krylov, A, P, W.R, S.n * ncols; atol, itmax = Int(nsteps))
-    permute_rhs!(ws.Y, D, S.perm)
+    permute_rhs!(ws.Y, D, S.perm)            # D is in the original numbering: scatter into the user columns
     add_correction!(X, ws.Y, S.perm; nrhs = nu, transposed, bm)
     progress[] = iters
     return iters

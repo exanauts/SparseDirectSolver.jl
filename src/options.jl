@@ -45,10 +45,11 @@ const CUDSS08_DATA_PARAMETERS = ("ir_n_steps", "ubatch_mask", "flops")
 
 Parameters beyond cuDSS (PLAN §1.7): the data parameters `"pivot_sign"` (input)
 and `"pivot_stats"` (output), and the configuration parameters `"ir_mode"`,
-`"factor_precision"`, `"amalgamation"`, `"schedule"` and `"pivot_pairs"`.
+`"factor_precision"`, `"amalgamation"`, `"schedule"`, `"pivot_pairs"` and
+`"pivot_pair_tolerance"`.
 """
 const EXTRA_PARAMETERS = ("pivot_sign", "pivot_stats", "ir_mode", "factor_precision",
-                          "amalgamation", "schedule", "pivot_pairs")
+                          "amalgamation", "schedule", "pivot_pairs", "pivot_pair_tolerance")
 
 """
     default_pivot_epsilon(T) -> Float64
@@ -128,7 +129,8 @@ defaults below. Keyword arguments are applied through [`setparam!`](@ref), so
 | `factor_precision` | `nothing` | factors in the input precision |
 | `amalgamation` | `(max_width = 32, zero_fraction = 0.25, min_width = 8)` | |
 | `schedule` | `SCHEDULE_AUTO` | |
-| `pivot_pairs` | `PIVOT_PAIRS_DEFAULT` | 2×2 pivot pairs in the analysis of `"S"`/`"H"` (structurally zero pivots; `"all"`: every candidate) |
+| `pivot_pairs` | `PIVOT_PAIRS_DEFAULT` | 2×2 pivot pairs in the analysis of `"S"`/`"H"` (structurally zero pivots; `"all"`: every candidate; with matching: the candidates' cycles of the matching) |
+| `pivot_pair_tolerance` | `1e-6` ([`PIVOT_PAIR_TOLERANCE`](@ref)) | relative diagonal size below which a row is a 2×2 candidate |
 | `regime_c_width` | `64` | fronts wider than this go to regime C (vendor dense calls) |
 | `regime_c_rows` | `512` | fronts with more rows than this go to regime C |
 | `subtree_budgets` | `[16384, 32768, 49152]` | regime A local-memory budgets in bytes; empty disables regime A |
@@ -177,6 +179,7 @@ mutable struct Options
     amalgamation::AmalgamationParams
     schedule::ScheduleKind
     pivot_pairs::PivotPairsMode
+    pivot_pair_tolerance::Float64
     # analysis tuning knobs of the schedule (T07; not parameter strings)
     regime_c_width::Int
     regime_c_rows::Int
@@ -196,7 +199,7 @@ mutable struct Options
             REORDERING_DEFAULT, FACTORIZATION_DEFAULT, SOLVE_DEFAULT, MATCHING_NONE,
             0, 0, 0.0, PIVOT_AUTO, 0.01, nothing, PIVOT_EPSILON_DEFAULT, -1,
             0, 0, 1, 0, 0, 10, 0, -1, 1, 0, 0, -1,
-            IR_PLAIN, nothing, DEFAULT_AMALGAMATION, SCHEDULE_AUTO, PIVOT_PAIRS_DEFAULT,
+            IR_PLAIN, nothing, DEFAULT_AMALGAMATION, SCHEDULE_AUTO, PIVOT_PAIRS_DEFAULT, PIVOT_PAIR_TOLERANCE,
             64, 512, copy(DEFAULT_SUBTREE_BUDGETS), SUBTREE_PARALLELISM, -1,
             nothing, nothing, nothing, nothing, nothing, nothing,
         )
@@ -315,6 +318,7 @@ const PARAMETER_SPECS = Dict{String, ParameterSpec}(
     "amalgamation" => ParameterSpec(:config, :port, :amalgamation),
     "schedule" => ParameterSpec(:config, :port, :schedule),
     "pivot_pairs" => ParameterSpec(:config, :port, :pivot_pairs),
+    "pivot_pair_tolerance" => ParameterSpec(:config, :port, :pivot_pair_tolerance),
 )
 
 """
@@ -412,7 +416,7 @@ for (field, lo, hi, expected) in (
         _parse_int($(String(field)), value, $lo, $hi, $expected)
 end
 
-for field in (:ir_tol, :pivot_threshold)
+for field in (:ir_tol, :pivot_threshold, :pivot_pair_tolerance)
     @eval _parse_option(::Val{$(QuoteNode(field))}, value, _) = _parse_float($(String(field)), value)
 end
 
@@ -536,6 +540,11 @@ Accepted values:
   (every such row, see [`pivot_pairs`](@ref); about 2× `nnz(L)` on KKT systems)
   or `"none"`;
   ignored for the other structures, with `user_perm` and with the natural ordering;
+  with `matching_alg ≠ "default"` the pairs come from the cycles of the
+  symmetric matching instead ([`matching_pairs`](@ref));
+* `"pivot_pair_tolerance"` (beyond cuDSS): a finite real `≥ 0`, the relative
+  diagonal size `τ` below which a row is a 2×2 candidate (`|aᵢᵢ| ≤ τ maxⱼ≠ᵢ |aᵢⱼ|`,
+  on the scaled matrix with matching; default [`PIVOT_PAIR_TOLERANCE`](@ref));
 * `"factor_precision"`: `Float32`, `Float64` or `nothing`;
 * `"amalgamation"`: a `NamedTuple` with any of `max_width`, `zero_fraction`, `min_width`;
 * `"user_perm"`, `"user_nd_partition_tree"`: an integer vector (host or device), or `nothing`;

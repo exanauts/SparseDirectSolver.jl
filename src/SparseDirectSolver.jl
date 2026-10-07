@@ -51,6 +51,9 @@ include("symbolic/schedule.jl")
 include("symbolic/layout.jl")
 include("symbolic/maps.jl")
 
+# matching and scaling (PLAN §1.3, milestone M9), host
+include("matching/mc64.jl")
+
 # numeric storage, CPU reference multifrontal factorization (PLAN §7, the oracle)
 include("numeric/batch.jl")
 include("numeric/storage.jl")

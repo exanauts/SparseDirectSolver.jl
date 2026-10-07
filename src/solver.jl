@@ -31,6 +31,10 @@ _numeric_type(backend, ::Type{T}) where {T} =
     Numeric{T, typeof(KernelAbstractions.allocate(backend, T, 0)), typeof(KernelAbstractions.allocate(backend, Int64, 0)),
             typeof(KernelAbstractions.allocate(backend, Int32, 0)), typeof(KernelAbstractions.allocate(backend, Int8, 0))}
 _workspace_type(backend, ::Type{T}) where {T} = SolveWorkspace{T, typeof(KernelAbstractions.allocate(backend, T, 0, 0))}
+_matching_type(backend, ::Type{T}, ::Type{INT}) where {T, INT} =
+    MatchingState{typeof(KernelAbstractions.allocate(backend, INT, 0)),
+                  typeof(KernelAbstractions.allocate(backend, real(T), 0)),
+                  typeof(KernelAbstractions.allocate(backend, T, 0))}
 _refinement_type(backend, ::Type{T}, ::Type{INT}) where {T, INT} =
     RefinementWorkspace{T, real(T), typeof(KernelAbstractions.allocate(backend, INT, 0)),
                         typeof(KernelAbstractions.allocate(backend, T, 0, 0)),
@@ -57,7 +61,44 @@ mutable struct SchurState
 end
 
 """
-    DirectSolver{T, INT, M, B, SY, NU, WS, RF} <: AbstractDirectSolver{T, INT}
+    MatchingState{VI, VR, VT}
+
+Device state of the matching and scaling of a [`DirectSolver`](@ref)
+(`matching_alg ≠ "default"`), built by `"symbolic_factorization"` from the host
+[`Matching`](@ref): `io` (the [`SolveScaling`](@ref) of the solve phases),
+`weights` (`rᵢ cⱼ` of every stored entry, [`entry_scaling`](@ref)) and `values`
+(the scaled values of every batch member, the input of the numeric phase,
+[`scale_values!`](@ref)).
+"""
+struct MatchingState{VI <: AbstractVector, VR <: AbstractVector, VT <: AbstractVector}
+    io::SolveScaling{VI, VR}
+    weights::VR
+    values::VT
+end
+
+@kernel function _scale_values_kernel!(out, w, nzval, nnz)
+    q = @index(Global, Linear)
+    @inbounds out[q] = w[(q - 1) % nnz + 1] * nzval[q]
+end
+
+"""
+    scale_values!(out, weights, nzval) -> out
+
+`out[k + (m - 1) nnz] = weights[k] nzval[k + (m - 1) nnz]` for the `nnz =
+length(weights)` stored entries of every batch member `m` (one launch,
+asynchronous): the values `rᵢ aᵢⱼ cⱼ` the numeric phase factors with matching.
+"""
+function scale_values!(out::AbstractVector, weights::AbstractVector, nzval::AbstractVector)
+    length(out) == length(nzval) ||
+        throw(DimensionMismatch("scale_values!: $(length(out)) outputs for $(length(nzval)) values"))
+    isempty(out) && return out
+    kernel! = _scale_values_kernel!(KernelAbstractions.get_backend(out), PERMUTE_WORKGROUP)
+    kernel!(out, weights, nzval, length(weights); ndrange = length(out))
+    return out
+end
+
+"""
+    DirectSolver{T, INT, M, B, SY, NU, WS, RF, MS} <: AbstractDirectSolver{T, INT}
 
 Sparse direct solver handle (≅ `CudssSolver`), PLAN §3.1–§3.2.
 
@@ -115,7 +156,22 @@ the numeric storage `numeric`, the solve `workspace`, the refinement storage
 `refinement` (allocated by the first solve that refines) and `ir_steps` (the
 `"ir_n_steps"` data parameter: refinement steps of the last solve, `-1` before
 one) and `schur` (the [`SchurState`](@ref) of an analysis with `schur_mode = 1`,
-else `nothing`).
+else `nothing`), `host_matching` (the host [`Matching`](@ref) of
+`matching_alg ≠ "default"`, else `nothing`), `analysis_colval` (the column
+indices the analysis runs on: those of `(Dr A Dc)[:, q]` for `"G"` with
+matching, else `host_colval`) and `matching` (the device
+[`MatchingState`](@ref), or `nothing`).
+
+Matching and scaling (PLAN §1.3, M9, `"matching_alg"` = `"algo1"`–`"algo6"`
+before the analysis; [`compute_matching`](@ref), from the first batch member's
+values): `"G"` factors `M = (Dr A Dc)[:, q]`, whose diagonal holds the matched
+entries (job 5: `|mᵢᵢ| = 1 ≥ |mᵢⱼ|`), and the symmetric structures factor
+`D A D` (same inertia as `A`; for `"S"`/`"H"` the 2×2 pivot pairs come from the
+cycles of the matching, [`matching_pairs`](@ref)). The solve phases apply the
+permutation and the scalings (`"solve_fwd_perm"`: `Dr`, `"solve_bwd_perm"`:
+`Dc Q`, as in cuDSS) and refinement measures the residual of `A` itself;
+`"diag"` and the pivot statistics are those of the scaled matrix. Not with the
+Schur complement mode.
 
 Schur complement mode (PLAN §3.6, ≅ CUDSS.jl's Schur complement): with
 `"schur_mode" = 1` and `"user_schur_indices"` (`n` flags 0/1) set before the
@@ -125,7 +181,7 @@ stops before them: `getparam(solver, "schur_shape")` and
 flagged block), and the solve phases are `"solve_fwd_schur"`, `"solve_diag"`
 and `"solve_bwd_schur"` (see [`execute!`](@ref)). Single matrices only.
 """
-mutable struct DirectSolver{T, INT, M <: CSR{T, INT}, B <: KernelAbstractions.Backend, SY, NU, WS, RF} <:
+mutable struct DirectSolver{T, INT, M <: CSR{T, INT}, B <: KernelAbstractions.Backend, SY, NU, WS, RF, MS} <:
                AbstractDirectSolver{T, INT}
     A::M
     structure::Structure
@@ -146,16 +202,22 @@ mutable struct DirectSolver{T, INT, M <: CSR{T, INT}, B <: KernelAbstractions.Ba
     refinement::Union{Nothing, RF}
     ir_steps::Int
     schur::Union{Nothing, SchurState}
-    # explicit parameters only: the default outer constructor would leave SY, NU, WS, RF unbound
+    host_matching::Union{Nothing, Matching}
+    analysis_colval::Vector{INT}
+    matching::Union{Nothing, MS}
+    # explicit parameters only: the default outer constructor would leave SY, NU, WS, RF, MS unbound
     # (they occur only in `Union{Nothing, …}` fields; Aqua on Julia 1.10)
-    function DirectSolver{T, INT, M, B, SY, NU, WS, RF}(A, structure, view, options, backend, nbatch,
-                                                        fresh_factorization, info, stage, host_rowptr,
-                                                        host_colval, ordering, host_symbolic, symbolic,
-                                                        numeric, workspace, refinement, ir_steps,
-                                                        schur) where {T, INT, M, B, SY, NU, WS, RF}
-        return new{T, INT, M, B, SY, NU, WS, RF}(A, structure, view, options, backend, nbatch, fresh_factorization,
-                                                 info, stage, host_rowptr, host_colval, ordering, host_symbolic,
-                                                 symbolic, numeric, workspace, refinement, ir_steps, schur)
+    function DirectSolver{T, INT, M, B, SY, NU, WS, RF, MS}(A, structure, view, options, backend, nbatch,
+                                                            fresh_factorization, info, stage, host_rowptr,
+                                                            host_colval, ordering, host_symbolic, symbolic,
+                                                            numeric, workspace, refinement, ir_steps, schur,
+                                                            host_matching, analysis_colval,
+                                                            matching) where {T, INT, M, B, SY, NU, WS, RF, MS}
+        return new{T, INT, M, B, SY, NU, WS, RF, MS}(A, structure, view, options, backend, nbatch,
+                                                     fresh_factorization, info, stage, host_rowptr, host_colval,
+                                                     ordering, host_symbolic, symbolic, numeric, workspace,
+                                                     refinement, ir_steps, schur, host_matching, analysis_colval,
+                                                     matching)
     end
 end
 
@@ -176,9 +238,10 @@ function DirectSolver(A::CSR{T, INT}, structure, view; index = A.index) where {T
     backend = KernelAbstractions.get_backend(A)
     SY, NU, WS = _symbolic_type(backend, INT), _numeric_type(backend, T), _workspace_type(backend, T)
     RF = _refinement_type(backend, T, INT)
-    return DirectSolver{T, INT, typeof(A), typeof(backend), SY, NU, WS, RF}(
+    MS = _matching_type(backend, T, INT)
+    return DirectSolver{T, INT, typeof(A), typeof(backend), SY, NU, WS, RF, MS}(
         A, s, v, Options(), backend, nb, true, zeros(Int, nb), STAGE_NONE, INT[], INT[], nothing, nothing, nothing,
-        nothing, nothing, nothing, -1, nothing)
+        nothing, nothing, nothing, -1, nothing, nothing, INT[], nothing)
 end
 
 function DirectSolver(rowptr::AbstractVector{<:Integer}, colval::AbstractVector{<:Integer}, nzval::AbstractVecOrMat,
@@ -373,8 +436,9 @@ function _check_analysis_supported(solver::DirectSolver{T}) where {T}
     opts.ubatch_size == 0 || opts.ubatch_size == solver.nbatch ||
         throw(InvalidValueError("ubatch_size = $(opts.ubatch_size), but the matrix values hold $(solver.nbatch) " *
                                 "batch member(s) (length(nzval) ÷ nnz)"))
-    opts.matching_alg == MATCHING_NONE ||
-        throw(NotSupportedError("matching_alg = \"$(convert(String, opts.matching_alg))\" is not implemented yet (T21)"))
+    opts.matching_alg == MATCHING_NONE || opts.schur_mode == 0 ||
+        throw(NotSupportedError("matching_alg = \"$(convert(String, opts.matching_alg))\" is not supported with " *
+                                "schur_mode = 1"))
     opts.schur_mode == 0 || solver.nbatch == 1 ||
         throw(NotSupportedError("schur_mode = 1 is not supported for uniform batches"))
     opts.user_nd_partition_tree === nothing ||
@@ -392,7 +456,13 @@ function _reorder!(solver::DirectSolver{T}) where {T}
     A = solver.A
     solver.host_rowptr = Array(A.rowptr)
     solver.host_colval = Array(A.colval)
-    P = SymmetricPattern(solver.host_rowptr, solver.host_colval, A.nrows, solver.structure;
+    # matching and scaling (from the values of the first batch member); "G": the analysis runs on (Dr A Dc)[:, q]
+    m = compute_matching(solver.host_rowptr, solver.host_colval, _first_member(A), A.nrows, solver.structure,
+                         solver.options; view = _stored_view(solver), index = A.index)
+    solver.host_matching = m
+    solver.analysis_colval = m === nothing || m.symmetric ? solver.host_colval :
+                             matched_colval(m, solver.host_colval, A.index)
+    P = SymmetricPattern(solver.host_rowptr, solver.analysis_colval, A.nrows, solver.structure;
                          view = _stored_view(solver), index = A.index)
     if solver.options.schur_mode == 1
         # Schur complement mode: the Schur rows and columns last, no 2×2 pivot pairs
@@ -400,6 +470,13 @@ function _reorder!(solver::DirectSolver{T}) where {T}
         solver.ordering = compute_schur_ordering(P, solver.options, flags; T)
         rowptr, colval = schur_pattern(P, flags)
         solver.schur = SchurState(flags, findall(flags), rowptr, colval, nothing, VIEW_FULL)
+    elseif m !== nothing && m.symmetric
+        # 2×2 pivot pairs ("S"/"H") from the cycles of the symmetric matching (issue #67)
+        pairs = pairs_enabled(solver.structure, solver.options) ?
+                matching_pairs(m, solver.host_rowptr, solver.host_colval, _first_member(A), A.nrows, solver.structure,
+                               solver.options; view = _stored_view(solver), index = A.index) : Tuple{Int, Int}[]
+        solver.ordering = compute_ordering(P, solver.options; T, pairs)
+        solver.schur = nothing
     else
         # 2×2 pivot pairs ("S"/"H"): the only host copy of the values, at analysis (of the first batch member)
         pp = analysis_pairs(P, solver.host_rowptr, solver.host_colval, _first_member(A), A.nrows, solver.structure,
@@ -408,10 +485,35 @@ function _reorder!(solver::DirectSolver{T}) where {T}
         solver.schur = nothing
     end
     solver.host_symbolic = solver.symbolic = solver.numeric = solver.workspace = solver.refinement = nothing
+    solver.matching = nothing
     solver.stage = STAGE_REORDERED
     _log(LOG_INFO, () -> "reordering: n = $(A.nrows), nnz = $(nnz(A)), $(_elapsed(tic))")
     return solver
 end
+
+# the device matching state of the analysis `Sh` (host) / `Sd` (device maps)
+function _matching_state(solver::DirectSolver{T, INT}, Sh::Symbolic, Sd::Symbolic) where {T, INT}
+    m = solver.host_matching
+    R = real(T)
+    be = solver.backend
+    cperm = m.symmetric ? Sd.perm : _index_vector(be, m.perm[Sh.perm], INT, :perm_matching)
+    dev(x) = (y = KernelAbstractions.allocate(be, R, length(x)); copyto!(y, R.(x)); y)
+    io = SolveScaling(Sd.perm, cperm, dev(m.rscale), dev(m.cscale))
+    weights = dev(entry_scaling(m, solver.host_rowptr, solver.host_colval, solver.A.nrows; index = solver.A.index))
+    values = KernelAbstractions.zeros(be, T, length(solver.A.nzval))
+    return MatchingState(io, weights, values)
+end
+
+# the values the numeric phase factors: the user's, or scaled by the matching
+function _factor_values(solver::DirectSolver)
+    nz = _flat(solver.A.nzval)
+    st = solver.matching
+    st === nothing && return nz
+    return scale_values!(st.values, st.weights, nz)
+end
+
+# the matching permutations and scalings of the solve phases (`nothing` without matching)
+_solve_scaling(solver::DirectSolver) = solver.matching === nothing ? nothing : solver.matching.io
 
 # the values of the first batch member (all of them for a single matrix)
 _first_member(A::CSR) = nbatch(A) == 1 ? A.nzval : A.nzval isa AbstractMatrix ? view(A.nzval, :, 1) :
@@ -426,7 +528,7 @@ function _symbolic!(solver::DirectSolver{T, INT}) where {T, INT}
     opts = solver.options
     A = solver.A
     ord = solver.ordering
-    P = SymmetricPattern(solver.host_rowptr, solver.host_colval, A.nrows, solver.structure;
+    P = SymmetricPattern(solver.host_rowptr, solver.analysis_colval, A.nrows, solver.structure;
                          view = _stored_view(solver), index = A.index)
     if solver.schur === nothing
         sp = supernode_partition(factor_pattern(P, ord), ord.perm, opts)
@@ -438,7 +540,7 @@ function _symbolic!(solver::DirectSolver{T, INT}) where {T, INT}
     sc = build_schedule(sp, opts, T; reserve = subtree_local_reserve(solver.structure),
                         elsize = schedule_elsize(solver.structure, T), schur)
     layout = build_layout(sp, sc; ldlt = _is_ldlt_structure(solver.structure))
-    Sh = Symbolic(sp, sc, layout, solver.host_rowptr, solver.host_colval, A.nrows, solver.structure;
+    Sh = Symbolic(sp, sc, layout, solver.host_rowptr, solver.analysis_colval, A.nrows, solver.structure;
                   view = _stored_view(solver), index = A.index)
     nrhs = solver.workspace === nothing ? solver.nbatch : max_rhs(solver.workspace)
     Sd = adapt(solver.backend, Sh, INT)
@@ -446,6 +548,7 @@ function _symbolic!(solver::DirectSolver{T, INT}) where {T, INT}
     solver.symbolic = Sd
     solver.numeric = allocate_numeric(Sd, T, solver.backend; nbatch = solver.nbatch)
     solver.workspace = allocate_solve(Sd, T, solver.backend, nrhs)
+    solver.matching = solver.host_matching === nothing ? nothing : _matching_state(solver, Sh, Sd)
     solver.refinement = nothing
     solver.stage = STAGE_ANALYZED
     solver.fresh_factorization = true
@@ -522,17 +625,17 @@ function _numeric_phase!(solver::DirectSolver)
 end
 
 function _numeric_phase_cholesky!(solver::DirectSolver)
-    factorize_cholesky!(solver.numeric, solver.symbolic, _flat(solver.A.nzval); opts = solver.options)
+    factorize_cholesky!(solver.numeric, solver.symbolic, _factor_values(solver); opts = solver.options)
     return nothing
 end
 
 function _numeric_phase_ldlt!(solver::DirectSolver)
-    factorize_ldlt!(solver.numeric, solver.symbolic, _flat(solver.A.nzval); opts = solver.options)
+    factorize_ldlt!(solver.numeric, solver.symbolic, _factor_values(solver); opts = solver.options)
     return nothing
 end
 
 function _numeric_phase_lu!(solver::DirectSolver)
-    factorize_lu!(solver.numeric, solver.symbolic, _flat(solver.A.nzval); opts = solver.options)
+    factorize_lu!(solver.numeric, solver.symbolic, _factor_values(solver); opts = solver.options)
     return nothing
 end
 
@@ -627,6 +730,7 @@ function _solve_phase!(solver::DirectSolver, p::Phase, X::AbstractVecOrMat, B::A
     S.schedule.schur > 0 && return _schur_solve_phase!(solver, p, X, B, transposed, nrhs, ws, bm, det, cj, tm)
     (p == PHASE_SOLVE_FWD_SCHUR || p == PHASE_SOLVE_BWD_SCHUR) &&
         throw(_phase_error(convert(String, p), "needs an analysis with schur_mode = 1"))
+    pin, sin, pout, sout = solve_io(S, _solve_scaling(solver), tm)
     refine = opts.ir_n_steps > 0 && (p == PHASE_SOLVE || p == PHASE_SOLVE_REFINEMENT)
     if p == PHASE_SOLVE_REFINEMENT && refine && Base.mightalias(X, B)
         throw(InvalidValueError("\"solve_refinement\" needs the original right-hand side: X and B must not alias"))
@@ -638,14 +742,14 @@ function _solve_phase!(solver::DirectSolver, p::Phase, X::AbstractVecOrMat, B::A
             copy_rhs!(W.Bc, B; nrhs = nu, transposed)
             Bs, bt = W.Bc, false
         end
-        permute_rhs!(ws.Y, B, S.perm; transposed, conjugate = cj, bm)
+        permute_rhs!(ws.Y, B, pin; transposed, conjugate = cj, bm, scale = sin)
         forward_sweep!(ws, S, N; nrhs, deterministic = det, transpose = tm)
         diagonal_sweep!(ws, S, N; nrhs)
         backward_sweep!(ws, S, N; nrhs, transpose = tm)
-        unpermute_solution!(X, ws.Y, S.perm; transposed, conjugate = cj, bm)
+        unpermute_solution!(X, ws.Y, pout; transposed, conjugate = cj, bm, scale = sout)
         refine ? _refine_phase!(solver, W, ws, X, Bs, transposed, bt, cj, det, tm) : (solver.ir_steps = 0)
     elseif p == PHASE_SOLVE_FWD_PERM
-        permute_rhs!(ws.Y, B, S.perm; transposed, conjugate = cj, bm)
+        permute_rhs!(ws.Y, B, pin; transposed, conjugate = cj, bm, scale = sin)
     elseif p == PHASE_SOLVE_FWD
         forward_sweep!(ws, S, N; nrhs, deterministic = det, transpose = tm)
     elseif p == PHASE_SOLVE_DIAG
@@ -653,7 +757,7 @@ function _solve_phase!(solver::DirectSolver, p::Phase, X::AbstractVecOrMat, B::A
     elseif p == PHASE_SOLVE_BWD
         backward_sweep!(ws, S, N; nrhs, transpose = tm)
     elseif p == PHASE_SOLVE_BWD_PERM
-        unpermute_solution!(X, ws.Y, S.perm; transposed, conjugate = cj, bm)
+        unpermute_solution!(X, ws.Y, pout; transposed, conjugate = cj, bm, scale = sout)
     else  # PHASE_SOLVE_REFINEMENT
         refine ? _refine_phase!(solver, W, ws, X, B, transposed, transposed, cj, det, tm) : (solver.ir_steps = 0)
     end
@@ -697,7 +801,8 @@ function _refine_phase!(solver::DirectSolver, W::RefinementWorkspace, ws::SolveW
         driver = opts.ir_mode == IR_FGMRES ? fgmres_refine! : refine!
         driver(X, B, W, ws, solver.symbolic, solver.numeric, vec(solver.A.nzval); nsteps = opts.ir_n_steps,
                tol = opts.ir_tol, transposed = xt, b_transposed = bt, conjugate = cj, deterministic = det,
-               interrupt = opts.user_host_interrupt, progress = done, transpose_matrix = tm)
+               interrupt = opts.user_host_interrupt, progress = done, transpose_matrix = tm,
+               scaling = _solve_scaling(solver))
     finally
         solver.ir_steps = done[]
     end
@@ -753,11 +858,10 @@ end
 # data parameters the solver computes (PLAN §1.4, §1.7)
 const SOLVER_OUTPUTS = ("lu_nnz", "flops", "nsuperpanels", "memory_estimates", "perm_reorder_row",
                         "perm_reorder_col", "perm_row", "perm_col", "diag", "npivots", "inertia", "pivot_stats",
-                        "schur_shape", "schur_matrix")
+                        "schur_shape", "schur_matrix", "perm_matching", "scale_row", "scale_col")
 
 # task that provides the other computed data parameters
 function _output_task(name)
-    name in ("perm_matching", "scale_row", "scale_col") && return "T21"
     name == "nd_partition_tree" && return "T24"
     return "M12"   # hybrid_device_memory_min
 end
@@ -838,7 +942,9 @@ The data parameters computed by the solver:
 | `"nsuperpanels"` | `Int`: supernodes after amalgamation | analysis |
 | `"memory_estimates"` | `Vector{Int64}` (16 entries, see [`memory_estimates`](@ref)) | analysis |
 | `"perm_reorder_row"`, `"perm_reorder_col"` | `Vector{Int}`: the fill-reducing permutation, 1-based (`perm[k]` = original index of the `k`-th pivot) | reordering |
-| `"perm_row"`, `"perm_col"` | `Vector{Int}`: the final permutation of the factor (= the reordering for Cholesky and LDLᵀ/LDLᴴ); LU (`"G"`) after a factorization: `perm_row[k]` is the original row of factor row `k` (the reordering composed with the local row interchanges of batch member 1), `perm_col` the reordering, so `A[perm_row, perm_col] = L D U` | analysis |
+| `"perm_row"`, `"perm_col"` | `Vector{Int}`: the final permutation of the factor (= the reordering for Cholesky and LDLᵀ/LDLᴴ); LU (`"G"`) after a factorization: `perm_row[k]` is the original row of factor row `k` (the reordering composed with the local row interchanges of batch member 1), `perm_col` the reordering (with matching: composed with the matching, `perm_matching[reordering]`), so `A[perm_row, perm_col] = L D U` (with matching `Dr A[perm_row, perm_col] Dc = L D U`, the scalings in that order) | analysis |
+| `"perm_matching"` | `Vector{Int}`: the matching permutation ([`Matching`](@ref)): row `i` is matched to column `perm_matching[i]` (`"G"`: `A[:, perm_matching]` has the matched entries on its diagonal; symmetric structures: only its cycles are used, for the 2×2 pivot pairs) | reordering (`matching_alg ≠ "default"`) |
+| `"scale_row"`, `"scale_col"` | `Vector{real(T)}`: the row and column scaling factors `Dr`, `Dc` of the factored matrix, in the original numbering (ones for `"algo1"`–`"algo4"`; equal for the symmetric structures) | reordering (`matching_alg ≠ "default"`) |
 | `"diag"` | vector of `T` on the solver's backend: the diagonal of `L` (Cholesky), of `D` (LDLᵀ/LDLᴴ; for a 2×2 block its two diagonal entries) or of `D` in `L D U` (LU, = the diagonal of `U` in `L U`) in factor order; Schur complement mode: `1` on the (unfactored) Schur block | factorization |
 | `"npivots"` | `INT`: perturbed pivots (LDLᵀ/LDLᴴ, LU; `0` for Cholesky) | factorization |
 | `"inertia"` | `Tuple{INT, INT}`: `(npos, nneg)` of D (after perturbation, so the inertia of `A + E`; read it with `"npivots"`); `(0, 0)` for complex symmetric `"S"` and for `"G"`; Cholesky: `(number of positive pivots, 0)` | factorization |
@@ -859,8 +965,9 @@ The pivot statistics are reduced on the device ([`reduce_stats!`](@ref)) and
 copied to the host when read (one synchronization). The reordering
 permutation after `"reordering"` alone is the ordering algorithm's; `"symbolic_factorization"` composes it with the supernodal
 renumbering, and from then on both permutations are the one the factor uses.
-Data parameters of later tasks (`"perm_matching"`, `"scale_row"`, …) raise [`NotSupportedError`](@ref); reading
-one before the phase that computes it raises [`FactorizationError`](@ref).
+Data parameters of later tasks (`"nd_partition_tree"`, `"hybrid_device_memory_min"`) raise
+[`NotSupportedError`](@ref); reading one before the phase that computes it raises [`FactorizationError`](@ref), and
+the matching outputs without matching [`InvalidValueError`](@ref).
 """
 function getparam(solver::DirectSolver, name::AbstractString)
     spec = parameter_spec(name)
@@ -873,6 +980,14 @@ function getparam(solver::DirectSolver, name::AbstractString)
         _need_stage(solver, STAGE_REORDERED, name)
         Sh = solver.host_symbolic
         return Sh === nothing ? copy(solver.ordering.perm) : copy(Sh.partition.perm)
+    end
+    if name in ("perm_matching", "scale_row", "scale_col")
+        _need_stage(solver, STAGE_REORDERED, name)
+        m = solver.host_matching
+        m === nothing && throw(InvalidValueError("the data parameter \"$name\" needs matching " *
+                                                 "(matching_alg ≠ \"default\" at the analysis)"))
+        name == "perm_matching" && return copy(m.perm)
+        return Vector{real(eltype(solver))}(name == "scale_row" ? m.rscale : m.cscale)
     end
     if name == "diag"
         _need_stage(solver, STAGE_FACTORIZED, name)
@@ -902,6 +1017,8 @@ function getparam(solver::DirectSolver, name::AbstractString)
         piv = Array(view(solver.numeric.piv, 1:Sh.n))    # local row order of member 1
         return sp.perm[piv]
     end
+    m = solver.host_matching
+    name == "perm_col" && m !== nothing && !m.symmetric && return m.perm[sp.perm]   # "G": the matched columns
     return copy(sp.perm)   # perm_row, perm_col
 end
 
