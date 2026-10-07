@@ -190,10 +190,11 @@ run once per selected element type (`test_api[Float64]`, …): `ELTYPES`, `REAL_
 and `COMPLEX_ELTYPES` are then that part's subset, and a testset that does not loop
 over the element types runs in the `Float64` part only (the first selected type's
 when `Float64` is not selected; `RUN_SHARED && @testset …`). In a split file, write
-every testset either over `ELTYPES` or behind `RUN_SHARED`. A testset for some
-element types only loops over `eltypes_among((Float64, ComplexF32))` or
+every testset either over `ELTYPES` or behind `RUN_SHARED`. A numeric testset for
+some element types only loops over `eltypes_among((Float64, ComplexF32))` or
 `eltypes_among(Complex)`, never over a hard-coded list or `ELTYPES[k]`, so any
-selection with a real type works.
+selection with a real type works (host-only symbolic checks of element sizes may
+name their types).
 
 ## Code conventions
 
