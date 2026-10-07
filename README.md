@@ -28,8 +28,12 @@ CUDA:
 * GPU LU (`"G"`, `L D U` on the symmetric pattern of `A + Aᵀ`) with row
   interchanges inside the fully-summed block of each front (threshold partial
   pivoting, `pivot_threshold`), static perturbation of tiny pivots, `perm_row`
-  and `perm_col`, solves with `A`, `Aᵀ` and `Aᴴ`, and uniform batches; the same
-  pivot sequence as the CPU reference LU;
+  and `perm_col`, and solves with `A`, `Aᵀ` and `Aᴴ`; the same pivot sequence
+  as the CPU reference LU;
+* uniform batches for every structure (`ubatch_size`, `ubatch_index`,
+  `ubatch_mask`; values as a long vector, a matrix or a 3-D array; strided
+  and 3-D right-hand sides; per-member `info` and statistics), with
+  strided-batched vendor calls on the root fronts;
 * GPU triangular solves with multiple right-hand sides, forward, diagonal and
   backward sub-phases, permutations, `solve_mode` (transposed and conjugated
   systems), and iterative refinement (`ir_n_steps`, `ir_tol`), allocation-free
@@ -52,12 +56,17 @@ CUDA:
   checked by the test suite of CUDSS.jl ported to this package; phase logging
   through `SDS_LOG_LEVEL`.
 
-Not there yet: non-uniform batches, mixed precision, and the AMDGPU, oneAPI and
-Metal extensions. Unsupported structures, phases and parameters raise
-`NotSupportedError` rather than falling back silently.
+Not there yet: non-uniform batches, ND partition-tree export, mixed precision,
+hybrid host memory, delayed pivots, and the AMDGPU, oneAPI and Metal
+extensions. Unsupported structures, phases and parameters raise
+`NotSupportedError` rather than falling back silently. The remaining gap to
+cuDSS is performance, not features (see below and
+[`PERFORMANCE.md`](PERFORMANCE.md)).
 
 * [`PLAN.md`](PLAN.md) — design, API, milestones.
 * [`TASKS.md`](TASKS.md) — implementation tasks and their reports.
+* [`STATE.md`](STATE.md) — the owner's state review between tasks.
+* [`PERFORMANCE.md`](PERFORMANCE.md) — gap analysis against cuDSS and the experiment plan.
 * [`RESEARCH.md`](RESEARCH.md) — background and state of the art.
 * [`bench/README.md`](bench/README.md) — benchmark harness and cuDSS baselines.
 * [`bench/comparison/comparison.md`](bench/comparison/comparison.md) — per-feature performance comparison with cuDSS.
@@ -91,8 +100,9 @@ dissection ordering; without it the ordering is AMD.
 
 The handle API mirrors CUDSS.jl: a `DirectSolver` is created from a CSR matrix
 living on a KernelAbstractions backend, with a structure string (`"SPD"`,
-`"HPD"`, `"S"`, `"H"`, or `"G"` for LU, which reads the full matrix, view `'F'`) and the
-triangle that is read (`'L'`, `'U'` or `'F'`). Phases are run with `execute!`.
+`"HPD"`, `"S"`, `"H"`, or `"G"` for LU) and the triangle that is read (`'L'`,
+`'U'` or `'F'`; ignored for `"G"`, which reads the full matrix, as in cuDSS).
+Phases are run with `execute!`.
 
 ```julia
 using SparseDirectSolver, SparseArrays, LinearAlgebra
@@ -132,6 +142,19 @@ getparam(solver, "pivot_stats")                       # (npos, nneg, nzero, nper
 execute!("solve", solver, x_gpu, b_gpu)
 ```
 
+Two things to know for KKT systems. The 2×2 pivot pairs that let the in-front
+pivoting handle zero dual diagonals (`pivot_pairs`, default `"default"`, also
+`"all"` and `"none"`) are chosen from the values present when `"analysis"`
+runs, so run the analysis after the first KKT assembly, not on an empty
+buffer. Badly scaled systems (late IPM iterates) need the MC64 scaling,
+`setparam!(solver, "matching_alg", "algo5")`, which brings the K2 systems of
+MadNLP to a handful of perturbed pivots at about 2× the factor size, plus a
+few refinement steps; `ir_mode = "fgmres"` (after `using Krylov`) is the
+robust choice there.
+
+General matrices use `"G"` and the same phases; `getparam(solver, "perm_row")`
+and `"perm_col"` give the composed permutations.
+
 The same code runs on the CPU backend by wrapping the host CSR arrays in a
 `CSR` (or passing a `SparseMatrixCSC`) instead of a `CuSparseMatrixCSR`. The
 `LinearAlgebra` layer offers the usual shortcuts, with two refinement steps per
@@ -142,6 +165,7 @@ F = cholesky(A_gpu; view = 'L')        # analysis + factorization
 ldiv!(x_gpu, F, b_gpu)                 # or x_gpu = F \ b_gpu
 cholesky!(F, A_gpu_new)                # refactorization with the same pattern
 F = ldlt(K_gpu; view = 'L')            # LDLᵀ (real) or LDLᴴ (complex)
+F = lu(G_gpu)                          # LDU with in-front pivoting
 logabsdet(F)
 ```
 
@@ -157,20 +181,24 @@ SDS_TEST_GPU=0 julia --project=. -e 'using Pkg; Pkg.test()'        # CPU only
 SDS_TEST_CPU=0 julia --project=. -e 'using Pkg; Pkg.test()'        # GPU only
 SDS_TEST_ONLY="test_symbolic_etree,test_options" julia --project=. -e 'using Pkg; Pkg.test()'
 SDS_TEST_SKIP="test_aqua" julia --project=. -e 'using Pkg; Pkg.test()'
+PTR_NUM_JOBS=4 julia --project=. -e 'using Pkg; Pkg.test()'                 # number of test workers
 ```
 
-GPU backends are tested when their package is present in the test environment
-and functional. CI adds them itself; locally, add one with
-`julia --project=test -e 'using Pkg; Pkg.add("CUDA")'` and do not commit that
-change to `test/Project.toml`.
+The test files run in parallel worker processes (ParallelTestRunner.jl); the
+long files run once per element type. Most of the wall time is kernel
+compilation, not tests. GPU backends are tested when their package is present
+in the test environment and functional. CI adds them itself; locally, add one
+with `julia --project=test -e 'using Pkg; Pkg.add("CUDA")'` and do not commit
+that change to `test/Project.toml`.
 
 ## Development
 
 The project is developed task by task; `TASKS.md` lists the tasks and the
 report of every finished one. Each task lands through a pull request that CI
-(CPU suite on GitHub runners, GPU suite on self-hosted `cuda` runners) and an
-automated review must pass. `AGENTS.md` describes the workflow and the code
-conventions.
+(CPU suite on GitHub and self-hosted runners, GPU suite on the self-hosted
+`cuda` runner) and an automated review must pass; between tasks the owner
+reviews the state (`STATE.md`) and refreshes `PLAN.md`. `AGENTS.md` describes
+the workflow and the code conventions.
 
 ## License
 
