@@ -195,6 +195,9 @@ end
                 b_cpu = rand(T, n)
                 xs = map(('L', 'U', 'F')) do view
                     solver = DirectSolver(api_matrix(backend, A_cpu, INT), "G", view)
+                    # the atomic forward sweep (default) adds in launch order on GPUs; bitwise
+                    # equality needs the deterministic solve (#36)
+                    setparam!(solver, "deterministic_mode", 1)
                     x_gpu = to_device(backend, zeros(T, n))
                     b_gpu = to_device(backend, b_cpu)
                     for phase in ("analysis", "factorization", "solve")
