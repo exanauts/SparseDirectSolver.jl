@@ -4,7 +4,8 @@
 #
 # Run a subset with SDS_TEST_ONLY="test_options,test_aqua" or with test arguments (prefix match, `!name` excludes:
 # `Pkg.test(; test_args = ["test_symbolic", "!test_symbolic_etree"])`), leave files out with SDS_TEST_SKIP="test_aqua",
-# skip the GPU backends with SDS_TEST_GPU=0 and the CPU backend with SDS_TEST_CPU=0 (see backends.jl). The number of
+# skip the GPU backends with SDS_TEST_GPU=0 and the CPU backend with SDS_TEST_CPU=0, and select the element types with
+# SDS_TEST_ELTYPES="Float64,ComplexF32" (default all four; see backends.jl). The number of
 # workers is ParallelTestRunner's default (CPU threads and free memory); set it with `--jobs=N` or PTR_NUM_JOBS.
 
 using ParallelTestRunner
@@ -41,20 +42,30 @@ const init_worker_code = quote
     const SDS_TEST_PART = Ref{Any}(nothing)
 end
 
-# Long test files run once per element type, "test_api[Float64]" etc., each part in a worker of its own: a
-# worker compiles the solver for every element type it tests, and that compilation, not the tests, sets the wall
-# time. The testsets that do not loop over the element types run in the Float64 part (`RUN_SHARED`).
+# the backends and the element types of the run (`SELECTED_ELTYPES`), read once from the environment in the main
+# process: prints the banner and fails early on an empty backend list or a bad SDS_TEST_ELTYPES
+module BackendBanner end
+Core.eval(BackendBanner, init_code)
+Core.eval(BackendBanner, :(include($(joinpath(TEST_DIR, "backends.jl")))))
+BackendBanner.print_backends()
+
+# Long test files run once per selected element type, "test_api[Float64]" etc., each part in a worker of its own:
+# a worker compiles the solver for every element type it tests, and that compilation, not the tests, sets the wall
+# time. The testsets that do not loop over the element types run in the Float64 part, or in the first selected
+# type's part when SDS_TEST_ELTYPES leaves Float64 out (`RUN_SHARED`).
 const SPLIT_FILES = ["test_api", "test_dense", "test_fgmres", "test_matching", "test_numeric_cholesky_a",
                      "test_numeric_cholesky_b", "test_numeric_cholesky_c", "test_numeric_ldlt", "test_numeric_lu",
                      "test_ported", "test_refinement", "test_schur", "test_solve", "test_ubatch"]
-const SPLIT_ELTYPES = (Float32, Float64, ComplexF32, ComplexF64)
+const SPLIT_ELTYPES = BackendBanner.SELECTED_ELTYPES
+const SHARED_ELTYPE = Float64 in SPLIT_ELTYPES ? Float64 : first(SPLIT_ELTYPES)
 
-# the seed goes with the test, not into `init_code`: ParallelTestRunner seeds with 1 after `init_code`
+# the seed goes with the test, not into `init_code`: ParallelTestRunner seeds with 1 after `init_code`; `backends.jl`
+# comes first, `utils.jl` derives `ELTYPES` from its `SELECTED_ELTYPES`
 test_expr(name, part) = quote
     Main.SDS_TEST_PART[] = $part
+    include($(joinpath(TEST_DIR, "backends.jl")))
     include($(joinpath(TEST_DIR, "utils.jl")))
     include($(joinpath(TEST_DIR, "matrices.jl")))
-    include($(joinpath(TEST_DIR, "backends.jl")))
     Random.seed!(666)
     include($(joinpath(TEST_DIR, "$name.jl")))
 end
@@ -63,7 +74,7 @@ testsuite = Dict{String, Expr}()
 for name in TEST_FILES
     if name in SPLIT_FILES
         for T in SPLIT_ELTYPES
-            testsuite["$name[$T]"] = test_expr(name, ((T,), T == Float64))
+            testsuite["$name[$T]"] = test_expr(name, ((T,), T == SHARED_ELTYPE))
         end
     else
         testsuite[name] = test_expr(name, nothing)
@@ -79,12 +90,6 @@ if filter_tests!(testsuite, args)
     isempty(only) || filter!(t -> names_test(only, first(t)), testsuite)
     filter!(t -> !names_test(skip, first(t)), testsuite)
 end
-
-# the backend banner once, from the main process (also fails early when no backend is left to test)
-module BackendBanner end
-Core.eval(BackendBanner, init_code)
-Core.eval(BackendBanner, :(include($(joinpath(TEST_DIR, "backends.jl")))))
-BackendBanner.print_backends()
 
 runtests(SparseDirectSolver, args; testsuite, init_code, init_worker_code,
          history_key = get(ENV, "SDS_TEST_CPU", "1") == "0" ? "gpu" : nothing)

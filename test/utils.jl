@@ -4,11 +4,12 @@
 using LinearAlgebra
 using SparseArrays
 
-# The element types under test. `runtests.jl` runs a long test file once per element type, each part in its own
-# worker: the part sets `Main.SDS_TEST_PART[] = (eltypes, shared)` before these helpers are included (`nothing`:
-# all element types, one part).
+# The element types under test: `SELECTED_ELTYPES` (`backends.jl`, from SDS_TEST_ELTYPES; `backends.jl` is
+# included before these helpers). `runtests.jl` runs a long test file once per selected element type, each part in
+# its own worker: the part sets `Main.SDS_TEST_PART[] = (eltypes, shared)` before the helpers are included
+# (`nothing`: all selected element types, one part).
 const TEST_PART = isdefined(Main, :SDS_TEST_PART) ? Main.SDS_TEST_PART[] : nothing
-const ELTYPES = TEST_PART === nothing ? (Float32, Float64, ComplexF32, ComplexF64) : TEST_PART[1]
+const ELTYPES = TEST_PART === nothing ? SELECTED_ELTYPES : TEST_PART[1]
 const REAL_ELTYPES = filter(T -> T <: Real, ELTYPES)
 const COMPLEX_ELTYPES = filter(T -> T <: Complex, ELTYPES)
 
@@ -17,9 +18,29 @@ const COMPLEX_ELTYPES = filter(T -> T <: Complex, ELTYPES)
 
 `true` when this run of a test file runs the testsets that do not loop over the
 element types (`RUN_SHARED && @testset …`): in the one part of a test file split
-by element type that owns them, and always in an unsplit test file.
+by element type that owns them (the `Float64` part, or the first selected type's
+when `Float64` is not selected), and always in an unsplit test file.
 """
 const RUN_SHARED = TEST_PART === nothing || TEST_PART[2]
+
+"""
+    eltypes_among(types) -> Tuple
+    eltypes_among(S::Type) -> Tuple
+
+The element types of this part that are among `types` (or subtypes of `S`), for a
+testset that runs for some element types only
+(`for T in eltypes_among((Float64, ComplexF32))`, `for T in eltypes_among(Complex)`).
+When `SDS_TEST_ELTYPES` selects none of `types`, the part that runs the shared
+testsets says that the testset is skipped.
+"""
+function eltypes_among(types)
+    if RUN_SHARED && !any(in(types), SELECTED_ELTYPES)
+        @info "SDS_TEST_ELTYPES selects none of $(join(types, ", ")): testset skipped"
+    end
+    return filter(in(types), ELTYPES)
+end
+eltypes_among(S::Type) = eltypes_among(filter(T -> T <: S, ALL_ELTYPES))
+
 const INTTYPES = (Int32, Int64)
 
 """

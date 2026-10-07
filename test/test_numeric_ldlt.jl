@@ -431,7 +431,7 @@ end
 end
 
 @testset "complex symmetric through the API ($(backend_name(backend)), $T)" for backend in BACKENDS,
-                                                                              T in COMPLEX_ELTYPES
+                                                                              T in eltypes_among(Complex)
     Random.seed!(666)
     A = random_symindef(T, 300, 0.02; hermitian = false)
     solver = DirectSolver(api_matrix(backend, tril(A), Int32), "S", 'L')

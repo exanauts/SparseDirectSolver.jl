@@ -9,6 +9,19 @@ on:
     types: [opened, synchronize, reopened]
   schedule:
     - cron: '0 0 * * 0'
+  workflow_dispatch:
+    inputs:
+      eltypes:
+        description: 'SDS_TEST_ELTYPES: comma-separated element types; empty runs all four'
+        required: false
+        default: 'Float32,Float64,ComplexF32,ComplexF64'
+        type: string
+
+# Element types under test (test/backends.jl, issue #91): pull requests and pushes run one real and one complex
+# type, the two that differ most in storage; the weekly schedule runs all four (the empty string), a manual run
+# what its input says (default all four). Kernel compilation per element type sets the test time.
+env:
+  SDS_TEST_ELTYPES: ${{ (github.event_name == 'pull_request' || github.event_name == 'push') && 'Float64,ComplexF32' || inputs.eltypes }}
 
 jobs:
   # Runs on the self-hosted kkt machine (more cores than a GitHub runner for the parallel test workers). The
