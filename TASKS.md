@@ -2577,7 +2577,8 @@ uniform-batch LU tests pass; `random_general` residuals `≤ tol(T)`.
   - #84 (found-by-agent): views `'L'`/`'U'` with `"G"`.
   - Regime-C performance (vendor BLAS-3, parallel pivot search) with #75 in T25. The pivot search is serial on
     work item 1 (`O(f)` per column, cheaper than the LDLᵀ fallback scan).
-  - `perm_row` reports batch member 1 for a uniform batch (each member has its own local row order).
+  - #92 (found-by-agent): `perm_row` reports batch member 1 for a uniform batch (each member has its own local
+    row order).
   - CUDA path exercised only by CI.
   - Device arithmetic fuses multiply-adds (GPUCompiler `-nvptx-fma-level=1`), so device-vs-reference equality is
     bitwise on the CPU backend only. On `weak_diagonal_general` with `pivot_threshold = 0.01` (growth ≈ 3e2) CUDA
