@@ -2654,8 +2654,15 @@ Constrained ordering, unfactorized root front, `schur_shape`, dense and CSR
   - Test adaptations required by the feature: `test_api.jl` expected `NotSupportedError` for `schur_mode = 1`, the
     Schur phases and `"schur_shape"`/`"schur_matrix"`; now: missing `user_schur_indices` → `InvalidValueError`,
     Schur phases without Schur mode → `FactorizationError`, Schur outputs without Schur mode → `InvalidValueError`.
-- Tests: SUBSET_COUNTS
-  CUDA/AMDGPU: pending CI on the PR.
+- Tests: `SDS_TEST_GPU=0 julia --project=. -e 'using Pkg; Pkg.test()'` (Julia 1.13.1, ubuntu-latest, KA CPU
+  backend): 68743 pass / 0 fail / 1 broken (the T16 `@test_broken`), 30.9 min, including `test_schur` (four
+  parts, ≈ 1800 checks; 5–7 min per part standalone, mostly kernel compilation) and `test_ported` with the Schur
+  port (`test_ported[Float32]` 2910 pass). During development the subset
+  `SDS_TEST_ONLY=test_schur,test_ported,test_api,test_aqua` found only over-strict regime assertions of my own new
+  test (no regime A by default at n = 120, regime-A children of the root only for the Laplacian), fixed before the
+  final run. CUDA/AMDGPU: pending CI on the PR.
+  The GitHub App token expired before the last push: the final commits are local and published by the workflow's
+  "Publish the branch" step (which also opens the PR from the last commit message).
 - Measurements: none asked for. The three CUDSS.jl examples reproduce `S` to rounding (Float64: `‖S − S_ref‖` ≤ 9e-16)
   and the solution `ones(5)` to ≤ 4e-16.
 - Deviations from PLAN.md / this task:
