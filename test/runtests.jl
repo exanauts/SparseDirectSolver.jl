@@ -46,7 +46,7 @@ end
 # time. The testsets that do not loop over the element types run in the Float64 part (`RUN_SHARED`).
 const SPLIT_FILES = ["test_api", "test_dense", "test_fgmres", "test_numeric_cholesky_a", "test_numeric_cholesky_b",
                      "test_numeric_cholesky_c", "test_numeric_ldlt", "test_numeric_lu", "test_ported", "test_refinement",
-                     "test_solve", "test_ubatch"]
+                     "test_schur", "test_solve", "test_ubatch"]
 const SPLIT_ELTYPES = (Float32, Float64, ComplexF32, ComplexF64)
 
 # the seed goes with the test, not into `init_code`: ParallelTestRunner seeds with 1 after `init_code`

@@ -582,3 +582,94 @@ function lu_error(A, S, N)
     L, D, U, p, q = SparseDirectSolver.extract_lu(S, N)
     return norm(A[p, q] - L * Diagonal(D) * U) / norm(A)
 end
+
+# ---------------------------------------------------------------------------
+# Schur complement mode (T20)
+
+"""
+    schur_reference(A, flags) -> Matrix
+
+Dense Schur complement `A₂₂ − A₂₁ A₁₁⁻¹ A₁₂` of the rows and columns flagged in
+`flags` (`2`), in their increasing order, computed on the host.
+"""
+function schur_reference(A::SparseMatrixCSC, flags::AbstractVector{Bool})
+    s, r = findall(flags), findall(!, flags)
+    M = Matrix(A)
+    isempty(r) && return M[s, s]
+    return M[s, s] - M[s, r] * (M[r, r] \ M[r, s])
+end
+
+"""
+    schur_pattern_reference(A, flags) -> BitMatrix
+
+Symbolic pattern of the Schur complement by dense Boolean elimination of the
+unflagged vertices of the symmetric pattern of `A + Aᵀ`, diagonal included.
+"""
+function schur_pattern_reference(A::SparseMatrixCSC, flags::AbstractVector{Bool})
+    n = size(A, 1)
+    F = Matrix((A .!= 0) .| (transpose(A) .!= 0))
+    for k in findall(!, flags)
+        nb = [i for i in 1:n if i != k && F[i, k]]
+        for i in nb, j in nb
+            F[i, j] = true
+        end
+        F[k, :] .= false
+        F[:, k] .= false
+    end
+    s = findall(flags)
+    P = F[s, s]
+    for i in eachindex(s)
+        P[i, i] = true
+    end
+    return BitMatrix(P)
+end
+
+"""
+    schur_solver(backend, A, structure, flags, INT = Int32; view, opts = nothing, params = ()) -> solver
+
+Analyzed and factorized [`DirectSolver`](@ref) of `triangle_view(A, view)` in
+Schur complement mode (`schur_mode = 1`, `user_schur_indices = flags`), with
+the tuning options `opts` and the extra parameters `params` set first.
+"""
+function schur_solver(backend, A::SparseMatrixCSC, structure, flags, ::Type{INT} = Int32;
+                      view = structure == "G" ? 'F' : 'L', opts = nothing, params = ()) where {INT}
+    solver = DirectSolver(api_matrix(backend, triangle_view(A, view), INT), structure, view)
+    opts === nothing || (solver.options = opts)
+    setparam!(solver, "schur_mode", 1)
+    setparam!(solver, "user_schur_indices", INT.(flags))
+    for (name, value) in params
+        setparam!(solver, name, value)
+    end
+    execute!("analysis", solver, nothing, nothing)
+    execute!("factorization", solver, nothing, nothing)
+    return solver
+end
+
+"""
+    schur_solve(backend, solver, S, B; diag = true) -> (X, Bs)
+
+Solve `op(A) X = B` (host `B`, vector or matrix) with the Schur phases as in the
+CUDSS.jl docs: `"solve_fwd_schur"`, `"solve_diag"` (when `diag`), the
+condensed system `op(S) Xₛ = Bₛ` on the host with the dense `op(S)`, and
+`"solve_bwd_schur"`. Returns the host solution and the condensed right-hand
+side `Bₛ` (the last `ns` rows written by the forward phase).
+"""
+function schur_solve(backend, solver, S::AbstractMatrix, B::AbstractVecOrMat; diag::Bool = true)
+    n, ns = size(B, 1), size(S, 1)
+    Bd = to_device(backend, B)
+    Xd = to_device(backend, zero(B))
+    execute!("solve_fwd_schur", solver, Xd, Bd)
+    diag && execute!("solve_diag", solver, Xd, Xd)
+    Xh = to_host(Xd)
+    tail = (n - ns + 1):n
+    Bs = B isa AbstractVector ? Xh[tail] : Xh[tail, :]
+    if B isa AbstractVector
+        Xh[tail] = S \ Bs
+    else
+        Xh[tail, :] = S \ Bs
+    end
+    copyto!(Xd, Xh)
+    Yd = to_device(backend, zero(B))
+    execute!("solve_bwd_schur", solver, Yd, Xd)
+    return to_host(Yd), Bs
+end

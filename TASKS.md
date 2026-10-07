@@ -2593,11 +2593,107 @@ uniform-batch LU tests pass; `random_general` residuals `≤ tol(T)`.
   - PLAN §2.4 / §3.3: regime C of `"G"` uses the KA in-front kernel (same pivot sequence as the oracle); vendor
     calls only for the BLAS-3 parts (T25).
 
-### T20 — Schur complement mode   `[ ]`
+### T20 — Schur complement mode   `[!]`
 
 Constrained ordering, unfactorized root front, `schur_shape`, dense and CSR
 `schur_matrix`, `solve_fwd_schur`/`solve_bwd_schur`; the three 5×5 examples of
 `../CUDSS.jl/docs/src/schur_complement.md` pass on CPU and CUDA (`test_schur_cudss.jl` ported).
+
+#### Report
+
+- Status: [!] (done on the KA CPU backend for every structure; CUDA from CI; deviations below)
+- What was built:
+  - Ordering (`src/symbolic/ordering.jl`): `schur_flags` (validates `user_schur_indices`), `induced_pattern`,
+    `compute_schur_ordering` (the Schur rows/columns last in increasing original order; `reordering_alg` runs on the
+    pattern induced by the other vertices, which is exactly the ordering problem of the factored block since the
+    Schur vertices are never intermediate vertices of a fill path; `user_perm` keeps its relative order of the other
+    vertices), `schur_pattern` (exact symbolic pattern of `S`: `A₂₂` ∪ the clique of the Schur neighbours of every
+    connected component of the eliminated vertices, diagonal included).
+  - Supernodes (`src/symbolic/supernodes.jl`): `schur_supernode_partition`: the Schur columns are one dense root
+    supernode, the last one (etree chain, dense column counts); the other columns get fundamental supernodes and
+    amalgamation on their own forest, so nothing is merged into the root; a subtree whose etree parent lies in the
+    Schur block hangs below the root.
+  - Schedule: `build_schedule(…; schur)` forces the Schur root into regime C on a schedule level of its own (alone
+    in the last step and launch group); `Schedule.schur`; `nlaunches` counts no dense calls for it. `NumericPlan`
+    takes that group out of the B/C groups (`schur_first`, `schur_maxchild`), so the A/B/C drivers and kernels are
+    unchanged.
+  - Numeric (`src/numeric/schur.jl`, new): `assemble_schur!` (called by `factorize_cholesky!`, `factorize_ldlt!`,
+    `factorize_lu!` after every other front): zero + scatter of A + extend-add of the children's contribution
+    blocks into the root panel (`zero_fronts!`/`scatter_A!`/`extend_add!`; for LU one kernel on the `L` and `Uᵀ`
+    structures), then identity local pivot order, `d = 1` (unit 1×1 pivots) and zero statistics on the Schur
+    columns, so the diagonal sweep is the identity there and `npivots`/`inertia`/`pivot_stats` count `A₁₁` only
+    (the Cholesky statistics kernel skips the root). `schur_matrix!` exports the assembled panel into a dense
+    `ns × ns` matrix or the values of a CSR (one launch each; symmetric mirror, Hermitian conjugate mirror, LU
+    from the two structures; transposed for a CSC input).
+  - Solve (`src/solve/sweeps.jl`): launch kind `SOLVE_SCHUR`: the forward sweep skips the root (its rows end as the
+    condensed right-hand side; the deterministic variant runs the owner-pull of its children's update buffers), the
+    backward sweep skips it (its rows hold `x₂`).
+  - API (`src/solver.jl`): `schur_mode`/`user_schur_indices` at `"reordering"` (`SchurState`: flags, indices, pattern,
+    registered destination); phases `"solve_fwd_schur"` (permute + forward, `X` = factor-order vector whose last `ns`
+    entries are `bₛ`), `"solve_diag"` (D⁻¹ of LDLᵀ/LDLᴴ on the factored part; identity for Cholesky and LU) and
+    `"solve_bwd_schur"` (LU: diagonal, then backward + inverse permutation), reading `B` and writing `X` as cuDSS
+    does, with `solve_mode` 1/2 and transposed (CSC) input; `getparam` `"schur_shape"` (`(ns, ns, nnz)` of `Int64`,
+    one triangle with the diagonal for the symmetric structures) and `"schur_matrix"` (fills the destination set
+    with `setparam!(solver, "schur_matrix", S)` — dense matrix, `MatrixDescriptor`, `CSR`, a backend CSR such as
+    `CuSparseMatrixCSR`, or `(csr, view)` with view `'L'`/`'U'`/`'F'`; without one a new dense matrix);
+    `getparam!(dest, solver, "schur_matrix")`. `"diag"` is `1` on the Schur block. README feature list.
+  - Tests: `test/ported/cudss_schur.jl` (port of CUDSS.jl `test_schur_cudss.jl`: `cudss_schur_lu`,
+    `cudss_schur_ldlt`, `cudss_schur_cholesky`, every `T`, `INT ∈ (Int32, Int64)`, index `'Z'`/`'O'`, dense and
+    sparse `S`, views `'L'`/`'U'`/`'F'`; sparse destinations alternate between `CSR` and the vendor CSR matrix),
+    `test/test_schur.jl` (new, split per element type): `"SPD"`/`"HPD"` (Laplacian 120), `"S"`/`"H"` and complex
+    symmetric `"S"` (`random_symindef` 120), `"G"` (`random_general` 120), 14 scattered Schur indices, under three
+    regime mixes (default = B + root; mostly regime A, for the Laplacian with a regime-A subtree root feeding the
+    Schur root; B and C):
+    root placement, `S` vs the dense `A₂₂ − A₂₁ A₁₁⁻¹ A₁₂`, `schur_shape` and `schur_pattern` vs dense Boolean
+    elimination, sparse export of every view zero-/one-based (exact pattern), `bₛ`, `relres ≤ tol(T)` with 1 and 3
+    right-hand sides, `"solve_diag"` identity for `"G"`/Cholesky, deterministic forward, statistics of `A₁₁` (inertia
+    vs eigenvalues), `"diag"`, refactorization with new values, refused phases; `solve_mode` 1/2 for `"G"`; CSC
+    (transposed) input for `"G"` and `"H"`/`"S"` and a transposed CSR destination; orderings `algo3`/`algo4`/`algo5`,
+    `user_perm`, no amalgamation, two disconnected blocks; every index in the Schur set (`S = A`); errors. Helpers
+    `schur_reference`, `schur_pattern_reference`, `schur_solver`, `schur_solve` (test/utils.jl).
+  - Test adaptations required by the feature: `test_api.jl` expected `NotSupportedError` for `schur_mode = 1`, the
+    Schur phases and `"schur_shape"`/`"schur_matrix"`; now: missing `user_schur_indices` → `InvalidValueError`,
+    Schur phases without Schur mode → `FactorizationError`, Schur outputs without Schur mode → `InvalidValueError`.
+- Tests: `SDS_TEST_GPU=0 julia --project=. -e 'using Pkg; Pkg.test()'` (Julia 1.13.1, ubuntu-latest, KA CPU
+  backend): 68743 pass / 0 fail / 1 broken (the T16 `@test_broken`), 30.9 min, including `test_schur` (four
+  parts, ≈ 1800 checks; 5–7 min per part standalone, mostly kernel compilation) and `test_ported` with the Schur
+  port (`test_ported[Float32]` 2910 pass). During development the subset
+  `SDS_TEST_ONLY=test_schur,test_ported,test_api,test_aqua` found only over-strict regime assertions of my own new
+  test (no regime A by default at n = 120, regime-A children of the root only for the Laplacian), fixed before the
+  final run. CUDA/AMDGPU: pending CI on the PR.
+  The GitHub App token expired before the last push: the final commits are local and published by the workflow's
+  "Publish the branch" step (which also opens the PR from the last commit message).
+- Measurements: none asked for. The three CUDSS.jl examples reproduce `S` to rounding (Float64: `‖S − S_ref‖` ≤ 9e-16)
+  and the solution `ones(5)` to ≤ 4e-16.
+- Deviations from PLAN.md / this task:
+  - The Schur root is not "a factorization that stops before the root": it is a regime-C front alone in the last
+    launch group, assembled by its own small launch sequence (`assemble_schur!`) after the A/B/C drivers, which stay
+    untouched. Cost: two (LU) or four extra launches per factorization.
+  - The Schur pattern (`"schur_shape"`, sparse export) is the exact *symbolic* pattern on the symmetric structure of
+    the analysis; for `"G"` that is `A + Aᵀ`, so an unsymmetric `S` can have explicit zeros (the LU example's 3×3
+    `S` is exported with 9 entries, 2 of them zero). For the symmetric structures `"schur_shape"` reports one
+    triangle with the diagonal (PLAN §1.4 "a correct nnz", unlike cuDSS); a sparse destination must hold exactly
+    the entries of its view (`'F'` exports both triangles).
+  - Solve phases in Schur mode follow cuDSS (read `B`, write `X`, intermediate vectors in factor order) instead of
+    the T16 workspace sub-phases; `"solve"`, `"solve_fwd_perm"`, `"solve_fwd"`, `"solve_bwd"`, `"solve_bwd_perm"` and
+    `"solve_refinement"` raise `NotSupportedError` in Schur mode (the factorization is partial). LU's `D` is applied
+    inside `"solve_bwd_schur"` (the CUDSS.jl LU example calls no `"solve_diag"`), so `"solve_diag"` is the identity
+    for `"G"` in Schur mode and the LDLᵀ flow (fwd, diag, bwd) also works for LU.
+  - Not supported in Schur mode: uniform batches (`NotSupportedError`) and the 2×2 pivot pairs of `"S"`/`"H"`
+    (`pivot_pairs` is ignored: the ordering runs on the induced pattern without pairs).
+  - `"lu_nnz"` and `"flops"` include the dense lower triangle of `S` and its would-be factorization; `"diag"` is 1 on
+    the Schur block.
+  - `"schur_matrix"` is not set-then-get through a C-style descriptor: `setparam!` registers a Julia destination
+    (dense, `MatrixDescriptor`, `CSR`, backend CSR, or `(csr, view)`), `getparam` fills and returns it.
+- Open issues / follow-ups:
+  - 2×2 pivot pairs and uniform batches in Schur mode (not needed by MadNLP today).
+  - The Schur root is assembled in global memory by one workgroup; a large `ns` (thousands) would want a
+    multi-workgroup assembly (T25).
+  - CUDA path (the export kernels, `Base.OneTo` as identity permutation in the permutation kernels) exercised only by
+    CI.
+- Suggested plan changes:
+  - PLAN §3.6: "the Schur root is a regime-C front alone in the last step, assembled by `assemble_schur!`; its pattern
+    is symbolic on `A + Aᵀ`; LU's diagonal belongs to `solve_bwd_schur`".
 
 ### T21 — Matching and scaling   `[ ]`
 

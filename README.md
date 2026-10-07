@@ -36,13 +36,18 @@ CUDA:
   after the analysis, or FGMRES-IR with the factorization as preconditioner
   (`ir_mode = "fgmres"`, after `using Krylov`); `user_host_interrupt` is
   polled between launch groups;
+* Schur complement mode (`schur_mode`, `user_schur_indices`) for every
+  structure: the Schur rows and columns are ordered last and their front is
+  assembled but not factored; `schur_shape` (exact symbolic pattern) and
+  `schur_matrix` (dense, or CSR of one triangle or the full matrix), and the
+  `solve_fwd_schur`/`solve_diag`/`solve_bwd_schur` phases of cuDSS;
 * the public API: `DirectSolver`, `execute!` with cuDSS phase strings, named
   phase wrappers, `update!`, `setparam!`/`getparam`, and the `LinearAlgebra`
   layer (`cholesky`, `cholesky!`, `ldlt`, `ldlt!`, `lu`, `lu!`, `ldiv!`, `\`, `logabsdet`),
   checked by the test suite of CUDSS.jl ported to this package; phase logging
   through `SDS_LOG_LEVEL`.
 
-Not there yet: non-uniform batches, Schur complements, matching and scaling
+Not there yet: non-uniform batches, matching and scaling
 (badly scaled MadNLP K2 systems still need them, see the refinement table in
 `TASKS.md`), mixed precision, and the AMDGPU, oneAPI and
 Metal extensions. Unsupported structures, phases and parameters raise

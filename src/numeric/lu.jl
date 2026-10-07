@@ -570,6 +570,7 @@ function factorize_lu!(N::Numeric{T}, S::Symbolic, nzval::AbstractVector; opts::
         a, b = plan.group_first[k], plan.group_last[k]
         _launch_front_lu!(N, S, nzval, a, b - a + 1, plan.group_maxchild[k], prm, Val(LU_WORKGROUP))
     end
+    assemble_schur!(N, S, nzval)
     reduce_stats!(N, S)
     return 0
 end

@@ -217,3 +217,151 @@ function compute_ordering(P::SymmetricPattern, opts::Options; T::Type = Float64,
              pair_rounds = rounds)
     return Ordering(perm, invperm(perm), alg_used, stats, used_pairs)
 end
+
+# ---------------------------------------------------------------------------
+# Schur complement mode (PLAN §3.6)
+
+"""
+    schur_flags(indices, n) -> BitVector
+
+The Schur set of `user_schur_indices` (`n` flags 0/1, `1` = the row and column
+belong to the Schur complement) as a `BitVector`; raises
+[`InvalidValueError`](@ref) when `indices` is missing, has the wrong length or
+selects no index.
+"""
+function schur_flags(indices, n::Integer)
+    indices === nothing &&
+        throw(InvalidValueError("schur_mode = 1 needs \"user_schur_indices\" (n flags 0/1)"))
+    length(indices) == n ||
+        throw(InvalidValueError("user_schur_indices has $(length(indices)) entries, the matrix has $n rows"))
+    flags = BitVector(x != 0 for x in indices)
+    any(flags) || throw(InvalidValueError("user_schur_indices selects no row: the Schur complement would be empty"))
+    return flags
+end
+
+"""
+    induced_pattern(P::SymmetricPattern, vertices) -> SymmetricPattern
+
+The pattern of `P` restricted to `vertices` (sorted, distinct), renumbered
+`1:length(vertices)` in their order.
+"""
+function induced_pattern(P::SymmetricPattern, vertices::AbstractVector{<:Integer})
+    loc = zeros(Int, P.n)
+    for (k, v) in enumerate(vertices)
+        loc[v] = k
+    end
+    colptr = Vector{Int}(undef, length(vertices) + 1)
+    colptr[1] = 1
+    rowval = Int[]
+    for (k, v) in enumerate(vertices)
+        for i in neighbors(P, v)
+            loc[i] > 0 && push!(rowval, loc[i])
+        end
+        colptr[k + 1] = length(rowval) + 1
+    end
+    return SymmetricPattern(length(vertices), colptr, rowval)
+end
+
+"""
+    compute_schur_ordering(P::SymmetricPattern, opts::Options, schur::AbstractVector{Bool}; T = Float64) -> Ordering
+
+Schur-constrained ordering (PLAN §3.6): the rows and columns flagged in
+`schur` ([`schur_flags`](@ref)) are ordered last, in increasing original
+order, and the others first. The fill-reducing ordering of
+[`compute_ordering`](@ref) (`reordering_alg`) runs on the pattern induced by the
+other vertices ([`induced_pattern`](@ref)); since the Schur vertices come
+last they are never intermediate vertices of a fill path, so this is the
+ordering of the factored part. A `user_perm` keeps its relative order of the
+other vertices. The 2×2 pivot pairs of `"S"`/`"H"` are not used (`pairs`
+empty). `stats` describe the whole ordering (the Schur block included).
+"""
+function compute_schur_ordering(P::SymmetricPattern, opts::Options, schur::AbstractVector{Bool}; T::Type = Float64)
+    n = P.n
+    length(schur) == n || throw(InvalidValueError("schur flags have length $(length(schur)), expected $n"))
+    inner = findall(!, schur)
+    outer = findall(schur)
+    if opts.user_perm !== nothing
+        up = _validate_user_perm(opts.user_perm, n)
+        perm = [filter(i -> !schur[i], up); outer]
+        alg_used = :user
+        candidates = OrderingCandidate[]
+        auto = false
+    else
+        o = compute_ordering(induced_pattern(P, inner), opts; T)
+        perm = [inner[o.perm]; outer]
+        alg_used = o.alg_used
+        candidates = o.stats.candidates
+        auto = o.stats.auto
+    end
+    e = evaluate_ordering(P, perm; T)
+    stats = (nnz_L = e.nnz_L, flops = e.flops, nlevels = e.nlevels, cost = e.cost, candidates = candidates,
+             auto = auto, nd_available = nd_available(), pair_rounds = 0)
+    return Ordering(perm, invperm(perm), alg_used, stats, Tuple{Int, Int}[])
+end
+
+"""
+    schur_pattern(P::SymmetricPattern, schur::AbstractVector{Bool}) -> (rowptr, colval)
+
+Symbolic pattern of the Schur complement `S = A₂₂ − A₂₁ A₁₁⁻¹ A₁₂` of the
+flagged rows and columns (`A₂₂`), in their increasing original order, as
+1-based CSR arrays with sorted columns, both triangles and the whole diagonal:
+`(i, j)` is in the pattern when `i == j`, when `(i, j)` is in `P`, or when
+both are adjacent to one connected component of the graph of the other
+vertices (a fill path through eliminated vertices only). `P` is the symmetric
+pattern of the analysis (`A + Aᵀ` for `"G"`), so for LU the pattern may hold
+entries that are numerically zero by structure (explicit zeros).
+"""
+function schur_pattern(P::SymmetricPattern, schur::AbstractVector{Bool})
+    n = P.n
+    loc = zeros(Int, n)
+    ns = 0
+    for v in 1:n
+        schur[v] && (ns += 1; loc[v] = ns)
+    end
+    adj = [Int[k] for k in 1:ns]
+    for v in 1:n
+        loc[v] > 0 || continue
+        for i in neighbors(P, v)
+            loc[i] > 0 && push!(adj[loc[v]], loc[i])
+        end
+    end
+    # connected components of the eliminated vertices: their Schur neighbours form a clique
+    seen = falses(n)
+    mark = zeros(Int, ns)
+    stack = Int[]
+    nbrs = Int[]
+    ncomp = 0
+    for v0 in 1:n
+        (loc[v0] == 0 && !seen[v0]) || continue
+        ncomp += 1
+        empty!(nbrs)
+        seen[v0] = true
+        push!(stack, v0)
+        while !isempty(stack)
+            v = pop!(stack)
+            for i in neighbors(P, v)
+                if loc[i] > 0
+                    if mark[loc[i]] != ncomp
+                        mark[loc[i]] = ncomp
+                        push!(nbrs, loc[i])
+                    end
+                elseif !seen[i]
+                    seen[i] = true
+                    push!(stack, i)
+                end
+            end
+        end
+        for a in nbrs, b in nbrs
+            a == b || push!(adj[a], b)
+        end
+    end
+    rowptr = Vector{Int}(undef, ns + 1)
+    rowptr[1] = 1
+    colval = Int[]
+    for k in 1:ns
+        cols = sort!(unique!(adj[k]))
+        append!(colval, cols)
+        rowptr[k + 1] = length(colval) + 1
+    end
+    return rowptr, colval
+end

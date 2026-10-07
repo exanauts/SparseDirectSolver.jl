@@ -37,6 +37,26 @@ _refinement_type(backend, ::Type{T}, ::Type{INT}) where {T, INT} =
                         typeof(KernelAbstractions.allocate(backend, real(T), 0))}
 
 """
+    SchurState
+
+Host state of the Schur complement mode of a [`DirectSolver`](@ref) (PLAN §3.6),
+set by `"reordering"` when `schur_mode = 1`: `flags` (the Schur rows and
+columns of `user_schur_indices`), `indices` (them, increasing: row `k` of `S`
+is row `indices[k]` of A), `rowptr`/`colval` (the symbolic pattern of `S`,
+[`schur_pattern`](@ref): 1-based CSR, both triangles, diagonal included) and
+`dest`, `dest_view` (the destination registered with
+`setparam!(solver, "schur_matrix", …)`, or `nothing`).
+"""
+mutable struct SchurState
+    flags::BitVector
+    indices::Vector{Int}
+    rowptr::Vector{Int}
+    colval::Vector{Int}
+    dest::Any
+    dest_view::MatrixView
+end
+
+"""
     DirectSolver{T, INT, M, B, SY, NU, WS, RF} <: AbstractDirectSolver{T, INT}
 
 Sparse direct solver handle (≅ `CudssSolver`), PLAN §3.1–§3.2.
@@ -66,8 +86,8 @@ of each front, `P_r P A Pᵀ = L D U`; view `'F'` only), single matrices
 and uniform batches (see below), the phases `"reordering"`, `"symbolic_factorization"`,
 `"analysis"`, `"factorization"`, `"refactorization"`, `"solve"`,
 `"solve_fwd_perm"`, `"solve_fwd"`, `"solve_diag"`, `"solve_bwd"`,
-`"solve_bwd_perm"` and `"solve_refinement"` ([`execute!`](@ref)). The Schur
-phases raise [`NotSupportedError`](@ref) when they are executed.
+`"solve_bwd_perm"` and `"solve_refinement"` ([`execute!`](@ref)), and the
+Schur complement mode with `"solve_fwd_schur"` and `"solve_bwd_schur"` (below).
 
 Uniform batch (PLAN §1.6, §3.5, ≅ CUDSS.jl's uniform batch): `nbatch`
 matrices with the pattern of `rowptr`/`colval` and values `nzval`, either a
@@ -94,7 +114,16 @@ parameter), the analysis (`ordering`, host `host_symbolic`, device `symbolic`),
 the numeric storage `numeric`, the solve `workspace`, the refinement storage
 `refinement` (allocated by the first solve that refines) and `ir_steps` (the
 `"ir_n_steps"` data parameter: refinement steps of the last solve, `-1` before
-one).
+one) and `schur` (the [`SchurState`](@ref) of an analysis with `schur_mode = 1`,
+else `nothing`).
+
+Schur complement mode (PLAN §3.6, ≅ CUDSS.jl's Schur complement): with
+`"schur_mode" = 1` and `"user_schur_indices"` (`n` flags 0/1) set before the
+analysis, the flagged rows and columns are ordered last and the factorization
+stops before them: `getparam(solver, "schur_shape")` and
+`getparam(solver, "schur_matrix")` export `S = A₂₂ − A₂₁ A₁₁⁻¹ A₁₂` (`2` = the
+flagged block), and the solve phases are `"solve_fwd_schur"`, `"solve_diag"`
+and `"solve_bwd_schur"` (see [`execute!`](@ref)). Single matrices only.
 """
 mutable struct DirectSolver{T, INT, M <: CSR{T, INT}, B <: KernelAbstractions.Backend, SY, NU, WS, RF} <:
                AbstractDirectSolver{T, INT}
@@ -116,16 +145,17 @@ mutable struct DirectSolver{T, INT, M <: CSR{T, INT}, B <: KernelAbstractions.Ba
     workspace::Union{Nothing, WS}
     refinement::Union{Nothing, RF}
     ir_steps::Int
+    schur::Union{Nothing, SchurState}
     # explicit parameters only: the default outer constructor would leave SY, NU, WS, RF unbound
     # (they occur only in `Union{Nothing, …}` fields; Aqua on Julia 1.10)
     function DirectSolver{T, INT, M, B, SY, NU, WS, RF}(A, structure, view, options, backend, nbatch,
                                                         fresh_factorization, info, stage, host_rowptr,
                                                         host_colval, ordering, host_symbolic, symbolic,
-                                                        numeric, workspace, refinement,
-                                                        ir_steps) where {T, INT, M, B, SY, NU, WS, RF}
+                                                        numeric, workspace, refinement, ir_steps,
+                                                        schur) where {T, INT, M, B, SY, NU, WS, RF}
         return new{T, INT, M, B, SY, NU, WS, RF}(A, structure, view, options, backend, nbatch, fresh_factorization,
                                                  info, stage, host_rowptr, host_colval, ordering, host_symbolic,
-                                                 symbolic, numeric, workspace, refinement, ir_steps)
+                                                 symbolic, numeric, workspace, refinement, ir_steps, schur)
     end
 end
 
@@ -148,7 +178,7 @@ function DirectSolver(A::CSR{T, INT}, structure, view; index = A.index) where {T
     RF = _refinement_type(backend, T, INT)
     return DirectSolver{T, INT, typeof(A), typeof(backend), SY, NU, WS, RF}(
         A, s, v, Options(), backend, nb, true, zeros(Int, nb), STAGE_NONE, INT[], INT[], nothing, nothing, nothing,
-        nothing, nothing, nothing, -1)
+        nothing, nothing, nothing, -1, nothing)
 end
 
 function DirectSolver(rowptr::AbstractVector{<:Integer}, colval::AbstractVector{<:Integer}, nzval::AbstractVecOrMat,
@@ -291,9 +321,27 @@ analyzed (the next phase must be `"factorization"`); an interrupted refinement
 leaves the last completed iterate in `X` and reports the steps completed in
 `"ir_n_steps"`.
 
-`"solve_fwd_schur"` and `"solve_bwd_schur"` raise [`NotSupportedError`](@ref)
-until their task (T20); unknown phase strings raise `ArgumentError`. Executing
-a phase before the phases it depends on raises [`FactorizationError`](@ref).
+Schur complement mode (`schur_mode = 1` at the analysis, PLAN §3.6, as in the
+CUDSS.jl docs): `"factorization"`/`"refactorization"` factor `A₁₁` (the rows and
+columns outside `"user_schur_indices"`) and assemble the Schur complement `S`
+([`getparam`](@ref) `"schur_matrix"`). The solve phases then read `B` and write
+`X` (`X === B` allowed), with intermediate vectors in factor order, where the
+last `ns` entries are the Schur block in increasing original order:
+
+* `"solve_fwd_schur"` (permutation and forward sweep): the last `ns` entries of
+  `X` are the condensed right-hand side `bₛ = b₂ − A₂₁ A₁₁⁻¹ b₁`;
+* `"solve_diag"`: `D⁻¹` of LDLᵀ/LDLᴴ on the factored part (the identity on the
+  Schur block, and for Cholesky and LU, whose diagonal is applied by
+  `"solve_bwd_schur"` as in cuDSS);
+* `"solve_bwd_schur"` (backward sweep and inverse permutation): with the
+  solution `x₂` of `S x₂ = bₛ` in the last `ns` entries of `B`, `X` is the
+  solution of `A x = b`.
+
+`solve_mode` 1/2 solve with `Aᵀ`/`Aᴴ` (condensed system `Sᵀ`/`Sᴴ`); the other solve
+phases raise [`NotSupportedError`](@ref) in Schur mode, and the Schur phases
+without it [`FactorizationError`](@ref). Unknown phase strings raise
+`ArgumentError`. Executing a phase before the phases it depends on raises
+[`FactorizationError`](@ref).
 With `asynchronous = false` the backend is synchronized before returning
 (`KernelAbstractions.synchronize`). Phase summaries are logged (see
 [`SparseDirectSolver.set_log_level!`](@ref)).
@@ -309,11 +357,8 @@ function execute!(phase::AbstractString, solver::DirectSolver, X, B; asynchronou
         _symbolic!(solver)
     elseif p == PHASE_FACTORIZATION || p == PHASE_REFACTORIZATION
         _factorize!(solver, p)
-    elseif p == PHASE_SOLVE || p == PHASE_SOLVE_FWD_PERM || p == PHASE_SOLVE_FWD || p == PHASE_SOLVE_DIAG ||
-           p == PHASE_SOLVE_BWD || p == PHASE_SOLVE_BWD_PERM || p == PHASE_SOLVE_REFINEMENT
-        _solve!(solver, p, X, B)
     else
-        throw(NotSupportedError("phase \"$phase\" is not implemented yet (T20)"))
+        _solve!(solver, p, X, B)
     end
     asynchronous || KernelAbstractions.synchronize(solver.backend)
     return nothing
@@ -330,7 +375,8 @@ function _check_analysis_supported(solver::DirectSolver{T}) where {T}
                                 "batch member(s) (length(nzval) ÷ nnz)"))
     opts.matching_alg == MATCHING_NONE ||
         throw(NotSupportedError("matching_alg = \"$(convert(String, opts.matching_alg))\" is not implemented yet (T21)"))
-    opts.schur_mode == 0 || throw(NotSupportedError("schur_mode = 1 is not implemented yet (T20)"))
+    opts.schur_mode == 0 || solver.nbatch == 1 ||
+        throw(NotSupportedError("schur_mode = 1 is not supported for uniform batches"))
     opts.user_nd_partition_tree === nothing ||
         throw(NotSupportedError("user_nd_partition_tree is not implemented yet (T24)"))
     opts.schedule == SCHEDULE_SYNCFREE && throw(NotSupportedError("schedule = \"syncfree\" is not implemented yet"))
@@ -348,10 +394,19 @@ function _reorder!(solver::DirectSolver{T}) where {T}
     solver.host_colval = Array(A.colval)
     P = SymmetricPattern(solver.host_rowptr, solver.host_colval, A.nrows, solver.structure;
                          view = _stored_view(solver), index = A.index)
-    # 2×2 pivot pairs ("S"/"H"): the only host copy of the values, at analysis (of the first batch member)
-    pp = analysis_pairs(P, solver.host_rowptr, solver.host_colval, _first_member(A), A.nrows, solver.structure,
-                        solver.options; view = _stored_view(solver), index = A.index)
-    solver.ordering = compute_ordering(P, solver.options; T, pp.pairs, pp.candidates)
+    if solver.options.schur_mode == 1
+        # Schur complement mode: the Schur rows and columns last, no 2×2 pivot pairs
+        flags = schur_flags(solver.options.user_schur_indices, A.nrows)
+        solver.ordering = compute_schur_ordering(P, solver.options, flags; T)
+        rowptr, colval = schur_pattern(P, flags)
+        solver.schur = SchurState(flags, findall(flags), rowptr, colval, nothing, VIEW_FULL)
+    else
+        # 2×2 pivot pairs ("S"/"H"): the only host copy of the values, at analysis (of the first batch member)
+        pp = analysis_pairs(P, solver.host_rowptr, solver.host_colval, _first_member(A), A.nrows, solver.structure,
+                            solver.options; view = _stored_view(solver), index = A.index)
+        solver.ordering = compute_ordering(P, solver.options; T, pp.pairs, pp.candidates)
+        solver.schur = nothing
+    end
     solver.host_symbolic = solver.symbolic = solver.numeric = solver.workspace = solver.refinement = nothing
     solver.stage = STAGE_REORDERED
     _log(LOG_INFO, () -> "reordering: n = $(A.nrows), nnz = $(nnz(A)), $(_elapsed(tic))")
@@ -373,9 +428,15 @@ function _symbolic!(solver::DirectSolver{T, INT}) where {T, INT}
     ord = solver.ordering
     P = SymmetricPattern(solver.host_rowptr, solver.host_colval, A.nrows, solver.structure;
                          view = _stored_view(solver), index = A.index)
-    sp = supernode_partition(factor_pattern(P, ord), ord.perm, opts)
+    if solver.schur === nothing
+        sp = supernode_partition(factor_pattern(P, ord), ord.perm, opts)
+        schur = 0
+    else
+        sp = schur_supernode_partition(factor_pattern(P, ord), ord.perm, length(solver.schur.indices), opts)
+        schur = nsupernodes(sp)
+    end
     sc = build_schedule(sp, opts, T; reserve = subtree_local_reserve(solver.structure),
-                        elsize = schedule_elsize(solver.structure, T))
+                        elsize = schedule_elsize(solver.structure, T), schur)
     layout = build_layout(sp, sc; ldlt = _is_ldlt_structure(solver.structure))
     Sh = Symbolic(sp, sc, layout, solver.host_rowptr, solver.host_colval, A.nrows, solver.structure;
                   view = _stored_view(solver), index = A.index)
@@ -563,6 +624,9 @@ function _solve_phase!(solver::DirectSolver, p::Phase, X::AbstractVecOrMat, B::A
     det = opts.deterministic_mode == 1
     cj = solve_conjugated(solver.structure, eltype(ws), solver.A.transposed, opts.solve_mode)
     tm = solve_transposed(solver.structure, solver.A.transposed, opts.solve_mode)   # LU: solve with Mᵀ
+    S.schedule.schur > 0 && return _schur_solve_phase!(solver, p, X, B, transposed, nrhs, ws, bm, det, cj, tm)
+    (p == PHASE_SOLVE_FWD_SCHUR || p == PHASE_SOLVE_BWD_SCHUR) &&
+        throw(_phase_error(convert(String, p), "needs an analysis with schur_mode = 1"))
     refine = opts.ir_n_steps > 0 && (p == PHASE_SOLVE || p == PHASE_SOLVE_REFINEMENT)
     if p == PHASE_SOLVE_REFINEMENT && refine && Base.mightalias(X, B)
         throw(InvalidValueError("\"solve_refinement\" needs the original right-hand side: X and B must not alias"))
@@ -593,6 +657,35 @@ function _solve_phase!(solver::DirectSolver, p::Phase, X::AbstractVecOrMat, B::A
     else  # PHASE_SOLVE_REFINEMENT
         refine ? _refine_phase!(solver, W, ws, X, B, transposed, transposed, cj, det, tm) : (solver.ir_steps = 0)
     end
+    return nothing
+end
+
+# Schur complement mode (PLAN §3.6, ≅ cuDSS): the phases read `B` and write `X`, the intermediate vectors are
+# in factor order (the Schur block last, in increasing original order); LU's diagonal is part of the backward
+# sweep, as in cuDSS, so `"solve_diag"` only applies D⁻¹ of LDLᵀ/LDLᴴ
+function _schur_solve_phase!(solver::DirectSolver, p::Phase, X, B, transposed::Bool, nrhs::Int, ws::SolveWorkspace,
+                             bm, det::Bool, cj::Bool, tm::Bool)
+    S, N = solver.symbolic, solver.numeric
+    lu = solver.structure == STRUCTURE_GENERAL
+    id = Base.OneTo(S.n)
+    if p == PHASE_SOLVE_FWD_SCHUR
+        permute_rhs!(ws.Y, B, S.perm; transposed, conjugate = cj, bm)
+        forward_sweep!(ws, S, N; nrhs, deterministic = det, transpose = tm)
+        unpermute_solution!(X, ws.Y, id; transposed, conjugate = cj, bm)
+    elseif p == PHASE_SOLVE_DIAG
+        permute_rhs!(ws.Y, B, id; transposed, conjugate = cj, bm)
+        lu || diagonal_sweep!(ws, S, N; nrhs)
+        unpermute_solution!(X, ws.Y, id; transposed, conjugate = cj, bm)
+    elseif p == PHASE_SOLVE_BWD_SCHUR
+        permute_rhs!(ws.Y, B, id; transposed, conjugate = cj, bm)
+        lu && diagonal_sweep!(ws, S, N; nrhs)
+        backward_sweep!(ws, S, N; nrhs, transpose = tm)
+        unpermute_solution!(X, ws.Y, S.perm; transposed, conjugate = cj, bm)
+    else
+        throw(NotSupportedError("phase \"$(convert(String, p))\" with schur_mode = 1: the factorization is partial; " *
+                                "use \"solve_fwd_schur\", \"solve_diag\" and \"solve_bwd_schur\""))
+    end
+    solver.ir_steps = 0
     return nothing
 end
 
@@ -659,12 +752,12 @@ end
 
 # data parameters the solver computes (PLAN §1.4, §1.7)
 const SOLVER_OUTPUTS = ("lu_nnz", "flops", "nsuperpanels", "memory_estimates", "perm_reorder_row",
-                        "perm_reorder_col", "perm_row", "perm_col", "diag", "npivots", "inertia", "pivot_stats")
+                        "perm_reorder_col", "perm_row", "perm_col", "diag", "npivots", "inertia", "pivot_stats",
+                        "schur_shape", "schur_matrix")
 
 # task that provides the other computed data parameters
 function _output_task(name)
     name in ("perm_matching", "scale_row", "scale_col") && return "T21"
-    name in ("schur_shape", "schur_matrix") && return "T20"
     name == "nd_partition_tree" && return "T24"
     return "M12"   # hybrid_device_memory_min
 end
@@ -686,6 +779,14 @@ device, or `nothing`) is checked against the size of the matrix; the next
 `"factorization"`/`"refactorization"` copies it to the device. Setting
 `"ir_n_steps"` (the number of refinement steps requested) makes
 [`getparam`](@ref) report that value again until the next solve.
+`"schur_matrix"` (Schur complement mode, after `"reordering"`/`"analysis"`)
+registers the destination that `getparam(solver, "schur_matrix")` fills (≅
+`cudss_set(solver, "schur_matrix", S)` then `cudss_get`): a dense `ns × ns`
+matrix on the solver's backend (or a [`MatrixDescriptor`](@ref) holding one),
+a [`CSR`](@ref) (or a backend CSR matrix, e.g. `CuSparseMatrixCSR`) with
+`ns + 1` row pointers and room for exactly the entries of the exported pattern,
+or a tuple `(csr, view)` with `view` `'L'`, `'U'` or `'F'` (the default) to
+export one triangle; `nothing` unregisters it.
 Computed data parameters (`"lu_nnz"`, `"diag"`, `"perm_row"`, …) cannot be set
 (`ArgumentError`): read them with [`getparam`](@ref) or [`getparam!`](@ref),
 which replaces cuDSS's set-buffer-then-get protocol.
@@ -703,7 +804,7 @@ function setparam!(solver::DirectSolver, name::AbstractString, value)
             fill!(solver.info, Int(value))
         end
     elseif name == "schur_matrix"
-        throw(NotSupportedError("the data parameter \"schur_matrix\" is not implemented yet (T20)"))
+        _set_schur_dest!(solver, value)
     elseif name == "pivot_sign" && value !== nothing && length(value) != size(solver, 1)
         throw(InvalidValueError("pivot_sign has $(length(value)) entries, the matrix has $(size(solver, 1)) rows"))
     else
@@ -738,10 +839,12 @@ The data parameters computed by the solver:
 | `"memory_estimates"` | `Vector{Int64}` (16 entries, see [`memory_estimates`](@ref)) | analysis |
 | `"perm_reorder_row"`, `"perm_reorder_col"` | `Vector{Int}`: the fill-reducing permutation, 1-based (`perm[k]` = original index of the `k`-th pivot) | reordering |
 | `"perm_row"`, `"perm_col"` | `Vector{Int}`: the final permutation of the factor (= the reordering for Cholesky and LDLᵀ/LDLᴴ); LU (`"G"`) after a factorization: `perm_row[k]` is the original row of factor row `k` (the reordering composed with the local row interchanges of batch member 1), `perm_col` the reordering, so `A[perm_row, perm_col] = L D U` | analysis |
-| `"diag"` | vector of `T` on the solver's backend: the diagonal of `L` (Cholesky), of `D` (LDLᵀ/LDLᴴ; for a 2×2 block its two diagonal entries) or of `D` in `L D U` (LU, = the diagonal of `U` in `L U`) in factor order | factorization |
+| `"diag"` | vector of `T` on the solver's backend: the diagonal of `L` (Cholesky), of `D` (LDLᵀ/LDLᴴ; for a 2×2 block its two diagonal entries) or of `D` in `L D U` (LU, = the diagonal of `U` in `L U`) in factor order; Schur complement mode: `1` on the (unfactored) Schur block | factorization |
 | `"npivots"` | `INT`: perturbed pivots (LDLᵀ/LDLᴴ, LU; `0` for Cholesky) | factorization |
 | `"inertia"` | `Tuple{INT, INT}`: `(npos, nneg)` of D (after perturbation, so the inertia of `A + E`; read it with `"npivots"`); `(0, 0)` for complex symmetric `"S"` and for `"G"`; Cholesky: `(number of positive pivots, 0)` | factorization |
-| `"pivot_stats"` | `NamedTuple` `(npos, nneg, nzero, nperturbed, n2x2)` of `Int64` (PLAN §1.7) | factorization |
+| `"pivot_stats"` | `NamedTuple` `(npos, nneg, nzero, nperturbed, n2x2)` of `Int64` (PLAN §1.7); in Schur complement mode `"npivots"`, `"inertia"` and `"pivot_stats"` count the factored block `A₁₁` only | factorization |
+| `"schur_shape"` | `(nrows, ncols, nnz)` of `Int64`: the size `ns` of the Schur complement and the nonzeros of its symbolic pattern ([`schur_pattern`](@ref)); for the symmetric structures one triangle with the diagonal (as the sparse export of one triangle) | analysis (`schur_mode = 1`) |
+| `"schur_matrix"` | the Schur complement `S = A₂₂ − A₂₁ A₁₁⁻¹ A₁₂` of the rows and columns of `"user_schur_indices"` (in their increasing order), written into the destination registered with [`setparam!`](@ref) and returned; without one, a new dense `ns × ns` matrix on the solver's backend. Symmetric structures: a dense destination gets the full matrix, a sparse one the triangle of its view | factorization (`schur_mode = 1`) |
 
 Uniform batch (`nbatch > 1`): `"info"`, `"npivots"`, `"inertia"` and
 `"pivot_stats"` are vectors with one entry per batch member, `"diag"` is the
@@ -756,8 +859,7 @@ The pivot statistics are reduced on the device ([`reduce_stats!`](@ref)) and
 copied to the host when read (one synchronization). The reordering
 permutation after `"reordering"` alone is the ordering algorithm's; `"symbolic_factorization"` composes it with the supernodal
 renumbering, and from then on both permutations are the one the factor uses.
-Data parameters of later tasks (`"perm_matching"`, `"scale_row"`,
-`"schur_shape"`, …) raise [`NotSupportedError`](@ref); reading
+Data parameters of later tasks (`"perm_matching"`, `"scale_row"`, …) raise [`NotSupportedError`](@ref); reading
 one before the phase that computes it raises [`FactorizationError`](@ref).
 """
 function getparam(solver::DirectSolver, name::AbstractString)
@@ -775,6 +877,15 @@ function getparam(solver::DirectSolver, name::AbstractString)
     if name == "diag"
         _need_stage(solver, STAGE_FACTORIZED, name)
         return _factor_diag(solver)
+    end
+    if name == "schur_shape" || name == "schur_matrix"
+        _need_stage(solver, name == "schur_shape" ? STAGE_ANALYZED : STAGE_FACTORIZED, name)
+        state = _schur_state(solver, name)
+        name == "schur_shape" && return _schur_shape(solver, state)
+        dest = state.dest === nothing ? KernelAbstractions.zeros(solver.backend, eltype(solver), _schur_size(state),
+                                                                _schur_size(state)) : state.dest
+        _write_schur!(solver, state, dest, state.dest === nothing ? VIEW_FULL : state.dest_view)
+        return dest
     end
     if name in ("npivots", "inertia", "pivot_stats")
         _need_stage(solver, STAGE_FACTORIZED, name)
@@ -803,9 +914,17 @@ Write the vector-valued data parameter `name` (`"perm_reorder_row"`,
 `"perm_reorder_col"`, `"perm_row"`, `"perm_col"`, `"diag"`,
 `"memory_estimates"`, `"user_perm"`) of [`getparam`](@ref) into `buffer`, a host
 or device vector of the right length (converted to its element type), without
-the C-style set-buffer-then-get protocol of CUDSS.jl.
+the C-style set-buffer-then-get protocol of CUDSS.jl. `"schur_matrix"`: `buffer`
+is any destination [`setparam!`](@ref) accepts for it (dense matrix, CSR,
+`(csr, view)`), filled without registering it.
 """
+function getparam!(buffer, solver::DirectSolver, name::AbstractString)
+    name == "schur_matrix" && return _getparam_schur!(buffer, solver)
+    throw(InvalidValueError("getparam!: the buffer of \"$name\" must be a vector, got $(typeof(buffer))"))
+end
+
 function getparam!(buffer::AbstractVector, solver::DirectSolver, name::AbstractString)
+    name == "schur_matrix" && return _getparam_schur!(buffer, solver)
     value = getparam(solver, name)
     value isa AbstractVector ||
         throw(InvalidValueError("getparam!: the parameter \"$name\" is not a vector; use getparam"))
@@ -820,7 +939,7 @@ function getparam!(buffer::AbstractVector, solver::DirectSolver, name::AbstractS
 end
 
 # work item (s, member k of nb): the diagonal of the panel of supernode s of member k into d[(k - 1) n + …]
-@kernel function _factor_diag_kernel!(d, factor, super_ptr, front_ptr, front_nrows, ns, nb)
+@kernel function _factor_diag_kernel!(d, factor, super_ptr, front_ptr, front_nrows, ns, nb, schur)
     q = @index(Global, Linear)
     s = (q - 1) % ns + 1
     k = (q - 1) ÷ ns + 1
@@ -831,7 +950,7 @@ end
         f = Int(front_nrows[s])
         p0 = Int(member_panels(front_ptr, k, nb)[s])
         for j in 0:(w - 1)
-            dk[c0 + j] = factor[p0 + j * f + j]
+            dk[c0 + j] = s == schur ? one(eltype(dk)) : factor[p0 + j * f + j]   # the Schur root is not factored
         end
     end
 end
@@ -864,7 +983,126 @@ function _factor_diag(solver::DirectSolver{T}) where {T}
     end
     ns = nsupernodes(S)
     ns > 0 || return d
-    _factor_diag_kernel!(solver.backend, 64)(d, N.factor, S.super_ptr, S.front_ptr, S.front_nrows, ns, nb;
-                                             ndrange = ns * nb)
+    _factor_diag_kernel!(solver.backend, 64)(d, N.factor, S.super_ptr, S.front_ptr, S.front_nrows, ns, nb,
+                                             S.schedule.schur; ndrange = ns * nb)
     return d
+end
+
+# ---------------------------------------------------------------------------
+# Schur complement export (PLAN §3.6)
+
+function _schur_state(solver::DirectSolver, name)
+    solver.schur === nothing &&
+        throw(InvalidValueError("the data parameter \"$name\" needs an analysis with schur_mode = 1"))
+    return solver.schur
+end
+
+_schur_size(state::SchurState) = length(state.indices)
+
+# nonzeros of the exported pattern for a view: one triangle with the diagonal, or all of it
+function _schur_nnz(state::SchurState, view::MatrixView)
+    view == VIEW_FULL && return length(state.colval)
+    lower = 0
+    for i in eachindex(state.indices), p in state.rowptr[i]:(state.rowptr[i + 1] - 1)
+        state.colval[p] <= i && (lower += 1)
+    end
+    return lower      # the pattern is symmetric: as many entries in the upper triangle
+end
+
+function _schur_shape(solver::DirectSolver, state::SchurState)
+    ns = _schur_size(state)
+    view = solver.structure == STRUCTURE_GENERAL ? VIEW_FULL : VIEW_LOWER
+    return (Int64(ns), Int64(ns), Int64(_schur_nnz(state, view)))
+end
+
+# a destination of "schur_matrix": (array or CSR, view)
+_schur_destination(x::DenseMatrix) = (x, VIEW_FULL)
+_schur_destination(x::CSR) = (x, VIEW_FULL)
+function _schur_destination(x::MatrixDescriptor)
+    (x.data isa DenseMatrix && !x.transposed && x.nbatch == 1) ||
+        throw(InvalidValueError("a dense Schur complement descriptor must hold an ns × ns column-major matrix"))
+    return (x.data, VIEW_FULL)
+end
+function _schur_destination(x::Tuple{Any, Any})
+    d, _ = _schur_destination(x[1])
+    d isa CSR || throw(InvalidValueError("a view only applies to a sparse (CSR) Schur complement destination"))
+    return (d, _matrix_view(x[2]))
+end
+# a backend sparse matrix (`CuSparseMatrixCSR`, …) through its zero-copy `CSR` wrapper (extensions); not a host
+# `SparseMatrixCSC`, whose `CSR` is a copy
+function _schur_destination(x)
+    (x isa DenseArray || x isa SparseMatrixCSC || !applicable(CSR, x)) &&
+        throw(InvalidValueError("schur_matrix: expected a dense matrix, a MatrixDescriptor, a CSR matrix (or a " *
+                                "backend CSR such as CuSparseMatrixCSR) or (csr, view), got $(typeof(x))"))
+    return (CSR(x), VIEW_FULL)
+end
+
+function _check_schur_destination(solver::DirectSolver{T}, state::SchurState, d, view::MatrixView) where {T}
+    ns = _schur_size(state)
+    size(d) == (ns, ns) ||
+        throw(InvalidValueError("schur_matrix: the Schur complement is $ns × $ns, the destination $(size(d))"))
+    eltype(d) == T || throw(InvalidValueError("schur_matrix: the destination holds $(eltype(d)), the solver $T"))
+    backend = KernelAbstractions.get_backend(d)
+    typeof(backend) == typeof(solver.backend) ||
+        throw(InvalidValueError("schur_matrix: the destination lives on $(typeof(backend)), the solver on " *
+                                "$(typeof(solver.backend))"))
+    if d isa CSR
+        nz = _schur_nnz(state, view)
+        nbatch(d) == 1 && length(d.nzval) == nz && nnz(d) == nz ||
+            throw(InvalidValueError("schur_matrix: the sparse Schur complement with view " *
+                                    "'$(convert(Char, view))' has $nz entries, the destination $(nnz(d)) " *
+                                    "(colval) and $(length(d.nzval)) (nzval); see \"schur_shape\""))
+    end
+    return nothing
+end
+
+function _set_schur_dest!(solver::DirectSolver, value)
+    state = _schur_state(solver, "schur_matrix")
+    if value === nothing
+        state.dest = nothing
+        state.dest_view = VIEW_FULL
+        return nothing
+    end
+    d, view = _schur_destination(value)
+    _check_schur_destination(solver, state, d, view)
+    state.dest = value isa Tuple ? value[1] : value
+    state.dest_view = view
+    return nothing
+end
+
+function _getparam_schur!(dest, solver::DirectSolver)
+    _need_stage(solver, STAGE_FACTORIZED, "schur_matrix")
+    state = _schur_state(solver, "schur_matrix")
+    d, view = _schur_destination(dest)
+    _write_schur!(solver, state, d, view)
+    return dest
+end
+
+# write S into the destination `dest` (a user object, see `_schur_destination`) with `view`
+function _write_schur!(solver::DirectSolver{T, INT}, state::SchurState, dest, view::MatrixView) where {T, INT}
+    d, _ = _schur_destination(dest)
+    _check_schur_destination(solver, state, d, view)
+    tr = solver.A.transposed
+    if d isa CSR
+        # a transposed CSR destination stores Sᵀ: the other triangle, transposed values
+        d.transposed && (tr = !tr; view = view == VIEW_LOWER ? VIEW_UPPER : view == VIEW_UPPER ? VIEW_LOWER : view)
+        base = d.index == INDEX_ZERO ? 0 : 1
+        keep(i, j) = view == VIEW_FULL || (view == VIEW_LOWER ? j <= i : j >= i)
+        ns = _schur_size(state)
+        rp = Vector{eltype(d.rowptr)}(undef, ns + 1)
+        cv = Vector{eltype(d.colval)}(undef, nnz(d))
+        rp[1] = base
+        q = 0
+        for i in 1:ns
+            for p in state.rowptr[i]:(state.rowptr[i + 1] - 1)
+                j = state.colval[p]
+                keep(i, j) && (q += 1; cv[q] = j - 1 + base)
+            end
+            rp[i + 1] = q + base
+        end
+        copyto!(d.rowptr, rp)
+        copyto!(d.colval, cv)
+    end
+    schur_matrix!(d, solver.numeric, solver.symbolic; transposed = tr)
+    return dest
 end

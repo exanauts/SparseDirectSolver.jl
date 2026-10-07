@@ -129,12 +129,12 @@ end
     execute!("refactorization", solver, x, b)
     execute!("solve", solver, x, b)
     @test relres(A, to_host(x), to_host(b)) <= tol(T)
-    # unknown phase strings: ArgumentError; phases of later tasks: NotSupportedError
+    # unknown phase strings: ArgumentError
     @test thrown(() -> execute!("solving", solver, x, b)) isa ArgumentError
     @test thrown(() -> execute!("Solve", solver, x, b)) isa ArgumentError
     @test execute!("solve_refinement", solver, x, b) === nothing     # T16; ir_n_steps = 0: no-op
-    for phase in ("solve_fwd_schur", "solve_bwd_schur")
-        @test thrown(() -> execute!(phase, solver, x, b)) isa NotSupportedError
+    for phase in ("solve_fwd_schur", "solve_bwd_schur")      # T20: need an analysis with schur_mode = 1
+        @test thrown(() -> execute!(phase, solver, x, b)) isa FactorizationError
     end
     # "solve_diag" (T15) is the identity for Cholesky
     @test execute!("solve_diag", solver, x, b) === nothing
@@ -155,11 +155,15 @@ end
     backend isa CPU ||
         @test thrown(() -> execute!("solve", solver, rand(T, 40), rand(T, 40))) isa InvalidValueError
     # options and structures that are not implemented yet
-    for (name, value) in (("matching_alg", "algo1"), ("schur_mode", 1), ("schedule", "syncfree"))
+    for (name, value) in (("matching_alg", "algo1"), ("schedule", "syncfree"))
         s2 = DirectSolver(api_matrix(backend, tril(A)), spd_structure(T), 'L')
         setparam!(s2, name, value)
         @test thrown(() -> execute!("analysis", s2, x, b)) isa NotSupportedError
     end
+    # Schur complement mode (T20) needs user_schur_indices
+    s2 = DirectSolver(api_matrix(backend, tril(A)), spd_structure(T), 'L')
+    setparam!(s2, "schur_mode", 1)
+    @test thrown(() -> execute!("analysis", s2, x, b)) isa InvalidValueError
     # uniform batches since T17: ubatch_size must match the batch size of the values (1 here)
     s2 = DirectSolver(api_matrix(backend, tril(A)), spd_structure(T), 'L')
     setparam!(s2, "ubatch_size", 2)
@@ -228,9 +232,11 @@ end
     for name in ("lu_nnz", "perm_row", "diag", "nsuperpanels", "memory_estimates")
         @test thrown(() -> setparam!(solver, name, 1)) isa ArgumentError
     end
-    for name in ("perm_matching", "scale_row", "scale_col", "schur_shape", "schur_matrix", "nd_partition_tree",
-                 "hybrid_device_memory_min")
+    for name in ("perm_matching", "scale_row", "scale_col", "nd_partition_tree", "hybrid_device_memory_min")
         @test thrown(() -> getparam(solver, name)) isa NotSupportedError
+    end
+    for name in ("schur_shape", "schur_matrix")                 # T20: need an analysis with schur_mode = 1
+        @test thrown(() -> getparam(solver, name)) isa InvalidValueError
     end
     # pivot statistics of a successful Cholesky factorization (T15)
     @test getparam(solver, "inertia") == (n, 0) && getparam(solver, "inertia") isa Tuple{INT, INT}

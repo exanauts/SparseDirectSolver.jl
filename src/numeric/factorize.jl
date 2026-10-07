@@ -10,8 +10,8 @@
 "Workgroup size of the per-phase reduction of the front statistics."
 const STATS_WORKGROUP = 256
 
-@kernel function _cholesky_stats_kernel!(stats_all, info_all, super_ptr, front_ncols, ns, bm, ::Val{WG}, ::Val{NF},
-                                         ::Val{LOG2WG}) where {WG, NF, LOG2WG}
+@kernel function _cholesky_stats_kernel!(stats_all, info_all, super_ptr, front_ncols, ns, schur, bm, ::Val{WG},
+                                         ::Val{NF}, ::Val{LOG2WG}) where {WG, NF, LOG2WG}
     li = @index(Local, Linear)
     G = @index(Group, Linear)
     best = @localmem Int64 (WG,)
@@ -22,7 +22,7 @@ const STATS_WORKGROUP = 256
         for s in li:WG:ns
             fi = Int64(info[s])
             base = (s - 1) * NF
-            stats[base + 1] = fi == 0 ? Int64(front_ncols[s]) : fi - 1
+            stats[base + 1] = s == schur ? Int64(0) : fi == 0 ? Int64(front_ncols[s]) : fi - 1
             for k in 2:(NF - 1)
                 stats[base + k] = 0
             end
@@ -52,7 +52,8 @@ end
 
 Fill the per-front statistics of a Cholesky factorization from the per-front
 `potrf` status `numeric.info[1:ns]` (`npos` = `w`, or the failed local column
-minus one; `info` = the failed local column) and reduce the smallest failed
+minus one; `info` = the failed local column; the unfactored Schur root counts
+nothing) and reduce the smallest failed
 factor column into `numeric.info[ns + 1]` (0 = none), for every active batch
 member. One workgroup per member, no atomics. Asynchronous.
 """
@@ -60,7 +61,8 @@ function cholesky_stats!(N::Numeric, S::Symbolic)
     WG = STATS_WORKGROUP
     bm = batch_map(N)
     kernel! = _cholesky_stats_kernel!(KernelAbstractions.get_backend(N.factor), WG)
-    kernel!(N.stats, N.info, S.super_ptr, S.front_ncols, nsupernodes(S), bm, Val(WG), Val(FRONT_STATS_FIELDS),
+    kernel!(N.stats, N.info, S.super_ptr, S.front_ncols, nsupernodes(S), S.schedule.schur, bm, Val(WG),
+            Val(FRONT_STATS_FIELDS),
             Val(_ilog2(WG)); ndrange = WG * bm.nact)
     return N
 end
@@ -270,6 +272,7 @@ function factorize_cholesky!(N::Numeric{T}, S::Symbolic, nzval::AbstractVector; 
             end
         end
     end
+    assemble_schur!(N, S, nzval)
     cholesky_stats!(N, S)
     nb = N.nbatch
     copyto!(plan.info_host, 1, N.info, nsupernodes(S) * nb + 1, nb)  # the phase's only host synchronization
