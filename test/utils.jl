@@ -169,14 +169,33 @@ panel_tol(::Type{T}) where {T} = 100 * eps(real(T))
 """
     factor_growth(Nr)
 
-Element growth `max(max |L|, max |Uᵀ|) / min |d[1:n]|` of the reference factor
+Element growth `max(max |L|, max |Uᵀ|) / min σ(pivot)` of the reference factor
 `Nr` (`ufactor` is empty for the symmetric structures, then only `L` counts).
+The minimum runs over the pivots of `D`: `|d[k]|` of a 1×1 pivot and a lower
+bound `|det| / ‖·‖_F` of the smallest singular value of a 2×2 block (whose
+diagonal may be zero; the smaller determinant of the symmetric and the
+Hermitian block). Perturbed pivots (`±ε`, compared exactly by the tests) are
+left out.
 """
 function factor_growth(Nr)
     n = length(Nr.piv)
     big = max(maximum(abs, Nr.factor; init = zero(real(eltype(Nr.factor)))),
               maximum(abs, Nr.ufactor; init = zero(real(eltype(Nr.ufactor)))))
-    return big / minimum(abs, @view Nr.d[1:n])
+    d, kind = Nr.d, Nr.pivot_kind
+    small = typemax(real(eltype(d)))
+    k = 1
+    while k <= n
+        if kind[k] == SparseDirectSolver.PIVOT_KIND_2X2_FIRST
+            a, b, c = d[k], d[n + k], d[k + 1]
+            det = min(abs(a * c - b * b), abs(a * c - abs2(b)))
+            small = min(small, det / sqrt(abs2(a) + 2 * abs2(b) + abs2(c)))
+            k += 2
+        else
+            kind[k] == SparseDirectSolver.PIVOT_KIND_PERTURBED || (small = min(small, abs(d[k])))
+            k += 1
+        end
+    end
+    return big / small
 end
 
 """

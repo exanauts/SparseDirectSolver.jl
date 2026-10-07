@@ -36,15 +36,18 @@ end
             S, Nr, Sd, Nd, nz = ldlt_setup(backend, A; opts, structure)
             @test SDS.factorize!(Nd, Sd, nz; opts) == 0
             Nh = SDS.host_numeric(Nd)
-            # the same pivot sequence: local orders and pivot kinds are equal, D and L to rounding
+            # the same pivot sequence: local orders and pivot kinds are equal, D and L to rounding (scaled by the
+            # element growth: the device may contract to FMA, #86)
             @test Nh.piv == Nr.piv
             @test Nh.pivot_kind == Nr.pivot_kind
-            @test d_error(Nh, Nr) <= panel_tol(T)
-            @test panel_error(Nh, Nr) <= panel_tol(T)
+            @test d_error(Nh, Nr) <= growth_tol(T, Nr)
+            @test panel_error(Nh, Nr) <= growth_tol(T, Nr)
+            herm = structure == "H" || T <: Real
+            # the backward error of the device factor: P A Pᵀ = L D Lᴴ (Lᵀ for complex symmetric)
+            @test ldlt_error(A, S, Nh; herm) <= tol(T)
             @test Nh.stats == Nr.stats
             st = SDS.pivot_totals(Nd)
             @test st == SDS.pivot_stats(Nr) && Nh.totals == Nr.totals
-            herm = structure == "H" || T <: Real
             herm && eig && @test (st.npos, st.nneg) == eigen_npos_nneg(A)
             herm && @test st.npos + st.nneg == size(A, 1)
             # device solve: forward (local pivot orders), diagonal, backward sweeps
@@ -73,7 +76,8 @@ end
     SDS.factorize!(Nd, Sd, nz; opts)
     Nh = SDS.host_numeric(Nd)
     @test Nh.piv == Nr.piv && Nh.pivot_kind == Nr.pivot_kind
-    @test d_error(Nh, Nr) <= panel_tol(T) && panel_error(Nh, Nr) <= panel_tol(T)
+    @test d_error(Nh, Nr) <= growth_tol(T, Nr) && panel_error(Nh, Nr) <= growth_tol(T, Nr)
+    @test ldlt_error(A, S, Nh) <= tol(T)
     # views of the matrix give the same factor
     for view in ('U', 'F')
         _, _, Sv, Nv, nzv = ldlt_setup(backend, A, Int64; view, opts)
@@ -83,6 +87,7 @@ end
 end
 
 @testset "perturbation and pivot_sign ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
+    Random.seed!(666)
     n, j = 60, 23
     R = real(T)
     # the zero pivot in its own root front, regime C ("algo2"), or as the analysis schedules it
@@ -97,7 +102,7 @@ end
         Nh = SDS.host_numeric(Nd)
         # the same pivot sequence; D to rounding (the device may contract to FMA), perturbed pivots exactly
         @test Nh.pivot_kind == Nr.pivot_kind && Nh.piv == Nr.piv
-        @test d_error(Nh, Nr) <= panel_tol(T)
+        @test d_error(Nh, Nr) <= growth_tol(T, Nr)
         pert = Nr.pivot_kind .== SDS.PIVOT_KIND_PERTURBED
         @test Nh.d[1:n][pert] == Nr.d[1:n][pert]
         st = SDS.pivot_totals(Nd)
@@ -126,7 +131,7 @@ end
         SDS.factorize!(Nd, Sd, nz; opts)
         Nh = SDS.host_numeric(Nd)
         @test Nh.pivot_kind == Nr.pivot_kind && Nh.piv == Nr.piv
-        @test d_error(Nh, Nr) <= panel_tol(T)
+        @test d_error(Nh, Nr) <= growth_tol(T, Nr)
         pert = Nr.pivot_kind .== SDS.PIVOT_KIND_PERTURBED
         @test Nh.d[1:n][pert] == Nr.d[1:n][pert]
         @test SDS.pivot_totals(Nd).nperturbed == 1
@@ -169,8 +174,9 @@ end
                 Nh = SDS.host_numeric(Nd)
                 @test Nh.piv == Nr.piv
                 @test Nh.pivot_kind == Nr.pivot_kind
-                @test d_error(Nh, Nr) <= panel_tol(T)
-                @test panel_error(Nh, Nr) <= panel_tol(T)
+                @test d_error(Nh, Nr) <= growth_tol(T, Nr)
+                @test panel_error(Nh, Nr) <= growth_tol(T, Nr)
+                @test ldlt_error(A, S, Nh) <= tol(T)
                 @test Nh.stats == Nr.stats
                 @test SDS.pivot_totals(Nd) == SDS.pivot_stats(Nr)
                 ws = SDS.allocate_solve(Sd, T, backend, 1)
@@ -185,8 +191,38 @@ end
     @test thrown(() -> SDS.factorize_ldlt!(Nd, Sd, nz; nb = SDS.LDLT_C_NB + 1)) isa InvalidValueError
 end
 
+@testset "regime B on the blocked path ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
+    # regime-B bins of width class ≥ LDLT_BLOCKED_MIN_WCLASS and row class ≥ LDLT_BLOCKED_MIN_FCLASS run the
+    # blocked steps and GEMMs of ldlt_c.jl after the regular assembly kernels (`ldlt_blocked_path`, #89); the
+    # regime-C thresholds are raised so that these fronts stay in regime B whatever their row counts
+    Random.seed!(666)
+    A = kkt_matrix(T, 200, 100, 0.0; hessian = :indefinite, hessian_scale = 1.0e-3)
+    opts = Options(user_perm = kkt_interleaved_perm(200, 100), regime_c_width = SDS.REGIME_B_MAX_WIDTH,
+                   regime_c_rows = 1024)
+    S, Nr, Sd, Nd, nz = ldlt_setup(backend, A; opts)
+    sc, sp = S.schedule, S.partition
+    blocked_b = [s for s in 1:SDS.nsupernodes(S) if sc.regime[s] == SDS.REGIME_B && SDS.ldlt_blocked_path(sc, s) &&
+                 !SDS.takes_c_path(sc, s)]
+    @test !isempty(blocked_b)
+    # 2×2 pivots inside such a front
+    @test any(s -> any(k -> Nr.pivot_kind[k] == SDS.PIVOT_KIND_2X2_FIRST, SDS.sncols(sp, s)), blocked_b)
+    @test SDS.factorize!(Nd, Sd, nz; opts) == 0
+    Nh = SDS.host_numeric(Nd)
+    @test Nh.piv == Nr.piv
+    @test Nh.pivot_kind == Nr.pivot_kind
+    @test d_error(Nh, Nr) <= growth_tol(T, Nr)
+    @test panel_error(Nh, Nr) <= growth_tol(T, Nr)
+    @test ldlt_error(A, S, Nh) <= tol(T)
+    @test Nh.stats == Nr.stats
+    @test SDS.pivot_totals(Nd) == SDS.pivot_stats(Nr)
+    ws = SDS.allocate_solve(Sd, T, backend, 1)
+    b = rand(T, size(A, 1))
+    @test relres(A, device_solve(backend, ws, Sd, Nd, b; deterministic = true), b) <= tol(T)
+end
+
 @testset "pivot_type 'D' and 'N' on quasi-definite KKT ($(backend_name(backend)), $T)" for backend in BACKENDS,
                                                                                          T in ELTYPES
+    Random.seed!(666)
     nh, nj = 300, 100
     A = kkt_matrix(T, nh, nj, 1.0e-2)
     for pt in ('D', 'N')
@@ -194,7 +230,7 @@ end
         S, Nr, Sd, Nd, nz = ldlt_setup(backend, A; opts)
         SDS.factorize!(Nd, Sd, nz; opts)
         Nh = SDS.host_numeric(Nd)
-        @test Nh.piv == Nr.piv && Nh.pivot_kind == Nr.pivot_kind && d_error(Nh, Nr) <= panel_tol(T)
+        @test Nh.piv == Nr.piv && Nh.pivot_kind == Nr.pivot_kind && d_error(Nh, Nr) <= growth_tol(T, Nr)
         st = SDS.pivot_totals(Nd)
         @test st.n2x2 == 0 && st.nperturbed == 0 && (st.npos, st.nneg) == (nh, nj)
         pt == 'N' && @test Nh.piv == 1:(nh + nj)
@@ -202,6 +238,7 @@ end
 end
 
 @testset "determinism and refactorization ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
+    Random.seed!(666)
     A = kkt_matrix(T, 200, 100, 0.0; hessian = :indefinite, hessian_scale = 1.0e-3)
     opts = Options(user_perm = kkt_interleaved_perm(200, 100), subtree_budgets = [8192, 16384], regime_c_width = 16,
                    regime_c_rows = 128)
@@ -231,6 +268,7 @@ end
 
 @testset "solve sweeps: diagonal step and dense path ($(backend_name(backend)), $T)" for backend in BACKENDS,
                                                                                       T in ELTYPES
+    Random.seed!(666)
     A = kkt_matrix(T, 200, 100, 0.0; hessian = :indefinite, hessian_scale = 1.0e-3)
     for (rname, rkw) in LDLT_REGIMES
         opts = Options(; user_perm = kkt_interleaved_perm(200, 100), rkw...)
@@ -268,6 +306,7 @@ end
 
 @testset "MadNLP-style inertia correction on the device ($(backend_name(backend)), $T)" for backend in BACKENDS,
                                                                                          T in ELTYPES
+    Random.seed!(666)
     nh, nj = 200, 100
     A = kkt_matrix(T, nh, nj, 0.0; hessian = :indefinite)
     for (label, opts) in MADNLP_ORDERINGS
@@ -288,6 +327,7 @@ end
 end
 
 @testset "public API ($(backend_name(backend)), $T, $INT)" for backend in BACKENDS, T in ELTYPES, INT in INTTYPES
+    Random.seed!(666)
     nh, nj = 200, 100
     n = nh + nj
     A = kkt_matrix(T, nh, nj, 0.0; hessian = :indefinite, hessian_scale = 1.0e-3)
@@ -314,7 +354,7 @@ end
     @test getparam(solver, "npivots") == 0 && getparam(solver, "npivots") isa INT
     d = getparam(solver, "diag")
     @test typeof(KernelAbstractions.get_backend(d)) == typeof(backend)
-    @test norm(to_host(d) - Nr.d[1:n]) <= panel_tol(T) * norm(Nr.d)
+    @test norm(to_host(d) - Nr.d[1:n]) <= growth_tol(T, Nr) * norm(Nr.d)
     hd = zeros(T, n)
     getparam!(hd, solver, "diag")
     @test hd == to_host(d)
@@ -357,6 +397,7 @@ end
 
 @testset "complex symmetric through the API ($(backend_name(backend)), $T)" for backend in BACKENDS,
                                                                               T in COMPLEX_ELTYPES
+    Random.seed!(666)
     A = random_symindef(T, 300, 0.02; hermitian = false)
     solver = DirectSolver(api_matrix(backend, tril(A), Int32), "S", 'L')
     execute!("analysis", solver, nothing, nothing)

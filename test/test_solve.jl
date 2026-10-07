@@ -43,6 +43,7 @@ RUN_SHARED && @testset "solve plan and workspace" begin
 end
 
 @testset "permutation kernels ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
+    Random.seed!(666)
     n, nrhs = 37, 4
     perm = randperm(n)
     pd = to_device(backend, perm)
@@ -93,6 +94,7 @@ end
 
 @testset "forward and backward sweeps against L ($(backend_name(backend)), $T)" for backend in BACKENDS,
                                                                                        T in ELTYPES
+    Random.seed!(666)
     A = laplacian3d(T, 10, 10, 10)
     S, Sd, Nd, ws = solve_setup(backend, A; opts = SOLVE_OPTS, nrhs = 2)
     L = SDS.extract_L(S, SDS.host_numeric(Nd))
@@ -136,6 +138,7 @@ end
 end
 
 @testset "right-hand-side layouts and columns ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
+    Random.seed!(666)
     A = random_spd(T, 500, 0.01)
     S, Sd, Nd, ws = solve_setup(backend, A; opts = SOLVE_OPTS)
     n = size(A, 1)
@@ -166,6 +169,7 @@ end
 end
 
 @testset "schedules and dense implementations ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
+    Random.seed!(666)
     A = laplacian3d(T, 8, 8, 8)
     b = rand(T, size(A, 1), 2)
     for opts in (Options(), Options(subtree_budgets = Int[]), Options(factorization_alg = "algo1", regime_c_width = 16),
@@ -186,6 +190,7 @@ end
 end
 
 @testset "no allocations (CPU, $T)" for T in ELTYPES
+    Random.seed!(666)
     A = laplacian2d(T, 40, 40)
     S, Sd, Nd, ws = solve_setup(CPU(), A; opts = SOLVE_OPTS)
     b = rand(T, size(A, 1), 5)

@@ -2184,8 +2184,8 @@ repeat it once T21 has landed. The bar is cuDSS with `"matching_alg" =
 
 ### Report
 
-- Status: [!] (done on the CPU backend; the "100× on a badly scaled SPD matrix" assertion is `@test_broken`, see
-  deviations; CUDA from CI)
+- Status: [!] (done on the CPU backend; the "100× on a badly scaled SPD matrix" assertion is replaced by what holds,
+  see deviations; CUDA from CI)
 - What was built:
   - `src/solve/refinement.jl` (new): `RefinementWorkspace` (device CSR of the full matrix over the contributions
     of the user's `nzval`, signed source index = conjugated mirror entry for `"H"`/`"HPD"`, built from the existing
@@ -2251,7 +2251,9 @@ repeat it once T21 has landed. The bar is cuDSS with `"matching_alg" =
     is backward stable and invariant under symmetric diagonal scaling (the only scaling that keeps the matrix
     SPD). Measured on 3 generators × 3 scalings × 5 right-hand-side choices: the unrefined relres is either at
     rounding level (`b = A x`) or limited by `cond(A)` (random `b`), and one step gains ≤ 7× (once 42×). The SPD
-    assertion is `@test_broken` with that comment; the 100× reduction is asserted on a KKT matrix whose
+    assertion was `@test_broken` with that comment; since the post-T21 test hardening (#79 review: a backend with
+    other rounding could flip it to an unexpected pass) it asserts what holds instead, `r0 ≤ 100 eps` and
+    `r1 ≤ r0`; the 100× reduction is asserted on a KKT matrix whose
     factorization carries static pivot perturbations (the case refinement is meant for, issue #71), together with
     the `ir_tol`/early-exit/steps-performed checks (also run on the SPD matrix, where they pass).
   - `ir_tol` is the largest `‖Rₖ‖₂/‖Bₖ‖₂` over the right-hand sides; checking it costs one host synchronization

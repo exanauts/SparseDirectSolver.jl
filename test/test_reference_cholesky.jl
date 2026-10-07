@@ -48,6 +48,7 @@ reference_matrices(::Type{T}) where {T} =
 end
 
 @testset "P A Pᵀ = L Lᴴ and solves: $T" for T in ELTYPES
+    Random.seed!(666)
     for (name, A) in reference_matrices(T)
         @testset "$name" begin
             S, N, info, _ = reference_cholesky(A)
@@ -76,6 +77,7 @@ end
 end
 
 @testset "views, index bases and refactorization: $T" for T in ELTYPES
+    Random.seed!(666)
     A = random_spd(T, 300, 0.02)
     S, N, info, _ = reference_cholesky(A; view = 'L')
     @test info == 0
@@ -104,6 +106,7 @@ end
 end
 
 @testset "info: first non-positive pivot: $T" for T in ELTYPES
+    Random.seed!(666)
     n, j = 60, 23
     for opts in (Options(), Options(reordering_alg = "algo5"), Options(use_superpanels = 0))
         A = singular_block_matrix(T, n, j; stored_zero = true)
@@ -126,6 +129,7 @@ end
 end
 
 @testset "amalgamation on and off: $T" for T in ELTYPES
+    Random.seed!(666)
     for A in (laplacian2d(T, 30, 30), random_spd(T, 400, 0.01), laplacian3d(T, 8, 8, 8))
         b = rand(T, size(A, 1), 3)
         S1, N1, i1, _ = reference_cholesky(A)

@@ -6,6 +6,7 @@ stat_of(N, s, q) = N.stats[(s - 1) * SDS.FRONT_STATS_FIELDS + q]
 psign_minus(n, j) = (v = zeros(Int8, n); v[j] = -1; v)
 
 @testset "inputs and storage" begin
+    Random.seed!(666)
     A = random_symindef(Float64, 60, 0.05)
     S, N, info, C = reference_ldlt(A)
     @test info == 0
@@ -94,6 +95,7 @@ end
 end
 
 @testset "inertia equals the eigenvalue signs: $T" for T in ELTYPES
+    Random.seed!(666)
     nh, nj = 200, 100
     cases = [("random_symindef(300,0.02)", random_symindef(T, 300, 0.02), Options()),
              ("random_symindef(250,0.05) natural", random_symindef(T, 250, 0.05), Options(reordering_alg = "algo5")),
@@ -132,6 +134,7 @@ end
 end
 
 @testset "views and refactorization: $T" for T in ELTYPES
+    Random.seed!(666)
     A = kkt_matrix(T, 200, 100, 0.0; hessian = :indefinite, hessian_scale = 1.0e-3)
     opts = Options(user_perm = kkt_interleaved_perm(200, 100))
     S, N, _, _ = reference_ldlt(A; view = 'L', opts)
@@ -153,6 +156,7 @@ end
 end
 
 @testset "complex symmetric LDLᵀ: $T" for T in COMPLEX_ELTYPES
+    Random.seed!(666)
     A = random_symindef(T, 300, 0.02; hermitian = false)
     @test transpose(A) == A && A' != A
     S, N, info, _ = reference_ldlt(A; structure = "S")
@@ -174,6 +178,7 @@ end
 end
 
 @testset "perturbation and pivot_sign: $T" for T in ELTYPES
+    Random.seed!(666)
     n, j = 60, 23
     for stored_zero in (false, true), sgn in (1, -1)
         A = singular_block_matrix(T, n, j; stored_zero)
@@ -217,6 +222,7 @@ end
 end
 
 @testset "pivot_type 'D' and 'N' on quasi-definite KKT: $T" for T in ELTYPES
+    Random.seed!(666)
     nh, nj = 300, 100
     for δ in (1.0e-8, 1.0e-2), pt in ('D', 'N')
         A = kkt_matrix(T, nh, nj, δ)
@@ -239,6 +245,7 @@ end
 end
 
 @testset "MadNLP-style inertia correction ($label): $T" for T in ELTYPES, (label, opts) in MADNLP_ORDERINGS
+    Random.seed!(666)
     nh, nj = 200, 100
     # primal regularization δw on an indefinite H, no dual regularization (δ = 0); the
     # 2×2 pivot pairs of the analysis (#64) or the KKT-aware ordering keep every dual row

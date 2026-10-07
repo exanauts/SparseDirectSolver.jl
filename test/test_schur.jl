@@ -28,6 +28,7 @@ schur_ldlt(structure) = structure in ("S", "H")
                                                                                  T in ELTYPES,
                                                                                  (structure, gen) in schur_cases(T),
                                                                                  (rname, opts) in schur_regimes()
+    Random.seed!(666)
     A = gen()
     n = size(A, 1)
     flags = schur_test_flags(n)
@@ -133,6 +134,7 @@ end
 
 @testset "Schur complement: solve_mode and transposed input ($(backend_name(backend)), $T)" for backend in BACKENDS,
                                                                                                T in ELTYPES
+    Random.seed!(666)
     A = random_general(T, 90, 0.05)
     n = size(A, 1)
     flags = schur_test_flags(n)
@@ -175,6 +177,7 @@ end
 end
 
 RUN_SHARED && @testset "Schur complement: orderings, edge cases, errors ($(backend_name(backend)))" for backend in BACKENDS
+    Random.seed!(666)
     T = Float64
     # two disconnected blocks, Schur indices in the second one only: the first block is a separate tree
     A = blockdiag(laplacian2d(T, 6, 6), laplacian2d(T, 7, 5))
