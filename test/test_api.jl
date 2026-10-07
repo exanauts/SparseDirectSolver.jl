@@ -164,7 +164,7 @@ end
     s2 = DirectSolver(api_matrix(backend, tril(A)), spd_structure(T), 'L')
     setparam!(s2, "matching_alg", "algo1")
     setparam!(s2, "schur_mode", 1)
-    setparam!(s2, "user_schur_indices", [i > n - 3 ? 1 : 0 for i in 1:n])
+    setparam!(s2, "user_schur_indices", [i > size(A, 1) - 3 ? 1 : 0 for i in 1:size(A, 1)])
     @test thrown(() -> execute!("analysis", s2, x, b)) isa NotSupportedError
     # Schur complement mode (T20) needs user_schur_indices
     s2 = DirectSolver(api_matrix(backend, tril(A)), spd_structure(T), 'L')
