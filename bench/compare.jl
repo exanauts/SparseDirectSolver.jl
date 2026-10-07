@@ -226,7 +226,7 @@ function measure(sys; samples, seconds, single_run_above)
     foreach(p -> run_phase(sys, st, p), PHASES)
     sync()
     info = API.get(st[1], "info")
-    info == 0 || error("info = $info after the factorization")
+    all(iszero, info) || error("info = $info after the factorization")
     stats = (relres = sys.check(solution(st)), lu_nnz = stat(s -> API.get(s, "lu_nnz"), st[1]),
              flops = stat(API.flops, st[1]), nsuperpanels = stat(s -> API.get(s, "nsuperpanels"), st[1]))
     st = sys.fresh()
