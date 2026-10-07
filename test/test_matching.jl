@@ -131,11 +131,15 @@ end
     # the final permutations: perm_col composes the matching with the reordering
     @test getparam(solver, "perm_col") == q[getparam(solver, "perm_reorder_col")]
     @test isperm(getparam(solver, "perm_row"))
-    # the sub-phases compose to "solve" bitwise
+    # the sub-phases compose to "solve" bitwise; both under the deterministic forward sweep
+    # (the atomic one reorders sums between runs on GPUs)
+    setparam!(solver, "deterministic_mode", 1)
+    execute!("solve", solver, x, b)
     x2 = to_device(backend, zeros(T, n))
     for phase in SOLVE_SUBPHASES
         execute!(phase, solver, x2, b)
     end
+    setparam!(solver, "deterministic_mode", 0)
     @test to_host(x2) == to_host(x)
     # solve_mode 1 (Aᵀ), 2 (Aᴴ), with and without refinement
     for (mode, Aop) in ((1, sparse(transpose(A))), (2, sparse(adjoint(A)))), steps in (0, 2)
