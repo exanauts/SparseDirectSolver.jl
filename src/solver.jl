@@ -746,7 +746,11 @@ The data parameters computed by the solver:
 Uniform batch (`nbatch > 1`): `"info"`, `"npivots"`, `"inertia"` and
 `"pivot_stats"` are vectors with one entry per batch member, `"diag"` is the
 `n · nbatch` vector of the members' diagonals one after the other; the
-analysis outputs are shared by the members.
+analysis outputs are shared by the members. `"perm_row"` of an LU batch is
+batch member 1's row order, by design: cuDSS returns the vector outputs of a
+uniform batch (`"diag"`) for member 1 only and does not implement
+`"perm_row"` at all (cuDSS 0.8). `"diag"` is the deliberate exception and
+returns every member.
 
 The pivot statistics are reduced on the device ([`reduce_stats!`](@ref)) and
 copied to the host when read (one synchronization). The reordering
