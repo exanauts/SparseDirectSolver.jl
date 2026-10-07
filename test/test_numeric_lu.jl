@@ -125,6 +125,7 @@ end
 end
 
 @testset "perturbation ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
+    Random.seed!(666)
     n, j = 60, 23
     R = real(T)
     # a zero row and column j: no row of the front can replace the zero pivot, it is perturbed

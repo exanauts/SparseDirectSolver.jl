@@ -49,6 +49,7 @@ end
 
 # synthetic assembled fronts through the dense part of the kernel, against LAPACK on the host
 @testset "front_cholesky! on synthetic fronts ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
+    Random.seed!(666)
     for W in SDS.REGIME_B_WIDTHS
         shapes = [(w, m, cb) for w in unique((1, W ÷ 2 + 1, W)) for (m, cb) in ((0, false), (1, true), (37, true),
                                                                                (5, false))]
@@ -115,6 +116,7 @@ end
 end
 
 @testset "panels, solves, determinism ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
+    Random.seed!(666)
     for (name, A, opts) in numeric_b_matrices(T), INT in (name == "laplacian2d(40,40)" ? INTTYPES : (Int32,))
         @testset "$name $INT" begin
             S, Nr, info_ref, Sd, Nd, nz = numeric_setup(backend, A, INT; opts)
@@ -139,6 +141,7 @@ end
 end
 
 @testset "factorization_alg algo1 vs algo2 ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
+    Random.seed!(666)
     for A in (laplacian2d(T, 40, 40), random_spd(T, 500, 0.01))
         b = rand(T, size(A, 1), 2)
         x = map(("algo1", "algo2")) do alg
@@ -156,6 +159,7 @@ end
 end
 
 @testset "views, index bases, refactorization ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
+    Random.seed!(666)
     A = random_spd(T, 300, 0.02)
     for opts in (NUMERIC_B_OPTS, NUMERIC_BC_OPTS)
         S, Nr, _, Sd, Nd, nz = numeric_setup(backend, A; opts)
@@ -191,6 +195,7 @@ end
 end
 
 @testset "info: first non-positive pivot ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
+    Random.seed!(666)
     n, j = 60, 23
     for opts in (NUMERIC_B_OPTS, Options(subtree_budgets = Int[], reordering_alg = "algo5"),
                  Options(subtree_budgets = Int[], use_superpanels = 0), NUMERIC_BC_OPTS)

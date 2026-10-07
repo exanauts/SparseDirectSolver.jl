@@ -37,6 +37,7 @@ end
 
 @testset "FGMRES-IR: element types, multiple right-hand sides, solve_mode ($(backend_name(backend)), $T)" for backend in BACKENDS,
                                                                                                                T in ELTYPES
+    Random.seed!(666)
     n = 200
     for (A, structure) in ((random_spd(T, n, 0.02), spd_structure(T)), (random_symindef(T, n, 0.02), sym_structure(T)))
         solver = ir_solver(backend, A, structure; params = (("ir_mode", "fgmres"), ("deterministic_mode", 1)))
@@ -74,6 +75,7 @@ end
 
 @testset "FGMRES-IR: uniform batch ($(backend_name(backend)), $T)" for backend in BACKENDS,
                                                                        T in filter(in((Float64, ComplexF32)), ELTYPES)
+    Random.seed!(666)
     n, nb, nrhs = 120, 3, 2
     members = batch_members(random_symindef(T, n, 0.03), nb)
     solver = DirectSolver(api_batch_matrix(backend, members, 'L'), sym_structure(T), 'L')

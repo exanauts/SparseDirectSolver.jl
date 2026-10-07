@@ -16,6 +16,7 @@ nregime(S, r) = count(==(r), S.schedule.regime)
 solve_allocated(x, ws, S, N, b; kwargs...) = @allocated SDS.sweep_solve!(x, ws, S, N, b; kwargs...)
 
 RUN_SHARED && @testset "solve plan and workspace" begin
+    Random.seed!(666)
     for (name, A) in solve_matrices(Float64)
         C = SDS.CSR(tril(A))
         S = SDS.symbolic_analysis(C, "SPD", 'L'; opts = SOLVE_OPTS)
@@ -43,6 +44,7 @@ RUN_SHARED && @testset "solve plan and workspace" begin
 end
 
 @testset "permutation kernels ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
+    Random.seed!(666)
     n, nrhs = 37, 4
     perm = randperm(n)
     pd = to_device(backend, perm)
@@ -74,6 +76,7 @@ end
 end
 
 @testset "residuals, all regimes ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
+    Random.seed!(666)
     for (name, A) in solve_matrices(T), INT in (name == "laplacian2d(40,40)" ? INTTYPES : (Int32,))
         @testset "$name $INT" begin
             S, Sd, Nd, ws = solve_setup(backend, A, INT; opts = SOLVE_OPTS)
@@ -93,6 +96,7 @@ end
 
 @testset "forward and backward sweeps against L ($(backend_name(backend)), $T)" for backend in BACKENDS,
                                                                                        T in ELTYPES
+    Random.seed!(666)
     A = laplacian3d(T, 10, 10, 10)
     S, Sd, Nd, ws = solve_setup(backend, A; opts = SOLVE_OPTS, nrhs = 2)
     L = SDS.extract_L(S, SDS.host_numeric(Nd))
@@ -120,6 +124,7 @@ end
 end
 
 @testset "deterministic and atomic variants ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
+    Random.seed!(666)
     for (name, A) in solve_matrices(T)
         S, Sd, Nd, ws = solve_setup(backend, A; opts = SOLVE_OPTS)
         @test ws.atomic == SDS.capabilities(backend, T).atomic_add
@@ -136,6 +141,7 @@ end
 end
 
 @testset "right-hand-side layouts and columns ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
+    Random.seed!(666)
     A = random_spd(T, 500, 0.01)
     S, Sd, Nd, ws = solve_setup(backend, A; opts = SOLVE_OPTS)
     n = size(A, 1)
@@ -166,6 +172,7 @@ end
 end
 
 @testset "schedules and dense implementations ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
+    Random.seed!(666)
     A = laplacian3d(T, 8, 8, 8)
     b = rand(T, size(A, 1), 2)
     for opts in (Options(), Options(subtree_budgets = Int[]), Options(factorization_alg = "algo1", regime_c_width = 16),
@@ -186,6 +193,7 @@ end
 end
 
 @testset "no allocations (CPU, $T)" for T in ELTYPES
+    Random.seed!(666)
     A = laplacian2d(T, 40, 40)
     S, Sd, Nd, ws = solve_setup(CPU(), A; opts = SOLVE_OPTS)
     b = rand(T, size(A, 1), 5)

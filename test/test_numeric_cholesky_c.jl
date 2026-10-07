@@ -46,6 +46,7 @@ RUN_SHARED && @testset "storage and plan" begin
 end
 
 @testset "panels, solves, determinism ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
+    Random.seed!(666)
     for (name, A) in numeric_c_matrices(T), INT in (name == "laplacian2d(40,40)" ? INTTYPES : (Int32,))
         @testset "$name $INT" begin
             S, Nr, info_ref, Sd, Nd, nz = numeric_c_setup(backend, A, INT)
@@ -70,6 +71,7 @@ end
 end
 
 @testset "dense implementations ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
+    Random.seed!(666)
     A = laplacian2d(T, 25, 25)
     S, Nr, _, Sd, Nd, nz = numeric_c_setup(backend, A)
     b = rand(T, size(A, 1), 2)
@@ -85,6 +87,7 @@ end
 end
 
 @testset "views, index bases, refactorization ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
+    Random.seed!(666)
     A = random_spd(T, 300, 0.02)
     S, Nr, _, Sd, Nd, nz = numeric_c_setup(backend, A)
     @test SDS.factorize!(Nd, Sd, nz) == 0
@@ -118,6 +121,7 @@ end
 end
 
 @testset "info: first non-positive pivot ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
+    Random.seed!(666)
     n, j = 60, 23
     for opts in (NUMERIC_C_OPTS,
                  Options(subtree_budgets = Int[], factorization_alg = "algo2", reordering_alg = "algo5"),

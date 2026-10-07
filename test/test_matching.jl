@@ -13,6 +13,7 @@ host_matching(A::SparseMatrixCSC, structure, alg; view = 'F') =
                                                           Options(matching_alg = alg); view))
 
 RUN_SHARED && @testset "MC64 jobs against brute force" begin
+    Random.seed!(666)
     for trial in 1:12
         n = 6
         A = sprand(n, n, 0.4) + sparse(randperm(n), 1:n, rand(n) .+ 0.5)   # structurally nonsingular
@@ -63,6 +64,7 @@ RUN_SHARED && @testset "MC64 jobs against brute force" begin
 end
 
 RUN_SHARED && @testset "symmetric scaling and matching pairs" begin
+    Random.seed!(666)
     nh, nj = 40, 15
     K = kkt_matrix(Float64, nh, nj, 1.0e-10)
     for view in ('L', 'U', 'F')
@@ -101,6 +103,7 @@ RUN_SHARED && @testset "symmetric scaling and matching pairs" begin
 end
 
 @testset "LU with matching: badly scaled ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
+    Random.seed!(666)
     n = 80
     INT = Int32
     A = badly_scaled_general(T, n, 0.05)
@@ -209,6 +212,7 @@ end
 end
 
 @testset "inertia with matching ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
+    Random.seed!(666)
     INT = Int32
     structure = sym_structure(T)
     for (name, A) in (("random_symindef(100)", random_symindef(T, 100, 0.05)),
@@ -260,6 +264,7 @@ end
 end
 
 @testset "uniform batch with matching ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
+    Random.seed!(666)
     n = 50
     A = badly_scaled_general(T, n, 0.08)
     members = [A, 2 * A, 3 * A]

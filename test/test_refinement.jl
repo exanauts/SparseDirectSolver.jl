@@ -16,6 +16,7 @@ function Base.CoreLogging.handle_message(L::InterruptAtStepLogger, level, messag
 end
 
 RUN_SHARED && @testset "refinement on a badly scaled SPD matrix ($(backend_name(backend)))" for backend in BACKENDS
+    Random.seed!(666)
     T = Float64
     A = badly_scaled_spd(T, 300, 0.02)       # rows scaled by up to 10^(±8)
     b = A * rand(T, 300)
@@ -26,10 +27,12 @@ RUN_SHARED && @testset "refinement on a badly scaled SPD matrix ($(backend_name(
     @test getparam(solver, "ir_n_steps") == 1
     @test r1 <= tol(T)
     # Cholesky is backward stable under symmetric scaling: the unrefined residual is already at
-    # rounding level (≈ 3e-16, the gain of one step is 2× to 7×, see the T16 report), so the
-    # 100× reduction of the task text can't be observed on an SPD matrix; it is checked on the
-    # perturbed LDLᵀ factorization below.
-    @test_broken r1 <= r0 / 100
+    # rounding level (≈ 1.3 eps; one step gains 3× to 5.4× over 16 seeds on the CPU backend, 2× to 7×
+    # in the T16 report), so the 100× reduction of the task text can't be observed on an SPD matrix;
+    # it is checked on the perturbed LDLᵀ factorization below. What holds on every backend: r0 at
+    # rounding level and a step that does not lose accuracy.
+    @test r0 <= 100 * eps(T)
+    @test r1 <= r0
     # ir_tol: early exit, the data parameter reports the steps performed
     x = ir_solve(backend, solver, b; steps = 10, tol = 1.0e-14)
     @test getparam(solver, "ir_n_steps") < 10
@@ -40,6 +43,7 @@ end
 RUN_SHARED &&
 @testset "refinement with static pivot perturbation ($(backend_name(backend)), $INT)" for backend in BACKENDS,
                                                                                            INT in INTTYPES
+    Random.seed!(666)
     # KKT matrix without 2×2 pairs: the zero (2,2) block is perturbed (pivot_epsilon), and refinement
     # removes the perturbation error (the case of the MadNLP K2 systems, issue #71)
     T = Float64
@@ -65,6 +69,7 @@ end
 
 @testset "refinement: layouts, aliasing, element types ($(backend_name(backend)), $T)" for backend in BACKENDS,
                                                                                            T in ELTYPES
+    Random.seed!(666)
     n = 200
     for (A, structure) in ((random_spd(T, n, 0.02), spd_structure(T)), (random_symindef(T, n, 0.02), sym_structure(T)))
         # bitwise comparisons between solves: the atomic forward sweep (default on GPUs for real T)
@@ -128,6 +133,7 @@ end
 end
 
 @testset "solve sub-phases compose to \"solve\" ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
+    Random.seed!(666)
     n = 150
     for (A, structure) in ((random_spd(T, n, 0.03), spd_structure(T)), (random_symindef(T, n, 0.03), sym_structure(T)))
         # bitwise comparison: deterministic forward sweep (the atomic one is run-dependent on GPUs)
@@ -151,6 +157,7 @@ end
 end
 
 @testset "solve_mode ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
+    Random.seed!(666)
     n = 120
     b = rand(T, n)
     cases = Any[(random_spd(T, n, 0.03), spd_structure(T)), (random_symindef(T, n, 0.03), sym_structure(T))]
@@ -187,6 +194,7 @@ end
 end
 
 @testset "user_host_interrupt ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
+    Random.seed!(666)
     A = random_symindef(T, 300, 0.02)
     b = rand(T, 300)
     for structure in (sym_structure(T), spd_structure(T))
@@ -242,6 +250,7 @@ end
 end
 
 @testset "LinearAlgebra layer refines ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
+    Random.seed!(666)
     A = random_spd(T, 100, 0.03)
     b = rand(T, 100)
     for F in (cholesky(api_matrix(backend, tril(A), Int32); view = 'L'), ldlt(api_matrix(backend, tril(A), Int32); view = 'L'))
@@ -257,6 +266,7 @@ end
 end
 
 RUN_SHARED && @testset "logging" begin
+    Random.seed!(666)
     backend = first(BACKENDS)
     A = random_spd(Float64, 80, 0.05)
     b = rand(80)

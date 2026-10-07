@@ -64,6 +64,42 @@ end
     @test maximum(batch_relres([A, A], api_solve(backend, sb, bb), bb)) <= tol(T)
 end
 
+@testset "SparseMatrixCSC constructor and update! (CPU, $T, $INT)" for backend in filter(b -> b isa CPU, BACKENDS),
+                                                                       T in ELTYPES, INT in INTTYPES
+    # a SparseMatrixCSC is converted to host CSR arrays (index type kept) once, for the CPU backend
+    Random.seed!(666)
+    n = 60
+    A = random_spd(T, n, 0.05)
+    s = spd_structure(T)
+    for (view, index) in (('L', 'O'), ('U', 'Z'), ('F', 'O'))
+        solver = DirectSolver(SparseMatrixCSC{T, INT}(triangle_view(A, view)), s, view; index)
+        @test solver isa DirectSolver{T, INT}
+        @test solver.backend isa CPU
+        @test solver.A.index == SDS._index_base(index)
+        @test size(solver) == (n, n)
+        b = rand(T, n)
+        execute!("analysis", solver, nothing, nothing)
+        execute!("factorization", solver, nothing, nothing)
+        @test relres(A, api_solve(backend, solver, b), b) <= tol(T)
+        # new values of the same pattern, then refactorization
+        A2 = A + 2 * I
+        update!(solver, SparseMatrixCSC{T, INT}(triangle_view(A2, view)))
+        execute!("refactorization", solver, nothing, nothing)
+        @test getparam(solver, "info") == 0
+        @test relres(A2, api_solve(backend, solver, b), b) <= tol(T)
+        # a different size or number of stored entries
+        @test thrown(() -> update!(solver, SparseMatrixCSC{T, INT}(triangle_view(random_spd(T, n + 1, 0.05), view)))) isa
+              InvalidValueError
+        @test thrown(() -> update!(solver, SparseMatrixCSC{T, INT}(triangle_view(A2 + sprand(T, n, n, 0.2), view)))) isa
+              InvalidValueError
+        # another index type
+        @test thrown(() -> update!(solver, SparseMatrixCSC{T, INT == Int32 ? Int64 : Int32}(triangle_view(A2, view)))) isa
+              InvalidValueError
+    end
+    # a rectangular matrix
+    @test thrown(() -> DirectSolver(SparseMatrixCSC{T, INT}(sprand(T, n, n + 1, 0.05)), s, 'F')) isa InvalidValueError
+end
+
 @testset "phases ($(backend_name(backend)), $T, $INT)" for backend in BACKENDS, T in ELTYPES, INT in INTTYPES
     A = laplacian2d(T, 15, 12) + spdiagm(0 => rand(real(T), 180))
     n = size(A, 1)

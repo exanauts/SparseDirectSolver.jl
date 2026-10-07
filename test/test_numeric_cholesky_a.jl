@@ -31,6 +31,7 @@ function subtree_move_rounds(S, v)
 end
 
 RUN_SHARED && @testset "plan: regime-A groups" begin
+    Random.seed!(666)
     for (name, A, opts) in numeric_a_matrices(Float64)
         S, _, _, _, Nd, _ = numeric_setup(CPU(), A; opts)
         sc, plan = S.schedule, Nd.plan
@@ -69,6 +70,7 @@ RUN_SHARED && @testset "plan: regime-A groups" begin
 end
 
 @testset "panels, solves, determinism ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
+    Random.seed!(666)
     for (name, A, opts) in numeric_a_matrices(T), INT in (name == "laplacian2d(40,40) A+B+C" ? INTTYPES : (Int32,))
         @testset "$name $INT" begin
             S, Nr, info_ref, Sd, Nd, nz = numeric_setup(backend, A, INT; opts)
@@ -95,6 +97,7 @@ end
 end
 
 @testset "budget classes and kernel sizes ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
+    Random.seed!(666)
     # the same matrix under different budgets: other subtrees, other local sizes, same factor
     A = laplacian3d(T, 8, 8, 8)
     for opts in (Options(subtree_budgets = [8192], subtree_parallelism = 0),
@@ -114,6 +117,7 @@ end
 
 @testset "nlaunches on laplacian2d(100, 100) with AMD ($(backend_name(backend)), $T)" for backend in BACKENDS,
                                                                                             T in ELTYPES
+    Random.seed!(666)
     A = laplacian2d(T, 100, 100)
     b = rand(T, size(A, 1), 2)
     x = map((Options(reordering_alg = "algo3", subtree_parallelism = 0),
@@ -137,6 +141,7 @@ end
 end
 
 @testset "views, index bases, refactorization ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
+    Random.seed!(666)
     A = random_spd(T, 300, 0.02)
     for opts in (NUMERIC_A_OPTS, NUMERIC_ABC_OPTS)
         S, Nr, _, Sd, Nd, nz = numeric_setup(backend, A; opts)
@@ -172,6 +177,7 @@ end
 end
 
 @testset "info: first non-positive pivot ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
+    Random.seed!(666)
     n, j = 60, 23
     for opts in (NUMERIC_A_OPTS, Options(reordering_alg = "algo5", subtree_parallelism = 0),
                  Options(use_superpanels = 0, subtree_parallelism = 0), NUMERIC_ABC_OPTS)

@@ -36,6 +36,7 @@ end
 
 @testset "batches of SPD and symmetric systems ($(backend_name(backend)), $T)" for backend in BACKENDS,
                                                                                   T in ELTYPES
+    Random.seed!(666)
     for (structure, A) in ((spd_structure(T), ubatch_spd(T)), ("S", ubatch_sym(T))), nb in (1, 2, 3, 16, 64)
         @testset "$structure nb = $nb" begin
             members = batch_members(A, nb)
@@ -52,6 +53,7 @@ end
 end
 
 @testset "regimes A, B, C and refinement ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
+    Random.seed!(666)
     nb, nrhs = 5, 3
     for (structure, A) in ((spd_structure(T), ubatch_spd(T)), ("S", ubatch_sym(T))), (rname, opts) in ubatch_regimes()
         @testset "$structure $rname" begin
@@ -75,6 +77,7 @@ end
 
 @testset "per-member inertia and pivot statistics ($(backend_name(backend)), $T)" for backend in BACKENDS,
                                                                                       T in ELTYPES
+    Random.seed!(666)
     nb = 3
     A = random_symindef(T, 60, 0.05)                         # "S" (real) / "H" (complex)
     members = batch_members(A, nb)
@@ -102,6 +105,7 @@ end
 end
 
 @testset "ubatch_index and ubatch_mask ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
+    Random.seed!(666)
     nb, nrhs = 4, 2
     for (structure, A) in ((spd_structure(T), ubatch_spd(T)), ("S", ubatch_sym(T))), (rname, opts) in ubatch_regimes()
         @testset "$structure $rname" begin
@@ -163,6 +167,7 @@ end
 end
 
 @testset "right-hand side layouts ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
+    Random.seed!(666)
     nb = 3
     for (structure, A) in ((spd_structure(T), ubatch_spd(T)), ("S", ubatch_sym(T))), nrhs in (1, 2)
         n = size(A, 1)
@@ -200,6 +205,7 @@ end
 end
 
 @testset "a failed member ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
+    Random.seed!(666)
     nb, j = 4, 37
     A = ubatch_spd(T)
     n = size(A, 1)
@@ -240,6 +246,7 @@ end
 end
 
 @testset "LinearAlgebra layer and errors ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
+    Random.seed!(666)
     nb = 3
     A = ubatch_spd(T)
     n = size(A, 1)
