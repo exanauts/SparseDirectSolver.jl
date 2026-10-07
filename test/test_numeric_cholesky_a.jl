@@ -31,6 +31,7 @@ function subtree_move_rounds(S, v)
 end
 
 RUN_SHARED && @testset "plan: regime-A groups" begin
+    Random.seed!(666)
     for (name, A, opts) in numeric_a_matrices(Float64)
         S, _, _, _, Nd, _ = numeric_setup(CPU(), A; opts)
         sc, plan = S.schedule, Nd.plan

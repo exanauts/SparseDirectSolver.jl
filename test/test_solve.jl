@@ -16,6 +16,7 @@ nregime(S, r) = count(==(r), S.schedule.regime)
 solve_allocated(x, ws, S, N, b; kwargs...) = @allocated SDS.sweep_solve!(x, ws, S, N, b; kwargs...)
 
 RUN_SHARED && @testset "solve plan and workspace" begin
+    Random.seed!(666)
     for (name, A) in solve_matrices(Float64)
         C = SDS.CSR(tril(A))
         S = SDS.symbolic_analysis(C, "SPD", 'L'; opts = SOLVE_OPTS)
@@ -75,6 +76,7 @@ end
 end
 
 @testset "residuals, all regimes ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
+    Random.seed!(666)
     for (name, A) in solve_matrices(T), INT in (name == "laplacian2d(40,40)" ? INTTYPES : (Int32,))
         @testset "$name $INT" begin
             S, Sd, Nd, ws = solve_setup(backend, A, INT; opts = SOLVE_OPTS)
@@ -122,6 +124,7 @@ end
 end
 
 @testset "deterministic and atomic variants ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
+    Random.seed!(666)
     for (name, A) in solve_matrices(T)
         S, Sd, Nd, ws = solve_setup(backend, A; opts = SOLVE_OPTS)
         @test ws.atomic == SDS.capabilities(backend, T).atomic_add

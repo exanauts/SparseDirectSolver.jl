@@ -175,7 +175,9 @@ The minimum runs over the pivots of `D`: `|d[k]|` of a 1×1 pivot and a lower
 bound `|det| / ‖·‖_F` of the smallest singular value of a 2×2 block (whose
 diagonal may be zero; the smaller determinant of the symmetric and the
 Hermitian block). Perturbed pivots (`±ε`, compared exactly by the tests) are
-left out.
+left out. Also used by `test_numeric_lu.jl`, where `Nr.pivot_kind` can hold
+`PIVOT_KIND_PERTURBED`: leaving those out of the minimum only tightens the LU
+tolerance.
 """
 function factor_growth(Nr)
     n = length(Nr.piv)
@@ -446,7 +448,8 @@ end
 
 `max |D_device - D_ref| / max |D_ref|` (both entries `d[k]` and the 2×2
 subdiagonals `d[n + k]`) of a host copy `Nh` of a device LDLᵀ factor and the
-reference factor `Nr`; compare with [`panel_tol`](@ref) (T15).
+reference factor `Nr`; compare with [`growth_tol`](@ref) (T15; `panel_tol`
+only on generators without element growth).
 """
 d_error(Nh, Nr) = maximum(abs, Nh.d - Nr.d) / maximum(abs, Nr.d)
 
