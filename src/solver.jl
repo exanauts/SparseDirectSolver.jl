@@ -321,9 +321,27 @@ analyzed (the next phase must be `"factorization"`); an interrupted refinement
 leaves the last completed iterate in `X` and reports the steps completed in
 `"ir_n_steps"`.
 
-`"solve_fwd_schur"` and `"solve_bwd_schur"` raise [`NotSupportedError`](@ref)
-until their task (T20); unknown phase strings raise `ArgumentError`. Executing
-a phase before the phases it depends on raises [`FactorizationError`](@ref).
+Schur complement mode (`schur_mode = 1` at the analysis, PLAN §3.6, as in the
+CUDSS.jl docs): `"factorization"`/`"refactorization"` factor `A₁₁` (the rows and
+columns outside `"user_schur_indices"`) and assemble the Schur complement `S`
+([`getparam`](@ref) `"schur_matrix"`). The solve phases then read `B` and write
+`X` (`X === B` allowed), with intermediate vectors in factor order, where the
+last `ns` entries are the Schur block in increasing original order:
+
+* `"solve_fwd_schur"` (permutation and forward sweep): the last `ns` entries of
+  `X` are the condensed right-hand side `bₛ = b₂ − A₂₁ A₁₁⁻¹ b₁`;
+* `"solve_diag"`: `D⁻¹` of LDLᵀ/LDLᴴ on the factored part (the identity on the
+  Schur block, and for Cholesky and LU, whose diagonal is applied by
+  `"solve_bwd_schur"` as in cuDSS);
+* `"solve_bwd_schur"` (backward sweep and inverse permutation): with the
+  solution `x₂` of `S x₂ = bₛ` in the last `ns` entries of `B`, `X` is the
+  solution of `A x = b`.
+
+`solve_mode` 1/2 solve with `Aᵀ`/`Aᴴ` (condensed system `Sᵀ`/`Sᴴ`); the other solve
+phases raise [`NotSupportedError`](@ref) in Schur mode, and the Schur phases
+without it [`FactorizationError`](@ref). Unknown phase strings raise
+`ArgumentError`. Executing a phase before the phases it depends on raises
+[`FactorizationError`](@ref).
 With `asynchronous = false` the backend is synchronized before returning
 (`KernelAbstractions.synchronize`). Phase summaries are logged (see
 [`SparseDirectSolver.set_log_level!`](@ref)).
@@ -821,10 +839,10 @@ The data parameters computed by the solver:
 | `"memory_estimates"` | `Vector{Int64}` (16 entries, see [`memory_estimates`](@ref)) | analysis |
 | `"perm_reorder_row"`, `"perm_reorder_col"` | `Vector{Int}`: the fill-reducing permutation, 1-based (`perm[k]` = original index of the `k`-th pivot) | reordering |
 | `"perm_row"`, `"perm_col"` | `Vector{Int}`: the final permutation of the factor (= the reordering for Cholesky and LDLᵀ/LDLᴴ); LU (`"G"`) after a factorization: `perm_row[k]` is the original row of factor row `k` (the reordering composed with the local row interchanges of batch member 1), `perm_col` the reordering, so `A[perm_row, perm_col] = L D U` | analysis |
-| `"diag"` | vector of `T` on the solver's backend: the diagonal of `L` (Cholesky), of `D` (LDLᵀ/LDLᴴ; for a 2×2 block its two diagonal entries) or of `D` in `L D U` (LU, = the diagonal of `U` in `L U`) in factor order | factorization |
+| `"diag"` | vector of `T` on the solver's backend: the diagonal of `L` (Cholesky), of `D` (LDLᵀ/LDLᴴ; for a 2×2 block its two diagonal entries) or of `D` in `L D U` (LU, = the diagonal of `U` in `L U`) in factor order; Schur complement mode: `1` on the (unfactored) Schur block | factorization |
 | `"npivots"` | `INT`: perturbed pivots (LDLᵀ/LDLᴴ, LU; `0` for Cholesky) | factorization |
 | `"inertia"` | `Tuple{INT, INT}`: `(npos, nneg)` of D (after perturbation, so the inertia of `A + E`; read it with `"npivots"`); `(0, 0)` for complex symmetric `"S"` and for `"G"`; Cholesky: `(number of positive pivots, 0)` | factorization |
-| `"pivot_stats"` | `NamedTuple` `(npos, nneg, nzero, nperturbed, n2x2)` of `Int64` (PLAN §1.7) | factorization |
+| `"pivot_stats"` | `NamedTuple` `(npos, nneg, nzero, nperturbed, n2x2)` of `Int64` (PLAN §1.7); in Schur complement mode `"npivots"`, `"inertia"` and `"pivot_stats"` count the factored block `A₁₁` only | factorization |
 | `"schur_shape"` | `(nrows, ncols, nnz)` of `Int64`: the size `ns` of the Schur complement and the nonzeros of its symbolic pattern ([`schur_pattern`](@ref)); for the symmetric structures one triangle with the diagonal (as the sparse export of one triangle) | analysis (`schur_mode = 1`) |
 | `"schur_matrix"` | the Schur complement `S = A₂₂ − A₂₁ A₁₁⁻¹ A₁₂` of the rows and columns of `"user_schur_indices"` (in their increasing order), written into the destination registered with [`setparam!`](@ref) and returned; without one, a new dense `ns × ns` matrix on the solver's backend. Symmetric structures: a dense destination gets the full matrix, a sparse one the triangle of its view | factorization (`schur_mode = 1`) |
 
@@ -900,6 +918,11 @@ the C-style set-buffer-then-get protocol of CUDSS.jl. `"schur_matrix"`: `buffer`
 is any destination [`setparam!`](@ref) accepts for it (dense matrix, CSR,
 `(csr, view)`), filled without registering it.
 """
+function getparam!(buffer, solver::DirectSolver, name::AbstractString)
+    name == "schur_matrix" && return _getparam_schur!(buffer, solver)
+    throw(InvalidValueError("getparam!: the buffer of \"$name\" must be a vector, got $(typeof(buffer))"))
+end
+
 function getparam!(buffer::AbstractVector, solver::DirectSolver, name::AbstractString)
     name == "schur_matrix" && return _getparam_schur!(buffer, solver)
     value = getparam(solver, name)
@@ -916,7 +939,7 @@ function getparam!(buffer::AbstractVector, solver::DirectSolver, name::AbstractS
 end
 
 # work item (s, member k of nb): the diagonal of the panel of supernode s of member k into d[(k - 1) n + …]
-@kernel function _factor_diag_kernel!(d, factor, super_ptr, front_ptr, front_nrows, ns, nb)
+@kernel function _factor_diag_kernel!(d, factor, super_ptr, front_ptr, front_nrows, ns, nb, schur)
     q = @index(Global, Linear)
     s = (q - 1) % ns + 1
     k = (q - 1) ÷ ns + 1
@@ -927,7 +950,7 @@ end
         f = Int(front_nrows[s])
         p0 = Int(member_panels(front_ptr, k, nb)[s])
         for j in 0:(w - 1)
-            dk[c0 + j] = factor[p0 + j * f + j]
+            dk[c0 + j] = s == schur ? one(eltype(dk)) : factor[p0 + j * f + j]   # the Schur root is not factored
         end
     end
 end
@@ -960,8 +983,8 @@ function _factor_diag(solver::DirectSolver{T}) where {T}
     end
     ns = nsupernodes(S)
     ns > 0 || return d
-    _factor_diag_kernel!(solver.backend, 64)(d, N.factor, S.super_ptr, S.front_ptr, S.front_nrows, ns, nb;
-                                             ndrange = ns * nb)
+    _factor_diag_kernel!(solver.backend, 64)(d, N.factor, S.super_ptr, S.front_ptr, S.front_nrows, ns, nb,
+                                             S.schedule.schur; ndrange = ns * nb)
     return d
 end
 

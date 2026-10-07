@@ -882,8 +882,10 @@ per regime-C step). Uniform batch: `nrhs` right-hand sides per active member
 of `numeric` (`nrhs × nact` columns of `ws.Y`, each solved with its member's
 factor; regime-C-path fronts use strided-batched `trsm`/`gemm` over runs of
 consecutive members). LU (`"G"`): `L Z = Y` with the local row order, or
-`Uᵀ Z = Y` with `transpose = true` (the solve of `Aᵀ`). Asynchronous; allocates
-nothing on the device.
+`Uᵀ Z = Y` with `transpose = true` (the solve of `Aᵀ`). Schur complement mode
+(`schedule.schur > 0`): the Schur root is not solved, its rows end as the
+condensed right-hand side `Y₂ − L₂₁ Z₁`. Asynchronous; allocates nothing on the
+device.
 """
 function forward_sweep!(ws::SolveWorkspace, S::Symbolic, N::Numeric; nrhs::Integer = max_rhs(ws) ÷ N.plan.nact[],
                         deterministic::Bool = false, impl::Symbol = :auto, transpose::Bool = false)
@@ -957,7 +959,8 @@ fronts, then one launch over all regime-A subtrees (supernodes in reverse
 processing order). Gather-based and conflict-free: no atomics, deterministic.
 Uniform batch as in [`forward_sweep!`](@ref). LU (`"G"`): `U X = W`, or
 `Lᵀ X = W` followed by the inverse local row order with `transpose = true`.
-Asynchronous.
+Schur complement mode: the rows of the Schur root hold its solution and are
+only read. Asynchronous.
 """
 function backward_sweep!(ws::SolveWorkspace, S::Symbolic, N::Numeric; nrhs::Integer = max_rhs(ws) ÷ N.plan.nact[],
                          impl::Symbol = :auto, transpose::Bool = false)
