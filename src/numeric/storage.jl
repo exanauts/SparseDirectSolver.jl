@@ -23,11 +23,11 @@ first): group `k` covers the subtree ids `sub_first[k]:sub_last[k]` of
 buffer of the one `info` read per phase (one entry per batch member).
 Batch state (PLAN §3.5): `members_host[1:nact[]]` are the active members of the
 last phase (mirrored in `numeric.members`), `runs` the starts of their runs of
-consecutive members ([`member_runs!`](@ref), the strided batches of regime C).
+consecutive members (`member_runs!`, the strided batches of regime C).
 `vendor_ptrs[s]` (regime-C front `s` of a batch on a backend with batched vendor
 `potrf`/`trsm`, else `nothing`): the device vectors of member pointers
 `(F11, F21)` of its `nbatch` panels, built once at allocation
-([`vendor_batch_pointers`](@ref)).
+(`vendor_batch_pointers`).
 Schur complement mode (PLAN §3.6): the launch group of the Schur root
 (`schedule.schur`) is not one of the B/C groups; `schur_first` is its position
 in `group_nodes` (`0` = no Schur root) and `schur_maxchild` its number of

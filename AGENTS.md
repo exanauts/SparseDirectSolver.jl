@@ -166,7 +166,19 @@ julia --project=bench bench/cudss_baseline.jl
 julia --project=bench bench/compare.jl --solver=cudss
 julia --project=bench bench/compare.jl --solver=sds --backend=cuda
 julia --project=bench/report bench/compare_report.jl
+
+# documentation (Documenter.jl; the examples need a functional CUDA) -> docs/build/
+julia --project=docs -e 'using Pkg; Pkg.instantiate()'
+julia --project=docs docs/make.jl
 ```
+
+The documentation is built by `.github/workflows/Documentation.yml` on the
+self-hosted `cuda` runner for every push to `main` (deployed to
+`https://exanauts.github.io/SparseDirectSolver.jl/dev/`) and every PR (preview
+under `previews/PR<n>`). It is not a required check, but keep it green: every
+exported name needs a docstring listed in `docs/src/lib/`, and a
+``[`name`](@ref)`` in a docstring must point at a documented name of the
+package (write plain backticks for anything else).
 
 `SDS_TEST_GPU` and `SDS_TEST_ONLY` are implemented in `test/runtests.jl` (T01),
 `SDS_TEST_CPU` (in `test/backends.jl`) and `SDS_TEST_SKIP` were added for CI: the
@@ -232,7 +244,7 @@ a split file, write every testset either over `ELTYPES` or behind `RUN_SHARED`.
 ```text
 PLAN.md  TASKS.md  RESEARCH.md  AGENTS.md
 Project.toml  src/  ext/  test/  bench/  docs/
-.github/workflows/   ci.yml Aqua.yml (checks)  claude-implement.yml claude-review.yml claude-pipeline.yml (agents)
+.github/workflows/   ci.yml Aqua.yml (checks)  Documentation.yml DocPreviewCleanup.yml (docs)  claude-implement.yml claude-review.yml claude-pipeline.yml (agents)
 .github/scripts/     pr-verdict.sh (reads the reviewer's verdict)
 .github/ISSUE_TEMPLATE/agent-finding.md  .github/pull_request_template.md
 ```

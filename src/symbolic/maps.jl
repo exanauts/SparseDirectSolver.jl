@@ -11,7 +11,7 @@
     DEVICE_MAPS
 
 Names of the index vectors of a [`Symbolic`](@ref) that live on the device
-(`VI`), in the order [`adapt`](@ref) moves them.
+(`VI`), in the order `adapt` moves them.
 """
 const DEVICE_MAPS = (:perm, :iperm, :super_ptr, :snparent, :rowptr, :rowval, :front_ptr, :front_nrows,
                      :front_ncols, :cb_ptr, :child_ptr, :child_list, :relind_ptr, :relind, :amap, :amap_ptr,
