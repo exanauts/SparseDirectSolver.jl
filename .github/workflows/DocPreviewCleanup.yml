@@ -3,6 +3,13 @@ name: Doc Preview Cleanup
 on:
   pull_request:
     types: [closed]
+  # claude-pipeline.yml merges with github.token, whose PR close triggers nothing:
+  # it dispatches this workflow with the PR number instead
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: PR number whose preview is deleted
+        required: true
 
 permissions:
   contents: write
@@ -23,7 +30,7 @@ jobs:
           ref: gh-pages
       - name: Delete preview and history
         env:
-          PRNUM: ${{ github.event.number }}
+          PRNUM: ${{ github.event.number || inputs.pr }}
         run: |
           if [ ! -d "previews/PR$PRNUM" ]; then
             echo "no preview for PR $PRNUM"
