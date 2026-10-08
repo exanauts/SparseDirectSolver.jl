@@ -1,7 +1,7 @@
 name = "SparseDirectSolver"
 uuid = "dc8e0fd9-41f1-440b-9624-22817132f700"
-authors = ["Michel Schanen <Michel.Schanen@gmail.com>"]
 version = "0.1.0"
+authors = ["Michel Schanen <Michel.Schanen@gmail.com>"]
 
 [deps]
 AMD = "14f7f29c-3bd6-536c-9a0b-7339e30b5a3e"
@@ -33,7 +33,7 @@ Adapt = "4"
 Atomix = "1"
 CUDACore = "6"
 CliqueTrees = "1"
-GPUArrays = "11"
+GPUArrays = "11, 12"
 GPUArraysCore = "0.2"
 KernelAbstractions = "0.9"
 Krylov = "0.10"
