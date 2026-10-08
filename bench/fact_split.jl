@@ -109,9 +109,10 @@ end
 # one 128-row chunk of the trsm F21 <- F21 L11^-T per workgroup (m > SYRK_IN fronts)
 @kernel function trsm_chunk_kernel!(factor, @Const(info), @Const(cfront), @Const(cchunk), @Const(front_ptr),
                                     @Const(front_nrows), @Const(front_ncols), ::Val{WG}) where {WG}
+    @uniform TT = eltype(factor)
     li = @index(Local, Linear)
     G = @index(Group, Linear)
-    L11 = @localmem Float64 (2080,)
+    L11 = @localmem TT (2080,)
     @inbounds begin
         s = Int(cfront[G])
         f = Int(front_nrows[s])
@@ -190,10 +191,11 @@ end
 @kernel function syrk_tile_kernel!(stack, @Const(factor), @Const(info), @Const(tfront), @Const(tti),
                                    @Const(ttj), @Const(front_ptr), @Const(front_nrows), @Const(front_ncols),
                                    @Const(cb_ptr), ::Val{WG}) where {WG}
+    @uniform TT = eltype(factor)
     li = @index(Local, Linear)
     G = @index(Group, Linear)
-    Ai = @localmem Float64 (TILE * SYRK_IN,)
-    Aj = @localmem Float64 (TILE * SYRK_IN,)
+    Ai = @localmem TT (TILE * SYRK_IN,)
+    Aj = @localmem TT (TILE * SYRK_IN,)
     @inbounds begin
         s = Int(tfront[G])
         if info[s] == Int32(0) && cb_ptr[s] > 0
@@ -208,9 +210,9 @@ end
                 r = q % TILE + 1
                 c = q ÷ TILE + 1
                 row = i0 + r
-                Ai[r + (c - 1) * TILE] = row <= m ? factor[p0 + (c - 1) * f + row] : 0.0
+                Ai[r + (c - 1) * TILE] = row <= m ? factor[p0 + (c - 1) * f + row] : zero(TT)
                 row2 = j0 + r
-                Aj[r + (c - 1) * TILE] = row2 <= m ? factor[p0 + (c - 1) * f + row2] : 0.0
+                Aj[r + (c - 1) * TILE] = row2 <= m ? factor[p0 + (c - 1) * f + row2] : zero(TT)
             end
             @synchronize
             for q in (li - 1):WG:(TILE * TILE - 1)
@@ -219,7 +221,7 @@ end
                 ii = i0 + r
                 jj = j0 + cc
                 if ii <= m && jj <= m && ii >= jj
-                    acc = 0.0
+                    acc = zero(TT)
                     for kk in 1:w
                         acc += Ai[r + (kk - 1) * TILE] * Aj[cc + (kk - 1) * TILE]
                     end
@@ -240,10 +242,13 @@ end
 function _sorted_subtree_launch(N, S, nzval, list, ::Val{LB}, ::Val{WG}, backend) where {LB, WG}
     bm = SDS.batch_map(N; first = 1)
     k! = SDS.subtree_cholesky_kernel!(backend, WG)
+    _sorted_subtree_launch2(N, S, nzval, list, bm, k!, Val(LB), Val(WG))
+end
+function _sorted_subtree_launch2(N::SDS.Numeric{T}, S, nzval, list, bm, k!, ::Val{LB}, ::Val{WG}) where {T, LB, WG}
     k!(N.factor, N.stack, N.info, nzval, S.amap, S.amap_ptr, S.amap_src, list, bm, S.subtree_ptr,
        S.subtree_nodes, S.front_ptr, S.front_nrows, S.front_ncols, S.cb_ptr, S.local_front, S.local_cb,
        S.child_ptr, S.child_list, S.relind_ptr, S.relind,
-       Val((LB - SDS.SUBTREE_LOCAL_RESERVE) ÷ sizeof(Float64)), Val(WG); ndrange = WG * length(list) * bm.nact)
+       Val((LB - SDS.SUBTREE_LOCAL_RESERVE) ÷ sizeof(T)), Val(WG); ndrange = WG * length(list) * bm.nact)
     return nothing
 end
 
@@ -390,19 +395,29 @@ bh = rand(n)
 Lh = tril(A)
 const UP = (p = Vector{Int32}(undef, n); read!(joinpath(@__DIR__, "cudss_perm.bin"), p); Int.(p))
 
-function run_config(label; cw = 32, rows = 512, sp = 16384)
-    bd = CuArray(bh); xd = similar(bd)
-    s = DirectSolver(CuSparseMatrixCSR(Lh), "SPD", 'L')
+function run_config(label; cw = 32, rows = 512, sp = 16384, amalg = nothing, T = Float64, scale = false, delta = 0.0)
+    if scale
+        dsc = 1.0 ./ sqrt.(abs.(Vector(diag(A))))
+        Dm = Diagonal(dsc)
+        Ls = tril(SparseMatrixCSC{Float64, Int}(Dm * A * Dm + delta * I))
+        bs = dsc .* bh
+    else
+        dsc = ones(n); Ls = Lh; bs = bh
+    end
+    bd = CuArray(T.(bs)); xd = similar(bd)
+    s = DirectSolver(CuSparseMatrixCSR(SparseMatrixCSC{T, Int}(Ls)), "SPD", 'L')
     s.options.regime_c_width = cw
     s.options.regime_c_rows = rows
     s.options.subtree_parallelism = sp
+    amalg === nothing || setfield!(s.options, :amalgamation,
+        typeof(getfield(s.options, :amalgamation))(amalg))
     SDS.setparam!(s, "user_perm", UP)
     ex(p) = SDS.execute!(p, s, xd, bd; asynchronous = false)
     ex("analysis"); ex("factorization"); ex("refactorization")
     CUDA.synchronize()
     t0 = median([(@elapsed ex("refactorization")) for _ in 1:10])
     ex("solve")
-    rel0 = norm(bh - A * Array(xd)) / norm(bh)
+    rel0 = norm(bh - A * (dsc .* Float64.(Array(xd)))) / norm(bh)
     fac0 = Array(s.numeric.factor)
     nzval = SDS._factor_values(s)
     tiles, chunks, cnodes, cwide, ea, ssub = build_tiles(s.symbolic, s.numeric.plan)
@@ -410,7 +425,7 @@ function run_config(label; cw = 32, rows = 512, sp = 16384)
     info = refact_info!(s)
     fac1 = Array(s.numeric.factor)
     ex("solve")
-    rel1 = norm(bh - A * Array(xd)) / norm(bh)
+    rel1 = norm(bh - A * (dsc .* Float64.(Array(xd)))) / norm(bh)
     for _ in 1:2; refact_split!(s, nzval, tiles, chunks, cnodes, cwide, ea, ssub); end
     CUDA.synchronize()
     t1 = median([(@elapsed (refact_split!(s, nzval, tiles, chunks, cnodes, cwide, ea, ssub); CUDA.synchronize())) for _ in 1:10])
@@ -434,6 +449,7 @@ function run_config(label; cw = 32, rows = 512, sp = 16384)
     GC.gc(); CUDA.reclaim()
 end
 
-run_config("cw32 rows64 sp16384"; rows = 64)
-run_config("cw32 rows64 sp65536"; rows = 64, sp = 65536)
+run_config("FP32 scaled d1e-6"; rows = 64, T = Float32, scale = true, delta = 1e-6)
+run_config("FP32 scaled d1e-4"; rows = 64, T = Float32, scale = true, delta = 1e-4)
+run_config("FP64 scaled d1e-6"; rows = 64, scale = true, delta = 1e-6)
 println("done")
