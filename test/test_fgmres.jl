@@ -74,7 +74,7 @@ end
 end
 
 @testset "FGMRES-IR: uniform batch ($(backend_name(backend)), $T)" for backend in BACKENDS,
-                                                                       T in filter(in((Float64, ComplexF32)), ELTYPES)
+                                                                       T in eltypes_among((Float64, ComplexF32))
     Random.seed!(666)
     n, nb, nrhs = 120, 3, 2
     members = batch_members(random_symindef(T, n, 0.03), nb)

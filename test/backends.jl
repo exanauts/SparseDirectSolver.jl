@@ -13,6 +13,37 @@ using SparseArrays
 const TEST_CPU = get(ENV, "SDS_TEST_CPU", "1") != "0"
 const TEST_GPU = get(ENV, "SDS_TEST_GPU", "1") != "0"
 
+# Element types under test (issue #91): SDS_TEST_ELTYPES is a comma-separated subset of these, default all four.
+# Pull-request CI selects two (Float64,ComplexF32), the weekly run and local runs all four.
+const ALL_ELTYPES = (Float32, Float64, ComplexF32, ComplexF64)
+
+"""
+    selected_eltypes(spec = ENV["SDS_TEST_ELTYPES"]) -> Tuple
+
+The element types named by the comma-separated `spec` (`"Float64,ComplexF32"`), in the order of
+`ALL_ELTYPES`; all four when `spec` is empty. Unknown names and a selection without a real type are errors
+(the testsets that do not loop over the element types need a real one).
+"""
+function selected_eltypes(spec::AbstractString = get(ENV, "SDS_TEST_ELTYPES", ""))
+    names = [String(strip(s)) for s in split(spec, ',') if !isempty(strip(s))]
+    isempty(names) && return ALL_ELTYPES
+    known = Dict(("Float32", "Float64", "ComplexF32", "ComplexF64") .=> ALL_ELTYPES)
+    unknown = setdiff(names, keys(known))
+    isempty(unknown) ||
+        error("SDS_TEST_ELTYPES names unknown element types $(unknown); available: $(join(keys(known), ", "))")
+    eltypes = Tuple(T for T in ALL_ELTYPES if any(n -> known[n] === T, names))
+    any(T -> T <: Real, eltypes) || error("SDS_TEST_ELTYPES = \"$spec\" selects no real element type")
+    return eltypes
+end
+
+"""
+    SELECTED_ELTYPES
+
+The element types of this run (`SDS_TEST_ELTYPES`, see [`selected_eltypes`](@ref)). `runtests.jl` splits the
+long test files over them; `ELTYPES` (`utils.jl`) is the subset of the running part.
+"""
+const SELECTED_ELTYPES = selected_eltypes()
+
 is_package_installed(name::String) = Base.find_package(name) !== nothing
 
 const CUDA_LOADED = TEST_GPU && is_package_installed("CUDA")
@@ -188,6 +219,8 @@ function print_backends()
     TEST_CPU || push!(gpus, "CPU backend disabled by SDS_TEST_CPU=0")
     println("Backends under test: ", join(backend_name.(BACKENDS), ", "),
             isempty(gpus) ? "" : "  [" * join(gpus, "; ") * "]")
+    println("Element types under test: ", join(SELECTED_ELTYPES, ", "),
+            SELECTED_ELTYPES == ALL_ELTYPES ? "" : "  [selected by SDS_TEST_ELTYPES]")
     return nothing
 end
 

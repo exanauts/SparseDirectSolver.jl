@@ -151,6 +151,9 @@ SDS_TEST_CPU=0 julia --project=. -e 'using Pkg; Pkg.test()'
 SDS_TEST_ONLY="test_symbolic_etree,test_options" julia --project=. -e 'using Pkg; Pkg.test()'
 SDS_TEST_SKIP="test_aqua" julia --project=. -e 'using Pkg; Pkg.test()'
 
+# fewer element types (default all four), as pull-request CI runs
+SDS_TEST_ELTYPES="Float64,ComplexF32" julia --project=. -e 'using Pkg; Pkg.test()'
+
 # the same with ParallelTestRunner arguments (prefix match, `!` excludes), and the number of workers
 julia --project=. -e 'using Pkg; Pkg.test(; test_args = ["test_symbolic", "!test_symbolic_etree"])'
 PTR_NUM_JOBS=4 julia --project=. -e 'using Pkg; Pkg.test()'
@@ -171,19 +174,27 @@ julia --project=bench/report bench/compare_report.jl
 `SDS_TEST_GPU` and `SDS_TEST_ONLY` are implemented in `test/runtests.jl` (T01),
 `SDS_TEST_CPU` (in `test/backends.jl`) and `SDS_TEST_SKIP` were added for CI: the
 CUDA jobs run with `SDS_TEST_CPU=0 SDS_TEST_SKIP=test_aqua`, since the CPU-only
-jobs already cover the CPU backend and Aqua. A task's "passes on CPU and CUDA"
-still means the default run (both backends) on the owner's machine.
+jobs already cover the CPU backend and Aqua. `SDS_TEST_ELTYPES` (in
+`test/backends.jl`, issue #91) selects the element types: pull-request and push CI
+runs `Float64,ComplexF32`, the weekly scheduled run (and a manual run, by default)
+all four. A task's "passes on CPU and CUDA" still means the default run (both
+backends, all four element types) on the owner's machine.
 
 The test files run in parallel through ParallelTestRunner.jl: each `test_*.jl` is
 evaluated in its own module on a pool of worker processes, after the packages,
-`test/utils.jl`, `test/matrices.jl`, `test/backends.jl` and `Random.seed!(666)`
+`test/backends.jl`, `test/utils.jl`, `test/matrices.jl` and `Random.seed!(666)`
 (`test/runtests.jl`). A test file therefore cannot use definitions from another
 test file; shared code belongs in the helpers. A worker's cold compilation, not the
 tests, sets the wall time, so the long files (`SPLIT_FILES` in `test/runtests.jl`)
-run once per element type (`test_api[Float64]`, …): `ELTYPES`, `REAL_ELTYPES` and
-`COMPLEX_ELTYPES` are then that part's subset, and a testset that does not loop over
-the element types runs in the `Float64` part only (`RUN_SHARED && @testset …`). In
-a split file, write every testset either over `ELTYPES` or behind `RUN_SHARED`.
+run once per selected element type (`test_api[Float64]`, …): `ELTYPES`, `REAL_ELTYPES`
+and `COMPLEX_ELTYPES` are then that part's subset, and a testset that does not loop
+over the element types runs in the `Float64` part only (the first selected type's
+when `Float64` is not selected; `RUN_SHARED && @testset …`). In a split file, write
+every testset either over `ELTYPES` or behind `RUN_SHARED`. A numeric testset for
+some element types only loops over `eltypes_among((Float64, ComplexF32))` or
+`eltypes_among(Complex)`, never over a hard-coded list or `ELTYPES[k]`, so any
+selection with a real type works (host-only symbolic checks of element sizes may
+name their types).
 
 ## Code conventions
 
@@ -217,7 +228,10 @@ a split file, write every testset either over `ELTYPES` or behind `RUN_SHARED`.
   `test/utils.jl` (created in T01). Use them; do not define new generators or
   tolerances inside individual test files.
 * Every numeric test loops over `BACKENDS` and over `ELTYPES` unless the task
-  says otherwise. Seed with `Random.seed!(666)`. Tolerance is `tol(T) =
+  says otherwise. `ELTYPES` is the set selected by `SDS_TEST_ELTYPES` (default
+  all four; pull-request CI runs `Float64,ComplexF32`, the weekly run all four),
+  so a test passing on a pull request has seen two element types; a task's
+  "passes on CPU and CUDA" means the full set on the owner's machine. Seed with `Random.seed!(666)`. Tolerance is `tol(T) =
   sqrt(eps(real(T)))` on well-conditioned generators. Elementwise
   device-vs-reference panel checks use `panel_tol(T)` only on well-conditioned
   generators; on generators with element growth (weak pivots, static pivoting)

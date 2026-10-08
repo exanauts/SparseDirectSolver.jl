@@ -155,7 +155,7 @@ end
     @test N.factor == Nf.factor && N.d == Nf.d && N.piv == Nf.piv && N.stats == Nf.stats
 end
 
-@testset "complex symmetric LDLᵀ: $T" for T in COMPLEX_ELTYPES
+@testset "complex symmetric LDLᵀ: $T" for T in eltypes_among(Complex)
     Random.seed!(666)
     A = random_symindef(T, 300, 0.02; hermitian = false)
     @test transpose(A) == A && A' != A

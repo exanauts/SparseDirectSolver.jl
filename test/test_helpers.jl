@@ -157,3 +157,18 @@ end
     @test spd_structure(Float32) == "SPD" && spd_structure(ComplexF32) == "HPD"
     @test sym_structure(Float64) == "S" && sym_structure(ComplexF64) == "H"
 end
+
+@testset "element type selection (SDS_TEST_ELTYPES)" begin
+    @test selected_eltypes("") == ALL_ELTYPES == (Float32, Float64, ComplexF32, ComplexF64)
+    @test selected_eltypes("ComplexF32, Float64") == (Float64, ComplexF32)   # the order of ALL_ELTYPES
+    @test selected_eltypes("Float32,Float32,") == (Float32,)
+    @test_throws ErrorException selected_eltypes("Float16")
+    @test_throws ErrorException selected_eltypes("ComplexF32,ComplexF64")   # no real type
+    @test SELECTED_ELTYPES == selected_eltypes()
+    @test ELTYPES == SELECTED_ELTYPES   # an unsplit file tests every selected type
+    @test REAL_ELTYPES == filter(T -> T <: Real, SELECTED_ELTYPES) && !isempty(REAL_ELTYPES)
+    # `@test_logs` keeps the "testset skipped" note of a selection without these types out of the output
+    @test (@test_logs match_mode = :any eltypes_among(Complex)) == COMPLEX_ELTYPES
+    @test (@test_logs match_mode = :any eltypes_among((Float64, ComplexF32))) ==
+          filter(in((Float64, ComplexF32)), SELECTED_ELTYPES)
+end
