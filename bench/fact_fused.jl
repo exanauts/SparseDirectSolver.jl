@@ -582,7 +582,8 @@ function build_fused_plan(s)
             s2 = CUDA.CuStream())
 end
 
-function refact_fused!(s, nzval, fp)
+const WPOOL = Ref{Any}(nothing)      # (streams, work buffers) for boundary wides
+function refact_fused!(s, nzval, fp; nstreams::Int = 1)
     N, S = s.numeric, s.symbolic
     plan = N.plan
     backend = KA.get_backend(N.factor)
@@ -614,10 +615,31 @@ function refact_fused!(s, nzval, fp)
                                              S.snparent, S.front_ptr, S.front_nrows, S.front_ncols,
                                              S.cb_ptr, S.child_ptr, S.child_list, S.relind_ptr, S.relind,
                                              Int32(base), Val(WGF); ndrange = WGF * count)
-        for v in gwides
-            SDS._factor_panel_c!(N.factor, fp.pcb, N.work, N.info, v, S.layout.panel_ptr[v],
-                                 S.schedule.rows[v], S.schedule.width[v], fp.cb2_h[v], p)
-            signal_kernel!(backend, 32)(fp.cbd, fp.arrived, S.snparent, v; ndrange = 32)
+        if nstreams <= 1 || length(gwides) <= 1
+            for v in gwides
+                SDS._factor_panel_c!(N.factor, fp.pcb, N.work, N.info, v, S.layout.panel_ptr[v],
+                                     S.schedule.rows[v], S.schedule.width[v], fp.cb2_h[v], p)
+                signal_kernel!(backend, 32)(fp.cbd, fp.arrived, S.snparent, v; ndrange = 32)
+            end
+        else
+            streams, works, evs = WPOOL[]
+            ev0 = CUDA.CuEvent(CUDA.EVENT_DISABLE_TIMING)
+            CUDA.record(ev0)                       # pool streams wait for the segment kernel
+            for (i, v) in enumerate(gwides)
+                k = (i - 1) % length(streams) + 1
+                CUDA.stream!(streams[k]) do
+                    i <= length(streams) && CUDA.wait(ev0)
+                    SDS._factor_panel_c!(N.factor, fp.pcb, works[k], N.info, v, S.layout.panel_ptr[v],
+                                         S.schedule.rows[v], S.schedule.width[v], fp.cb2_h[v], p)
+                    signal_kernel!(backend, 32)(fp.cbd, fp.arrived, S.snparent, v; ndrange = 32)
+                end
+            end
+            for (k, st) in enumerate(streams)      # main stream waits for the pool
+                CUDA.stream!(st) do
+                    CUDA.record(evs[k])
+                end
+                CUDA.wait(evs[k])
+            end
         end
     end
     SDS.assemble_schur!(N, S, nzval)
@@ -634,13 +656,14 @@ bh = rand(n)
 Lh = tril(A)
 const UP = (p = Vector{Int32}(undef, n); read!(joinpath(@__DIR__, "cudss_perm.bin"), p); Int.(p))
 
-function run_fused(label; cw = 32, rows = 64, sp = 16384, uperm = UP, alg = nothing, smf = 0)
+function run_fused(label; cw = 32, rows = 64, sp = 16384, uperm = UP, alg = nothing, smf = 0, budgets = nothing, nstreams = 1)
     bd = CuArray(bh); xd = similar(bd)
     s = DirectSolver(CuSparseMatrixCSR(Lh), "SPD", 'L')
     s.options.regime_c_width = cw
     s.options.regime_c_rows = rows
     s.options.subtree_parallelism = sp
     s.options.subtree_max_fronts = smf
+    budgets === nothing || (s.options.subtree_budgets = Vector{Int}(budgets))
     uperm === nothing || SDS.setparam!(s, "user_perm", uperm)
     alg === nothing || SDS.setparam!(s, "reordering_alg", alg)
     ex(ph) = SDS.execute!(ph, s, xd, bd; asynchronous = false)
@@ -653,7 +676,14 @@ function run_fused(label; cw = 32, rows = 64, sp = 16384, uperm = UP, alg = noth
     nzval = SDS._factor_values(s)
     fp = build_fused_plan(s)
     println("mega blocks: ", fp.nblocks, "  wides: ", length(fp.wides)); flush(stdout)
-    info = refact_fused!(s, nzval, fp); CUDA.synchronize()
+    if nstreams > 1 && WPOOL[] === nothing
+        mw = maximum((S0.schedule.rows[v] - S0.schedule.width[v])^2
+                     for S0 in (s.symbolic,) for v in fp.wides; init = 1)
+        WPOOL[] = ([CUDA.CuStream() for _ in 1:nstreams],
+                   [CUDA.zeros(Float64, mw) for _ in 1:nstreams],
+                   [CUDA.CuEvent(CUDA.EVENT_DISABLE_TIMING) for _ in 1:nstreams])
+    end
+    info = refact_fused!(s, nzval, fp; nstreams); CUDA.synchronize()
     begin
         sc = s.symbolic.schedule
         ns = length(sc.width)
@@ -673,18 +703,16 @@ function run_fused(label; cw = 32, rows = 64, sp = 16384, uperm = UP, alg = noth
     ex("solve")
     rel1 = norm(bh - A * Array(xd)) / norm(bh)
     for _ in 1:2
-        refact_fused!(s, nzval, fp)
+        refact_fused!(s, nzval, fp; nstreams)
     end
     CUDA.synchronize()
-    t1 = median([(@elapsed (refact_fused!(s, nzval, fp); CUDA.synchronize())) for _ in 1:10])
+    t1 = median([(@elapsed (refact_fused!(s, nzval, fp; nstreams); CUDA.synchronize())) for _ in 1:10])
     @printf "%-22s stock %7.2f ms | fused %7.2f ms  info %d  Δfactor %.2e  relres %.2e (stock %.2e)\n" label t0*1e3 t1*1e3 info norm(fac1 - fac0) / norm(fac0) rel1 rel0
     flush(stdout)
     GC.gc(); CUDA.reclaim()
 end
 
-run_fused("ND smf=0 (base)"; uperm = nothing, alg = "algo4")
-run_fused("ND smf=96"; uperm = nothing, alg = "algo4", smf = 96)
-run_fused("ND smf=64"; uperm = nothing, alg = "algo4", smf = 64)
-run_fused("ND smf=48"; uperm = nothing, alg = "algo4", smf = 48)
-run_fused("ND smf=32"; uperm = nothing, alg = "algo4", smf = 32)
+run_fused("b16k 1 stream"; uperm = nothing, alg = "algo4", budgets = [16384])
+run_fused("b16k 4 streams"; uperm = nothing, alg = "algo4", budgets = [16384], nstreams = 4)
+run_fused("b16k 8 streams"; uperm = nothing, alg = "algo4", budgets = [16384], nstreams = 8)
 println("done")
