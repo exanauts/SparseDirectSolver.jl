@@ -57,7 +57,7 @@ const ROLE_EA = Int8(5)
 end
 
 @kernel function fused_fact_kernel!(factor, stack, pcb, info, @Const(nzval), @Const(amap), @Const(amap_ptr),
-                                    @Const(amap_src), @Const(cb2), @Const(role), @Const(ra), @Const(rb), @Const(rc),
+                                    @Const(amap_src), @Const(cb2), @Const(wt), @Const(role), @Const(ra), @Const(rb), @Const(rc),
                                     @Const(nchild), arrived, ea_left, panel_done, trsm_left, tiles_left,
                                     cb_done, @Const(snparent), @Const(front_ptr), @Const(front_nrows),
                                     @Const(front_ncols), @Const(cb_ptr), @Const(child_ptr),
@@ -304,15 +304,43 @@ end
                 kk0 += 32
             end
             if ok
-                for (slot, q) in enumerate((li - 1):WG:(TILE * TILE - 1))
-                    rr = q % TILE + 1
-                    cc = q ÷ TILE + 1
-                    ii = i0 + rr
-                    jj = j0 + cc
-                    if ii <= m && jj <= m && ii >= jj
-                        a = slot == 1 ? acc1 : slot == 2 ? acc2 : slot == 3 ? acc3 : slot == 4 ? acc4 :
-                            slot == 5 ? acc5 : slot == 6 ? acc6 : slot == 7 ? acc7 : acc8
-                        pcb[c0 + SDS._packed(ii, jj, m) - 1] -= a
+                pw = Int(wt[v])
+                if pw == 0
+                    for (slot, q) in enumerate((li - 1):WG:(TILE * TILE - 1))
+                        rr = q % TILE + 1
+                        cc = q ÷ TILE + 1
+                        ii = i0 + rr
+                        jj = j0 + cc
+                        if ii <= m && jj <= m && ii >= jj
+                            a = slot == 1 ? acc1 : slot == 2 ? acc2 : slot == 3 ? acc3 : slot == 4 ? acc4 :
+                                slot == 5 ? acc5 : slot == 6 ? acc6 : slot == 7 ? acc7 : acc8
+                            pcb[c0 + SDS._packed(ii, jj, m) - 1] -= a
+                        end
+                    end
+                else                                 # write the finished CB entry through into the parent
+                    fpw = Int(front_nrows[pw])
+                    wpw = Int(front_ncols[pw])
+                    mpw = fpw - wpw
+                    ppw = Int(front_ptr[pw])
+                    cpw = Int(cb2[pw])
+                    r0w = Int(relind_ptr[v]) - 1
+                    for (slot, q) in enumerate((li - 1):WG:(TILE * TILE - 1))
+                        rr = q % TILE + 1
+                        cc = q ÷ TILE + 1
+                        ii = i0 + rr
+                        jj = j0 + cc
+                        if ii <= m && jj <= m && ii >= jj
+                            a = slot == 1 ? acc1 : slot == 2 ? acc2 : slot == 3 ? acc3 : slot == 4 ? acc4 :
+                                slot == 5 ? acc5 : slot == 6 ? acc6 : slot == 7 ? acc7 : acc8
+                            x = pcb[c0 + SDS._packed(ii, jj, m) - 1] - a   # children's extend-adds + own syrk
+                            ri = Int(relind[r0w + ii])
+                            rj = Int(relind[r0w + jj])
+                            if rj <= wpw
+                                factor[ppw + (rj - 1) * fpw + ri - 1] += x
+                            else
+                                pcb[cpw + SDS._packed(ri - wpw, rj - wpw, mpw) - 1] += x
+                            end
+                        end
                     end
                 end
             end
@@ -324,6 +352,7 @@ end
                     Atomix.@atomic cb_done[v] += Int32(1)
                     pv = Int(snparent[v])
                     pv > 0 && (Atomix.@atomic arrived[pv] += Int32(1))
+                    Int(wt[v]) > 0 && (Atomix.@atomic ea_left[Int(wt[v])] += Int32(-1))
                 end
             end
         end
@@ -417,9 +446,37 @@ function build_fused_plan(s)
         covered[v] && (cb_done_base[v] = 1)
     end
 
+    # proposal B: a child writes its CB through into the parent when the parent is a
+    # pre-assembled C-group front and the child is its ONLY CB child (any kind)
+    cset = Set{Int}()
+    for k in eachindex(plan.group_first)
+        plan.group_width[k] > 0 && continue
+        for q in plan.group_first[k]:plan.group_last[k]
+            push!(cset, Int(nodes[q]))
+        end
+    end
+    wt_h = zeros(Int32, ns)
+    nwt = 0; ewt = 0
+    for v in 1:ns
+        (covered[v] || cbp[v] == 0) && continue
+        width_h[v] <= 64 || continue             # wide children have no tiles to settle the debt
+        m = rows_h[v] - width_h[v]
+        m > SYRK_IN || continue
+        pv = Int(S.partition.snparent[v])
+        (pv > 0 && pv in cset) || continue
+        count(c -> cbp[c] > 0, chl[chp[pv]:(chp[pv + 1] - 1)]) == 1 || continue
+        wt_h[v] = Int32(pv)
+        nwt += 1; ewt += m * (m + 1) ÷ 2
+    end
+    println("write-through: ", nwt, " fronts, ", round(ewt / 1e6; digits = 2), "M CB entries"); flush(stdout)
+
     emit_ea(v) = for kc in chp[v]:(chp[v + 1] - 1)
         c = chl[kc]
         cbp[c] > 0 || continue
+        if wt_h[c] == v
+            ea_left[v] += 1                      # settled by the child's last write-through tile
+            continue
+        end
         mc = rows_h[c] - width_h[c]
         for ch in 1:cld(mc * mc, 16384)
             push!(role, ROLE_EA); push!(ra, Int32(v)); push!(rb, Int32(c)); push!(rc, Int32(ch))
@@ -514,7 +571,7 @@ function build_fused_plan(s)
     return (; role = CuArray(role), ra = CuArray(ra), rb = CuArray(rb), rc = CuArray(rc),
             nblocks = length(role), wides, ssub, segments,
             cb2 = CuArray(Int32.(cb2_h)), cb2_h, pcb = CUDA.zeros(Float64, off - 1),
-            czero = CuArray(czero),
+            czero = CuArray(czero), wt = CuArray(wt_h),
             nchild = CuArray(nchild),
             arrived_base = CuArray(arrived_base), ea_base = CuArray(ea_left),
             trsm_base = CuArray(trsm_left), tiles_base = CuArray(tiles_left),
@@ -552,7 +609,7 @@ function refact_fused!(s, nzval, fp)
     for (base, count, gwides) in fp.segments
         count > 0 &&
             fused_fact_kernel!(backend, WGF)(N.factor, N.stack, fp.pcb, N.info, nzval, S.amap, S.amap_ptr,
-                                             S.amap_src, fp.cb2, fp.role, fp.ra, fp.rb, fp.rc, fp.nchild,
+                                             S.amap_src, fp.cb2, fp.wt, fp.role, fp.ra, fp.rb, fp.rc, fp.nchild,
                                              fp.arrived, fp.ea, fp.pdone, fp.trsm, fp.tiles, fp.cbd,
                                              S.snparent, S.front_ptr, S.front_nrows, S.front_ncols,
                                              S.cb_ptr, S.child_ptr, S.child_list, S.relind_ptr, S.relind,
@@ -577,13 +634,14 @@ bh = rand(n)
 Lh = tril(A)
 const UP = (p = Vector{Int32}(undef, n); read!(joinpath(@__DIR__, "cudss_perm.bin"), p); Int.(p))
 
-function run_fused(label; cw = 32, rows = 64, sp = 16384)
+function run_fused(label; cw = 32, rows = 64, sp = 16384, uperm = UP, alg = nothing)
     bd = CuArray(bh); xd = similar(bd)
     s = DirectSolver(CuSparseMatrixCSR(Lh), "SPD", 'L')
     s.options.regime_c_width = cw
     s.options.regime_c_rows = rows
     s.options.subtree_parallelism = sp
-    SDS.setparam!(s, "user_perm", UP)
+    uperm === nothing || SDS.setparam!(s, "user_perm", uperm)
+    alg === nothing || SDS.setparam!(s, "reordering_alg", alg)
     ex(ph) = SDS.execute!(ph, s, xd, bd; asynchronous = false)
     print("analysis… "); @time ex("analysis")
     ex("factorization"); ex("refactorization"); CUDA.synchronize()
@@ -623,7 +681,8 @@ function run_fused(label; cw = 32, rows = 64, sp = 16384)
     GC.gc(); CUDA.reclaim()
 end
 
-run_fused("rows64 sp16384")
-run_fused("rows96 sp16384"; rows = 96)
-run_fused("rows64 again"; rows = 64)
+const SEED7 = (p = Vector{Int32}(undef, n); read!(joinpath(@__DIR__, "perm_best.bin"), p); Int.(p))
+run_fused("cuDSS perm")
+run_fused("metis seed7 perm"; uperm = SEED7)
+run_fused("native ND (algo4)"; uperm = nothing, alg = "algo4")
 println("done")
