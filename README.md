@@ -1,5 +1,8 @@
 # SparseDirectSolver.jl
 
+[![docs-dev](https://img.shields.io/badge/docs-dev-blue.svg)](https://exanauts.github.io/SparseDirectSolver.jl/dev/)
+[![Run tests](https://github.com/exanauts/SparseDirectSolver.jl/actions/workflows/ci.yml/badge.svg)](https://github.com/exanauts/SparseDirectSolver.jl/actions/workflows/ci.yml)
+
 A portable sparse direct solver (LLᵀ/LLᴴ, LDLᵀ/LDLᴴ, LDU) for GPUs, written in
 Julia on KernelAbstractions.jl and GPUArrays.jl. It keeps the parameter names
 and phases of [CUDSS.jl](https://github.com/exanauts/CUDSS.jl) so that MadNLP
@@ -63,6 +66,7 @@ extensions. Unsupported structures, phases and parameters raise
 cuDSS is performance, not features (see below and
 [`PERFORMANCE.md`](PERFORMANCE.md)).
 
+* [Documentation](https://exanauts.github.io/SparseDirectSolver.jl/dev/) — user guide and API reference.
 * [`PLAN.md`](PLAN.md) — design, API, milestones.
 * [`TASKS.md`](TASKS.md) — implementation tasks and their reports.
 * [`STATE.md`](STATE.md) — the owner's state review between tasks.

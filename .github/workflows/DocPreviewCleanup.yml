@@ -1,0 +1,37 @@
+name: Doc Preview Cleanup
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: doc-preview-cleanup
+  cancel-in-progress: false
+
+jobs:
+  # Deletes previews/PR<n> from gh-pages and squashes its history, so that the
+  # previews of the many task PRs do not grow the repository.
+  doc-preview-cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout gh-pages branch
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+      - name: Delete preview and history
+        env:
+          PRNUM: ${{ github.event.number }}
+        run: |
+          if [ ! -d "previews/PR$PRNUM" ]; then
+            echo "no preview for PR $PRNUM"
+            exit 0
+          fi
+          git config user.name "Documenter.jl"
+          git config user.email "documenter@juliadocs.github.io"
+          git rm -rf "previews/PR$PRNUM"
+          git commit -m "delete preview of PR $PRNUM"
+          git branch gh-pages-new "$(echo "delete history" | git commit-tree HEAD^{tree})"
+          git push --force origin gh-pages-new:gh-pages

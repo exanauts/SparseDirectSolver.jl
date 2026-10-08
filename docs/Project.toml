@@ -1,0 +1,14 @@
+[deps]
+CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
+SparseDirectSolver = "dc8e0fd9-41f1-440b-9624-22817132f700"
+
+[sources]
+SparseDirectSolver = {path = ".."}
+
+[compat]
+CUDA = "6"
+Documenter = "1"
