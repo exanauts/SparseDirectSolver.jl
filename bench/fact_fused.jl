@@ -634,12 +634,13 @@ bh = rand(n)
 Lh = tril(A)
 const UP = (p = Vector{Int32}(undef, n); read!(joinpath(@__DIR__, "cudss_perm.bin"), p); Int.(p))
 
-function run_fused(label; cw = 32, rows = 64, sp = 16384, uperm = UP, alg = nothing)
+function run_fused(label; cw = 32, rows = 64, sp = 16384, uperm = UP, alg = nothing, smf = 0)
     bd = CuArray(bh); xd = similar(bd)
     s = DirectSolver(CuSparseMatrixCSR(Lh), "SPD", 'L')
     s.options.regime_c_width = cw
     s.options.regime_c_rows = rows
     s.options.subtree_parallelism = sp
+    s.options.subtree_max_fronts = smf
     uperm === nothing || SDS.setparam!(s, "user_perm", uperm)
     alg === nothing || SDS.setparam!(s, "reordering_alg", alg)
     ex(ph) = SDS.execute!(ph, s, xd, bd; asynchronous = false)
@@ -681,8 +682,9 @@ function run_fused(label; cw = 32, rows = 64, sp = 16384, uperm = UP, alg = noth
     GC.gc(); CUDA.reclaim()
 end
 
-const SEED7 = (p = Vector{Int32}(undef, n); read!(joinpath(@__DIR__, "perm_best.bin"), p); Int.(p))
-run_fused("cuDSS perm")
-run_fused("metis seed7 perm"; uperm = SEED7)
-run_fused("native ND (algo4)"; uperm = nothing, alg = "algo4")
+run_fused("ND smf=0 (base)"; uperm = nothing, alg = "algo4")
+run_fused("ND smf=96"; uperm = nothing, alg = "algo4", smf = 96)
+run_fused("ND smf=64"; uperm = nothing, alg = "algo4", smf = 64)
+run_fused("ND smf=48"; uperm = nothing, alg = "algo4", smf = 48)
+run_fused("ND smf=32"; uperm = nothing, alg = "algo4", smf = 32)
 println("done")
