@@ -579,7 +579,7 @@ end
 
 # fused segment: the maximal run of plan entries from `kstart` in which every
 # front has width <= wcap (regime-A subtree entries break a run)
-function build_fused(s; kstart::Int = 1, wcap::Int = MW)
+function build_fused(s; kstart::Int = 1, wcap::Int = MW, merged::Bool = (kstart == 1))
     S = s.symbolic
     ws = s.workspace
     plan = ws.plan
@@ -607,8 +607,10 @@ function build_fused(s; kstart::Int = 1, wcap::Int = MW)
     nchild_h = Int32[child_ptr_h[v + 1] - child_ptr_h[v] for v in 1:ns]
     stp_h = Array(S.subtree_ptr)
     stn_h = Array(S.subtree_nodes)
-    live_root = falses(ns)                   # roots of subtrees merged into this launch (wcap covers tier 1 only)
-    if wcap <= 128
+    live_root = falses(ns)                   # roots of subtrees merged into this launch (the merged tier only;
+    # keying this on wcap instead of `merged` double-counts subtree-root signals when tier 1 runs
+    # with a wider cap, and the early-released waiters produce silently wrong solves)
+    if merged
         for e in 1:(length(stp_h) - 1)
             live_root[stn_h[stp_h[e + 1] - 1]] = true
         end

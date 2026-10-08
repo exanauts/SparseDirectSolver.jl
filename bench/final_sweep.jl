@@ -607,9 +607,7 @@ function build_fused(s; kstart::Int = 1, wcap::Int = MW, merged::Bool = (kstart 
     nchild_h = Int32[child_ptr_h[v + 1] - child_ptr_h[v] for v in 1:ns]
     stp_h = Array(S.subtree_ptr)
     stn_h = Array(S.subtree_nodes)
-    live_root = falses(ns)                   # roots of subtrees merged into this launch (the merged tier only;
-    # keying this on wcap instead of `merged` double-counts subtree-root signals when tier 1 runs
-    # with a wider cap, and the early-released waiters produce silently wrong solves)
+    live_root = falses(ns)                   # roots of subtrees merged into this launch (the merged tier only)
     if merged
         for e in 1:(length(stp_h) - 1)
             live_root[stn_h[stp_h[e + 1] - 1]] = true
@@ -771,93 +769,80 @@ function byname_profile(f, label)
 end
 
 # ---------------------------------------------------------------------------
-ENV["DATADEPS_ALWAYS_ACCEPT"] = "true"
-using .BenchMatrices: bench_matrices
+const PATH = joinpath(@__DIR__, "data", "kkt_pglib_opf_case78484_epigrids_condensed_10.mtx")
+A = SparseMatrixCSC{Float64, Int}(sparse(read_mtx(PATH)))
+n = size(A, 1)
+Random.seed!(666)
+bh = rand(n)
+Lh = tril(A)
+const UP = (p = Vector{Int32}(undef, n); read!(joinpath(@__DIR__, "cudss_perm.bin"), p); Int.(p))
 
-function bench_one(M; cw = 128)
-    A = SparseMatrixCSC{Float64, Int}(M.A)
-    n = size(A, 1)
-    Random.seed!(666)
-    bh = rand(n)
-    Lh = tril(A)
-    println("==== ", M.name, "  n = ", n, " ===="); flush(stdout)
-
-println("---- regime_c_width = ", cw, " ----")
-bd = CuArray(bh); xd = similar(bd)
-Ad = CuSparseMatrixCSR(Lh)
-s = DirectSolver(Ad, "SPD", 'L')
-s.options.regime_c_width = cw
-ex(ph) = SDS.execute!(ph, s, xd, bd; asynchronous = false)
-print("analysis… "); @time ex("analysis")
-ex("factorization")
-ex("solve")                      # allocates ws, warms stock path
-x_stock = Array(xd)
-println("stock relres      ", norm(bh - A * x_stock) / norm(bh))
-
-inv11, inv_ptr, invert!, bytes = build_inverse(s)
-@printf "inverse buffer     %.1f MB\n" bytes / 1e6
-invert!(); CUDA.synchronize()
-tinv = median([(CUDA.@elapsed (invert!(); CUDA.synchronize())) for _ in 1:5])
-@printf "invert pass        %.2f ms (per refactorization)\n" tinv * 1e3
-
-algo1_solve!(xd, s, bd, inv11, inv_ptr); CUDA.synchronize()
-x1 = Array(xd)
-println("algo1 relres      ", norm(bh - A * x1) / norm(bh))
-println("‖x_algo1 − x_stock‖/‖x‖ = ", norm(x1 - x_stock) / norm(x_stock))
-
-for _ in 1:3
-    algo1_solve!(xd, s, bd, inv11, inv_ptr)
-end
-CUDA.synchronize()
-t1 = [(@elapsed (algo1_solve!(xd, s, bd, inv11, inv_ptr); CUDA.synchronize())) for _ in 1:20]
-t0 = [(@elapsed ex("solve")) for _ in 1:20]
-@printf "stock solve        %.2f ms (median of 20)\n" median(t0) * 1e3
-@printf "algo1 solve        %.2f ms (median of 20)\n" median(t1) * 1e3
-plan0 = s.workspace.plan
-nodes0 = s.symbolic.schedule.group_nodes
-stp = Array(s.symbolic.subtree_ptr)
-sub_ids = Int32[]
-for k in eachindex(plan0.kind)
-    plan0.kind[k] == SDS.SOLVE_SUBTREES || continue
-    append!(sub_ids, Int32.(nodes0[plan0.first[k]:plan0.last[k]]))
-end
-sort!(sub_ids; by = e -> stp[e + 1] - stp[e], rev = true)
-SSUB[] = CuArray(sub_ids); NSUB[] = length(sub_ids)
-fz1 = build_fused(s; kstart = 1, wcap = 128)
-if fz1 === nothing
-    println("(no fused range; skipping)")
-    GC.gc(); CUDA.reclaim()
-    return nothing
-end
-fz2 = build_fused(s; kstart = fz1.i2 + 1, wcap = 256)
-segs = [(fz1, 64)]
-fz2 === nothing || push!(segs, (fz2, 1024))
-fz = (segs, true)
-algo2_solve!(xd, s, bd, inv11, inv_ptr, fz; debug = true); CUDA.synchronize()
-x2 = Array(xd)
-println("algo2 relres      ", norm(bh - A * x2) / norm(bh))
-println("‖x_algo2 − x_stock‖/‖x‖ = ", norm(x2 - x_stock) / norm(x_stock))
-for _ in 1:3
-    algo2_solve!(xd, s, bd, inv11, inv_ptr, fz)
-end
-CUDA.synchronize()
-t2v = [(@elapsed (algo2_solve!(xd, s, bd, inv11, inv_ptr, fz); CUDA.synchronize())) for _ in 1:20]
-@printf "algo2 solve        %.2f ms (median of 20)\n" median(t2v) * 1e3
-
-GC.gc(); CUDA.reclaim()
-return nothing
-    GC.gc(); CUDA.reclaim()
-    return nothing
+short_name(nm) = begin
+    m = match(r"(gpu_)?_?([A-Za-z0-9_!]+)", split(nm, '(')[1])
+    m === nothing ? nm : m.captures[2]
 end
 
-for M in bench_matrices()
-    "SPD" in M.structures || continue
-    try
-        bench_one(M)
-    catch err
-        println("ERROR on ", M.name, ": ", sprint(showerror, err)[1:min(end, 300)])
-        flush(stdout)
-        GC.gc(); CUDA.reclaim()
+function trial(label; uperm = nothing, cw = 128, wcap1 = 128, ub = nothing, profile = false)
+    bd = CuArray(bh); xd = similar(bd)
+    Ad = CuSparseMatrixCSR(Lh)
+    s = DirectSolver(Ad, "SPD", 'L')
+    s.options.regime_c_width = cw
+    ub === nothing || (s.options.nd_ubfactor = ub)
+    uperm === nothing || SDS.setparam!(s, "user_perm", uperm)
+    ex(p) = SDS.execute!(p, s, xd, bd; asynchronous = false)
+    ta = @elapsed ex("analysis")
+    ex("factorization"); ex("solve")
+    inv11, inv_ptr, invert!, _ = build_inverse(s)
+    invert!(); CUDA.synchronize()
+    INV11[] = inv11; INVPTR[] = inv_ptr
+    plan0 = s.workspace.plan
+    nodes0 = s.symbolic.schedule.group_nodes
+    stp = Array(s.symbolic.subtree_ptr)
+    sub_ids = Int32[]
+    for k in eachindex(plan0.kind)
+        plan0.kind[k] == SDS.SOLVE_SUBTREES || continue
+        append!(sub_ids, Int32.(nodes0[plan0.first[k]:plan0.last[k]]))
     end
+    sort!(sub_ids; by = e -> stp[e + 1] - stp[e], rev = true)
+    SSUB[] = CuArray(sub_ids); NSUB[] = length(sub_ids)
+    fz1 = build_fused(s; kstart = 1, wcap = wcap1)
+    if fz1 === nothing
+        println(rpad(label, 26), " no fused range"); GC.gc(); CUDA.reclaim(); return nothing
+    end
+    fz2 = wcap1 >= 256 ? nothing : build_fused(s; kstart = fz1.i2 + 1, wcap = 256)
+    segs = [(fz1, 64)]
+    fz2 === nothing || push!(segs, (fz2, 1024))
+    fz = (segs, true)
+    algo2_solve!(xd, s, bd, inv11, inv_ptr, fz); CUDA.synchronize()
+    relres = norm(bh - A * Array(xd)) / norm(bh)
+    for _ in 1:3; algo2_solve!(xd, s, bd, inv11, inv_ptr, fz); end
+    CUDA.synchronize()
+    t = median([(@elapsed (algo2_solve!(xd, s, bd, inv11, inv_ptr, fz); CUDA.synchronize())) for _ in 1:20])
+    sc = s.symbolic.schedule
+    @printf "%-26s solve %6.2f ms  analysis %5.1f s  levels %3d  tier1 %5d  chain %4d  relres %.2e\n" label t*1e3 ta maximum(Array(sc.level); init=0) fz1.nfused (fz2===nothing ? 0 : fz2.nfused) relres
+    flush(stdout)
+    if profile
+        algo2_solve!(xd, s, bd, inv11, inv_ptr, fz); CUDA.synchronize()
+        r = CUDA.@profile trace = true (algo2_solve!(xd, s, bd, inv11, inv_ptr, fz); CUDA.synchronize())
+        d = r.device
+        agg = Dict{String, Tuple{Int, Float64}}()
+        for i in eachindex(d.id)
+            d.grid[i] === missing && continue
+            k = short_name(d.name[i]); c, tt = get(agg, k, (0, 0.0)); agg[k] = (c + 1, tt + (d.stop[i] - d.start[i]) * 1e3)
+        end
+        for (k, (c, tt)) in sort(collect(agg); by = x -> -x[2][2])
+            @printf "    %-34s %4d kernels  %7.3f ms\n" k c tt
+        end
+        flush(stdout)
+    end
+    GC.gc(); CUDA.reclaim()
+    return nothing
 end
-println("ALL DONE")
+
+trial("warmup"; uperm = UP)
+trial("1tier256 (1)"; uperm = UP, wcap1 = 256)
+trial("cw128 2tier"; uperm = UP)
+trial("1tier256 (2)"; uperm = UP, wcap1 = 256)
+trial("1tier256 metis"; wcap1 = 256)
+trial("1tier256 (3)"; uperm = UP, wcap1 = 256, profile = true)
+println("done")
