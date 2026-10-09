@@ -170,9 +170,11 @@ regime A); **T26** segmented fused factorization with dependency counters,
 with #109 (stack lifetimes) and #110 (verify the regime-C host sync) inside
 it, plus the #75 remainder and the #96 re-measurement; **T27** hybrid memory
 (was T26); **T28** robustness extras (was T27); **T29** non-uniform batch (was
-T22); **T30** ND partition-tree export and ordering cache (was T24); External
-unchanged and last (owner decision: integrate against finished kernels; the
-§5 item 5 recommendation is withdrawn). GitHub: issues #22–#27 renamed to the
-new titles, #22 loses `on-hold`, new task issues for T28–T30; #96 and
-#108–#110 labelled `triaged` (#108 → T22, #109/#110 → T26). The chain resumes
-with T22.
+T22); **T30** ND partition-tree export and ordering cache (was T24); **T31**
+oneAPI and Metal extensions with the allocation-free `:ka` fallbacks (#112,
+#53), the remainder of T23 after PR #113 delivered the AMDGPU extension alone;
+External unchanged and last (owner decision: integrate against finished
+kernels; the §5 item 5 recommendation is withdrawn). GitHub: issues #22–#27
+renamed to the new titles, #22 loses `on-hold`, new task issues for T28–T31;
+#96, #108–#110 and #112 labelled `triaged` (#108 → T22, #109/#110 → T26,
+#112 → T31). The chain resumes with T22 once PR #113 (T23) has merged.
