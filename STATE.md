@@ -178,3 +178,11 @@ kernels; the §5 item 5 recommendation is withdrawn). GitHub: issues #22–#27
 renamed to the new titles, #22 loses `on-hold`, new task issues for T28–T31;
 #96, #108–#110 and #112 labelled `triaged` (#108 → T22, #109/#110 → T26,
 #112 → T31). The chain resumes with T22 once PR #113 (T23) has merged.
+
+What happened instead: the issues were renamed before #114 reached `main`,
+and the pipeline chains `T(NN+1)` from the merged PR's title, so #113 (T23)
+started T24 with the old task text (PR #120, closed; branch kept, note under
+T30). The pipeline now continues with the lowest open task id above the
+merged one, so T22 → T24 works once T23 is closed; T22 itself has no
+predecessor merge to chain from and is started by labelling #22
+`claude:implement`.
