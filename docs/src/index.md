@@ -18,9 +18,9 @@ cuDSS it is open source and not tied to one vendor: it runs on CUDA, AMDGPU,
 oneAPI, Metal and the KernelAbstractions CPU backend.
 
 !!! warning "Status"
-    Version 0.1 is under construction. The CPU backend and CUDA are tested; the
-    AMDGPU, oneAPI and Metal extensions, non-uniform batches and mixed precision
-    are not there yet. Unsupported structures, phases and parameters raise
+    Version 0.1 is under construction. The CPU backend, CUDA and AMDGPU are
+    tested; the oneAPI and Metal extensions, non-uniform batches and mixed
+    precision are not there yet. Unsupported structures, phases and parameters raise
     [`NotSupportedError`](@ref) rather than falling back silently.
 
 ## Features
@@ -57,7 +57,9 @@ Pkg.add(url = "https://github.com/exanauts/SparseDirectSolver.jl")
 ```
 
 Loading CUDA.jl enables the CUDA extension (`CuSparseMatrixCSR` and
-`CuSparseMatrixCSC` inputs, cuBLAS and cuSOLVER dense kernels). Loading Metis.jl
+`CuSparseMatrixCSC` inputs, cuBLAS and cuSOLVER dense kernels); loading
+AMDGPU.jl enables the AMDGPU extension (`ROCSparseMatrixCSR` and
+`ROCSparseMatrixCSC` inputs, rocBLAS and rocSOLVER dense kernels). Loading Metis.jl
 enables nested dissection ordering; Krylov.jl enables FGMRES refinement.
 
 ## Where to go next

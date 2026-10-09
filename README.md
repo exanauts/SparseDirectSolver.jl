@@ -9,8 +9,8 @@ and phases of [CUDSS.jl](https://github.com/exanauts/CUDSS.jl) so that MadNLP
 and other cuDSS users can switch to it mechanically, and targets CUDA, AMDGPU,
 oneAPI, Metal and the KernelAbstractions CPU backend.
 
-**Status: v0.1 under construction.** Working today, on the CPU backend and on
-CUDA:
+**Status: v0.1 under construction.** Working today, on the CPU backend, on
+CUDA and on AMDGPU (ROCm):
 
 * host symbolic analysis: AMD or nested dissection (METIS through the Metis
   extension) ordering, elimination tree, supernodes with GPU-tuned
@@ -60,10 +60,8 @@ CUDA:
   through `SDS_LOG_LEVEL`.
 
 Not there yet: non-uniform batches, ND partition-tree export, mixed precision,
-hybrid host memory, delayed pivots, and the AMDGPU, oneAPI and Metal
-extensions (the kernels already run on AMD hardware through the raw-array
-constructors; the test suite passes there except for the vendor-type
-forwarders). Unsupported structures, phases and parameters raise
+hybrid host memory, delayed pivots, and the oneAPI and Metal
+extensions. Unsupported structures, phases and parameters raise
 `NotSupportedError` rather than falling back silently. The remaining gap to
 cuDSS is performance, not features (see below and
 [`PERFORMANCE.md`](PERFORMANCE.md)); a MadNLP end-to-end run on CUDA and AMD
@@ -100,7 +98,9 @@ Pkg.add(url = "https://github.com/exanauts/SparseDirectSolver.jl")
 ```
 
 Loading CUDA.jl enables the CUDA extension (`CuSparseMatrixCSR`/`CuSparseMatrixCSC`
-constructors, cuBLAS/cuSOLVER dense kernels). Loading Metis.jl enables nested
+constructors, cuBLAS/cuSOLVER dense kernels); loading AMDGPU.jl enables the
+AMDGPU extension (`ROCSparseMatrixCSR`/`ROCSparseMatrixCSC` constructors,
+rocBLAS/rocSOLVER dense kernels; ROCm must be found by AMDGPU.jl). Loading Metis.jl enables nested
 dissection ordering; without it the ordering is AMD.
 
 ## Usage

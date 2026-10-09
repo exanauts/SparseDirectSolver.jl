@@ -305,10 +305,10 @@ function _launch_subtrees!(N::Numeric{T}, S::Symbolic, nzval, first, count, ::Va
 end
 
 # the local-memory size class as a compile-time constant (explicit branches: no dynamic dispatch, no allocation;
-# every branch is compiled with the first launch, hence the short list of sizes; branch 5 is the error)
+# every branch is compiled with the first launch, hence the short list of sizes; branch 6 is the error)
 @inline function _with_local_bytes(fn, nbytes::Int)
-    length(SUBTREE_LOCAL_SIZES) == 4 || error("update _with_local_bytes")
-    Base.Cartesian.@nif 5 d -> (nbytes == SUBTREE_LOCAL_SIZES[d]) d -> fn(Val(SUBTREE_LOCAL_SIZES[d])) d -> throw(
+    length(SUBTREE_LOCAL_SIZES) == 5 || error("update _with_local_bytes")
+    Base.Cartesian.@nif 6 d -> (nbytes == SUBTREE_LOCAL_SIZES[d]) d -> fn(Val(SUBTREE_LOCAL_SIZES[d])) d -> throw(
         InvalidValueError("no regime-A kernel with $nbytes bytes of local memory; sizes: $SUBTREE_LOCAL_SIZES"))
 end
 

@@ -32,9 +32,11 @@ const REGIME_B_MAX_WIDTH = 64
 
 """
 `@localmem` sizes (bytes) of the regime-A kernel instances; a budget uses the largest one it holds.
-Capped at 48 KiB: `@localmem` is static shared memory on CUDA, where ptxas rejects more than 48 KiB.
+`@localmem` is static shared memory, so the usable sizes depend on the backend
+([`max_local_bytes`](@ref)): 48 KiB on CUDA (ptxas rejects more static shared data), 64 KiB on AMDGPU
+(LDS per workgroup); the analysis keeps the budgets within the backend's cap.
 """
-const SUBTREE_LOCAL_SIZES = (8192, 16384, 32768, 49152)
+const SUBTREE_LOCAL_SIZES = (8192, 16384, 32768, 49152, 65536)
 
 "Bytes of a regime-A kernel's local memory kept for its control words and pivot (not for fronts)."
 const SUBTREE_LOCAL_RESERVE = 256
@@ -60,11 +62,32 @@ subtree_local_reserve(structure) =
     subtree_local_bytes(budget) -> Int
 
 `@localmem` bytes of the regime-A kernel of a budget class: the largest of
-`SUBTREE_LOCAL_SIZES` (8, 16, 32, 48 KiB) that is `≤ budget`, `0` below
+`SUBTREE_LOCAL_SIZES` (8, 16, 32, 48, 64 KiB) that is `≤ budget`, `0` below
 8 KiB. The size is a `Val` parameter of the kernel, so a short list of
 instances serves every budget.
 """
 subtree_local_bytes(budget::Integer) = foldl((acc, b) -> b <= budget ? b : acc, SUBTREE_LOCAL_SIZES; init = 0)
+
+"""
+    resolve_subtree_budgets(budgets, max_local) -> Vector{Int}
+
+The regime-A budgets an analysis uses on a backend with `max_local` bytes of
+static local memory per workgroup ([`max_local_bytes`](@ref), issue #60), sorted.
+The default budgets (`DEFAULT_SUBTREE_BUDGETS`, 16, 32 and 48 KiB) are clamped
+to `max_local` (duplicates dropped), so the defaults work on every backend; an
+explicit budget above `max_local` raises [`InvalidValueError`](@ref), since its
+kernel could not be launched there.
+"""
+function resolve_subtree_budgets(budgets::AbstractVector{<:Integer}, max_local::Integer)
+    b = sort!(Vector{Int}(budgets))
+    cap = Int(max_local)
+    b == DEFAULT_SUBTREE_BUDGETS && return unique!(min.(b, cap))
+    for x in b
+        x <= cap || throw(InvalidValueError("subtree_budgets entry $x exceeds the backend's local memory of $cap " *
+                                            "bytes per workgroup (max_local_bytes); use budgets ≤ $cap"))
+    end
+    return b
+end
 
 """
     subtree_capacity(budget, elsize, reserve = SUBTREE_LOCAL_RESERVE) -> Int
@@ -276,7 +299,7 @@ schedule_elsize(structure, ::Type{T}) where {T} = (_structure(structure) == STRU
 
 """
     build_schedule(sp::SupernodePartition, opts::Options = Options(), ::Type{T} = Float64;
-                   elsize = sizeof(T), reserve = SUBTREE_LOCAL_RESERVE) -> Schedule
+                   elsize = sizeof(T), reserve = SUBTREE_LOCAL_RESERVE, max_local = typemax(Int)) -> Schedule
 
 Regime assignment, binning, levels and launch groups (PLAN §2.3 step 5) for
 the supernodes of `sp`, with byte budgets for the element type `T` (`elsize`
@@ -290,7 +313,9 @@ blocks are two packed triangles, see `src/numeric/lu.jl`):
    plus the packed `m×m` contribution blocks waiting for their parent,
    `m = f - w`) fits the [`subtree_capacity`](@ref) of the largest of
    `opts.subtree_budgets` (local memory minus `reserve` bytes,
-   [`subtree_local_reserve`](@ref) of the structure), and its subtree's flops ([`front_flops`](@ref))
+   [`subtree_local_reserve`](@ref) of the structure; the budgets are those of
+   [`resolve_subtree_budgets`](@ref) for the backend's `max_local` bytes of local
+   memory, [`max_local_bytes`](@ref)), and its subtree's flops ([`front_flops`](@ref))
    are at most `total ÷ opts.subtree_parallelism` (`0`: no flop limit), so
    that a large tree of small fronts is split into enough subtrees to fill
    the device instead of running on one workgroup; the maximal
@@ -311,13 +336,13 @@ launch group (assembled, never factored, see [`assemble_schur!`](@ref)).
 """
 function build_schedule(sp::SupernodePartition, opts::Options = Options(), ::Type{T} = Float64;
                         elsize::Integer = sizeof(T), reserve::Integer = SUBTREE_LOCAL_RESERVE,
-                        schur::Integer = 0) where {T}
+                        schur::Integer = 0, max_local::Integer = typemax(Int)) where {T}
     0 <= schur <= nsupernodes(sp) && (schur == 0 || sp.snparent[schur] == 0) ||
         throw(InvalidValueError("build_schedule: the Schur front $schur must be a root supernode"))
     ns = nsupernodes(sp)
     elsize = Int(elsize)
     cw, cr = opts.regime_c_width, opts.regime_c_rows
-    budgets = sort(opts.subtree_budgets)
+    budgets = resolve_subtree_budgets(opts.subtree_budgets, max_local)
     capacity = [subtree_capacity(b, elsize, reserve) for b in budgets]
     maxcap = isempty(budgets) ? 0 : maximum(capacity)
     alg = opts.factorization_alg

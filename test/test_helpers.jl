@@ -12,6 +12,9 @@
     if CUDA_LOADED  # loading CUDA triggers the package extension
         @test Base.get_extension(SparseDirectSolver, :SparseDirectSolverCUDAExt) !== nothing
     end
+    if AMDGPU_LOADED  # likewise AMDGPU (T23)
+        @test Base.get_extension(SparseDirectSolver, :SparseDirectSolverAMDGPUExt) !== nothing
+    end
     for backend in BACKENDS
         x = rand(Float32, 7)
         dx = to_device(backend, x)

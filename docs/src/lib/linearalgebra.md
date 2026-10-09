@@ -2,7 +2,8 @@
 
 A [`DirectSolver`](@ref) is a `LinearAlgebra.Factorization`. The functions below
 take a [`CSR`](@ref) matrix; the [CUDA extension](@ref "CUDA extension") adds
-methods for `CuSparseMatrixCSR`.
+methods for `CuSparseMatrixCSR`, the [AMDGPU extension](@ref "AMDGPU extension")
+for `ROCSparseMatrixCSR`.
 
 ```@docs
 LinearAlgebra.cholesky(::SparseDirectSolver.CSR, ::LinearAlgebra.NoPivot)

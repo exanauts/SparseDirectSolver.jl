@@ -73,7 +73,8 @@ const AmalgamationParams = @NamedTuple{max_width::Int, zero_fraction::Float64, m
 
 const DEFAULT_AMALGAMATION = AmalgamationParams((32, 0.25, 8))
 
-# regime A local-memory budgets (bytes): 16, 32 and 48 KiB (PLAN §2.3 step 5)
+# regime A local-memory budgets (bytes): 16, 32 and 48 KiB (PLAN §2.3 step 5), clamped to the backend's
+# `max_local_bytes` by the analysis (`resolve_subtree_budgets`)
 const DEFAULT_SUBTREE_BUDGETS = [16 * 1024, 32 * 1024, 48 * 1024]
 
 # Regime A runs a subtree on one workgroup. A tree of small fronts fits the
@@ -134,7 +135,7 @@ defaults below. Keyword arguments are applied through [`setparam!`](@ref), so
 | `pivot_pair_tolerance` | `1e-6` ([`PIVOT_PAIR_TOLERANCE`](@ref)) | relative diagonal size below which a row is a 2×2 candidate |
 | `regime_c_width` | `64` | fronts wider than this go to regime C (vendor dense calls) |
 | `regime_c_rows` | `512` | fronts with more rows than this go to regime C |
-| `subtree_budgets` | `[16384, 32768, 49152]` | regime A local-memory budgets in bytes; empty disables regime A |
+| `subtree_budgets` | `[16384, 32768, 49152]` | regime A local-memory budgets in bytes (kernel classes of 8 to 64 KiB); the defaults are clamped to the backend's local memory per workgroup, an explicit budget above it is an `InvalidValueError`; empty disables regime A |
 | `subtree_parallelism` | `4096` | a regime-A subtree does at most `1/subtree_parallelism` of the factorization flops (`0`: no limit) |
 | `subtree_max_fronts` | `0` | a regime-A subtree has at most this many fronts (`0`: no limit); the serial walk of a subtree is its workgroup's critical path |
 | `memory_budget` | `-1` | update-stack bytes per level chunk (negative: no limit, no chunking) |

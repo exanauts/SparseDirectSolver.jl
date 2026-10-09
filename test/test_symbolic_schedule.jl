@@ -206,6 +206,49 @@ triangle(A, view) = view == 'L' ? tril(A) : view == 'U' ? triu(A) : A
     @test thrown(() -> setparam!(Options(), "memory_budget", 1)) isa ArgumentError
 end
 
+@testset "local memory per backend: max_local_bytes (issue #60)" begin
+    # the ladder ends at 64 KiB; a budget picks the largest class it holds
+    @test SDS.SUBTREE_LOCAL_SIZES[end] == 65536
+    @test SDS.subtree_local_bytes(1 << 20) == 65536
+    @test SDS.subtree_local_bytes(65535) == 49152
+    # the caps: no limit on the CPU backend, at least the CUDA-safe 48 KiB on every GPU backend
+    @test SDS.max_local_bytes(CPU()) >= 65536
+    for backend in BACKENDS
+        @test SDS.max_local_bytes(backend) >= 49152
+        CUDA_LOADED && backend isa CUDABackend && @test SDS.max_local_bytes(backend) == 49152
+        AMDGPU_LOADED && backend isa ROCBackend && @test SDS.max_local_bytes(backend) >= 65536
+    end
+    # the defaults are clamped to the cap, explicit budgets above it are rejected
+    @test SDS.resolve_subtree_budgets(SDS.DEFAULT_SUBTREE_BUDGETS, typemax(Int)) == [16384, 32768, 49152]
+    @test SDS.resolve_subtree_budgets(SDS.DEFAULT_SUBTREE_BUDGETS, 32768) == [16384, 32768]
+    @test SDS.resolve_subtree_budgets([49152, 8192], 49152) == [8192, 49152]
+    @test SDS.resolve_subtree_budgets([65536], 65536) == [65536]
+    @test thrown(() -> SDS.resolve_subtree_budgets([65536], 49152)) isa InvalidValueError
+    @test thrown(() -> SDS.resolve_subtree_budgets([8192, 1 << 20], 65536)) isa InvalidValueError
+    # in the analysis: the schedule's budgets (and so its kernel classes) stay within the cap
+    A = SDS.CSR(tril(laplacian3d(Float64, 8, 8, 8)))
+    for (opts, cap) in ((Options(subtree_parallelism = 0), 32768), (Options(subtree_parallelism = 0), 49152),
+                        (Options(subtree_budgets = [65536], subtree_parallelism = 0), 65536))
+        S = SDS.symbolic_analysis(A, "SPD", 'L'; opts, max_local = cap)
+        sc = S.schedule
+        @test all(<=(cap), sc.budgets)
+        @test SDS.nsubtrees(sc) > 0
+        @test all(t -> SDS.subtree_local_bytes(sc.budgets[sc.subtree_class[t]]) <= cap, 1:SDS.nsubtrees(sc))
+    end
+    S48 = SDS.symbolic_analysis(A, "SPD", 'L'; opts = Options(subtree_parallelism = 0), max_local = 49152)
+    @test S48.schedule.budgets == [16384, 32768, 49152]   # the defaults are unchanged on a 48 KiB backend
+    @test thrown(() -> SDS.symbolic_analysis(A, "SPD", 'L'; opts = Options(subtree_budgets = [65536]),
+                                             max_local = 49152)) isa InvalidValueError
+    # a host analysis with a 64 KiB class cannot be allocated on a backend with less local memory
+    S64 = SDS.symbolic_analysis(A, "SPD", 'L'; opts = Options(subtree_budgets = [65536], subtree_parallelism = 0))
+    @test maximum(SDS.subtree_local_bytes, S64.schedule.budgets) == 65536
+    @test SDS.allocate_numeric(S64, Float64, CPU()) isa SDS.Numeric
+    for backend in BACKENDS
+        SDS.max_local_bytes(backend) < 65536 || continue
+        @test thrown(() -> SDS.allocate_numeric(SDS.adapt(backend, S64, Int32), Float64, backend)) isa InvalidValueError
+    end
+end
+
 @testset "subtree_parallelism: flop limit of the regime-A subtrees" begin
     @test Options().subtree_parallelism == SDS.SUBTREE_PARALLELISM == 4096
     @test Options(subtree_parallelism = 0).subtree_parallelism == 0
@@ -419,6 +462,9 @@ end
     end
     if CUDA_LOADED && backend isa CUDABackend
         @test Sd.amap isa CuVector{INT}
+    end
+    if AMDGPU_LOADED && backend isa ROCBackend
+        @test Sd.amap isa ROCVector{INT}
     end
     @test Sd.partition === S.partition && Sd.schedule === S.schedule && Sd.layout === S.layout
     # round trip to the host

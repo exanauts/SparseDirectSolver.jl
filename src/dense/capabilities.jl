@@ -82,6 +82,23 @@ function print_capabilities(io::IO, backend; eltypes = (Float32, Float64, Comple
 end
 print_capabilities(backend; kwargs...) = print_capabilities(stdout, backend; kwargs...)
 
+"""
+    max_local_bytes(backend) -> Int
+
+Largest static `@localmem` size (bytes) one workgroup of a KernelAbstractions
+kernel may declare on `backend` (issue #60). The regime-A subtree kernels pick
+their local-memory class from `SUBTREE_LOCAL_SIZES` up to this cap: the
+analysis clamps the default `subtree_budgets` to it and rejects an explicit
+budget above it with an [`InvalidValueError`](@ref).
+
+`49152` (48 KiB) for a backend without a method, the static shared-memory
+limit of CUDA; the CPU backend has no limit (`typemax(Int)`). The backend
+extensions add their own methods (CUDA: 48 KiB; AMDGPU: the device's LDS size
+per workgroup, 64 KiB on CDNA).
+"""
+max_local_bytes(backend) = 49152
+max_local_bytes(::KernelAbstractions.CPU) = typemax(Int)
+
 # ---------------------------------------------------------------------------
 # probes
 
