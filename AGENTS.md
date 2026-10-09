@@ -110,8 +110,11 @@ reviewing agent must pass. The moving parts:
 * `ubuntu-latest`, Julia `1` from `julia-actions/setup-julia`, the project
   instantiated, `gh` authenticated as the Claude GitHub App. **CPU backend
   only**: no GPU, CUDA.jl is not installed; GPU results come from the
-  self-hosted `cuda` runner through `ci.yml` on the PR (the `amdgpu` runner is
-  disabled in `ci.yml` until the AMDGPU extension exists, T23).
+  self-hosted `cuda` runner through `ci.yml` on the PR. The `amdgpu` leg of
+  `ci.yml` runs the suite on the self-hosted AMD runner as a non-required,
+  continue-on-error job (PR #107): it fails today only on the missing
+  `ROCSparseMatrixCSR` constructor forwarders, and is promoted to a required
+  check with T23.
 * Reference code is cloned next to the checkout, read-only: `../CUDSS.jl` and
   `../KrylovPreconditioners.jl` (same relative paths as below). MadNLPGPU's
   cuDSS integration is not checked out; when a task needs it, read it from the
