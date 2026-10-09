@@ -3187,6 +3187,13 @@ feature, not a performance one. The ordering cache (analysis under a stored
 permutation ran in 3.6 s against 12 s for a fresh METIS analysis) is the part
 MadNLP benefits from.
 
+**Owner note (PR #120)**: a pipeline run chained after T23 implemented this
+task under its former number before the renumbering reached `main`; the PR
+was closed, but its branch `task/T24-nd-tree-ordering-cache` holds twenty
+minutes of work (`src/symbolic/ndtree.jl` with the tree export/import and a
+canonical supernode postorder, `test/test_ndtree.jl`), unreviewed and without
+CI. Start from it or from scratch; it was not checked against this text.
+
 ### T31 — oneAPI and Metal extensions, allocation-free KA dense fallbacks (issues #112, #53)   `[ ]`
 
 The remainder of T23, split off by owner decision when PR #113 delivered the
