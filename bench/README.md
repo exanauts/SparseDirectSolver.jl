@@ -96,7 +96,7 @@ julia --project=bench bench/compare.jl --solver=sds --features=ldlt
   solve (no residual). `nubatch` batches all selected condensed dumps into one
   row. The SDS calls for uniform batches assume `(n, nbatch)` right-hand sides
   and the non-uniform batch assumes `BatchedDirectSolver` (PLAN §3); adjust
-  `compare.jl` when T17/T22 fix the API.
+  `compare.jl` when T17/T29 fix the API.
 * **Adding a feature.** One `Feature(...)` entry in `features.jl` (task id,
   structure, matrix selector, parameters); `compare.jl` handles the kinds
   `:single`, `:ubatch`, `:nubatch` and `:schur`.

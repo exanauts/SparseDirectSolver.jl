@@ -156,3 +156,25 @@ Out-of-chain PRs merged since this review, all by hand and on `main`:
 New issues from #107, all `found-by-agent` + `performance`, none `triaged` yet (they hold nothing while #22 carries `on-hold`, but they gate the chain once it resumes): #108 (ordering chooser picks AMD on large KKT: score the supernodal schedule depth), #109 (update-stack placement assumes level-synchronous execution), #110 (regime-C Cholesky reportedly host-synchronizes per front; verify). Owner notes for them are under T23, T24, T25 and the External task in `TASKS.md`.
 
 Still open from §5–§6: #96 and #108–#110 untriaged; #60 item 1 unmeasured; `CLAUDE_GH_PAT` unset; the two `lts` required checks in the ruleset (unless already removed); the External MadNLP task before T22–T24 is still the recommendation, now with `bench/e2e/MadNLPSDS.jl`, `reordering_alg = "algo4"` and the phase-coupled knobs as known inputs; T25 absorbs #82, #75's remainder and the #107 designs.
+
+## 8. Addendum (2026-10-09): task restructuring after PR #107
+
+The former T25 held six deliverables from the #107 prototypes; it is split and
+the post-v1 tasks are renumbered so the pipeline's `TNN → TNN+1` chaining
+still holds. New order in `TASKS.md`: **T22** ordering chooser scoring the
+supernodal schedule depth (#108, host only, precondition for the fused solve);
+**T23** AMDGPU/oneAPI/Metal extensions (unchanged); **T24** partitioned-inverse
+fused solve `solve_alg = "algo1"` (#82, solve half); **T25** split
+factorization (tiled SYRK, chunked TRSM, split regime-C fronts, longest-first
+regime A); **T26** segmented fused factorization with dependency counters,
+with #109 (stack lifetimes) and #110 (verify the regime-C host sync) inside
+it, plus the #75 remainder and the #96 re-measurement; **T27** hybrid memory
+(was T26); **T28** robustness extras (was T27); **T29** non-uniform batch (was
+T22); **T30** ND partition-tree export and ordering cache (was T24); **T31**
+oneAPI and Metal extensions with the allocation-free `:ka` fallbacks (#112,
+#53), the remainder of T23 after PR #113 delivered the AMDGPU extension alone;
+External unchanged and last (owner decision: integrate against finished
+kernels; the §5 item 5 recommendation is withdrawn). GitHub: issues #22–#27
+renamed to the new titles, #22 loses `on-hold`, new task issues for T28–T31;
+#96, #108–#110 and #112 labelled `triaged` (#108 → T22, #109/#110 → T26,
+#112 → T31). The chain resumes with T22 once PR #113 (T23) has merged.
