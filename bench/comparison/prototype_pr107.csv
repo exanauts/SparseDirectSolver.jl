@@ -1,0 +1,7 @@
+metric,device,stock_ms,prototype_ms,cudss_ms
+solve (1 RHS),Quadro GV100,18.0,3.5,3.8
+refactorization,Quadro GV100,167.7,31.9,24.3
+refactorization + solve,Quadro GV100,185,35,28.1
+MadNLP iteration loop,Quadro GV100,26100,11700,9800
+solve (1 RHS),Radeon VII,20.5,8.05,
+MadNLP iteration loop,Radeon VII,63200,33900,
