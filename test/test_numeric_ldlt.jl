@@ -71,6 +71,16 @@ end
     Random.seed!(666)
     A = kkt_matrix(T, 200, 100, 0.0; hessian = :indefinite, hessian_scale = 1.0e-3)
     opts = Options(user_perm = kkt_interleaved_perm(200, 100), subtree_budgets = [8192, 16384, 32768, 49152])
+    # the 64 KiB regime-A class (issue #60) where the backend has the local memory (CPU, ROCm)
+    if SDS.max_local_bytes(backend) >= 65536
+        o64 = Options(user_perm = kkt_interleaved_perm(200, 100), subtree_budgets = [65536], subtree_parallelism = 0)
+        S, Nr, Sd, Nd, nz = ldlt_setup(backend, A, Int32; opts = o64)
+        @test 65536 in Nd.plan.sub_local
+        SDS.factorize!(Nd, Sd, nz; opts = o64)
+        Nh = SDS.host_numeric(Nd)
+        @test Nh.piv == Nr.piv && Nh.pivot_kind == Nr.pivot_kind
+        @test d_error(Nh, Nr) <= growth_tol(T, Nr) && panel_error(Nh, Nr) <= growth_tol(T, Nr)
+    end
     S, Nr, Sd, Nd, nz = ldlt_setup(backend, A, Int64; opts)
     @test !isempty(Nd.plan.sub_first) && SDS.pivot_stats(Nr).n2x2 > 0
     SDS.factorize!(Nd, Sd, nz; opts)

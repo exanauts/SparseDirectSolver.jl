@@ -544,7 +544,8 @@ function _symbolic!(solver::DirectSolver{T, INT}) where {T, INT}
         schur = nsupernodes(sp)
     end
     sc = build_schedule(sp, opts, T; reserve = subtree_local_reserve(solver.structure),
-                        elsize = schedule_elsize(solver.structure, T), schur)
+                        elsize = schedule_elsize(solver.structure, T), schur,
+                        max_local = max_local_bytes(solver.backend))
     layout = build_layout(sp, sc; ldlt = _is_ldlt_structure(solver.structure))
     Sh = Symbolic(sp, sc, layout, solver.host_rowptr, solver.analysis_colval, A.nrows, solver.structure;
                   view = _stored_view(solver), index = A.index)

@@ -1,6 +1,7 @@
 module SparseDirectSolverCUDAExt
 
-# CUDA support: CSR adapters (T02) and the vendor dense bindings of the dense
+# CUDA support: CSR adapters (T02), the static shared-memory cap of the regime-A
+# kernels (T23, issue #60) and the vendor dense bindings of the dense
 # layer (T03, PLAN §2.6): cuBLAS gemm/syrk/herk/trsm/strided-batched gemm/
 # batched trsm, cuSOLVER potrf (also with a device info)/getrf/sytrf/potrfBatched,
 # cuBLAS getrfBatched; the batched trsm/potrf also on member pointers built once
@@ -67,6 +68,16 @@ function SparseDirectSolver.to_backend(A::SparseMatrixCSC, ::CUDABackend; index 
     return CSR(CuVector(B.rowptr), CuVector(B.colval), CuVector(B.nzval), B.nrows, B.ncols;
                index = B.index, transposed = B.transposed)
 end
+
+"""
+    max_local_bytes(::CUDABackend) -> Int
+
+48 KiB: `@localmem` is static shared memory, and ptxas rejects more than
+48 KiB of static shared data per kernel on every CUDA device (larger amounts
+need dynamic shared memory with an opt-in attribute). The regime-A kernels
+therefore stop at the 48 KiB class on CUDA (issue #60).
+"""
+SparseDirectSolver.max_local_bytes(::CUDABackend) = 49152
 
 # ---------------------------------------------------------------------------
 # public API (T13, PLAN §3.1): solver constructors, update!, the LinearAlgebra layer

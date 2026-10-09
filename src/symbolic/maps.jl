@@ -229,7 +229,8 @@ function Symbolic(sp::SupernodePartition, sc::Schedule, layout::Layout, rowptr::
 end
 
 """
-    symbolic_analysis(A::CSR, structure, view = 'F'; opts = Options(), T = eltype(A)) -> Symbolic{Int, Vector{Int}}
+    symbolic_analysis(A::CSR, structure, view = 'F'; opts = Options(), T = eltype(A), max_local = typemax(Int))
+        -> Symbolic{Int, Vector{Int}}
 
 The whole host analysis of PLAN §2.3: [`SymmetricPattern`](@ref),
 [`compute_ordering`](@ref) (with the 2×2 pivot pair candidates or fixed pairs
@@ -237,9 +238,13 @@ of [`analysis_pairs`](@ref) for `"S"`/`"H"`), [`supernode_partition`](@ref) on
 [`factor_pattern`](@ref), [`build_schedule`](@ref) for element type `T`,
 [`build_layout`](@ref) and the maps of [`Symbolic`](@ref). `A.rowptr`/`A.colval`
 are copied to the host once; `A.nzval` too when pairs are looked for
-([`pairs_enabled`](@ref)), and only then.
+([`pairs_enabled`](@ref)), and only then. `max_local`: the bytes of local memory
+per workgroup of the backend the analysis is for ([`max_local_bytes`](@ref)),
+which bound the regime-A budgets ([`resolve_subtree_budgets`](@ref)); the
+default leaves them unbounded (host analyses, the CPU backend).
 """
-function symbolic_analysis(A::CSR, structure, view = VIEW_FULL; opts::Options = Options(), T::Type = eltype(A))
+function symbolic_analysis(A::CSR, structure, view = VIEW_FULL; opts::Options = Options(), T::Type = eltype(A),
+                           max_local::Integer = typemax(Int))
     A.nrows == A.ncols || throw(InvalidValueError("the matrix must be square, got $(A.nrows) × $(A.ncols)"))
     rowptr = Array(A.rowptr)
     colval = Array(A.colval)
@@ -248,7 +253,7 @@ function symbolic_analysis(A::CSR, structure, view = VIEW_FULL; opts::Options = 
     ord = compute_ordering(P, opts; T, pp.pairs, pp.candidates)
     sp = supernode_partition(factor_pattern(P, ord), ord.perm, opts)
     sc = build_schedule(sp, opts, T; reserve = subtree_local_reserve(structure),
-                        elsize = schedule_elsize(structure, T))
+                        elsize = schedule_elsize(structure, T), max_local)
     layout = build_layout(sp, sc; ldlt = _is_ldlt_structure(_structure(structure)))
     return Symbolic(sp, sc, layout, rowptr, colval, A.nrows, structure; view, index = A.index)
 end

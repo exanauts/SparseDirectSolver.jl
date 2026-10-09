@@ -8,7 +8,8 @@ copy and every numeric phase runs where they live.
 | :--- | :--- | :--- | :--- |
 | CPU (`KernelAbstractions.CPU()`) | `SparseMatrixCSC`, [`CSR`](@ref) of `Vector`s | KernelAbstractions kernels | tested |
 | CUDA (`using CUDA`) | `CuSparseMatrixCSR`, `CuSparseMatrixCSC`, [`CSR`](@ref) of `CuArray`s | cuBLAS, cuSOLVER | tested |
-| AMDGPU, oneAPI, Metal | [`CSR`](@ref) of device arrays | KernelAbstractions kernels | planned extensions |
+| AMDGPU (`using AMDGPU`) | `ROCSparseMatrixCSR`, `ROCSparseMatrixCSC`, [`CSR`](@ref) of `ROCArray`s | rocBLAS, rocSOLVER | tested (MI300X) |
+| oneAPI, Metal | [`CSR`](@ref) of device arrays | KernelAbstractions kernels | planned extensions |
 
 [`to_backend`](@ref) moves a `SparseMatrixCSC` to a backend:
 

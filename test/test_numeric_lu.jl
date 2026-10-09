@@ -79,6 +79,17 @@ end
     Random.seed!(666)
     A = weak_diagonal_general(T, 400, 0.01)
     opts = Options(pivot_threshold = 1.0, subtree_budgets = [8192, 16384, 32768, 49152])
+    # the 64 KiB regime-A class (issue #60) where the backend has the local memory (CPU, ROCm)
+    if SDS.max_local_bytes(backend) >= 65536
+        o64 = Options(pivot_threshold = 1.0, subtree_budgets = [65536], subtree_parallelism = 0)
+        S, Nr, Sd, Nd, nz = lu_setup(backend, A, Int32; opts = o64)
+        @test 65536 in Nd.plan.sub_local
+        SDS.factorize!(Nd, Sd, nz; opts = o64)
+        Nh = SDS.host_numeric(Nd)
+        @test Nh.piv == Nr.piv && Nh.pivot_kind == Nr.pivot_kind
+        gt = growth_tol(T, Nr)
+        @test d_error(Nh, Nr) <= gt && panel_error(Nh, Nr) <= gt && upanel_error(Nh, Nr) <= gt
+    end
     S, Nr, Sd, Nd, nz = lu_setup(backend, A, Int64; opts)
     @test !isempty(Nd.plan.sub_first) && Nr.piv != 1:400
     SDS.factorize!(Nd, Sd, nz; opts)

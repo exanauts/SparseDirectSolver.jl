@@ -198,7 +198,8 @@ statistics and their totals, status vector, pivot order, pivot kinds, pivot sign
 `T` on the KernelAbstractions `backend`, for a uniform batch of `nbatch`
 matrices (every length times `nbatch`, all members active), and build its [`NumericPlan`](@ref).
 This is the only allocation of the numeric phase. Raises [`InvalidValueError`](@ref) when the
-panels or the regime-C workspace of the batch do not fit the index type `INT` of `symbolic`.
+panels or the regime-C workspace of the batch do not fit the index type `INT` of `symbolic`, or when a
+regime-A kernel of the analysis needs more local memory than `backend` has ([`max_local_bytes`](@ref)).
 """
 function allocate_numeric(S::Symbolic{INT}, ::Type{T}, backend::KernelAbstractions.Backend = KernelAbstractions.CPU();
                           nbatch::Integer = 1) where {INT, T}
@@ -211,6 +212,15 @@ function allocate_numeric(S::Symbolic{INT}, ::Type{T}, backend::KernelAbstractio
     nb * L.work_len < typemax(INT) ||
         throw(InvalidValueError("a batch of $nb regime-C workspaces of $(L.work_len) entries does not fit the " *
                                 "index type $INT; use Int64 indices"))
+    # a regime-A class above the backend's static local memory (a host analysis built without its `max_local`)
+    cap = max_local_bytes(backend)
+    for grp in S.schedule.groups
+        grp.regime == REGIME_A || continue
+        lb = subtree_local_bytes(S.schedule.budgets[grp.class])
+        lb <= cap || throw(InvalidValueError("the analysis uses a regime-A kernel with $lb bytes of local memory, " *
+                                             "more than the $cap bytes per workgroup of $backend " *
+                                             "(max_local_bytes); analyze with max_local = $cap"))
+    end
     factor = KernelAbstractions.zeros(backend, T, nb * L.factor_len)
     d = KernelAbstractions.zeros(backend, T, nb * L.d_len)
     stack = KernelAbstractions.zeros(backend, T, nb * L.stack_len)

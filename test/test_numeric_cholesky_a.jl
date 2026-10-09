@@ -54,7 +54,7 @@ RUN_SHARED && @testset "plan: regime-A groups" begin
     # the budget classes map to the kernel sizes, smaller budgets disable regime A
     @test SDS.subtree_local_bytes(16 * 1024) == 16384
     @test SDS.subtree_local_bytes(20000) == 16384
-    @test SDS.subtree_local_bytes(1 << 20) == 49152
+    @test SDS.subtree_local_bytes(1 << 20) == 65536
     @test SDS.subtree_local_bytes(4096) == 0 && SDS.subtree_capacity(4096, 8) == 0
     S = SDS.symbolic_analysis(SDS.CSR(tril(laplacian2d(Float64, 10, 10))), "SPD", 'L';
                               opts = Options(subtree_budgets = [4096]))
@@ -101,9 +101,17 @@ end
     # the same matrix under different budgets: other subtrees, other local sizes, same factor
     A = laplacian3d(T, 8, 8, 8)
     for opts in (Options(subtree_budgets = [8192], subtree_parallelism = 0),
+                 Options(subtree_budgets = [49152], subtree_parallelism = 0),
                  Options(subtree_budgets = [65536], subtree_parallelism = 0),
+                 Options(subtree_budgets = [8192, 20000, 49152], regime_c_width = 32, subtree_parallelism = 0),
                  Options(subtree_budgets = [8192, 20000, 1 << 20], regime_c_width = 32, subtree_parallelism = 0),
                  Options(subtree_budgets = [32768], factorization_alg = "algo2", subtree_parallelism = 0))
+        # the 64 KiB class (issue #60) runs where the backend has the local memory (CPU, ROCm); elsewhere (CUDA)
+        # the allocation of an analysis that uses it is rejected
+        if SDS.subtree_local_bytes(maximum(opts.subtree_budgets)) > SDS.max_local_bytes(backend)
+            @test thrown(() -> numeric_setup(backend, A; opts)) isa InvalidValueError
+            continue
+        end
         S, Nr, _, Sd, Nd, nz = numeric_setup(backend, A; opts)
         @test SDS.nsubtrees(S.schedule) > 0
         @test SDS.factorize!(Nd, Sd, nz) == 0

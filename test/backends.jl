@@ -164,11 +164,12 @@ api_csr(::CPU, rowptr, colval, nzval, n) = CSR(copy(rowptr), copy(colval), copy(
     device_allocated(backend, f) -> Union{Int, Missing}
 
 Bytes of device memory allocated by `f()` (T13): `@allocated` on the CPU
-backend (device memory is host memory), `CUDA.@allocated` on CUDA; `missing`
-when the backend offers no counter.
+backend (device memory is host memory), `CUDA.@allocated` on CUDA, the bytes
+AMDGPU.jl's memory pool hands out on ROCm (T23); `missing` when the backend
+offers no counter. `f()` runs in every case.
 """
 device_allocated(::CPU, f) = @allocated f()
-device_allocated(backend, f) = missing
+device_allocated(backend, f) = (f(); missing)
 
 if CUDA_LOADED
     if isdefined(CUDA, Symbol("@allocated"))
@@ -189,6 +190,14 @@ if CUDA_LOADED
 end
 
 if AMDGPU_LOADED
+    # pool allocations, what `CUDA.@allocated` counts on CUDA (an AMDGPU.jl internal, hence the guard)
+    if isdefined(AMDGPU, :alloc_stats)
+        function device_allocated(::ROCBackend, f)
+            before = @atomic AMDGPU.alloc_stats.alloc_bytes
+            f()
+            return (@atomic AMDGPU.alloc_stats.alloc_bytes) - before
+        end
+    end
     backend_name(::ROCBackend) = "ROCm"
     to_device(::ROCBackend, x::Array) = ROCArray(x)
     to_device(backend::ROCBackend, A::SparseMatrixCSC{T, INT}) where {T, INT} = to_device(backend, A, INT)
@@ -202,6 +211,18 @@ if AMDGPU_LOADED
         ROCSparseMatrixCSR{eltype(nzval), INT}(ROCVector{INT}(rowptr), ROCVector{INT}(colval), ROCVector(vec(nzval)),
                                                (n, n))
 end
+
+"""
+    vendor_sparse_types(backend) -> Union{Nothing, Tuple}
+
+`(CSR type, CSC type, vector type)` of the vendor sparse matrices of a GPU
+`backend` (`CuSparseMatrixCSR`, `CuSparseMatrixCSC`, `CuVector` on CUDA; the
+`ROC` twins on ROCm), `nothing` for the CPU backend: the adapter tests of the
+backend extensions loop over these.
+"""
+vendor_sparse_types(backend) = nothing
+CUDA_LOADED && (vendor_sparse_types(::CUDABackend) = (CuSparseMatrixCSR, CuSparseMatrixCSC, CuVector))
+AMDGPU_LOADED && (vendor_sparse_types(::ROCBackend) = (ROCSparseMatrixCSR, ROCSparseMatrixCSC, ROCVector))
 
 """
     print_backends()

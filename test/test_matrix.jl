@@ -101,13 +101,16 @@ end
     @test logical_matrix(Bt) == A
 end
 
-@testset "CUDA adapters ($T, $INT)" for backend in BACKENDS, T in ELTYPES, INT in INTTYPES
-    backend_name(backend) == "CUDA" || continue
+# the CSR adapters of the GPU extensions (CUDA: T02; AMDGPU: T23)
+@testset "GPU adapters ($(backend_name(backend)), $T, $INT)" for backend in BACKENDS, T in ELTYPES, INT in INTTYPES
+    types = vendor_sparse_types(backend)
+    types === nothing && continue
+    SpCSR, SpCSC, DVec = types
     A = SparseMatrixCSC{T, INT}(random_general(T, 20, 0.2))
     # Built from the host CSR arrays: `to_device(::CUDABackend, A, Int64)` yields Int32
     # indices because cuSPARSE ignores the index type parameter (see the T02 Report).
     Bh = CSR(A)
-    dA = CuSparseMatrixCSR{T, INT}(CuVector{INT}(Bh.rowptr), CuVector{INT}(Bh.colval), CuVector{T}(Bh.nzval), size(A))
+    dA = SpCSR{T, INT}(DVec{INT}(Bh.rowptr), DVec{INT}(Bh.colval), DVec{T}(Bh.nzval), size(A))
     B = CSR(dA)
     @test B isa CSR{T, INT}
     @test !B.transposed
@@ -117,24 +120,24 @@ end
     @test pointer(B.nzval) == pointer(dA.nzVal)
     @test get_backend(B) == backend
     @test SparseMatrixCSC(B) == A
-    dC = CuSparseMatrixCSC{T, INT}(CuVector{INT}(A.colptr), CuVector{INT}(A.rowval), CuVector{T}(A.nzval), size(A))
+    dC = SpCSC{T, INT}(DVec{INT}(A.colptr), DVec{INT}(A.rowval), DVec{T}(A.nzval), size(A))
     Bt = CSR(dC)
     @test Bt.transposed
     @test size(Bt) == reverse(size(A))
     @test pointer(Bt.rowptr) == pointer(dC.colPtr)
     @test pointer(Bt.nzval) == pointer(dC.nzVal)
     @test logical_matrix(Bt) == A
-    dA2 = CuSparseMatrixCSR(B)
-    @test dA2 isa CuSparseMatrixCSR{T, INT}
+    dA2 = SpCSR(B)
+    @test dA2 isa SpCSR{T, INT}
     @test pointer(dA2.nzVal) == pointer(dA.nzVal)
     @test SparseMatrixCSC(CSR(dA2)) == A
     Bz = to_backend(A, backend; index = 'Z')
-    dZ = CuSparseMatrixCSR(Bz)
-    @test dZ isa CuSparseMatrixCSR{T, INT}
+    dZ = SpCSR(Bz)
+    @test dZ isa SpCSR{T, INT}
     @test pointer(dZ.rowPtr) != pointer(Bz.rowptr)   # rebased copy
     @test SparseMatrixCSC(CSR(dZ)) == A
     Bd = to_backend(A, backend)
-    @test Bd.rowptr isa CuVector{INT}
+    @test Bd.rowptr isa DVec{INT}
     @test SparseMatrixCSC(Bd) == A
 end
 

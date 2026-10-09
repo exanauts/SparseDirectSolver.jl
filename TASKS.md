@@ -2837,7 +2837,7 @@ inertia with matching enabled equals the eigenvalue count (the cuDSS defect).
 
 Block-diagonal packing, forest schedule; `test_nonuniform_batch_cudss.jl` ported.
 
-### T23 — AMDGPU, oneAPI and Metal extensions   `[ ]`
+### T23 — AMDGPU, oneAPI and Metal extensions   `[!]`
 
 **Owner note (issue #53)**: the `impl = :ka` dense fallbacks of T03
 (`ka_potrf!`, `ka_trsm!`, `ka_gemm!`, batched variants) allocate per call;
@@ -2873,6 +2873,90 @@ Written by analogy with the CUDA extension (sparse adapters, vendor dense
 bindings, capability probes). Test on this machine: a temporary environment
 that adds AMDGPU and oneAPI and precompiles the extensions (no hardware
 needed to load them on Linux); Metal only by review. Mark both as untested.
+
+#### Report
+
+- Status: [!] (AMDGPU extension and item 2 of #60 done, tested on CPU and on an AMD MI300X; oneAPI, Metal and the
+  #53 allocation-free `:ka` fallbacks split off by owner decision, see #112; CUDA from CI)
+- What was built:
+  - `ext/SparseDirectSolverAMDGPUExt.jl` (new, weak dependency `AMDGPU`, compat `"2"`): `CSR(::ROCSparseMatrixCSR)`
+    (shares the arrays), `CSR(::ROCSparseMatrixCSC)` (CSR of the transpose), `ROCSparseMatrixCSR(::CSR)` (zero-based
+    copies rebased, batches rejected), `to_backend(::SparseMatrixCSC, ::ROCBackend)`; the T13 API on rocSPARSE
+    matrices (`DirectSolver`, `update!`, `cholesky`/`ldlt`/`lu` and the `Symmetric`/`Hermitian` wrappers); every
+    `vendor_*` binding of `src/dense/vendor.jl` on rocBLAS/rocSOLVER: `gemm!`/`syrk!`/`trsm!` through the AMDGPU.jl
+    wrappers, `herk` (the wrapper takes contiguous `ROCMatrix` only), `potrf_info!` (status written to the device
+    vector, no host read), `gemm_strided_batched` (the wrapper takes `ROCArray{T,3}` only), batched `trsm`/`potrf`
+    on member pointers and `getrf_batched` through the C bindings; `max_local_bytes(::ROCBackend)` from
+    `hipDeviceAttributeMaxSharedMemoryPerBlock`. rocBLAS runs in host pointer mode, so α/β are host `Ref`s and no
+    scalar cache is needed (the CUDA extension's `_SCALARS`).
+  - Issue #60 item 2: `max_local_bytes(backend)` (`src/dense/capabilities.jl`: 48 KiB default, unlimited on `CPU()`;
+    CUDA extension: 48 KiB; AMDGPU: the device's LDS per workgroup, 64 KiB on gfx942). `SUBTREE_LOCAL_SIZES` gains
+    a 64 KiB class (`_with_local_bytes` dispatches over five sizes). `resolve_subtree_budgets` (`src/symbolic/
+    schedule.jl`): the default budgets are clamped to the cap, an explicit budget above it raises
+    `InvalidValueError`; `build_schedule` and `symbolic_analysis` take `max_local` (default unlimited), the solver
+    passes `max_local_bytes(solver.backend)`, so `sc.budgets`, `NumericPlan.sub_local` and `memory_estimates` agree
+    with the launched kernel. `allocate_numeric` rejects a host-built schedule whose regime-A class exceeds the
+    backend's cap.
+  - Tests: `vendor_sparse_types` in `test/backends.jl`; the CUDA adapter testset of `test_matrix.jl` now runs per GPU
+    backend; `test_dense.jl` asserts the full vendor column on ROCm; `test_helpers.jl` checks the extension loads;
+    `test_symbolic_schedule.jl` gains "local memory per backend" (ladder, caps, clamping, rejection, the
+    `allocate_numeric` check) and the `ROCVector` maps of `adapt`; the 64 KiB class runs in `test_numeric_cholesky_a`
+    (cap-aware: `InvalidValueError` expected where the cap is 48 KiB), `test_numeric_ldlt` and `test_numeric_lu`.
+  - `device_allocated` (`test/backends.jl`) fixed: its fallback returned `missing` without calling `f`, so on ROCm
+    the MadNLP-like loop of `test_api.jl` never factored (relres ≈ 322). It now runs `f` and, on ROCm, returns the
+    bytes of AMDGPU.jl's pool (`AMDGPU.alloc_stats`, what `CUDA.@allocated` counts): refactorization and solve
+    allocate 0 bytes on ROCm.
+  - CI: the `amdgpu` leg of `ci.yml` is no longer `continue-on-error`. Docs: `lib/amdgpu.md` (`@autodocs` of the
+    extension), `docs/make.jl` and `docs/Project.toml` load AMDGPU, backend table, index and README status.
+- Tests: on `amdgpu00` (8× AMD Instinct MI300X, gfx942; `module load rocm/7.0.2`, AMDGPU.jl 2.8.0, rocBLAS 5.0.2,
+  rocSOLVER 3.30.1; AMDGPU added to `test/Project.toml` locally, not committed), all four element types:
+  - CPU: `SDS_TEST_GPU=0 julia --project=. -e 'using Pkg; Pkg.test()'`: 71726 pass, 0 fail, 0 broken (68 parts with `test_aqua`, 4.8 min with 48 workers).
+  - ROCm: `SDS_TEST_CPU=0 SDS_TEST_SKIP=test_aqua julia --project=. -e 'using Pkg; Pkg.test()'`: 78064 pass, 0 fail, 0 broken (67 parts, 7.2 min with 24 workers).
+  - CUDA: pending CI on the PR (the CUDA extension only gains `max_local_bytes`; on CUDA the 64 KiB test cases
+    expect `InvalidValueError`).
+  - Docs: a draft build (`draft = true`, no CUDA GPU) passes the cross-reference and document checks; the real build
+    runs on the `cuda` runner.
+- Measurements: dense capabilities of `ROCBackend()` (every probe checked against host LAPACK):
+
+  | capability | Float32 | Float64 | ComplexF32 | ComplexF64 |
+  | --- | --- | --- | --- | --- |
+  | generic_mul, generic_trsm, generic_cholesky, generic_lu | yes | yes | yes | yes |
+  | vendor_gemm, vendor_syrk, vendor_trsm, vendor_potrf, vendor_getrf, vendor_sytrf | yes | yes | yes | yes |
+  | vendor_herk | no | no | yes | yes |
+  | vendor_gemm_strided_batched, vendor_trsm_batched, vendor_potrf_batched, vendor_getrf_batched | yes | yes | yes | yes |
+  | reshape_view_mul | yes | yes | yes | yes |
+  | atomic_add | yes | yes | no | no |
+
+  `max_local_bytes(ROCBackend()) = 65536`; a KA kernel with 64 KiB `@localmem` compiles and runs on gfx942.
+- Deviations from PLAN.md / this task:
+  - Scope: only the AMDGPU part of T23 and #60 item 2 (owner decision in the session). oneAPI, Metal and the #53
+    allocation-free `:ka` fallbacks are open in #112. Tested on an AMD node, not on the owner's CUDA machine.
+  - Budget semantics: the owner note asks to "cap `subtree_budgets`" and to "raise … for a budget above the cap".
+    Both hold: the default budgets are clamped (so they work on any backend, e.g. Metal's 32 KiB later), an
+    explicit budget above the cap raises, since clamping it silently would be the fallback AGENTS.md forbids. An
+    explicit `[…, 1 << 20]` ("as large as possible") now raises on GPUs; it still works on the CPU backend.
+  - `max_local_bytes(::CUDABackend)` is the constant 48 KiB (ptxas' static shared-memory limit), not a device query.
+    #60 mentions a CUDA CI run that compiled a 64 KiB instance (run 36956560314) while review round 1 of #59 removed
+    the class because ptxas rejected it; if 64 KiB static `@localmem` does work on the runner's GPU, raising the CUDA
+    cap is a one-line change.
+  - The test helpers `numeric_setup`/`ldlt_setup`/`lu_setup` keep an unlimited `max_local` (host analyses); the
+    device tests that use the 64 KiB class are cap-aware instead, and `allocate_numeric` guards the mismatch.
+- Owner note (PR #107): both halves are in (the rocSPARSE constructor forwarders and the rocBLAS/rocSOLVER
+  bindings); the ROCm suite that failed 174 checks on the forwarders now passes completely, so the `amdgpu` leg is
+  no longer `continue-on-error`. Of the three shims of `bench/amd_proto.jl`, `ROCArray` and the raw-array
+  constructor are what `to_backend`/`CSR(::ROCSparseMatrixCSR)` provide; the `Threads.atomic_fence` device fence
+  serves the prototypes' sync-free kernels (T25) and is not needed by the core, so the extension has none.
+- Open issues / follow-ups:
+  - #112: oneAPI and Metal extensions and the #53 fallbacks (also: `select_impl` picks the allocating `:generic`
+    path before `:ka` on a backend without vendor bindings).
+  - #60 stays open for its item 1 (CUDA timings, owner).
+  - Owner: add the `amdgpu` check to the required checks of the branch ruleset.
+  - On this node AMDGPU.jl finds ROCm only after `module load rocm/<version>` (the default `/opt/rocm` 7.2.3 is not
+    picked up); `AMDGPU.versioninfo()` throws with ROCm 7.0.2 (`hiptensorGetVersion`, an AMDGPU.jl issue; not used).
+- Suggested plan changes:
+  - PLAN §2.6 table, AMDGPU column: verified by the T23 audit (every row yes; batched getrf/potrf yes, not "audit").
+  - PLAN §2.3 step 5 / §2.7 hazard row: regime-A ladder 8–64 KiB, capped per backend by `max_local_bytes`.
+  - TASKS.md: a task for the oneAPI/Metal remainder of T23 with the #53 owner note.
 
 ### T24 — ND partition-tree export/import and ordering cache   `[ ]`
 

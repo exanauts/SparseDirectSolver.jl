@@ -26,6 +26,13 @@ dense_part(C, uplo::Char) = uplo == 'L' ? tril(C) : triu(C)
             @test caps.vendor_gemm_strided_batched
             @test caps.vendor_potrf
         end
+        if backend_name(backend) == "ROCm"  # the AMDGPU column of PLAN §2.6 (T23): every rocBLAS/rocSOLVER binding
+            for f in fieldnames(SDS.DenseCapabilities)
+                f in (:atomic_add, :vendor_herk) && continue
+                @test getfield(caps, f)
+            end
+            @test caps.vendor_herk == (T <: Complex)
+        end
         for op in keys(SDS.DENSE_OPS)
             impls = SDS.dense_impls(op, backend, T)
             @test last(impls) === :ka

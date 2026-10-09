@@ -15,6 +15,7 @@ LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
 
 [weakdeps]
+AMDGPU = "21141c5a-9bdb-4563-92ae-f87d6854732e"
 CUDACore = "bd0ed864-bdfe-4181-a5ed-ce625a5fdea2"
 Krylov = "ba0b0d4f-ebba-5204-a429-3ac8c609bfb7"
 Metis = "2679e427-3c69-5b7f-982b-ece356f1e94b"
@@ -23,12 +24,14 @@ cuSOLVER = "887afef0-6a32-4de5-add4-7827692ba8fc"
 cuSPARSE = "b26da814-b3bc-49ef-b0ee-c816305aa060"
 
 [extensions]
+SparseDirectSolverAMDGPUExt = "AMDGPU"
 SparseDirectSolverCUDAExt = ["CUDACore", "cuBLAS", "cuSOLVER", "cuSPARSE"]
 SparseDirectSolverKrylovExt = "Krylov"
 SparseDirectSolverMetisExt = "Metis"
 
 [compat]
 AMD = "0.5"
+AMDGPU = "2"
 Adapt = "4"
 Atomix = "1"
 CUDACore = "6"
