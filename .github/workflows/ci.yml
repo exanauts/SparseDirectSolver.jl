@@ -72,10 +72,14 @@ jobs:
         os: [ubuntu-latest]
         julia-version: ['1']
         julia-arch: [x64]
-        # 'amdgpu' is disabled until the AMDGPU extension exists (T23); add it
-        # back here and to the required checks of the branch ruleset.
-        backend: ['cuda']
+        # 'amdgpu' runs as a non-required, continue-on-error leg until the
+        # AMDGPU extension exists (T23): the test suite already includes
+        # ROCBackend when AMDGPU is functional (test/backends.jl), so this
+        # exercises the KernelAbstractions kernels on AMD hardware today.
+        # Promote it to the required checks of the branch ruleset with T23.
+        backend: ['cuda', 'amdgpu']
     runs-on: [self-hosted, linux, X64, gpu, '${{ matrix.backend }}']
+    continue-on-error: ${{ matrix.backend == 'amdgpu' }}
 
     steps:
       - uses: actions/checkout@v4
