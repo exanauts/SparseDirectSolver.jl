@@ -99,7 +99,8 @@ end
     ReorderingAlg
 
 `reordering_alg` values (cuDSS `cudssReorderingAlg_t`): `"default"` automatic
-AMD/ND choice, `"algo1"` BTF+COLAMD and `"algo2"` COLAMD (both fall back to the
+AMD/ND choice (ND needs `using Metis`) by flops plus a charge per level of the
+supernodal schedule (the same on every backend), `"algo1"` BTF+COLAMD and `"algo2"` COLAMD (both fall back to the
 symmetric-pattern path), `"algo3"` AMD, `"algo4"` nested dissection, `"algo5"`
 natural ordering.
 """

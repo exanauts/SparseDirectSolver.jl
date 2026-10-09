@@ -31,10 +31,13 @@ end
 """
     OrderingCandidate
 
-Evaluation of one ordering by the cost model of [`compute_ordering`](@ref):
-fields `alg::Symbol`, `nnz_L::Int`, `flops::Float64`, `nlevels::Int`, `cost::Float64`.
+Evaluation of one ordering by the cost model of [`compute_ordering`](@ref)
+([`evaluate_ordering`](@ref)): fields `alg::Symbol`, `nnz_L::Int`, `flops::Float64`,
+`nlevels::Int` (column-etree depth), `sdepth::Int` (supernodal schedule depth),
+`nsupernodes::Int` (fundamental supernodes), `cost::Float64` ([`ordering_cost`](@ref)).
 """
-const OrderingCandidate = @NamedTuple{alg::Symbol, nnz_L::Int, flops::Float64, nlevels::Int, cost::Float64}
+const OrderingCandidate = @NamedTuple{alg::Symbol, nnz_L::Int, flops::Float64, nlevels::Int, sdepth::Int,
+                                      nsupernodes::Int, cost::Float64}
 
 """
     Ordering
@@ -44,9 +47,11 @@ Result of [`compute_ordering`](@ref):
 * `perm`, `iperm`: the fill-reducing permutation (`perm[k]` is the original index
   of the `k`-th pivot, so the factorized matrix is `A[perm, perm]`) and its inverse;
 * `alg_used`: `:natural`, `:amd`, `:mmd`, `:nd` or `:user`;
-* `stats::NamedTuple`: `nnz_L`, `flops`, `nlevels`, `cost` of the chosen
+* `stats::NamedTuple`: `nnz_L`, `flops`, `nlevels` (column-etree depth),
+  `sdepth` (supernodal schedule depth), `nsupernodes`, `cost` of the chosen
   ordering, `candidates::Vector{OrderingCandidate}` (every ordering evaluated,
-  the chosen one included), `auto::Bool` (whether the automatic choice ran) and
+  the chosen one included), `auto::Bool` (whether the automatic choice ran),
+  `level_flops` (the depth weight of [`ordering_cost`](@ref) used) and
   `nd_available::Bool`;
 * `pairs::Vector{Tuple{Int,Int}}`: the 2×2 pivot candidate pairs `(partner,
   candidate)` the ordering was computed with (empty for no pair): `perm` puts
@@ -59,40 +64,114 @@ struct Ordering
     perm::Vector{Int}
     iperm::Vector{Int}
     alg_used::Symbol
-    stats::@NamedTuple{nnz_L::Int, flops::Float64, nlevels::Int, cost::Float64,
-                       candidates::Vector{OrderingCandidate}, auto::Bool, nd_available::Bool, pair_rounds::Int}
+    stats::@NamedTuple{nnz_L::Int, flops::Float64, nlevels::Int, sdepth::Int, nsupernodes::Int, cost::Float64,
+                       candidates::Vector{OrderingCandidate}, auto::Bool, level_flops::Float64,
+                       nd_available::Bool, pair_rounds::Int}
     pairs::Vector{Tuple{Int, Int}}
 end
 
 Base.show(io::IO, o::Ordering) =
     print(io, "Ordering($(o.alg_used), n = $(length(o.perm)), nnz_L = $(o.stats.nnz_L), ",
-          "flops = $(o.stats.flops), nlevels = $(o.stats.nlevels)",
+          "flops = $(o.stats.flops), sdepth = $(o.stats.sdepth)",
           isempty(o.pairs) ? "" : ", npairs = $(length(o.pairs))", ")")
 
 _flop_factor(::Type{T}) where {T} = T <: Complex ? 4.0 : 1.0
 
 """
-    ordering_cost(flops, nlevels, n) -> Float64
+    ORDERING_LEVEL_FLOPS
 
-Cost model of the automatic ordering choice (PLAN §2.3 step 2): predicted
-flops weighted by the relative critical path, `flops × (1 + nlevels / n)`.
+Default depth weight of [`ordering_cost`](@ref): flops charged per level of the
+supernodal schedule, `1e8`. See [`ordering_cost`](@ref) for the model.
 """
-ordering_cost(flops::Real, nlevels::Integer, n::Integer) = Float64(flops) * (1 + nlevels / max(n, 1))
+const ORDERING_LEVEL_FLOPS = 1.0e8
 
 """
-    evaluate_ordering(P::SymmetricPattern, perm; T = Float64) -> (; nnz_L, flops, nlevels, cost)
+    ordering_cost(flops, sdepth, level_flops = ORDERING_LEVEL_FLOPS) -> Float64
 
-Elimination tree, column counts and tree height of `A[perm, perm]`, condensed
-into the quantities of the cost model ([`ordering_cost`](@ref)). `flops` counts
-real operations (`4×` for complex `T`).
+Cost model of the automatic ordering choice (PLAN §2.3 step 2, issue #108):
+the time of one factorization and its solves, in flops,
+
+    cost = flops + level_flops × sdepth.
+
+*Terms.* `flops` is the real-arithmetic Cholesky operation count of the
+candidate ([`cholesky_flops`](@ref)), the throughput-bound part. `sdepth` is
+the depth of its supernodal schedule ([`schedule_depth`](@ref)): the numeric
+phase launches the fronts level by level and both solve sweeps walk the same
+levels, so every level costs a latency (launches, synchronization, a tail of
+few fronts) whatever its size, and the solve, nearly all latency, scales with
+the depth alone. `level_flops` is that latency times the throughput.
+
+*Why the supernodal schedule and not the column etree.* The column-etree depth
+(`nlevels`) counts every column of a chain, and chains collapse into
+supernodes, so it does not predict the schedule depth (issue #108, 78k-bus
+condensed KKT: cuDSS's ordering 1279 column levels → 30 schedule levels,
+METIS 1216 → 29, AMD a comparable column depth → 65). The fundamental
+partition does not predict it either: on the random KKT generators it ranks
+AMD 33 vs ND 63 where the amalgamated schedules both have 12 levels, and it
+ranks AMD ahead of ND on `apache2` (48 vs 57) where the amalgamated schedule
+ranks ND ahead (35 vs 39). So `sdepth` is the height of the amalgamated
+supernodal tree, the `nlevels` of the [`Schedule`](@ref) the analysis builds.
+
+*Weight.* The term is absolute, not relative to `n` (the previous model,
+`flops × (1 + nlevels / n)`, weighed depth at 0.2% at `n ≈ 7e5` and was a flop
+contest). `level_flops = 1e8` ([`ORDERING_LEVEL_FLOPS`](@ref)) is ~100 µs per
+level at ~1 Tflop/s: one level of the level-batched factorization (several
+launches) plus a forward and a backward sweep for each of a few solves per
+factorization (refinement), as measured on the 78k-bus KKT in PR #107 (ND's
+36 fewer levels: solve −36%, factorization −11 to −17% despite AMD's lower
+flop count). Consequences: matrices below ~1e10 flops choose the shallower
+schedule, unless the depths are within a few levels; 3-D problems, where ND
+saves 10¹⁰ flops and more, choose the fewer flops. One weight serves every
+backend, so that the CPU and GPU backends factor the same ordering. Ties keep
+the first candidate (AMD).
 """
-function evaluate_ordering(P::SymmetricPattern, perm::AbstractVector{<:Integer}; T::Type = Float64)
+ordering_cost(flops::Real, sdepth::Integer, level_flops::Real = ORDERING_LEVEL_FLOPS) =
+    Float64(flops) + Float64(level_flops) * sdepth
+
+"""
+    schedule_depth(parent, post, counts, amalgamation = DEFAULT_AMALGAMATION) -> (sdepth::Int, nsupernodes::Int)
+
+Depth of the supernodal schedule of an ordering and its number of supernodes:
+the [`fundamental_supernodes`](@ref) of the etree `parent` with postorder
+`post` and column counts `counts` (etree numbering, from [`etree`](@ref),
+[`postorder`](@ref), [`colcounts`](@ref)), relaxed by [`amalgamate`](@ref) with
+the `amalgamation` limits (`nothing`: no amalgamation, `use_superpanels = 0`),
+and the number of levels of their tree ([`tree_levels`](@ref)). It equals the
+`nlevels` of the [`Schedule`](@ref) of the analysis of that ordering (outside
+Schur complement mode).
+"""
+function schedule_depth(parent::AbstractVector{<:Integer}, post::AbstractVector{<:Integer},
+                        counts::AbstractVector{<:Integer}, amalgamation = DEFAULT_AMALGAMATION)
+    cp = fundamental_supernodes(parent, post, counts)
+    amalgamation === nothing || (cp = amalgamate(cp, parent, counts, amalgamation))
+    _, sdepth = tree_levels(cp.snparent)
+    return sdepth, nsupernodes(cp)
+end
+
+# the amalgamation limits of the analysis (`nothing` without amalgamation)
+_amalgamation(opts::Options) = opts.use_superpanels != 0 ? opts.amalgamation : nothing
+
+"""
+    evaluate_ordering(P::SymmetricPattern, perm; T = Float64, level_flops = ORDERING_LEVEL_FLOPS,
+                      amalgamation = DEFAULT_AMALGAMATION) -> (; nnz_L, flops, nlevels, sdepth, nsupernodes, cost)
+
+Elimination tree, column counts, column-etree height (`nlevels`) and
+supernodal schedule depth and supernode count (`sdepth`, `nsupernodes`,
+[`schedule_depth`](@ref) with `amalgamation`) of `A[perm, perm]`, condensed
+into the cost of [`ordering_cost`](@ref). `flops` counts real operations (`4×`
+for complex `T`); `cost` uses the real-arithmetic count whatever `T`, so the
+element type does not change the choice.
+"""
+function evaluate_ordering(P::SymmetricPattern, perm::AbstractVector{<:Integer}; T::Type = Float64,
+                           level_flops::Real = ORDERING_LEVEL_FLOPS, amalgamation = DEFAULT_AMALGAMATION)
     parent = etree(P, perm)
     post = postorder(parent)
     counts = colcounts(P, perm, parent, post)
     _, nlevels = tree_levels(parent)
-    flops = cholesky_flops(counts) * _flop_factor(T)
-    return (nnz_L = nnz_L(counts), flops = flops, nlevels = nlevels, cost = ordering_cost(flops, nlevels, P.n))
+    sdepth, nsn = schedule_depth(parent, post, counts, amalgamation)
+    rflops = cholesky_flops(counts)
+    return (nnz_L = nnz_L(counts), flops = rflops * _flop_factor(T), nlevels = nlevels, sdepth = sdepth,
+            nsupernodes = nsn, cost = ordering_cost(rflops, sdepth, level_flops))
 end
 
 function _validate_user_perm(v::AbstractVector{<:Integer}, n::Integer)
@@ -132,8 +211,8 @@ function _requested_alg(opts::Options)
 end
 
 """
-    compute_ordering(P::SymmetricPattern, opts::Options; T = Float64, alg = nothing, pairs = [], candidates = nothing)
-        -> Ordering
+    compute_ordering(P::SymmetricPattern, opts::Options; T = Float64, alg = nothing, pairs = [], candidates = nothing,
+                     level_flops = ORDERING_LEVEL_FLOPS) -> Ordering
 
 Fill-reducing ordering of the pattern `P` (PLAN §2.3 step 2):
 
@@ -148,11 +227,14 @@ Fill-reducing ordering of the pattern `P` (PLAN §2.3 step 2):
   `"algo1"`/`"algo2"`: AMD on the symmetric pattern;
 * `"default"`: AMD and, if Metis is loaded, ND are both evaluated with
   [`evaluate_ordering`](@ref) and the one with the lower
-  `flops × (1 + nlevels / n)` is chosen; `stats.candidates` lists both.
+  [`ordering_cost`](@ref) `flops + level_flops × sdepth` (supernodal schedule
+  depth) is chosen; `stats.candidates` lists both with their schedule depths.
 
 The keyword `alg` (`:natural`, `:amd`, `:mmd`, `:nd`, `:auto`) overrides
 `reordering_alg` (MMD has no cuDSS spelling); `T` scales the flop counts in
-`stats` (complex: `4×`) and does not change the choice.
+`stats` (complex: `4×`) and does not change the choice. `level_flops` is the
+depth weight of [`ordering_cost`](@ref); the schedule depth is that of the
+amalgamation of `opts` (`opts.amalgamation`, none with `use_superpanels = 0`).
 
 2×2 pivot pairs (`"S"`/`"H"`, issues #64 and #66), from [`analysis_pairs`](@ref)
 in the analysis when [`pairs_enabled`](@ref):
@@ -184,7 +266,7 @@ no structurally zero pivot) the result is the one of the plain ordering, bitwise
 """
 function compute_ordering(P::SymmetricPattern, opts::Options; T::Type = Float64,
                           alg::Union{Nothing, Symbol} = nothing, pairs = Tuple{Int, Int}[],
-                          candidates = nothing)
+                          candidates = nothing, level_flops::Real = ORDERING_LEVEL_FLOPS)
     requested = alg === nothing ? _requested_alg(opts) : alg
     (candidates === nothing || isempty(pairs)) ||
         throw(InvalidValueError("compute_ordering: pass either pairs or candidates, not both"))
@@ -211,15 +293,16 @@ function compute_ordering(P::SymmetricPattern, opts::Options; T::Type = Float64,
     best = 0
     Q = search ? nothing : pair_pattern(P, perms[1][3])   # the fixed pairs are shared by all algorithms
     for (k, (a, perm, prs, _)) in enumerate(perms)
-        e = evaluate_ordering(search ? pair_pattern(P, prs) : Q, perm; T)
-        push!(evaluated, (alg = a, nnz_L = e.nnz_L, flops = e.flops, nlevels = e.nlevels, cost = e.cost))
+        e = evaluate_ordering(search ? pair_pattern(P, prs) : Q, perm; T, level_flops, amalgamation = _amalgamation(opts))
+        push!(evaluated, (alg = a, nnz_L = e.nnz_L, flops = e.flops, nlevels = e.nlevels, sdepth = e.sdepth,
+                          nsupernodes = e.nsupernodes, cost = e.cost))
         (best == 0 || e.cost < evaluated[best].cost) && (best = k)
     end
     alg_used, perm, used_pairs, rounds = perms[best]
     c = evaluated[best]
-    stats = (nnz_L = c.nnz_L, flops = c.flops, nlevels = c.nlevels, cost = c.cost,
-             candidates = evaluated, auto = requested === :auto, nd_available = nd_available(),
-             pair_rounds = rounds)
+    stats = (nnz_L = c.nnz_L, flops = c.flops, nlevels = c.nlevels, sdepth = c.sdepth, nsupernodes = c.nsupernodes,
+             cost = c.cost, candidates = evaluated, auto = requested === :auto, level_flops = Float64(level_flops),
+             nd_available = nd_available(), pair_rounds = rounds)
     return Ordering(perm, invperm(perm), alg_used, stats, used_pairs)
 end
 
@@ -268,7 +351,8 @@ function induced_pattern(P::SymmetricPattern, vertices::AbstractVector{<:Integer
 end
 
 """
-    compute_schur_ordering(P::SymmetricPattern, opts::Options, schur::AbstractVector{Bool}; T = Float64) -> Ordering
+    compute_schur_ordering(P::SymmetricPattern, opts::Options, schur::AbstractVector{Bool}; T = Float64,
+                           level_flops = ORDERING_LEVEL_FLOPS) -> Ordering
 
 Schur-constrained ordering (PLAN §3.6): the rows and columns flagged in
 `schur` ([`schur_flags`](@ref)) are ordered last, in increasing original
@@ -280,7 +364,8 @@ ordering of the factored part. A `user_perm` keeps its relative order of the
 other vertices. The 2×2 pivot pairs of `"S"`/`"H"` are not used (`pairs`
 empty). `stats` describe the whole ordering (the Schur block included).
 """
-function compute_schur_ordering(P::SymmetricPattern, opts::Options, schur::AbstractVector{Bool}; T::Type = Float64)
+function compute_schur_ordering(P::SymmetricPattern, opts::Options, schur::AbstractVector{Bool}; T::Type = Float64,
+                                level_flops::Real = ORDERING_LEVEL_FLOPS)
     n = P.n
     length(schur) == n || throw(InvalidValueError("schur flags have length $(length(schur)), expected $n"))
     inner = findall(!, schur)
@@ -292,15 +377,16 @@ function compute_schur_ordering(P::SymmetricPattern, opts::Options, schur::Abstr
         candidates = OrderingCandidate[]
         auto = false
     else
-        o = compute_ordering(induced_pattern(P, inner), opts; T)
+        o = compute_ordering(induced_pattern(P, inner), opts; T, level_flops)
         perm = [inner[o.perm]; outer]
         alg_used = o.alg_used
         candidates = o.stats.candidates
         auto = o.stats.auto
     end
-    e = evaluate_ordering(P, perm; T)
-    stats = (nnz_L = e.nnz_L, flops = e.flops, nlevels = e.nlevels, cost = e.cost, candidates = candidates,
-             auto = auto, nd_available = nd_available(), pair_rounds = 0)
+    e = evaluate_ordering(P, perm; T, level_flops, amalgamation = _amalgamation(opts))
+    stats = (nnz_L = e.nnz_L, flops = e.flops, nlevels = e.nlevels, sdepth = e.sdepth, nsupernodes = e.nsupernodes,
+             cost = e.cost, candidates = candidates, auto = auto, level_flops = Float64(level_flops),
+             nd_available = nd_available(), pair_rounds = 0)
     return Ordering(perm, invperm(perm), alg_used, stats, Tuple{Int, Int}[])
 end
 
