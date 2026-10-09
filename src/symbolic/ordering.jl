@@ -8,7 +8,7 @@
 """
     ND_PROVIDER
 
-`Ref` holding `nothing` or a function `(nd_nlevels, nd_ubfactor) -> alg` that
+`Ref` holding `nothing` or a function `(nd_nlevels, nd_ubfactor, nd_nseps) -> alg` that
 returns the CliqueTrees nested-dissection algorithm. Set by the Metis extension.
 """
 const ND_PROVIDER = Ref{Any}(nothing)
@@ -25,7 +25,7 @@ function _nd_algorithm(opts::Options)
     nd_available() ||
         throw(NotSupportedError("nested dissection (reordering_alg = \"algo4\") needs Metis.jl; " *
                                 "run `using Metis` to load SparseDirectSolverMetisExt"))
-    return ND_PROVIDER[](opts.nd_nlevels, opts.nd_ubfactor)
+    return ND_PROVIDER[](opts.nd_nlevels, opts.nd_ubfactor, opts.nd_nseps)
 end
 
 """
@@ -142,7 +142,9 @@ Fill-reducing ordering of the pattern `P` (PLAN §2.3 step 2):
 * `reordering_alg = "algo5"`: natural ordering; `"algo3"`: AMD
   (`CliqueTrees.AMD()`); `"algo4"`: nested dissection with Metis (needs
   `using Metis`, otherwise [`NotSupportedError`](@ref)): `METIS_NodeND` with
-  `ufactor = nd_ubfactor` (`-1`: METIS default); `nd_nlevels` is the cuDSS
+  `ufactor = nd_ubfactor` and `nseps = nd_nseps` (`-1`: METIS defaults; on
+  fill-bound problems `nd_nseps = 4` trades a slower ordering for less fill);
+  `nd_nlevels` is the cuDSS
   *minimum* number of dissection levels, which METIS' full recursion meets on
   every graph large enough to be split that often;
   `"algo1"`/`"algo2"`: AMD on the symmetric pattern;
