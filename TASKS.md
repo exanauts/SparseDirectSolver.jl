@@ -2833,7 +2833,7 @@ inertia with matching enabled equals the eigenvalue count (the cuDSS defect).
     matching cycles give the 2×2 pairs; jobs 1–4 keep the default pairs".
   - PLAN §5 M13: keep a posteriori pivoting after the MadNLP integration (T21 measurement above).
 
-### T22 — Ordering chooser: supernodal schedule depth (issue #108)   `[ ]`
+### T22 — Ordering chooser: supernodal schedule depth (issue #108)   `[!]`
 
 **Why this is first (PR #107)**: the automatic ordering (`compute_ordering`,
 `src/symbolic/ordering.jl`, `reordering_alg = "default"`) picks AMD on large
@@ -2868,6 +2868,101 @@ flops for AMD, ND and the chosen ordering on every T04 harness matrix, and on
 the 78k-bus dump if the owner provides it (`bench/order_search.jl`,
 `bench/dump_madnlp_kkt.jl`). Closes #108. The PLAN §2.3 step 2 sentence
 "until T25 scores the schedule depth" is updated by the owner after the merge.
+
+#### Report
+
+- Status: [!] (done; the scored depth is the *amalgamated* supernodal tree, not the fundamental one the task text
+  suggests, see Deviations; the 78k-bus dump and the KKT dumps of the harness are not available here)
+- What was built:
+  - `src/symbolic/ordering.jl`: `ordering_cost(flops, sdepth, level_flops = ORDERING_LEVEL_FLOPS) = flops +
+    level_flops × sdepth` with `ORDERING_LEVEL_FLOPS = 1e8`; the model and its rationale are in the
+    `ordering_cost` docstring. `schedule_depth(parent, post, counts, amalgamation)`: fundamental supernodes, relaxed
+    by `amalgamate` with the analysis' limits (`nothing` for `use_superpanels = 0`), `tree_levels(snparent)`; it
+    equals the `Schedule.nlevels` the analysis builds (outside Schur mode), the metric of `bench/order_search.jl`
+    and of issue #108. `evaluate_ordering` returns `sdepth` and `nsupernodes` too and takes `level_flops` and
+    `amalgamation`; the cost uses the real flop count, so `T` still does not change the choice.
+  - `OrderingCandidate` gains `sdepth`, `nsupernodes`; `Ordering.stats` gains `sdepth`, `nsupernodes`,
+    `level_flops` (every candidate's schedule depth is in `stats.candidates`). `compute_ordering` and
+    `compute_schur_ordering` take `level_flops` (keyword, not a parameter; no cuDSS spelling).
+  - One weight for every backend (no backend-dependent fallback was needed, see Measurements): the options table
+    (`Options` docstring), `ReorderingAlg` docstring and `docs/src/man/parameters.md` say so.
+  - `bench/ordering_chooser.jl` (host only): the table below, for the generated, SuiteSparse and every
+    `bench/data/` dump matrix, with the choice of the T22 and the T05 model; listed in `bench/README.md`.
+  - Tests (`test/test_symbolic_etree.jl`, new testset "ordering chooser: supernodal schedule depth (T22)"): on six
+    KKT generators (`kkt_matrix` 60/20, 200/80, 300/100, 2000/800, indefinite Hessian, `kkt_slack_matrix`) the
+    chooser takes the candidate with the minimum `stats.sdepth` (ties: lower cost; at least two strict cases);
+    each candidate's `sdepth`/`nsupernodes` equals the height/size of `supernode_partition`'s tree, with and
+    without amalgamation; `"algo1"`–`"algo4"` reproduce `CliqueTrees.permutation` with AMD / the Metis provider bit
+    for bit; `level_flops = 0` is a flop contest (AMD on lap2d), `1e12` a depth contest (ND); the analysis of a
+    solver reports `host_symbolic.schedule.nlevels == ordering.stats.sdepth` (every backend, `Float64`/`ComplexF32`).
+    One existing assertion of the "orderings" testset encoded the T05 model (auto flops within 1.1× of the best):
+    ND on lap2d 30×30 is 10 levels shallower for 1.4× the flops, which the task asks for, so it is replaced by the
+    bound the new model implies (`flops ≤ best + level_flops × (deepest − chosen depth)`) plus `auto.perm ==` the
+    chosen algorithm's permutation; the comment in the test says why.
+- Tests:
+  - `SDS_TEST_GPU=0 SDS_TEST_ONLY="test_symbolic_etree" julia --project=. -e 'using Pkg; Pkg.test()'`: 1191 pass, 0
+    fail, 0 broken (all four element types).
+  - Full CPU suite `SDS_TEST_GPU=0 julia --project=. -e 'using Pkg; Pkg.test()'`: running at the time the PR was
+    opened (≈2.5 h on the 4-core runner); counts are added in a follow-up commit or PR comment.
+  - CUDA/AMDGPU: pending CI on the PR.
+- Measurements (`bench/ordering_chooser.jl`, host, `Options()` defaults; "schedule depth" is the scored amalgamated
+  depth, "fundamental" the depth of the fundamental supernodes; flops real):
+
+  | matrix | n | ordering | schedule depth | fundamental depth | column-etree depth | nnz(L) | flops | T22 choice | T05 choice |
+  | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+  | lap2d_300 | 90000 | AMD | 40 | 54 | 1997 | 2.93e6 | 4.67e8 | | |
+  | lap2d_300 | 90000 | ND | 27 | 34 | 863 | 2.47e6 | 3.49e8 | ✓ | ✓ |
+  | lap3d_40 | 64000 | AMD | 29 | 45 | 6178 | 2.06e7 | 3.27e10 | | |
+  | lap3d_40 | 64000 | ND | 36 | 60 | 3311 | 1.44e7 | 1.62e10 | ✓ | ✓ |
+  | HB/bcsstk17 | 10974 | AMD | 34 | 43 | 1893 | 1.04e6 | 1.57e8 | | ✓ |
+  | HB/bcsstk17 | 10974 | ND | 16 | 31 | 785 | 1.12e6 | 1.80e8 | ✓ | |
+  | Boeing/bcsstk38 | 8032 | AMD | 37 | 58 | 1520 | 7.37e5 | 1.19e8 | | |
+  | Boeing/bcsstk38 | 8032 | ND | 14 | 27 | 697 | 8.05e5 | 1.29e8 | ✓ | ✓ |
+  | GHS_psdef/apache2 | 715176 | AMD | 39 | 48 | 14485 | 1.77e8 | 2.82e11 | | |
+  | GHS_psdef/apache2 | 715176 | ND | 35 | 57 | 6793 | 1.29e8 | 1.65e11 | ✓ | ✓ |
+  | Rajat/rajat21 (A+Aᵀ) | 411676 | AMD | 116 | 337 | 1152 | 2.35e6 | 2.93e8 | ✓ | ✓ |
+  | Rajat/rajat21 (A+Aᵀ) | 411676 | ND | 221 | 1061 | 2085 | 3.74e6 | 2.00e9 | | |
+  | TSOPF_RS_b39_c7 (A+Aᵀ) | 14098 | AMD | 153 | 506 | 1574 | 5.22e5 | 2.04e7 | | ✓ |
+  | TSOPF_RS_b39_c7 (A+Aᵀ) | 14098 | ND | 13 | 18 | 172 | 7.26e5 | 4.12e7 | ✓ | |
+  | kkt_matrix(300,100) | 400 | AMD | 12 | 33 | 203 | 2.33e4 | 2.76e6 | ✓ | |
+  | kkt_matrix(300,100) | 400 | ND | 12 | 63 | 224 | 2.66e4 | 3.49e6 | | |
+  | kkt_matrix(60,20) | 80 | AMD | 6 | 16 | 46 | 1.31e3 | 3.22e4 | | |
+  | kkt_matrix(60,20) | 80 | ND | 4 | 17 | 48 | 1.37e3 | 3.59e4 | ✓ | |
+  | kkt_matrix(200,80) | 280 | AMD | 10 | 28 | 144 | 1.21e4 | 9.98e5 | | |
+  | kkt_matrix(200,80) | 280 | ND | 9 | 52 | 157 | 1.34e4 | 1.23e6 | ✓ | |
+  | kkt_matrix(2000,800) | 2800 | AMD | 47 | 207 | 1361 | 9.59e5 | 8.34e8 | ✓ | |
+  | kkt_matrix(2000,800) | 2800 | ND | 89 | 499 | 1527 | 1.17e6 | 1.13e9 | | |
+  | kkt_slack_matrix(200,60) | 320 | AMD | 11 | 26 | 126 | 9.40e3 | 6.54e5 | ✓ | |
+  | kkt_slack_matrix(200,60) | 320 | ND | 14 | 57 | 143 | 1.15e4 | 9.17e5 | | |
+
+  (The T05 choice on the generators is AMD everywhere except where AMD has more flops; not printed by the script
+  for them.) The new model changes the choice on bcsstk17 and TSOPF (to ND: 18 and 140 fewer levels for 1.15×
+  and 2× the flops, both tiny in absolute flops) and on the small KKT generators where ND is shallower; lap3d_40
+  keeps ND for its 1.6e10 fewer flops although AMD is 7 levels shallower. Scoring cost: `schedule_depth` of both
+  candidates on apache2 takes 0.38 s next to 11.9 s for the automatic ordering (≈3%). The 78k-bus dump and the
+  MadNLP KKT dumps of the T04 harness (`bench/data/`) are not on the runner, so the table has no pglib row; on the
+  78k dump the model picks ND whenever ND's flops exceed AMD's by less than 36 × 1e8 = 3.6e9 (the 65 vs 29 levels of
+  #108); the owner can check with `julia --project=bench bench/ordering_chooser.jl`.
+- Deviations from PLAN.md / this task:
+  - Scored depth: the task suggests the fundamental supernode partition ("the amalgamation step is not needed for
+    the ranking"). The measurements contradict it: the fundamental depth ranks AMD 33 vs ND 63 on
+    `kkt_matrix(300,100)` where both amalgamated schedules have 12 levels, ranks AMD ahead of ND on apache2 (48 vs
+    57; amalgamated 39 vs 35) and on `kkt_matrix(60,20)` (16 vs 17; amalgamated 6 vs 4). The amalgamated depth is
+    exactly the `Schedule.nlevels` the GPU runs (asserted in the tests) and the metric #108 reports; it costs one
+    `amalgamate` per candidate (≈3% of the ordering time). `use_superpanels = 0` scores the fundamental tree.
+  - The cost model is absolute (`flops + 1e8 × sdepth`), not of the form `flops × (1 + …/n)`; `level_flops = 1e8`
+    is ~100 µs per level at ~1 Tflop/s (one factorization level plus forward/backward sweeps of a few solves),
+    estimated from the PR #107 78k-bus timings, not fitted on GPU runs here (no GPU on the runner).
+  - No backend-dependent fallback: one model works on every harness matrix, and one ordering on every backend
+    keeps the CPU and GPU suites factoring the same matrix.
+  - One assertion of the T05 testset replaced (see Tests above); it encoded the old model.
+- Open issues / follow-ups: verify the choice and `level_flops` on the 78k-bus dump and the K2/condensed dumps with
+  `bench/ordering_chooser.jl` and a GPU timing of both orderings; T24/T25 may want to re-fit `level_flops` once the
+  fused solve changes the per-level latency. Default orderings changed on several matrices (ND instead of AMD),
+  so the next `bench/compare.jl` run will move nnz(L) and timings on bcsstk17, TSOPF and similar.
+- Suggested plan changes: PLAN §2.3 step 2: replace "`flops × (1 + nlevels/n)` on the column etree" by "`flops +
+  level_flops × sdepth`, `sdepth` the height of the amalgamated supernodal tree (`Schedule.nlevels`), `level_flops
+  = 1e8`" and drop the "until T22 … GPU users should set `algo4`" sentence.
 
 ### T23 — AMDGPU, oneAPI and Metal extensions   `[!]`
 
