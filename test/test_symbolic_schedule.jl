@@ -248,6 +248,44 @@ end
     @test SDS.nsubtrees(schedules[3].schedule) >= 100
 end
 
+@testset "subtree_max_fronts: front-count limit of the regime-A subtrees" begin
+    @test Options().subtree_max_fronts == 0
+    @test copy(Options(subtree_max_fronts = 7)).subtree_max_fronts == 7
+    @test thrown(() -> Options(subtree_max_fronts = -1)) isa InvalidValueError
+    @test thrown(() -> Options(subtree_max_fronts = 1.5)) isa InvalidValueError
+    @test thrown(() -> setparam!(Options(), "subtree_max_fronts", 1)) isa ArgumentError
+    A = laplacian2d(Float64, 60, 60)
+    schedules = map((0, 8, 32)) do mf
+        S = SDS.symbolic_analysis(SDS.CSR(tril(A)), "SPD", 'L';
+                                  opts = Options(subtree_parallelism = 0, subtree_max_fronts = mf))
+        check_schedule(S)
+        S
+    end
+    S0 = schedules[1]
+    sp = S0.partition
+    ns = SDS.nsupernodes(S0)
+    nf = ones(Int, ns)
+    for s in 1:ns                                    # subtree front counts (children numbered before parents)
+        sp.snparent[s] != 0 && (nf[sp.snparent[s]] += nf[s])
+    end
+    for (mf, S) in zip((8, 32), schedules[2:end])
+        sc = S.schedule
+        @test S.partition.snparent == sp.snparent    # the limit changes the schedule only
+        # every subtree within the cap (counted from the schedule itself), regime A shrinks, and the
+        # subtrees are maximal: the parent of a subtree root is over the cap or was already outside A
+        @test all(t -> sc.subtree_ptr[t + 1] - sc.subtree_ptr[t] <= mf, 1:SDS.nsubtrees(sc))
+        @test all(t -> sc.subtree_ptr[t + 1] - sc.subtree_ptr[t] == nf[sc.subtree_root[t]],
+                  1:SDS.nsubtrees(sc))
+        @test all(s -> sc.regime[s] != SDS.REGIME_A || S0.schedule.regime[s] == SDS.REGIME_A, 1:ns)
+        @test all(sc.subtree_root) do r
+            q = sp.snparent[r]
+            q == 0 || nf[q] > mf || S0.schedule.regime[q] != SDS.REGIME_A
+        end
+    end
+    @test SDS.nsubtrees(schedules[1].schedule) < SDS.nsubtrees(schedules[3].schedule) <
+          SDS.nsubtrees(schedules[2].schedule)
+end
+
 @testset "small example" begin
     # arrow matrix: four leaves 1..4 coupled to the 2×2 root block 5..6
     A = sparse(Float64[4 0 0 0 1 1; 0 4 0 0 1 1; 0 0 4 0 1 1; 0 0 0 4 1 1; 1 1 1 1 4 1; 1 1 1 1 1 4])
