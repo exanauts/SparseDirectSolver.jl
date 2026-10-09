@@ -32,5 +32,5 @@ end
 println("building model on CUDA…"); flush(stdout)
 model, _ = ac_opf_model(CASE; backend = CUDABackend())
 run_one("cuDSS", model, MadNLPGPU.CUDSSSolver)
-run_one("SDS", model, SDSSolver)
+run_one("SDS-proto", model, SDSProtoSolver)
 println("done")

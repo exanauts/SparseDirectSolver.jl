@@ -31,5 +31,6 @@ end
 
 println("building model on ROCm…"); flush(stdout)
 model, _ = ac_opf_model(CASE; backend = ROCBackend())
-run_one("SDS/AMD", model, SDSSolver)
+run_one("SDS/AMD stock", model, SDSSolver)
+run_one("SDS/AMD proto", model, SDSProtoSolver)
 println("done")
