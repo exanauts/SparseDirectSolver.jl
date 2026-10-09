@@ -2899,11 +2899,20 @@ the 78k-bus dump if the owner provides it (`bench/order_search.jl`,
     ND on lap2d 30×30 is 10 levels shallower for 1.4× the flops, which the task asks for, so it is replaced by the
     bound the new model implies (`flops ≤ best + level_flops × (deepest − chosen depth)`) plus `auto.perm ==` the
     chosen algorithm's permutation; the comment in the test says why.
+  - CI round 1 (`pivot_pairs = "default"`): `compute_ordering` first minimizes the structurally zero pivots
+    each algorithm's pair search leaves (`structural_zero_pivots`), then the cost. On `kkt_slack_matrix(200, 100)`
+    ND's search stops with 9–21 zero pivots left (AMD: none) at ~2× AMD's nnz(L), yet its schedule is sometimes one
+    level shallower. The depth term then chose ND (ComplexF32 with seed 666), and the "KKT with slacks" testset of
+    `test_symbolic_pairs.jl` failed: zero pivots perturbed, 1.37× fill. The T05 flop contest had always chosen AMD
+    there. That testset now also asserts the chosen ordering has the fewest zero pivots left.
 - Tests:
   - `SDS_TEST_GPU=0 SDS_TEST_ONLY="test_symbolic_etree" julia --project=. -e 'using Pkg; Pkg.test()'`: 1191 pass, 0
     fail, 0 broken (all four element types).
   - Full CPU suite `SDS_TEST_GPU=0 julia --project=. -e 'using Pkg; Pkg.test()'`: running at the time the PR was
     opened (≈2.5 h on the 4-core runner); counts are added in a follow-up commit or PR comment.
+  - After CI round 1: full CPU suite `SDS_TEST_GPU=0 julia --project=. -e 'using Pkg; Pkg.test()'` (all four
+    element types): 71841 pass, 0 fail, 0 broken (34 min, 4 workers); `test_symbolic_pairs` + `test_symbolic_etree`
+    alone: 1868 pass.
   - CUDA/AMDGPU: pending CI on the PR.
 - Measurements (`bench/ordering_chooser.jl`, host, `Options()` defaults; "schedule depth" is the scored amalgamated
   depth, "fundamental" the depth of the fundamental supernodes; flops real):
@@ -2962,7 +2971,8 @@ the 78k-bus dump if the owner provides it (`bench/order_search.jl`,
   so the next `bench/compare.jl` run will move nnz(L) and timings on bcsstk17, TSOPF and similar.
 - Suggested plan changes: PLAN §2.3 step 2: replace "`flops × (1 + nlevels/n)` on the column etree" by "`flops +
   level_flops × sdepth`, `sdepth` the height of the amalgamated supernodal tree (`Schedule.nlevels`), `level_flops
-  = 1e8`" and drop the "until T22 … GPU users should set `algo4`" sentence.
+  = 1e8`" and drop the "until T22 … GPU users should set `algo4`" sentence. With `pivot_pairs = "default"`, rank
+  candidates by the structurally zero pivots left after the pair search first, then by cost.
 
 ### T23 — AMDGPU, oneAPI and Metal extensions   `[!]`
 

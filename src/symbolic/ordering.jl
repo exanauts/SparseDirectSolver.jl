@@ -247,6 +247,11 @@ in the analysis when [`pairs_enabled`](@ref):
   partners accepted down to `opts.pivot_threshold` of the row maximum) and the
   graph compressed by the pairs is re-ordered, until a round adds no pair (at
   most [`PIVOT_PAIRS_MAX_ROUNDS`](@ref)). Each algorithm keeps its own pairs.
+  The automatic choice takes the ordering with the fewest structurally zero
+  pivots left ([`structural_zero_pivots`](@ref)) and compares the cost only among
+  those: a zero pivot is perturbed in the factorization, an accuracy loss that no
+  saving in flops or depth pays for (on the slack KKT generators ND's search
+  stops with zero pivots left where AMD's has none).
 
 Both come from the values of the matrix at analysis: an all-zero `nzval` gives
 no pairs and an undefined one arbitrary pairs, so the analysis must run after the
@@ -291,12 +296,16 @@ function compute_ordering(P::SymmetricPattern, opts::Options; T::Type = Float64,
     end
     evaluated = OrderingCandidate[]
     best = 0
+    best_zeros = 0                                 # structurally zero pivots the pair search left in `best`
     Q = search ? nothing : pair_pattern(P, perms[1][3])   # the fixed pairs are shared by all algorithms
     for (k, (a, perm, prs, _)) in enumerate(perms)
         e = evaluate_ordering(search ? pair_pattern(P, prs) : Q, perm; T, level_flops, amalgamation = _amalgamation(opts))
         push!(evaluated, (alg = a, nnz_L = e.nnz_L, flops = e.flops, nlevels = e.nlevels, sdepth = e.sdepth,
                           nsupernodes = e.nsupernodes, cost = e.cost))
-        (best == 0 || e.cost < evaluated[best].cost) && (best = k)
+        zeros_left = search && length(perms) > 1 ? length(structural_zero_pivots(candidates, P, perm, prs)) : 0
+        if best == 0 || zeros_left < best_zeros || (zeros_left == best_zeros && e.cost < evaluated[best].cost)
+            best, best_zeros = k, zeros_left
+        end
     end
     alg_used, perm, used_pairs, rounds = perms[best]
     c = evaluated[best]
