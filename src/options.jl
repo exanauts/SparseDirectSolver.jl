@@ -88,6 +88,7 @@ const SUBTREE_PARALLELISM = 4096
 
 # `Options` fields that are analysis tuning knobs, not parameter strings (T07)
 const TUNING_OPTIONS = (:regime_c_width, :regime_c_rows, :subtree_budgets, :subtree_parallelism,
+                        :subtree_max_fronts,
                         :memory_budget)
 
 """
@@ -135,6 +136,7 @@ defaults below. Keyword arguments are applied through [`setparam!`](@ref), so
 | `regime_c_rows` | `512` | fronts with more rows than this go to regime C |
 | `subtree_budgets` | `[16384, 32768, 49152]` | regime A local-memory budgets in bytes; empty disables regime A |
 | `subtree_parallelism` | `4096` | a regime-A subtree does at most `1/subtree_parallelism` of the factorization flops (`0`: no limit) |
+| `subtree_max_fronts` | `0` | a regime-A subtree has at most this many fronts (`0`: no limit); the serial walk of a subtree is its workgroup's critical path |
 | `memory_budget` | `-1` | update-stack bytes per level chunk (negative: no limit, no chunking) |
 | `user_perm`, `user_schur_indices`, `user_nd_partition_tree`, `ubatch_mask`, `pivot_sign` | `nothing` | not provided |
 | `user_host_interrupt` | `nothing` | not provided |
@@ -185,6 +187,7 @@ mutable struct Options
     regime_c_rows::Int
     subtree_budgets::Vector{Int}
     subtree_parallelism::Int
+    subtree_max_fronts::Int
     memory_budget::Int64
     # user-provided data parameters (inputs of the phases)
     user_perm::Union{Nothing, Vector{Int}}
@@ -200,7 +203,7 @@ mutable struct Options
             0, 0, 0.0, PIVOT_AUTO, 0.01, nothing, PIVOT_EPSILON_DEFAULT, -1,
             0, 0, 1, 0, 0, 10, 0, -1, 1, 0, 0, -1,
             IR_PLAIN, nothing, DEFAULT_AMALGAMATION, SCHEDULE_AUTO, PIVOT_PAIRS_DEFAULT, PIVOT_PAIR_TOLERANCE,
-            64, 512, copy(DEFAULT_SUBTREE_BUDGETS), SUBTREE_PARALLELISM, -1,
+            64, 512, copy(DEFAULT_SUBTREE_BUDGETS), SUBTREE_PARALLELISM, 0, -1,
             nothing, nothing, nothing, nothing, nothing, nothing,
         )
         for (name, value) in kwargs
@@ -484,6 +487,8 @@ end
 
 _parse_tuning(::Val{:subtree_parallelism}, value) =
     _parse_int("subtree_parallelism", value, 0, typemax(Int), "an integer ≥ 0 (0: no limit)")
+_parse_tuning(::Val{:subtree_max_fronts}, value) =
+    _parse_int("subtree_max_fronts", value, 0, typemax(Int), "an integer ≥ 0 (0: no limit)")
 
 _parse_tuning(::Val{:memory_budget}, value) =
     Int64(_parse_int("memory_budget", value, typemin(Int64), typemax(Int64), "an integer (negative: no limit)"))

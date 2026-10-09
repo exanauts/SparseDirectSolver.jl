@@ -338,9 +338,11 @@ function build_schedule(sp::SupernodePartition, opts::Options = Options(), ::Typ
     end
     par = opts.subtree_parallelism
     maxwork = par <= 0 ? typemax(Int64) : total ÷ par
+    maxfronts = opts.subtree_max_fronts <= 0 ? typemax(Int) : opts.subtree_max_fronts
     big = [width[s] > cw || rows[s] > cr || s == schur for s in 1:ns]
     # 2. regime A: serial stack peak (entries) with children ordered by decreasing peak - cb (Liu)
     peak = zeros(Int, ns)
+    nfronts = ones(Int, ns)
     eligible = falses(ns)
     for s in 1:ns
         kids = children[s]
@@ -350,9 +352,11 @@ function build_schedule(sp::SupernodePartition, opts::Options = Options(), ::Typ
         for c in kids
             pk = max(pk, acc + peak[c])
             acc += cb[c]
+            nfronts[s] += nfronts[c]
         end
         peak[s] = max(pk, acc + packed_length(rows[s]))
-        eligible[s] = !big[s] && all(c -> eligible[c], kids) && peak[s] <= maxcap && work[s] <= maxwork
+        eligible[s] = !big[s] && all(c -> eligible[c], kids) && peak[s] <= maxcap && work[s] <= maxwork &&
+                      nfronts[s] <= maxfronts
     end
     regime = fill(REGIME_B, ns)
     subtree = zeros(Int, ns)
