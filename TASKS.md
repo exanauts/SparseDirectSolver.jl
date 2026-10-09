@@ -2924,19 +2924,19 @@ the 78k-bus dump if the owner provides it (`bench/order_search.jl`,
   | Rajat/rajat21 (A+Aᵀ) | 411676 | ND | 221 | 1061 | 2085 | 3.74e6 | 2.00e9 | | |
   | TSOPF_RS_b39_c7 (A+Aᵀ) | 14098 | AMD | 153 | 506 | 1574 | 5.22e5 | 2.04e7 | | ✓ |
   | TSOPF_RS_b39_c7 (A+Aᵀ) | 14098 | ND | 13 | 18 | 172 | 7.26e5 | 4.12e7 | ✓ | |
-  | kkt_matrix(300,100) | 400 | AMD | 12 | 33 | 203 | 2.33e4 | 2.76e6 | ✓ | |
+  | kkt_matrix(300,100) | 400 | AMD | 12 | 33 | 203 | 2.33e4 | 2.76e6 | ✓ | ✓ |
   | kkt_matrix(300,100) | 400 | ND | 12 | 63 | 224 | 2.66e4 | 3.49e6 | | |
-  | kkt_matrix(60,20) | 80 | AMD | 6 | 16 | 46 | 1.31e3 | 3.22e4 | | |
+  | kkt_matrix(60,20) | 80 | AMD | 6 | 16 | 46 | 1.31e3 | 3.22e4 | | ✓ |
   | kkt_matrix(60,20) | 80 | ND | 4 | 17 | 48 | 1.37e3 | 3.59e4 | ✓ | |
-  | kkt_matrix(200,80) | 280 | AMD | 10 | 28 | 144 | 1.21e4 | 9.98e5 | | |
+  | kkt_matrix(200,80) | 280 | AMD | 10 | 28 | 144 | 1.21e4 | 9.98e5 | | ✓ |
   | kkt_matrix(200,80) | 280 | ND | 9 | 52 | 157 | 1.34e4 | 1.23e6 | ✓ | |
-  | kkt_matrix(2000,800) | 2800 | AMD | 47 | 207 | 1361 | 9.59e5 | 8.34e8 | ✓ | |
+  | kkt_matrix(2000,800) | 2800 | AMD | 47 | 207 | 1361 | 9.59e5 | 8.34e8 | ✓ | ✓ |
   | kkt_matrix(2000,800) | 2800 | ND | 89 | 499 | 1527 | 1.17e6 | 1.13e9 | | |
-  | kkt_slack_matrix(200,60) | 320 | AMD | 11 | 26 | 126 | 9.40e3 | 6.54e5 | ✓ | |
+  | kkt_slack_matrix(200,60) | 320 | AMD | 11 | 26 | 126 | 9.40e3 | 6.54e5 | ✓ | ✓ |
   | kkt_slack_matrix(200,60) | 320 | ND | 14 | 57 | 143 | 1.15e4 | 9.17e5 | | |
 
-  (The T05 choice on the generators is AMD everywhere except where AMD has more flops; not printed by the script
-  for them.) The new model changes the choice on bcsstk17 and TSOPF (to ND: 18 and 140 fewer levels for 1.15×
+  (The generator rows come from the same evaluation; AMD has both fewer flops and a lower column-etree depth on
+  every generator, so the T05 model chose AMD on all of them.) The new model changes the choice on bcsstk17 and TSOPF (to ND: 18 and 140 fewer levels for 1.15×
   and 2× the flops, both tiny in absolute flops) and on the small KKT generators where ND is shallower; lap3d_40
   keeps ND for its 1.6e10 fewer flops although AMD is 7 levels shallower. Scoring cost: `schedule_depth` of both
   candidates on apache2 takes 0.38 s next to 11.9 s for the automatic ordering (≈3%). The 78k-bus dump and the
