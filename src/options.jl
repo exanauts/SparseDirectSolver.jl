@@ -103,7 +103,7 @@ defaults below. Keyword arguments are applied through [`setparam!`](@ref), so
 
 | Field | Default | Meaning of the default |
 | --- | --- | --- |
-| `reordering_alg` | `REORDERING_DEFAULT` | automatic AMD/ND choice |
+| `reordering_alg` | `REORDERING_DEFAULT` | automatic AMD/ND choice: flops + 1e8 × supernodal schedule depth, every backend |
 | `factorization_alg` | `FACTORIZATION_DEFAULT` | automatic regime choice |
 | `solve_alg` | `SOLVE_DEFAULT` | level-batched sweeps |
 | `matching_alg` | `MATCHING_NONE` | no matching |

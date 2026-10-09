@@ -205,6 +205,11 @@ end
     @test count(cands.candidate) == ns + ns ÷ 2                            # duals and zero-Σ slacks
     @test length(ord.pairs) < count(cands.candidate) ÷ 2
     @test no_zero_pivot(P, cands, ord)
+    # the automatic choice never trades a zero pivot for depth: ND's pair search can stop with structurally zero
+    # pivots left (here it does), and its schedule may still be shallower than AMD's
+    zeros_left = Dict(c.alg => length(SDS.structural_zero_pivots(cands, P, SDS._pair_ordering(P, c.alg, Options(), cands)[2:3]...))
+                      for c in ord.stats.candidates)
+    @test zeros_left[ord.alg_used] == minimum(values(zeros_left))
     @test ord.stats.nnz_L <= 1.15 * none.stats.nnz_L
     @test ord.stats.nnz_L < all_.stats.nnz_L
     S, N, info, _ = reference_ldlt(A)

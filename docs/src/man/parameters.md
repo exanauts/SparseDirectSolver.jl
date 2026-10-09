@@ -32,7 +32,7 @@ docstring. The ones that matter most in practice:
 
 | parameter | values | effect |
 | :--- | :--- | :--- |
-| `reordering_alg` | `"default"`, `"algo1"`–`"algo5"` | automatic, AMD (`"algo3"`), nested dissection (`"algo4"`, needs `using Metis`), natural (`"algo5"`); see [`SparseDirectSolver.ReorderingAlg`](@ref) |
+| `reordering_alg` | `"default"`, `"algo1"`–`"algo5"` | automatic (AMD or, with `using Metis`, ND, whichever has the lower flops + 1e8 × supernodal schedule depth), AMD (`"algo3"`), nested dissection (`"algo4"`, needs `using Metis`), natural (`"algo5"`); see [`SparseDirectSolver.ReorderingAlg`](@ref) |
 | `factorization_alg` | `"default"`, `"algo1"`, `"algo2"` | automatic, small-front kernels only, vendor dense calls for large fronts |
 | `matching_alg` | `"default"` (none), `"algo1"`–`"algo6"` | MC64 jobs 1–5 (`"algo6"`: automatic) before the ordering |
 | `pivot_type` | `'A'`, `'N'`, `'D'`, `'L'`, `'B'` | automatic, none, diagonal, local block, Bunch–Kaufman; global pivoting (`'C'`, `'R'`) is not supported |

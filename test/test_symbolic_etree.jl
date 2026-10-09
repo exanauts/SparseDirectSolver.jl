@@ -84,16 +84,21 @@ end
             end
             # AMD never fills more than natural ordering on these matrices
             @test results[:amd].stats.nnz_L <= results[:natural].stats.nnz_L
-            # automatic choice: both candidates evaluated, flops within 1.1× of the better one
+            # automatic choice: both candidates evaluated; the chosen one pays at most `level_flops` flops per
+            # schedule level it saves (T22: `flops + level_flops × sdepth`; the T05 model was within 1.1× of the
+            # best flops, which ND on lap2d, 10 levels shallower for 1.4× the flops, no longer is)
             auto = SDS.compute_ordering(P, Options())
             @test auto.stats.auto
             @test auto.alg_used in (:amd, :nd)
             @test sort([c.alg for c in auto.stats.candidates]) == [:amd, :nd]
             best = min(results[:amd].stats.flops, results[:nd].stats.flops)
-            @test auto.stats.flops <= 1.1 * best
+            deepest = max(results[:amd].stats.sdepth, results[:nd].stats.sdepth)
+            @test auto.stats.flops <= best + auto.stats.level_flops * (deepest - auto.stats.sdepth)
             chosen = only(c for c in auto.stats.candidates if c.alg === auto.alg_used)
             @test chosen.cost == minimum(c.cost for c in auto.stats.candidates)
             @test auto.stats.flops == chosen.flops
+            @test auto.stats.sdepth == chosen.sdepth
+            @test auto.perm == results[auto.alg_used].perm
             # complex element types scale the flop count only
             cplx = SDS.compute_ordering(P, Options(); T = ComplexF64)
             @test cplx.perm == auto.perm
@@ -155,6 +160,84 @@ end
                 @test ord.stats.nnz_L == n
             end
         end
+    end
+end
+
+@testset "ordering chooser: supernodal schedule depth (T22)" begin
+    # the KKT generators of test/matrices.jl: the chooser takes the candidate with the smaller schedule depth
+    # (ties: the smaller cost), reported through `Ordering.stats`
+    kkts = (("kkt_matrix(60, 20)", kkt_matrix(60, 20, 1.0e-8)), ("kkt_matrix(200, 80)", kkt_matrix(200, 80, 1.0e-8)),
+            ("kkt_matrix(300, 100)", kkt_matrix(300, 100, 1.0e-8)),
+            ("kkt_matrix(2000, 800)", kkt_matrix(2000, 800, 1.0e-8)),
+            ("kkt_slack_matrix(200, 60)", kkt_slack_matrix(Float64, 200, 60, 0.0)),
+            ("kkt_matrix(300, 100, indefinite)", kkt_matrix(300, 100, 1.0e-8; hessian = :indefinite)))
+    strict = 0
+    for (name, A) in kkts
+        @testset "$name" begin
+            P = SDS.SymmetricPattern(SDS.CSR(A), "S"; view = 'F')
+            auto = SDS.compute_ordering(P, Options())
+            cands = auto.stats.candidates
+            @test sort([c.alg for c in cands]) == [:amd, :nd]
+            chosen = only(c for c in cands if c.alg === auto.alg_used)
+            @test auto.stats.sdepth == chosen.sdepth == minimum(c.sdepth for c in cands)
+            ties = [c for c in cands if c.sdepth == chosen.sdepth]
+            @test chosen.cost == minimum(c.cost for c in ties)
+            strict += length(ties) == 1
+            opts = Options()
+            for c in cands
+                ord = SDS.compute_ordering(P, opts; alg = c.alg)
+                @test (ord.stats.sdepth, ord.stats.nnz_L, ord.stats.flops) == (c.sdepth, c.nnz_L, c.flops)
+                # the schedule depth is the height of the supernodal tree the analysis builds
+                sp = SDS.supernode_partition(P, ord.perm, opts)
+                @test SDS.tree_levels(sp.snparent)[2] == c.sdepth
+                @test SDS.nsupernodes(sp) == c.nsupernodes
+                @test c.cost == SDS.ordering_cost(c.flops, c.sdepth)
+                # without amalgamation: the fundamental supernodes
+                flat = SDS.compute_ordering(P, Options(use_superpanels = 0); alg = c.alg)
+                spf = SDS.supernode_partition(P, ord.perm, Options(use_superpanels = 0))
+                @test flat.stats.sdepth == SDS.tree_levels(spf.snparent)[2] >= c.sdepth
+            end
+        end
+    end
+    @test strict >= 2                # the generators include strict depth differences, not only ties
+
+    # explicit orderings reproduce the CliqueTrees/Metis permutations of T05 bit for bit
+    for (name, A) in (kkts[3], kkts[5], ("lap2d", laplacian2d(30, 30)))
+        P = SDS.SymmetricPattern(SDS.CSR(A), "S"; view = 'F')
+        G = SparseMatrixCSC(P)
+        amd = Vector{Int}(first(SDS.CliqueTrees.permutation(G; alg = SDS.CliqueTrees.AMD())))
+        nd = Vector{Int}(first(SDS.CliqueTrees.permutation(G; alg = SDS.ND_PROVIDER[](10, -1))))
+        for (s, ref) in (("algo1", amd), ("algo2", amd), ("algo3", amd), ("algo4", nd))
+            ord = SDS.compute_ordering(P, Options(reordering_alg = s))
+            @test ord.perm == ref
+            @test !ord.stats.auto && length(ord.stats.candidates) == 1
+        end
+    end
+
+    # the depth weight: 0 is a flop contest, a huge weight a depth contest
+    A = laplacian2d(30, 30)
+    P = SDS.SymmetricPattern(SDS.CSR(A), "SPD"; view = 'F')
+    flop = SDS.compute_ordering(P, Options(); level_flops = 0)
+    deep = SDS.compute_ordering(P, Options(); level_flops = 1.0e12)
+    @test flop.stats.level_flops == 0 && deep.stats.level_flops == 1.0e12
+    @test flop.stats.flops == minimum(c.flops for c in flop.stats.candidates)
+    @test deep.stats.sdepth == minimum(c.sdepth for c in deep.stats.candidates)
+    @test flop.alg_used === :amd && deep.alg_used === :nd      # AMD: fewer flops, ND: 10 fewer levels
+    @test SDS.compute_ordering(P, Options()).stats.level_flops == SDS.ORDERING_LEVEL_FLOPS
+    @test SDS.ordering_cost(2.0e6, 3, 1.0e5) == 2.3e6
+
+    # schedule_depth: chain of single-child columns with nested structure = one supernode
+    @test SDS.schedule_depth([2, 3, 4, 0], [1, 2, 3, 4], [4, 3, 2, 1], nothing) == (1, 1)
+    @test SDS.schedule_depth([4, 4, 4, 0], [1, 2, 3, 4], [2, 2, 2, 1], nothing) == (2, 4)
+
+    # the analysis reports the schedule depth it scored: `Schedule.nlevels`
+    for backend in BACKENDS, T in eltypes_among((Float64, ComplexF32))
+        A = kkt_matrix(T, 200, 80, 1.0e-8)
+        solver = DirectSolver(api_matrix(backend, triangle_view(A, 'L'), Int32), "S", 'L')
+        execute!("analysis", solver, nothing, nothing)
+        @test solver.ordering.stats.auto
+        @test solver.host_symbolic.schedule.nlevels == solver.ordering.stats.sdepth ==
+              minimum(c.sdepth for c in solver.ordering.stats.candidates)
     end
 end
 
