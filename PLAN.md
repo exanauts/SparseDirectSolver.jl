@@ -65,7 +65,7 @@ IPM KKT systems, 2026-10-01). What it changed in this plan:
   sync-free solves and graph capture live only in the CUDA/ROCm extensions.
 * **Benchmark harness and cuDSS baseline measurements** move into M0.
 
-Status: empty repository apart from `PLAN.md` and `RESEARCH.md`.
+Status: see §5 (M0–M9 done, M11 in progress through T22–T26).
 
 ---
 
@@ -123,7 +123,7 @@ solve phases raise `NotSupportedError` (T20, §3.6).
 | `use_cuda_register_memory` | reinterpret (M12) | Pinned host memory through the backend extension. |
 | `hybrid_execute_mode` | defer (M12) | Small levels on the KA CPU backend. |
 | `host_nthreads` | reinterpret | Julia threads for the host symbolic phase / CPU backend. |
-| `nd_nlevels`, `nd_ubfactor` | port (T05) | ND is `METIS_NodeND` through CliqueTrees; `nd_ubfactor` is passed through, `nd_nlevels` is read as cuDSS documents it, a *minimum* number of dissection levels, which NodeND's full recursion meets (a level-capped ND was 4–13× slower with more fill). It becomes meaningful with the partition-tree export (T24). |
+| `nd_nlevels`, `nd_ubfactor` | port (T05) | ND is `METIS_NodeND` through CliqueTrees; `nd_ubfactor` is passed through, `nd_nlevels` is read as cuDSS documents it, a *minimum* number of dissection levels, which NodeND's full recursion meets (a level-capped ND was 4–13× slower with more fill). It becomes meaningful with the partition-tree export (T30). |
 | `ubatch_size`, `ubatch_index` | port (M6) | Uniform batch. |
 | `use_superpanels` | reinterpret | Supernode amalgamation on/off. |
 | `device_count`, `device_indices` | not planned | Raise "not supported". |
@@ -210,7 +210,7 @@ user API: LinearAlgebra generics  +  handle-style layer (CUDSS.jl strings, C-wra
        │    regime A  fused subtree-per-workgroup kernels          (KA)
        │    regime B  fused per-front size-binned level kernels    (KA; vendor batched optional)
        │    regime C  Cholesky: vendor potrf + trsm + syrk/herk (extensions; KA fallback)
-       │              LDLᵀ: KA blocked in-front pivoting + vendor trsm/gemm; LU: KA kernel (BLAS-3 in T25)
+       │              LDLᵀ: KA blocked in-front pivoting + vendor trsm/gemm; LU: KA kernel (BLAS-3 in T26)
        │    + KA kernels for assembly, extend-add, gather/scatter, permutation
        ├─ solve (device): permute/scale → subtree/level fwd → diag → bwd → unpermute → IR/FGMRES
        └─ extensions: CUDA, AMDGPU, oneAPI, Metal (dense + sparse adapters + graph capture
@@ -253,7 +253,7 @@ tree levels, so the numeric phase is organized by front size:
   step. LDLᵀ: the fully-summed block is factored in blocks of 32 columns by a
   KA kernel that reproduces the reference pivot sequence, with one vendor GEMM
   per block for the trailing columns and the contribution block (#89). LU: the
-  fused KA kernel, one workgroup per front; BLAS-3 for `L₂₁`/`U₁₂` is a T25
+  fused KA kernel, one workgroup per front; BLAS-3 for `L₂₁`/`U₁₂` is a T26
   item. Vendor `sytrf`/`getrf` are not used (§3.3).
 
 This mirrors cuDSS keeping a distinct algorithm for very sparse factors, and
@@ -268,7 +268,7 @@ runtime decisions.
 2. **Ordering** via CliqueTrees.jl: `permutation(graph; alg)` with `AMD()`
    (AMD.jl, a hard dependency) /`MMD()` or `METIS_NodeND` (Metis extension,
    `nd_ubfactor` passed through, `nd_nlevels` a minimum); user permutation;
-   natural; ND-tree export/import in the cuDSS encoding (T24). **Automatic
+   natural; ND-tree export/import in the cuDSS encoding (T30). **Automatic
    choice** computes both AMD and ND candidates (cheap for KKT sizes) and picks
    by a cost model `flops × (1 + nlevels/n)` on the column etree: ND gives
    bushier, shallower trees; AMD often gives lower fill on power grids (and
@@ -276,7 +276,7 @@ runtime decisions.
    large KKT systems (issue #108, PR #107): at n ≈ 7e5 it weighs depth at
    0.2% and scores column-etree depth, which does not predict the supernodal
    schedule depth that governs GPU time, so it picks AMD where ND halves the
-   schedule depth (65 → 29) and is 36% faster on the solve; until T25 scores
+   schedule depth (65 → 29) and is 36% faster on the solve; until T22 scores
    the schedule depth, GPU users should set `reordering_alg = "algo4"`. Schur
    mode constrains the
    ordering (§3.6). Matching (T21) composes a column permutation for `"G"` and
@@ -366,7 +366,7 @@ test contract of T15/T19 (the pivot search is cooperative across the workgroup,
 the tie-breaking is the reference's). LDLᵀ root fronts run a blocked KA panel
 factorization (32 columns per block, lazily updated) with one vendor GEMM per
 block for the trailing columns and the contribution block (#89); LU root
-fronts run the fused KA kernel, BLAS-3 pending (T25, #75). On the pglib K2
+fronts run the fused KA kernel, BLAS-3 pending (T26, #75). On the pglib K2
 dumps the device and the reference can still differ by rounding (max|L| up to
 1e16 unscaled), which flips threshold and tie decisions: there the contract is
 equal inertia and `nperturbed` within a tolerance (#86). The whole phase is a
@@ -403,7 +403,7 @@ GEMV, and one fused dependency-counter kernel per direction over every front
 of width ≤ 256 solves the 78k-bus condensed KKT in 3.5 ms against 3.8 ms for
 cuDSS and 18 ms for the level-batched sweeps, on CUDA and (8 ms) on a Radeon
 VII; the shallow ND ordering (#108) is a precondition. On lap3d_40 and apache2
-the same approach regresses, so T25 picks the strategy per schedule.
+the same approach regresses, so T24 picks the strategy per schedule.
 
 Refinement: plain IR with a KA CSR SpMV residual (gather, no atomics; the
 workspace is allocated by the first refining solve, so the handle layer with
@@ -448,7 +448,7 @@ defect above 128×128 on macOS 27):
 
 Extensions: `…CUDAExt` (weak dependencies `CUDACore`, `cuSPARSE`, `cuBLAS`,
 `cuSOLVER` of CUDA.jl 6: dense bindings, sparse adapters; pinned memory, graph
-capture and the sync-free solve are T25/T26), `…AMDGPUExt`, `…OneAPIExt`,
+capture and the sync-free solve are T24/T26), `…AMDGPUExt`, `…OneAPIExt`,
 `…MetalExt` (T23), `…MetisExt` (ND), `…KrylovExt` (FGMRES-IR). Core depends on
 KernelAbstractions 0.9, GPUArrays(Core), Adapt, Atomix, LinearAlgebra,
 SparseArrays, CliqueTrees, AMD, Metis (ordering only through the extension).
@@ -615,7 +615,7 @@ front sizes, extend-add maps, layout, schedule. The numeric phase and the solve
 are pure "values in, factors/solution out" kernel sequences with no allocation
 and no host synchronization, so the CUDA and ROCm extensions can capture the
 refactorize+solve sequence in a graph and replay it per IPM iteration (graph
-capture itself is T25, #82). This holds for the dense implementations `:auto`,
+capture itself is T26, #82). This holds for the dense implementations `:auto`,
 `:vendor` and `:ka` (the latter still allocates until T23, #53); `:generic`
 (host LinearAlgebra) is the reference path and may allocate. Exceptions by
 design: the `ir_tol > 0` early-exit test and every FGMRES iteration read on the
@@ -680,7 +680,7 @@ rough: S ≈ days, M ≈ 1–2 weeks, L ≈ 3–4 weeks, XL ≈ more.
 | # | Milestone | Size | Definition of done |
 | --- | --- | --- | --- |
 | M0 | Scaffolding, audit, baselines | M | Package, four backend extensions with CSR adapters, CI matrix (GitHub Actions CPU; Buildkite juliagpu queue for CUDA/AMDGPU/oneAPI/Metal; self-hosted `kkt`), `Options` with the full name tables, error types, Aqua. **Capability audit** script filling the §2.6 table per backend and eltype (kept as a test). **Benchmark harness**: NREL opf_matrices, pglib-opf KKT and condensed matrices dumped from MadNLP, a CUTEst subset; cuDSS analysis/factorization/solve times, `flops`, supernode statistics and MA57 refinement counts recorded as the baseline every later milestone is measured against. |
-| M1 | Symbolic engine | L | Pattern, orderings with the AMD/ND cost model, etree, column counts, GPU-tuned amalgamation, subtree partition, size bins, level lists, static layout, device maps, `memory_estimates`, `flops`, `lu_nnz`, `nsuperpanels`, ND-tree I/O, `max_lu_nnz`. Validated against CHOLMOD's nnz(L) and etree; supernode/level statistics compared with the cuDSS baseline on the harness matrices. A CPU reference numeric factorization (plain Julia, same layout) for testing. |
+| M1 | Symbolic engine | L | Pattern, orderings with the AMD/ND cost model (scored on the supernodal schedule depth from T22, issue #108), etree, column counts, GPU-tuned amalgamation, subtree partition, size bins, level lists, static layout, device maps, `memory_estimates`, `flops`, `lu_nnz`, `nsuperpanels`, ND-tree I/O, `max_lu_nnz`. Validated against CHOLMOD's nnz(L) and etree; supernode/level statistics compared with the cuDSS baseline on the harness matrices. A CPU reference numeric factorization (plain Julia, same layout) for testing. |
 | M2 | Numeric kernels | L | Regime A fused subtree kernels, regime B fused per-front kernels (Cholesky first, LDLᵀ/LU hooks), regime C vendor bindings in all four extensions with KA tiled fallbacks, assembly/extend-add kernels. Unit tests against the CPU reference on every backend; per-bin micro-benchmarks deciding where vendor batched calls replace regime B. |
 | M3 | SPD/HPD end-to-end (**v0.1**) | M | All phases, single and multi RHS, `info`, `cholesky`/`cholesky!`/`ldiv!`/`\`, `Hermitian` wrapper, async flag; subtree/level solve sweeps. Ported `test_cudss.jl` subsets pass on all backends. **Target**: within 1.5× of cuDSS Cholesky refactorization+solve on condensed pglib-opf systems on CUDA, running on AMD and Intel. |
 | M4 | Symmetric indefinite LDLᵀ/LDLᴴ (**MadNLP-ready**) | L | In-front Bunch–Kaufman, `pivot_threshold`, `pivot_epsilon(_alg)`, `pivot_sign`, `inertia`, `pivot_stats`, `npivots`, `diag`, `solve_diag`, `ldlt`/`ldlt!`; vendor `sytrf` with post-check on root fronts. MadNLPGPU gets a `SparseDirectSolver` option; validated on OPF/ExaModels KKTs (MadNLP K2/K2r, MadIPM, MadNCL settings) against the cuDSS path, including refinement counts against MA27/MA57. |

@@ -2833,9 +2833,41 @@ inertia with matching enabled equals the eigenvalue count (the cuDSS defect).
     matching cycles give the 2×2 pairs; jobs 1–4 keep the default pairs".
   - PLAN §5 M13: keep a posteriori pivoting after the MadNLP integration (T21 measurement above).
 
-### T22 — Non-uniform batch (`BatchedDirectSolver`)   `[ ]`
+### T22 — Ordering chooser: supernodal schedule depth (issue #108)   `[ ]`
 
-Block-diagonal packing, forest schedule; `test_nonuniform_batch_cudss.jl` ported.
+**Why this is first (PR #107)**: the automatic ordering (`compute_ordering`,
+`src/symbolic/ordering.jl`, `reordering_alg = "default"`) picks AMD on large
+KKT systems where ND halves the supernodal schedule depth (65 → 29 on the
+78k-bus pglib condensed KKT, 36% on the solve, 11–17% on the factorization,
+GV100). Two causes: `ordering_cost(flops, nlevels, n) = flops × (1 +
+nlevels/n)` weighs depth at ~0.2% for n ≈ 7e5, so the chooser is a flop
+contest; and `nlevels` is the column-etree depth, which does not predict the
+schedule depth (cuDSS's permutation: 1279 column levels → 30 schedule levels;
+METIS: 1216 → 29; AMD: competitive column metrics → 65). The fused solve of
+T24 needs the shallow ordering to pay off, so the chooser is fixed before it.
+
+Deliverables, host code only: (1) `evaluate_ordering` scores each candidate
+by the depth of its supernodal schedule — fundamental supernode partition of
+the candidate's etree and `tree_levels(snparent)` (the T06 Report already
+suggested it; the amalgamation step is not needed for the ranking) — with a
+cost model whose depth term matters at n ≈ 1e6; the task picks the form and
+documents it in PLAN-style in the `ordering_cost` docstring. (2) If no model
+is robust across the harness, the fallback is a backend-dependent default
+(ND on GPU backends, the current model on the CPU backend), stated in the
+options table. (3) `Ordering.stats` reports the schedule depth of every
+candidate and the chosen one. (4) A METIS knob sweep is not part of this task
+(seed, ufactor and nseps move the depth 28–41 within noise in
+`bench/order_search.jl`; plain ND is enough).
+
+Tests: on the KKT generators of `test/matrices.jl` the chooser selects the
+candidate with the smaller schedule depth, asserted through `Ordering.stats`;
+explicit `reordering_alg = "algo1"`/`"algo4"` reproduce the current orderings
+bit for bit; `test_symbolic_*`, `test_options` and every numeric suite
+unchanged. Report: table of schedule depth, column-etree depth, nnz(L) and
+flops for AMD, ND and the chosen ordering on every T04 harness matrix, and on
+the 78k-bus dump if the owner provides it (`bench/order_search.jl`,
+`bench/dump_madnlp_kkt.jl`). Closes #108. The PLAN §2.3 step 2 sentence
+"until T25 scores the schedule depth" is updated by the owner after the merge.
 
 ### T23 — AMDGPU, oneAPI and Metal extensions   `[!]`
 
@@ -2958,7 +2990,191 @@ needed to load them on Linux); Metal only by review. Mark both as untested.
   - PLAN §2.3 step 5 / §2.7 hazard row: regime-A ladder 8–64 KiB, capped per backend by `max_local_bytes`.
   - TASKS.md: a task for the oneAPI/Metal remainder of T23 with the #53 owner note.
 
-### T24 — ND partition-tree export/import and ordering cache   `[ ]`
+### T24 — Partitioned-inverse fused solve (`solve_alg = "algo1"`, issue #82 solve half)   `[ ]`
+
+**Prototype adopted (PR #107)**: `bench/solve_proto_78k.jl`,
+`bench/solve_proto_all.jl`, `bench/final_sweep.jl`, `bench/e2e/SDSProto.jl`
+(solve part). On the 78k-bus condensed KKT under the ND ordering: 18.0 ms
+(stock level-batched sweeps) → 3.5 ms, cuDSS 3.8 ms, GV100; 20.5 → 8.05 ms on
+a Radeon VII. Two states of the prototype were faster and wrong (an
+early-release counter bug, relres 5e+11), so every timing in this task is
+gated on the residual.
+
+Deliverables: (1) `solve_alg = "algo1"`: per-front inverses of `L₁₁` for
+fronts of width ≤ `W` (default 256, an `Options` keyword), computed at the end
+of (re)factorization with the dense interface (`impl` keyword, no direct
+vendor calls), stored in a `Numeric` buffer sized at analysis and reported in
+`memory_estimates`; every TRSV of the sweeps becomes a GEMV. (2) One fused
+dependency-counter kernel per direction covering every front of width ≤ `W`,
+regime-A subtrees included; the vendor path only for the wider fronts
+(the root on KKT systems). Counters are the PLAN §2.5 place for atomics and
+must have an atomic-free variant (`deterministic = true` keeps the level
+sweeps); backward counters dispatch parents first or they deadlock. (3) The
+strategy is chosen per schedule at analysis: the prototype regresses on
+lap3d_40 and apache2 (wide fronts dominate), so `"default"` keeps the level
+sweeps and `"algo1"` is chosen automatically only when the schedule
+statistics predict a win; the Report states the rule and the full SPD-harness
+table that justifies it. (4) Cholesky and LDLᵀ (the inverse is of `L₁₁`, D is
+applied by `solve_diag` as today), real and complex, `nrhs > 1`, both
+permutation paths, `solve_mode` variants; LU may stay on the level sweeps with
+a documented reason. (5) No host synchronization in the solve
+(PLAN §3.9); the per-call synchronization measured in `bench/e2e/MadNLPSDS.jl`
+belongs to the wrapper, not here.
+
+Tests: every solve suite (`test_solve_*`, `test_api`, `test_refinement`,
+`test_batch_*`) unchanged under `"default"` and repeated under `"algo1"`
+(`SDS_TEST_SOLVE_ALG` or a loop, the task decides), with a relative-residual
+gate per matrix; `test_options` accepts `"algo1"` and rejects the unsupported
+combinations with `NotSupportedError`. Report: solve table (1 RHS and 6 RHS)
+vs the T04 cuDSS baseline for every harness matrix on CPU and CUDA, with the
+chosen strategy per matrix. Refs #82 (solve half).
+
+### T25 — Split factorization: tiled SYRK, chunked TRSM, split regime-C fronts   `[ ]`
+
+**Prototype adopted (PR #107)**: `bench/fact_split.jl`. Refactorization of
+the 78k-bus condensed KKT: 167.7 ms (stock) → 138.8 (ND ordering) → 72.7
+(`regime_c_rows = 256`, `subtree_parallelism = 16384`) → 64.0 (split kernels)
+→ 40.6 ms (regime-C fronts split, `regime_c_rows = 64`, longest-first
+subtree launches); cuDSS 24.3 ms. Factor bit-identical to stock on B-only
+configurations, ~3e-10 relative where vendor arithmetic was replaced.
+
+Deliverables, Cholesky first: (1) the regime-B fused kernel's one-workgroup
+SYRK (~12 ms on this matrix) and TRSM are replaced, for fronts with `m > 64`,
+by separate many-block kernels: tiled 32×32 SYRK with disjoint tile writes
+(deterministic, no atomics, bit-identical) and chunked TRSM; the fused kernel
+stays for the small fronts. (2) Regime C is the inverse of regime B — its
+vendor dense path costs ~8 API launches per tall-narrow front while its
+multi-block assembly kernels are the efficient part — so regime-C fronts
+narrower than 64 run the regular assembly kernels plus the split factor
+kernels batched per level, and vendor `potrf` is used only above width 64
+(the boundary is measured right: a 96-wide local-memory class loses to
+cuSOLVER's blocked `potrf`). (3) Regime-A subtree launches ordered longest
+walk first. (4) `regime_c_rows` default re-measured after (2): it matters as
+much as the width, and 64 is right once the C fronts are cheap; the knob is
+phase-coupled with the stock solve (300 fronts on its per-front vendor path,
+215 ms per backsolve), so the default must be chosen with T24's solve, not
+alone. (5) The LDLᵀ regime-C path already uses blocked pivot steps plus GEMMs
+(#89) and must not regress; if the tiled SYRK applies to `L₂₁ D L₂₁ᴴ` with
+the same determinism, say so in the Report, otherwise leave it.
+
+Negative results that must not be re-run: a tiled extend-add is neutral
+(~10 ms of scatter bandwidth is the floor); CUDA-graph replay of the
+~1600-launch sequence is bit-identical and timing-neutral (kernel-busy);
+amalgamation sweeps under the split kernels all regress, `(32, 0.25, 8)` is
+optimal; packed-triangle iteration inside element loops loses (33 → 42 ms);
+Float32 factorization is 18% faster and unusable (κ ≈ 1e14, with or without
+Jacobi scaling; δ-regularization fails even in FP64).
+
+Tests: every numeric suite unchanged (`test_numeric_*`, `test_reference_*`,
+`test_api`), with the bitwise panel checks of well-conditioned generators
+still passing for the split path; a test that exercises each of the three
+front classes (fused B, split B, split C) on one matrix. Report:
+refactorization table vs the T04 cuDSS baseline on every harness matrix,
+Cholesky and LDLᵀ, with the per-class time split from `bench/profile_phases.jl`.
+
+### T26 — Segmented fused factorization with dependency counters (issues #82, #109, #110)   `[ ]`
+
+**Prototype adopted (PR #107)**: `bench/fact_fused.jl`, `bench/e2e/SDSProto.jl`
+(factorization part). On top of T25: 40.6 → 33.5 ms (segmented
+dependency-counter kernel) → 33.1 (native ND) → 31.9 ms (`subtree_budgets =
+[16384]`); cuDSS 24.3 ms. Remaining buckets at 31.9: mega-kernel 11.0,
+subtrees 8.4, vendor dense ~10, statistics 0.6.
+
+Deliverables: (1) First, verify #110 with a CUDA profile of one
+refactorization on a matrix with several regime-C fronts
+(`bench/profile_phases.jl`): count the host synchronizations per
+factorization. If `_factor_panel_c!`'s `info` check does synchronize, an
+asynchronous vendor `potrf` whose `info` stays on the device with the
+workspace size queried once at analysis, and the same for the LDLᵀ/LU
+regime-C paths; the numeric phase is host-synchronization-free as PLAN §3.9
+states, or the Report says where it is not. Closes or documents #110. (2)
+#109 is a prerequisite of (3): the update-stack placement (`build_layout`,
+`src/symbolic/layout.jl`, PR #54) derives block lifetimes from schedule steps,
+so any out-of-level-order execution reuses a live slot and fails as
+mid-column pivot errors far from the cause. Either compute the lifetimes on
+the execution order the fused kernel actually follows (interval colouring over
+that order), or budget private slots for the non-subtree fronts and report
+them in `memory_estimates` (0.14 GB vs 34 MB on the 78k-bus KKT). Closes #109.
+(3) One kernel per segment of levels with four workgroup roles (extend-add,
+panel, TRSM, SYRK tiles) and per-front dependency counters; segments split at
+the launch groups holding wide (vendor) fronts, vendor fronts between
+segments: full cross-stream overlap deadlocks structurally on this tree
+(62 wide fronts from level ~3, 31.5k dependent blocks saturate the SMs ahead of
+the vendor stream). Concurrent extend-add of a parent's children needs atomic
+adds; keep the owner-pull level-synchronous path as the atomic-free variant
+(`deterministic = true`). The write-through extend-add (a child with a single
+consumer writes into a pre-assembled parent) is correct and worth ~0.4%; take
+it only if free. (4) `subtree_budgets` default: the 48 KiB class caps the
+subtree kernel at one block per SM; `[16384]` was 13.3 → 8.4 ms on that
+bucket. Re-measure on the RTX 4080 and the CI runner before changing the
+default; `subtree_max_fronts` stays off (neutral, ~3,300 subtrees hide the
+188-front walk). (5) The #75 remainder on the LDLᵀ side: the fallback-heavy
+`kkt(3000, 1000, 1e-8)` (CUDA 2.5 s, KA CPU 3.3 s vs reference 2.6 s) and the
+extend-add width; and #96: re-measure whether the extra fronts of the
+matching-based pairs matter once the levels are merged; otherwise accepted.
+
+**Owner note (issue #75, history)**: the device LDLᵀ of T15 follows the
+reference pivot for pivot and paid for it in three places: (1) the pivot
+search ran on one work item (`_lt_choose`, `O(w·f)` per column when the
+Bunch–Kaufman choice fails the threshold and `_best_1x1` scans the block);
+(2) regime-C fronts ran the fused KA kernel with one workgroup each and no
+vendor call (the `sytrf` path was dropped by owner decision, since `sytrf`
+picks its own pivot order on `F₁₁` and the reference equality test must
+hold); (3) regime B kept `F₁₁` in global memory. Delivered for #75 (perf PRs
+from `perf/exp1-pivot-search`, `perf/exp1-regime-b-local`,
+`perf/exp2-regime-c-blas`; numbers in PERFORMANCE.md "Experiments 1–2
+results"): (1) cooperative pivot search, cheaper exact fallback in the
+reference; (3) regime B with `F₁₁` in local memory, no scale phase, tiled
+contribution-block update; (2) regime C (and wide tall regime-B bins) as
+blocked pivot steps plus GEMMs through the dense interface, concurrent per
+launch group. Open: the fallback-heavy case above and LDLᵀ/Cholesky
+1.3–2.6×.
+
+Negative results that must not be re-run: subtree classes on concurrent
+streams are neutral and break graph capture; a stream pool for independent
+boundary wides is neutral until (1) is done; CUDA-graph replay is neutral
+above n ≈ 5e4 and only pays below, so it is not a deliverable here (PLAN
+§2.5 keeps it for the CUDA extension when a small-n case asks for it).
+
+Tests: every numeric suite unchanged under the default; the fused path on
+every generator of `test/matrices.jl` with a zero-failing-fronts gate and the
+factor compared to the level-synchronous path (`panel_tol`/`growth_tol`);
+a test that the lifetimes or private slots of (2) are respected (a
+deliberately reordered execution must not clobber a live block: assert
+through the factor equality on a matrix with deep CB reuse). Report:
+refactorization and refactorization+solve tables vs cuDSS on every harness
+matrix, launches per refactorization (#82's criterion: ≥ 3× fewer), the
+#110 synchronization count before and after, stack bytes with and without
+private slots; `bench/e2e/MadNLPSDS.jl` on the 78k-bus ACOPF as the
+end-to-end check. Closes #82.
+
+### T27 — Hybrid memory / hybrid execute   `[ ]`
+
+Host-resident panels streamed per level with pinned memory;
+`hybrid_device_memory_min`; CPU-backend execution of regime A/B levels;
+test: a factorization under a device memory budget smaller than the factor
+size completes with the same solution.
+
+### T28 — Robustness extras   `[ ]`
+
+A posteriori threshold pivoting with optional delayed pivots (host
+re-analysis), `factor_precision = Float32` with Float64 refinement; tests:
+delayed-pivot case where static perturbation gives `relres > 1e-6` and APTP
+gives `≤ 1e-10`; mixed precision reaches Float64 accuracy with FGMRES-IR.
+
+**Owner note (PR #107)**: on the condensed pglib KKT systems (κ ≈ 1e14) a
+Float32 factor is unusable with or without Jacobi scaling, and FP64's
+single-solve relres of 1.4e-2 is itself the κ·ε floor, consistent with cuDSS's
+documented FP32 failures there. The mixed-precision mode is therefore for
+better-conditioned systems and for Metal; it needs FGMRES-IR against the
+Float32 factor (T18) and a documented failure path, not a precision trick at
+the factorization level.
+
+### T29 — Non-uniform batch (`BatchedDirectSolver`)   `[ ]`
+
+Block-diagonal packing, forest schedule; `test_nonuniform_batch_cudss.jl` ported.
+
+### T30 — ND partition-tree export/import and ordering cache   `[ ]`
 
 `nd_partition_tree`/`user_nd_partition_tree` in the cuDSS binary-tree
 encoding; test: importing the exported tree reproduces the same supernode
@@ -2970,73 +3186,6 @@ partition and `nnz_L`.
 feature, not a performance one. The ordering cache (analysis under a stored
 permutation ran in 3.6 s against 12 s for a fresh METIS analysis) is the part
 MadNLP benefits from.
-
-### T25 — Performance pass   `[ ]`
-
-**Owner note (PR #107, issues #82, #108, #109, #110)**: experiments 5 and 6
-exist as bench-level prototypes measured on a Quadro GV100 against the 78k-bus
-pglib condensed KKT (`bench/solve_proto_*.jl`, `bench/fact_split.jl`,
-`bench/fact_fused.jl`, `bench/e2e/SDSProto.jl`): solve 18 → 3.5 ms (cuDSS
-3.8), refactorization 168 → 31.9 ms (cuDSS 24.3), per IPM iteration 185 → 35 ms
-(cuDSS 28), all cuDSS-free. The deliverables of this task follow from them, in
-this order: (1) the ordering chooser scores supernodal schedule depth, or GPU
-backends default to ND (#108; worth 2× schedule depth and 36% on the solve);
-(2) `solve_alg = "algo1"` as the partitioned-inverse solve with per-front
-`L₁₁` inverses and one fused dependency-counter kernel per direction for fronts
-of width ≤ 256, chosen per schedule (it regresses on lap3d_40 and apache2);
-(3) the split factorization: tiled 32×32 SYRK and chunked TRSM as separate
-many-block kernels for fronts with `m > 64`, the regime-C fronts narrower than
-64 through the same split kernels batched per level with the regular assembly
-kernels (vendor `potrf` only above width 64), longest-first regime-A launches;
-(4) the segmented fused factorization with dependency counters, segments split
-at the groups holding wide fronts (full overlap deadlocks, #109), which needs
-private contribution blocks or DAG-aware stack lifetimes (#109) and atomic
-extend-add of concurrent children; (5) an asynchronous vendor `potrf` whose
-`info` stays on the device if #110 is confirmed; (6) `subtree_budgets` default
-reconsidered for occupancy (16 KiB beat 48 KiB there) and `regime_c_rows` tuned
-per phase, since the knobs are phase-coupled (64 is right for the prototype
-factorization, 256 for the stock solve). Negative results to keep: CUDA-graph
-replay is neutral above n ≈ 5e4 (kernel-busy), tiled extend-add is at its
-scatter-bandwidth floor, packed-triangle iteration inside element loops loses,
-amalgamation changes regress, a 96-wide local-memory class loses to vendor
-`potrf`. `bench/e2e/MadNLPSDS.jl` is the end-to-end check.
-
-**Owner note (issue #75)**: the device LDLᵀ of T15 follows the reference
-pivot for pivot and pays for it in three places that are deliverables here:
-(1) the pivot search runs on one work item (`_lt_choose`, `O(w·f)` per
-column when the Bunch–Kaufman choice fails the threshold and `_best_1x1`
-scans the block): parallel reductions for the column maxima, `λ`/`σ` and the
-`_best_1x1` scan, and a cheaper fallback, in the reference too; (2) regime-C
-fronts run the fused KA kernel with one workgroup each and no vendor call
-(the task's `sytrf` path was dropped by owner decision, since `sytrf` picks
-its own pivot order on `F₁₁` and the reference equality test must hold): KA
-in-front pivoting of `F₁₁` keeping the reference sequence, then vendor
-`trsm`/`gemm` for `L₂₁` and the contribution block; (3) regime B keeps `F₁₁`
-in global memory: stage it in `@localmem` as the Cholesky kernel does.
-Baseline: `kkt_matrix(Float64, 3000, 1000, 1e-8)`, default analysis, 13.5 s
-device / 12.9 s reference on the KA CPU backend (T15 report); the Report
-gives the same numbers after, plus CUDA. Closes #75.
-Delivered for #75 (perf PRs from `perf/exp1-pivot-search`, `perf/exp1-regime-b-local`, `perf/exp2-regime-c-blas`; numbers in PERFORMANCE.md "Experiments 1–2 results"): (1) cooperative pivot search, cheaper exact fallback in the reference; (3) regime B with F₁₁ in local memory, no scale phase, tiled contribution-block update; (2) regime C (and wide tall regime-B bins) as blocked pivot steps plus GEMMs through the dense interface, concurrent per launch group. Open: the fallback-heavy kkt(3000,1000,1e-8) (CUDA 2.5 s, KA CPU 3.3 s vs reference 2.6 s) and LDLᵀ/Cholesky 1.3–2.6×.
-#96: matching pairs cost 2× nnz(L); re-measure after the T25 level merging whether the extra fronts matter; otherwise accepted.
-
-Partitioned-inverse solve (`solve_alg = "algo1"`), CUDA sync-free forward
-sweep behind a capability check, CUDA graph capture of refactorize+solve,
-level merging, amalgamation/bin tuning; tests: all previous suites unchanged;
-Report: timing table vs the T04 cuDSS baseline for every harness matrix.
-
-### T26 — Hybrid memory / hybrid execute   `[ ]`
-
-Host-resident panels streamed per level with pinned memory;
-`hybrid_device_memory_min`; CPU-backend execution of regime A/B levels;
-test: a factorization under a device memory budget smaller than the factor
-size completes with the same solution.
-
-### T27 — Robustness extras   `[ ]`
-
-A posteriori threshold pivoting with optional delayed pivots (host
-re-analysis), `factor_precision = Float32` with Float64 refinement; tests:
-delayed-pivot case where static perturbation gives `relres > 1e-6` and APTP
-gives `≤ 1e-10`; mixed precision reaches Float64 accuracy with FGMRES-IR.
 
 ### External — MadNLPGPU integration (in the MadNLP repository)   `[ ]`
 
@@ -3051,8 +3200,9 @@ upper triangle with view `'U'`, as `CUDSSSolver` does; values aliased with an
 `update!` fallback; Cholesky `info` mapped to inertia), backend-agnostic, run
 on the 78k-bus ACOPF with `SparseCondensedKKTSystem` on CUDA and AMD with the
 same 101 iterations and objective as cuDSS. Start from it. Known points: set
-`reordering_alg = "algo4"` (#108); the tuning knobs are phase-coupled
-(`regime_c_rows = 256` balances the stock factorization and solve); the 2×2
-pivot pairs of `"S"` are chosen from the values present at analysis, so
-analyse after the first KKT assembly; the per-call synchronization of the
-wrapper (`asynchronous = false`) is part of the measured gap.
+`reordering_alg = "algo4"` until T22 merges (#108); the tuning knobs are
+phase-coupled (`regime_c_rows = 256` balances the stock factorization and
+solve; T25 retunes them); the 2×2 pivot pairs of `"S"` are chosen from the
+values present at analysis, so analyse after the first KKT assembly; the
+per-call synchronization of the wrapper (`asynchronous = false`) is part of
+the measured gap.
