@@ -208,7 +208,7 @@ end
 """
     device_group_amap(backend, amap, layout, ns) -> (amap_ptr, order)
 
-[`_group_amap`](@ref) (unsigned) on `backend`: identical order and per-owner
+`_group_amap` (unsigned) on `backend`: identical order and per-owner
 counts. The signed (`"G"`) grouping stays on the host.
 """
 function device_group_amap(backend, amap::Vector{Int}, layout::Layout, ns::Int)
