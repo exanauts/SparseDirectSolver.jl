@@ -50,6 +50,31 @@ The outputs and when they become available are tabulated in the docstring of
 [`getparam`](@ref). For a uniform batch the per-factorization outputs are
 vectors with one entry per member.
 
+## Caching an ordering
+
+The ordering is usually the most expensive part of the analysis. Store the
+permutation and the nested-dissection partition tree of one analysis and pass
+them to a later one (another process, the same sparsity pattern), as with
+cuDSS:
+
+```julia
+analyze!(solver)
+perm = getparam(solver, "perm_reorder_row")
+tree = getparam(solver, "nd_partition_tree")   # 2^nd_nlevels - 1 sizes, cuDSS encoding
+
+later = DirectSolver(A, "SPD", 'L')
+setparam!(later, "user_perm", perm)
+setparam!(later, "user_nd_partition_tree", tree)  # checked against perm
+analyze!(later)                                   # no ordering; same supernodes and lu_nnz
+```
+
+The supernode partition, `lu_nnz` and the schedule depend only on the
+elimination tree of the permutation, so the second analysis reproduces the
+first exactly. The tree is validated (sizes, and every column's dependencies
+inside its node's ancestors) and is optional: `user_perm` alone gives the same
+analysis. The 2×2 pivot pairs that `"S"`/`"H"` choose at analysis are not part
+of the encoding and are not applied under a `user_perm`.
+
 ## Differences from cuDSS
 
 * `"info"` reports the original column of the first failed pivot.
@@ -58,3 +83,6 @@ vectors with one entry per member.
 * `pivot_sign` chooses the sign of the perturbation of each row, so that a
   perturbed KKT system keeps the inertia an interior-point method expects.
 * `pivot_stats` returns `(npos, nneg, nzero, nperturbed, n2x2)` in one read.
+* `nd_partition_tree` is available after the symbolic factorization (cuDSS:
+  after the reordering) and exists for every ordering, not only nested
+  dissection.

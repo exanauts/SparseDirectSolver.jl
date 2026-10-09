@@ -36,18 +36,28 @@ function etree(P::SymmetricPattern, perm::AbstractVector{<:Integer})
 end
 
 """
-    postorder(parent) -> post::Vector{Int}
+    postorder(parent; key = nothing) -> post::Vector{Int}
 
 A postorder of the forest `parent` (`0` = root): `post[k]` is the node visited
-`k`-th; children are visited in increasing index order and every node comes
-after all its descendants. Non-recursive.
+`k`-th; the roots and the children of every node are visited in increasing
+index order, or in increasing `key` order when a vector `key` of distinct values
+is given, and every node comes after all its descendants. Non-recursive.
+
+With `key = perm` (the original column of every node of the etree of
+`A[perm, perm]`) the visit sequence, in original columns, depends only on the
+tree and not on which topological order `perm` lists it in: the supernode step
+([`supernode_partition`](@ref)) uses it so that an analysis under its own
+output permutation reproduces itself (T24).
 """
-function postorder(parent::AbstractVector{<:Integer})
+function postorder(parent::AbstractVector{<:Integer}; key::Union{Nothing, AbstractVector{<:Integer}} = nothing)
     n = length(parent)
+    key === nothing || length(key) == n ||
+        throw(InvalidValueError("postorder: key has length $(length(key)), expected $n"))
+    seq = key === nothing ? (1:n) : sortperm(key)     # nodes in visiting order among siblings
     head = zeros(Int, n)     # first child
     next = zeros(Int, n)     # next sibling
     # insert in reverse so the child lists come out in increasing order
-    for j in n:-1:1
+    for j in Iterators.reverse(seq)
         p = parent[j]
         p == 0 && continue
         next[j] = head[p]
@@ -56,7 +66,7 @@ function postorder(parent::AbstractVector{<:Integer})
     post = Vector{Int}(undef, n)
     stack = Int[]
     k = 0
-    for root in 1:n
+    for root in seq
         parent[root] == 0 || continue
         push!(stack, root)
         while !isempty(stack)

@@ -292,9 +292,9 @@ end
     for name in ("lu_nnz", "perm_row", "diag", "nsuperpanels", "memory_estimates")
         @test thrown(() -> setparam!(solver, name, 1)) isa ArgumentError
     end
-    for name in ("nd_partition_tree", "hybrid_device_memory_min")
-        @test thrown(() -> getparam(solver, name)) isa NotSupportedError
-    end
+    @test thrown(() -> getparam(solver, "hybrid_device_memory_min")) isa NotSupportedError
+    tree = getparam(solver, "nd_partition_tree")               # T24: default nd_nlevels = 10
+    @test length(tree) == 2^10 - 1 && sum(tree) == n
     for name in ("perm_matching", "scale_row", "scale_col")      # T21: need an analysis with matching
         @test thrown(() -> getparam(solver, name)) isa InvalidValueError
     end

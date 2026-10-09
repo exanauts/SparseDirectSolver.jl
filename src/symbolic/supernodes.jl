@@ -347,13 +347,14 @@ end
     supernode_partition(P::SymmetricPattern, perm, opts::Options = Options()) -> SupernodePartition
 
 The whole supernode step for the ordering `perm` (e.g. `compute_ordering(P, opts).perm`):
-[`etree`](@ref), [`postorder`](@ref), [`colcounts`](@ref),
+[`etree`](@ref), [`postorder`](@ref) (siblings by original column, so the result depends only on the
+etree: an analysis under its own output permutation `sp.perm` reproduces `sp`), [`colcounts`](@ref),
 [`fundamental_supernodes`](@ref), [`amalgamate`](@ref) with `opts.amalgamation`
 unless `opts.use_superpanels == 0`, and the supernodal symbolic factorization.
 """
 function supernode_partition(P::SymmetricPattern, perm::AbstractVector{<:Integer}, opts::Options = Options())
     parent = etree(P, perm)
-    post = postorder(parent)
+    post = postorder(parent; key = perm)          # canonical: the result depends only on the etree (T24)
     counts = colcounts(P, perm, parent, post)
     cp = fundamental_supernodes(parent, post, counts)
     amalgamated = opts.use_superpanels != 0
@@ -387,7 +388,7 @@ function schur_supernode_partition(P::SymmetricPattern, perm::AbstractVector{<:I
         counts[j] = n - j + 1
     end
     subcounts = counts[1:m]
-    cp = fundamental_supernodes(subparent, postorder(subparent), subcounts)
+    cp = fundamental_supernodes(subparent, postorder(subparent; key = view(perm, 1:m)), subcounts)
     amalgamated = opts.use_superpanels != 0
     amalgamated && m > 0 && (cp = amalgamate(cp, subparent, subcounts, opts.amalgamation))
     nsub = nsupernodes(cp)

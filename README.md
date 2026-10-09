@@ -53,13 +53,16 @@ CUDA and on AMDGPU (ROCm):
   entries on the diagonal, the symmetric structures a symmetrically scaled
   matrix (inertia preserved) with 2×2 pivot pairs from the matching;
   `perm_matching`, `scale_row`, `scale_col`;
+* the ND partition tree in the cuDSS encoding (`nd_partition_tree`,
+  `user_nd_partition_tree` with `user_perm`): an analysis under a stored
+  permutation skips the ordering and reproduces the stored analysis exactly;
 * the public API: `DirectSolver`, `execute!` with cuDSS phase strings, named
   phase wrappers, `update!`, `setparam!`/`getparam`, and the `LinearAlgebra`
   layer (`cholesky`, `cholesky!`, `ldlt`, `ldlt!`, `lu`, `lu!`, `ldiv!`, `\`, `logabsdet`),
   checked by the test suite of CUDSS.jl ported to this package; phase logging
   through `SDS_LOG_LEVEL`.
 
-Not there yet: non-uniform batches, ND partition-tree export, mixed precision,
+Not there yet: non-uniform batches, mixed precision,
 hybrid host memory, delayed pivots, and the oneAPI and Metal
 extensions. Unsupported structures, phases and parameters raise
 `NotSupportedError` rather than falling back silently. The remaining gap to

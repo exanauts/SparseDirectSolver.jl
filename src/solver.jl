@@ -446,8 +446,6 @@ function _check_analysis_supported(solver::DirectSolver{T}) where {T}
                                 "schur_mode = 1"))
     opts.schur_mode == 0 || solver.nbatch == 1 ||
         throw(NotSupportedError("schur_mode = 1 is not supported for uniform batches"))
-    opts.user_nd_partition_tree === nothing ||
-        throw(NotSupportedError("user_nd_partition_tree is not implemented yet (T24)"))
     opts.schedule == SCHEDULE_SYNCFREE && throw(NotSupportedError("schedule = \"syncfree\" is not implemented yet"))
     opts.factor_precision === nothing || opts.factor_precision === real(T) ||
         throw(NotSupportedError("factor_precision = $(opts.factor_precision) for $T input is not implemented yet"))
@@ -490,11 +488,24 @@ function _reorder!(solver::DirectSolver{T}) where {T}
         solver.ordering = compute_ordering(P, solver.options; T, pp.pairs, pp.candidates)
         solver.schur = nothing
     end
+    _check_user_tree(solver.options, P, solver.ordering)
     solver.host_symbolic = solver.symbolic = solver.numeric = solver.workspace = solver.refinement = nothing
     solver.matching = nothing
     solver.stage = STAGE_REORDERED
     _log(LOG_INFO, () -> "reordering: n = $(A.nrows), nnz = $(nnz(A)), $(_elapsed(tic))")
     return solver
+end
+
+# "user_nd_partition_tree" (with "user_perm"): validated against the etree of the ordering it describes; the
+# analysis depends only on that etree (`supernode_partition`), so the tree is checked, not otherwise used
+function _check_user_tree(opts::Options, P::SymmetricPattern, ord::Ordering)
+    tree = opts.user_nd_partition_tree
+    tree === nothing && return nothing
+    opts.user_perm === nothing &&
+        throw(InvalidValueError("user_nd_partition_tree needs \"user_perm\" (the permutation the tree describes, " *
+                                "the \"perm_reorder_row\" of the analysis that exported it)"))
+    check_nd_partition_tree(tree, opts.nd_nlevels, etree(factor_pattern(P, ord), ord.perm))
+    return nothing
 end
 
 # the device matching state of the analysis `Sh` (host) / `Sd` (device maps)
@@ -863,15 +874,12 @@ end
 # parameters
 
 # data parameters the solver computes (PLAN §1.4, §1.7)
-const SOLVER_OUTPUTS = ("lu_nnz", "flops", "nsuperpanels", "memory_estimates", "perm_reorder_row",
+const SOLVER_OUTPUTS = ("lu_nnz", "flops", "nsuperpanels", "memory_estimates", "nd_partition_tree", "perm_reorder_row",
                         "perm_reorder_col", "perm_row", "perm_col", "diag", "npivots", "inertia", "pivot_stats",
                         "schur_shape", "schur_matrix", "perm_matching", "scale_row", "scale_col")
 
 # task that provides the other computed data parameters
-function _output_task(name)
-    name == "nd_partition_tree" && return "T24"
-    return "M12"   # hybrid_device_memory_min
-end
+_output_task(name) = "M12"   # hybrid_device_memory_min
 
 """
     setparam!(solver::DirectSolver, name::String, value)
@@ -950,6 +958,7 @@ The data parameters computed by the solver:
 | `"flops"` | `Float64`: factorization flops of the stored panels | analysis |
 | `"nsuperpanels"` | `Int`: supernodes after amalgamation | analysis |
 | `"memory_estimates"` | `Vector{Int64}` (16 entries, see [`memory_estimates`](@ref)) | analysis |
+| `"nd_partition_tree"` | `Vector{Int}`: the partition tree of the analysis in the cuDSS encoding, `2^k - 1` column counts with `k = nd_nlevels` (at the time of reading), leaves first and root last, for the permutation `"perm_reorder_row"` ([`nd_partition_tree`](@ref)); with that permutation as `"user_perm"` and the tree as `"user_nd_partition_tree"` a later analysis of the same matrix skips the ordering and reproduces the supernodes, `"lu_nnz"` and the schedule exactly (the 2×2 pivot pairs of `"S"`/`"H"` are not part of the encoding and are not applied under a `"user_perm"`) | analysis |
 | `"perm_reorder_row"`, `"perm_reorder_col"` | `Vector{Int}`: the fill-reducing permutation, 1-based (`perm[k]` = original index of the `k`-th pivot) | reordering |
 | `"perm_row"`, `"perm_col"` | `Vector{Int}`: the final permutation of the factor (= the reordering for Cholesky and LDLᵀ/LDLᴴ); LU (`"G"`) after a factorization: `perm_row[k]` is the original row of factor row `k` (the reordering composed with the local row interchanges of batch member 1), `perm_col` the reordering (with matching: composed with the matching, `perm_matching[reordering]`), so `A[perm_row, perm_col] = L D U` (with matching `Dr[perm_row] A[perm_row, perm_col] Dc[perm_col] = L D U`, the scalings `Dr`, `Dc` of `"scale_row"`/`"scale_col"` as diagonal matrices in the original numbering). For a CSC input (`CuSparseMatrixCSC`, [`csr_of_transpose`](@ref)) `A` is the stored CSR matrix, the transpose of the matrix given | analysis |
 | `"perm_matching"` | `Vector{Int}`: the matching permutation ([`Matching`](@ref)): row `i` is matched to column `perm_matching[i]` (`"G"`: `A[:, perm_matching]` has the matched entries on its diagonal; symmetric structures: only its cycles are used, for the 2×2 pivot pairs) | reordering (`matching_alg ≠ "default"`) |
@@ -977,8 +986,7 @@ The pivot statistics are reduced on the device ([`reduce_stats!`](@ref)) and
 copied to the host when read (one synchronization). The reordering
 permutation after `"reordering"` alone is the ordering algorithm's; `"symbolic_factorization"` composes it with the supernodal
 renumbering, and from then on both permutations are the one the factor uses.
-Data parameters of later tasks (`"nd_partition_tree"`, `"hybrid_device_memory_min"`) raise
-[`NotSupportedError`](@ref); reading one before the phase that computes it raises [`FactorizationError`](@ref), and
+The data parameter `"hybrid_device_memory_min"` (M12) raises [`NotSupportedError`](@ref); reading one before the phase that computes it raises [`FactorizationError`](@ref), and
 the matching outputs without matching [`InvalidValueError`](@ref).
 """
 function getparam(solver::DirectSolver, name::AbstractString)
@@ -1025,6 +1033,7 @@ function getparam(solver::DirectSolver, name::AbstractString)
     name == "flops" && return sp.flops
     name == "nsuperpanels" && return nsuperpanels(sp)
     name == "memory_estimates" && return _memory_estimates(solver)
+    name == "nd_partition_tree" && return nd_partition_tree(sp, solver.options.nd_nlevels)
     if name == "perm_row" && solver.structure == STRUCTURE_GENERAL && solver.stage >= STAGE_FACTORIZED
         piv = Array(view(solver.numeric.piv, 1:Sh.n))    # local row order of member 1
         return sp.perm[piv]
