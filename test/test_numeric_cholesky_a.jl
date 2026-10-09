@@ -103,6 +103,7 @@ end
     for opts in (Options(subtree_budgets = [8192], subtree_parallelism = 0),
                  Options(subtree_budgets = [49152], subtree_parallelism = 0),
                  Options(subtree_budgets = [65536], subtree_parallelism = 0),
+                 Options(subtree_budgets = [8192, 20000, 49152], regime_c_width = 32, subtree_parallelism = 0),
                  Options(subtree_budgets = [8192, 20000, 1 << 20], regime_c_width = 32, subtree_parallelism = 0),
                  Options(subtree_budgets = [32768], factorization_alg = "algo2", subtree_parallelism = 0))
         # the 64 KiB class (issue #60) runs where the backend has the local memory (CPU, ROCm); elsewhere (CUDA)
