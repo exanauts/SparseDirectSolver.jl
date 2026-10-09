@@ -193,10 +193,19 @@ Assemble the host [`Symbolic`](@ref) from the supernodes, schedule and layout
 of a pattern and its user CSR arrays (only the pattern is read).
 """
 function Symbolic(sp::SupernodePartition, sc::Schedule, layout::Layout, rowptr::AbstractVector{<:Integer},
-                  colval::AbstractVector{<:Integer}, n::Integer, structure; view = VIEW_FULL, index = INDEX_ONE)
+                  colval::AbstractVector{<:Integer}, n::Integer, structure; view = VIEW_FULL, index = INDEX_ONE,
+                  device = nothing)
     ns = nsupernodes(sp)
-    amap = assembly_map(sp, layout, rowptr, colval, n, structure; view, index)
-    amap_ptr, amap_src = _group_amap(amap, layout, ns, _structure(structure) == STRUCTURE_GENERAL)
+    signed = _structure(structure) == STRUCTURE_GENERAL
+    use_device = device !== nothing && !signed &&
+                 device_maps_supported(device, structure, view, n, length(colval), layout.factor_len)
+    if use_device
+        amap = device_assembly_map(device, sp, layout, rowptr, colval, n, structure; view, index)
+        amap_ptr, amap_src = device_group_amap(device, amap, layout, ns)
+    else
+        amap = assembly_map(sp, layout, rowptr, colval, n, structure; view, index)
+        amap_ptr, amap_src = _group_amap(amap, layout, ns, signed)
+    end
     child_ptr = zeros(Int, ns + 1)
     child_ptr[1] = 1
     for s in 1:ns
@@ -229,7 +238,7 @@ function Symbolic(sp::SupernodePartition, sc::Schedule, layout::Layout, rowptr::
 end
 
 """
-    symbolic_analysis(A::CSR, structure, view = 'F'; opts = Options(), T = eltype(A), max_local = typemax(Int))
+    symbolic_analysis(A::CSR, structure, view = 'F'; opts = Options(), T = eltype(A), device = nothing, max_local = typemax(Int))
         -> Symbolic{Int, Vector{Int}}
 
 The whole host analysis of PLAN §2.3: [`SymmetricPattern`](@ref),
@@ -244,18 +253,18 @@ which bound the regime-A budgets ([`resolve_subtree_budgets`](@ref)); the
 default leaves them unbounded (host analyses, the CPU backend).
 """
 function symbolic_analysis(A::CSR, structure, view = VIEW_FULL; opts::Options = Options(), T::Type = eltype(A),
-                           max_local::Integer = typemax(Int))
+                           max_local::Integer = typemax(Int), device = nothing)
     A.nrows == A.ncols || throw(InvalidValueError("the matrix must be square, got $(A.nrows) × $(A.ncols)"))
     rowptr = Array(A.rowptr)
     colval = Array(A.colval)
-    P = SymmetricPattern(rowptr, colval, A.nrows, structure; view, index = A.index)
+    P = SymmetricPattern(rowptr, colval, A.nrows, structure; view, index = A.index, device)
     pp = analysis_pairs(P, rowptr, colval, A.nzval, A.nrows, structure, opts; view, index = A.index)
     ord = compute_ordering(P, opts; T, pp.pairs, pp.candidates)
     sp = supernode_partition(factor_pattern(P, ord), ord.perm, opts)
     sc = build_schedule(sp, opts, T; reserve = subtree_local_reserve(structure),
                         elsize = schedule_elsize(structure, T), max_local)
     layout = build_layout(sp, sc; ldlt = _is_ldlt_structure(_structure(structure)))
-    return Symbolic(sp, sc, layout, rowptr, colval, A.nrows, structure; view, index = A.index)
+    return Symbolic(sp, sc, layout, rowptr, colval, A.nrows, structure; view, index = A.index, device)
 end
 
 function _index_vector(backend::KernelAbstractions.Backend, x::AbstractVector{<:Integer}, ::Type{INT},
