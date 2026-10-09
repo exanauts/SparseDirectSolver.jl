@@ -191,7 +191,7 @@ MadNLPGPU migrates).
 | `schedule` | config | `"auto"`, `"subtree+level"` (portable baseline), `"syncfree"` (CUDA/ROCm only, not implemented yet: raises). |
 | `pivot_pairs` | config | `"default"`: for `"S"`/`"H"` the analysis pairs every candidate row whose pivot is structurally zero in the ordering with a partner, so that in-front Bunch–Kaufman can form the 2×2 block (§2.3 step 2); `"all"` pairs every candidate (about 2× nnz(L) on KKT systems); `"none"`. Candidates are decided from the values present at analysis time: an all-zero `nzval` gives no pairs. |
 | `pivot_pair_tolerance` | config | Relative tolerance below which a diagonal counts as a pair candidate (default `1e-6`). |
-| regime thresholds | `Options` keywords only | `regime_c_width`, `regime_c_rows`, `subtree_budgets`, `subtree_parallelism`, `memory_budget` select the three regimes (§2.3 step 5); they are keywords of `Options(...)`, not `setparam!` strings, until there is a reason to expose them. |
+| regime thresholds | `Options` keywords only | `regime_c_width`, `regime_c_rows`, `subtree_budgets`, `subtree_parallelism`, `subtree_max_fronts`, `memory_budget` select the three regimes (§2.3 step 5); they are keywords of `Options(...)`, not `setparam!` strings, until there is a reason to expose them. Measured on the 78k-bus condensed KKT (PR #107): the width boundary 64 of regime B is right, `regime_c_rows` matters as much as the width, `subtree_budgets = [16384]` beats the 48 KiB class through occupancy, and `subtree_max_fronts` is neutral there. |
 
 ---
 
@@ -272,7 +272,13 @@ runtime decisions.
    choice** computes both AMD and ND candidates (cheap for KKT sizes) and picks
    by a cost model `flops × (1 + nlevels/n)` on the column etree: ND gives
    bushier, shallower trees; AMD often gives lower fill on power grids (and
-   wins on the KKT and random harness matrices). Schur mode constrains the
+   wins on the KKT and random harness matrices). That model is wrong for
+   large KKT systems (issue #108, PR #107): at n ≈ 7e5 it weighs depth at
+   0.2% and scores column-etree depth, which does not predict the supernodal
+   schedule depth that governs GPU time, so it picks AMD where ND halves the
+   schedule depth (65 → 29) and is 36% faster on the solve; until T25 scores
+   the schedule depth, GPU users should set `reordering_alg = "algo4"`. Schur
+   mode constrains the
    ordering (§3.6). Matching (T21) composes a column permutation for `"G"` and
    only scales the symmetric structures. **2×2 pivot pairs** for `"S"`/`"H"`
    (`pivot_pairs`): rows whose diagonal is absent or negligible are candidates;
@@ -314,7 +320,11 @@ runtime decisions.
    update-stack high-water mark; the block placement is offline over the known
    lifetimes (best of first fit and two size-ordered placements, #54), level
    chunking under `memory_budget` only bounds the bytes produced per chunk
-   until hybrid memory exists; no allocator at run time.
+   until hybrid memory exists; no allocator at run time. The lifetimes are
+   schedule steps, so the placement assumes level-synchronous execution: an
+   out-of-level-order numeric phase (dependency counters, streams, fused
+   kernels, experiment 5) needs private blocks (4× the stack on the 78k-bus
+   KKT) or lifetimes computed on its own execution order (issue #109).
 7. **Device maps**: destination of every `nzVal` entry inside its front
    (owner-pull grouping `amap_ptr`/`amap_src`, conjugation as a negative
    offset); child→parent relative indices for extend-add; gather lists for the
@@ -387,7 +397,13 @@ about six refinement solves per factorization on OPF matrices), so two
 accelerations are planned: partitioned-inverse diagonal blocks for
 refinement-heavy loops (`solve_alg = "algo1"`, M11) and a sync-free
 ready-flag sweep in the CUDA/ROCm extensions, selected only where the hardware
-guarantees forward progress (M11).
+guarantees forward progress (M11). Both were prototyped in PR #107
+(`bench/solve_proto_*.jl`): per-front `L₁₁` inverses turn each TRSV into a
+GEMV, and one fused dependency-counter kernel per direction over every front
+of width ≤ 256 solves the 78k-bus condensed KKT in 3.5 ms against 3.8 ms for
+cuDSS and 18 ms for the level-batched sweeps, on CUDA and (8 ms) on a Radeon
+VII; the shallow ND ordering (#108) is a precondition. On lap3d_40 and apache2
+the same approach regresses, so T25 picks the strategy per schedule.
 
 Refinement: plain IR with a KA CSR SpMV residual (gather, no atomics; the
 workspace is allocated by the first refining solve, so the handle layer with
@@ -686,11 +702,16 @@ by splitting the ND top level.
 MadNLPGPU integration (External task); M2 and M4 differ from the definitions
 above in that vendor batched calls are not used in regime B and vendor
 `sytrf`/`getrf` are not used in regime C (§2.4). CI runs the CPU backend and
-CUDA; AMDGPU/oneAPI/Metal wait for T23. The M3 target (1.5× cuDSS on condensed
-pglib systems) is not met: 2.5× factorization / 3.9× refactorization / 4.4×
-solve (geometric means, RTX 4080); LDLᵀ 4.4× / 6.3×. The remaining gap on KKT
-systems is launch- and level-bound (#82) and is M11's first item. Measurements
-and the experiment plan are in `PERFORMANCE.md`.
+CUDA, plus a non-required AMD leg that passes everything but the ROC
+constructor forwarders (T23); oneAPI/Metal wait for T23. The M3 target (1.5×
+cuDSS on condensed pglib systems) is not met by the library: 2.5×
+factorization / 3.9× refactorization / 4.4× solve (geometric means, RTX 4080);
+LDLᵀ 4.4× / 6.3×. The remaining gap on KKT systems is launch- and level-bound
+(#82); bench-level prototypes (PR #107) reach 1.3× cuDSS on the refactorization
+and parity on the solve of a 78k-bus condensed KKT, and a MadNLP end-to-end run
+on CUDA and AMD exists in `bench/e2e/`, so M11 is a matter of moving measured
+designs into `src/`. Measurements and the experiment plan are in
+`PERFORMANCE.md`.
 
 ---
 
@@ -720,7 +741,9 @@ and the experiment plan are in `PERFORMANCE.md`.
   plus the plain-Julia CPU reference factorization from M1, so every GPU test
   also runs on CPU and failures are debuggable in plain Julia.
 * **Backends**: every test runs on the CPU backend (GitHub runners) and on
-  CUDA (self-hosted runner) in CI; AMDGPU, oneAPI and Metal join with T23. The
+  CUDA (self-hosted runner) in CI, and on the AMD runner as a non-required leg
+  (99.4% pass without the AMDGPU extension, PR #107); the leg becomes required
+  with T23, oneAPI and Metal join then. The
   T03 capability audit documents which implementation each op took. The suite
   runs in parallel workers with a duration history (#90); compile time is the
   dominant cost (#91).

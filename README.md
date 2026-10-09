@@ -61,10 +61,13 @@ CUDA:
 
 Not there yet: non-uniform batches, ND partition-tree export, mixed precision,
 hybrid host memory, delayed pivots, and the AMDGPU, oneAPI and Metal
-extensions. Unsupported structures, phases and parameters raise
+extensions (the kernels already run on AMD hardware through the raw-array
+constructors; the test suite passes there except for the vendor-type
+forwarders). Unsupported structures, phases and parameters raise
 `NotSupportedError` rather than falling back silently. The remaining gap to
 cuDSS is performance, not features (see below and
-[`PERFORMANCE.md`](PERFORMANCE.md)).
+[`PERFORMANCE.md`](PERFORMANCE.md)); a MadNLP end-to-end run on CUDA and AMD
+lives in [`bench/e2e/`](bench/e2e/).
 
 * [Documentation](https://exanauts.github.io/SparseDirectSolver.jl/dev/) — user guide and API reference.
 * [`PLAN.md`](PLAN.md) — design, API, milestones.

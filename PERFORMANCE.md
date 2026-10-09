@@ -9,7 +9,11 @@ Performance issues carry the GitHub label `performance` ([list](https://github.c
 | issue | what | experiment | status |
 | --- | --- | --- | --- |
 | #81 (PR) | regime-A subtrees ran a whole KKT tree on one workgroup; flop limit `subtree_parallelism` | 0 | merged |
-| #82 | KKT refactorization and solve are level-bound after #81: 54–59 launches per refactorization, 62–85 per solve | 5, 6 | open |
+| #82 | KKT refactorization and solve are level-bound after #81: 54–59 launches per refactorization, 62–85 per solve | 5, 6 | open, triaged; both phases prototyped in PR #107 (see Experiments 5–6 prototypes), in-src adoption is T25 |
+| #107 (PR) | prototypes in `bench/`: partitioned-inverse fused solve, split/fused factorization, ordering study, `subtree_max_fronts`, MadNLP end-to-end on CUDA and AMD, AMD CI leg | 0, 4, 5, 6, 7 | merged (bench only; one `Options` knob in `src/`) |
+| #108 | ordering chooser picks AMD on large KKT systems: the cost model scores column-etree depth, not supernodal schedule depth (65 vs 29 levels, 36% on the solve) | 5, 6, 10 | open (found-by-agent) |
+| #109 | update-stack placement assumes level-synchronous execution: out-of-level-order numeric phases need private contribution blocks (4× the stack) or DAG lifetimes | 5 | open (found-by-agent) |
+| #110 | regime-C Cholesky reportedly host-synchronizes per front through its `info` check; to verify | 5 | open (found-by-agent) |
 | #75 | device LDLᵀ: serial pivot search, one workgroup per regime-B/C front, no vendor `sytrf` | 1, 2 | open, triaged; steps 1–3 in PRs from `perf/exp1-pivot-search`, `perf/exp1-regime-b-local`, `perf/exp2-regime-c-blas`; criteria partly met (see Experiments 1–2 results) |
 | #86 | device LDLᵀ differs from `ref_ldlt!` on the K2 dumps (pivot sequence, `nperturbed`; rounding with max\|L\| 1e14–1e16), pre-existing | 1, 3 | open (found-by-agent) |
 | #60 | regime-A follow-ups: CUDA timings (partly answered by experiment 0) and per-backend local-memory caps | 7 | open, triaged |
@@ -223,6 +227,59 @@ LDLᵀ refactorization, `main` → step 3:
 
 `bench/comparison/comparison.{md,png}` are regenerated with the step-3 LDLᵀ rows: SDS/cuDSS geometric mean of "LDLᵀ, static pivoting" (23 matrices) factorization 6.37× → 4.41×, refactorization 9.90× → 6.27×. The "LDLᵀ + 2 refinement steps" row (9 K2 dumps) reads 5.45× → 7.19×, but it is dominated by the three case1354 K2 dumps, whose `compare.jl` medians vary 2–3× between reruns of the same code (8.8–27.6 ms for `main`, 7.5–16.5 ms for step 3, fresh solver per sample); the profile above (6.3–7.0 ms after, 7.2–9.1 ms before) is the reliable number there.
 
+## Experiments 5–6 prototypes (2026-10-08/09, GV100 and Radeon VII; PR #107)
+
+A prototype campaign by a human collaborator with their own agent, recorded in `bench/` and the PR #107 thread; nothing of it is in `src/` except the `subtree_max_fronts` knob. Matrix: a 78k-bus ACOPF condensed KKT (n ≈ 6.7e5, Cholesky), median of 20 warm runs; cuDSS 0.8.0 on the same GV100. The numbers are the collaborator's; this section condenses them so the plan rows above can cite them.
+
+| per IPM iteration, 78k-bus condensed KKT | stock `main` | prototype | cuDSS |
+| --- | --- | --- | --- |
+| solve (1 RHS) | 18.0 ms | **3.5 ms** | 3.8 ms |
+| refactorization | 167.7 ms | **31.9 ms** | 24.3 ms |
+| refactorization + solve | 185 ms | ~35 ms | 28.1 ms |
+| solve, Radeon VII (gfx906, no vendor solver exists there) | 20.5 ms | **8.05 ms** | — |
+
+How the solve got there (`bench/solve_proto_*.jl`, `bench/solve_nd.jl`, `bench/final_sweep.jl`): per-front `L₁₁` inverses (the partitioned-inverse idea of plan row 6) turn every TRSV into a GEMV; one fused dependency-counter kernel per direction covers every front of width ≤ 256 and the vendor path only the root; the whole solve is two custom kernels, the root and two permutes. The ordering is a precondition: under the default METIS ND the schedule has 65 levels and the prototype reads 6.35 ms; under cuDSS's reordering (imported with `bench/get_cudss_perm.jl`) or SDS's own ND (`reordering_alg = "algo4"`, `bench/order_search.jl`) it has 29–30 levels and reads 3.5–3.6 ms. The default chooser picks AMD here because its cost model scores column-etree depth, which does not predict the supernodal schedule depth (#108). An amalgamation sweep only regresses the solve (8.7–28 ms), and on lap3d_40 and apache2 the same solve regresses, so T25 has to pick the strategy per schedule.
+
+How the factorization got there (`bench/fact_split.jl`, `bench/fact_fused.jl`), each step on top of the previous one:
+
+| step | refactorization |
+| --- | --- |
+| stock, METIS, defaults | 167.7 ms |
+| + ND ordering | 138.8 ms |
+| + `regime_c_rows = 256`, `subtree_parallelism = 16384` | 72.7 ms |
+| + split kernels (tiled syrk, chunked trsm for m > 64; bit-identical, no atomics) | 64.0 ms |
+| + C fronts split: multi-block assembly kernels, split factor kernels, vendor only for w > 64; `regime_c_rows = 64`; longest-first subtree launches | 40.6 ms |
+| + segmented dependency-counter kernel over the levels (private contribution blocks) | 33.5 ms |
+| + native ND (`algo4`) instead of the imported cuDSS permutation | 33.1 ms |
+| + `subtree_budgets = [16384]` (the 48 KiB class capped the subtree kernel at one block per SM) | **31.9 ms** |
+| cuDSS | 24.3 ms |
+
+Findings worth more than the numbers:
+
+- **The update stack assumes level-synchronous lifetimes** (#109). Dependency counters, streams and persistent kernels clobber live contribution blocks and fail as mid-column pivot errors far from the cause; the prototype gives every non-subtree front a private block (0.14 GB against the 34 MB reusing stack on this matrix). This is the memory price of experiment 5 until placement computes lifetimes on the execution order it is paired with.
+- **Full overlap deadlocks; the segmented form is safe.** Counters spanning the whole tree hang when the resident workgroups all wait on children that are not yet scheduled; one kernel per segment of levels keeps forward progress and most of the gain.
+- **Regime C is the inverse of regime B**: the vendor dense path costs about eight API launches per tall-narrow front, while its multi-block assembly kernels are the efficient part; the fused regime-B kernel has cheap assembly but serializes the factor math (its syrk alone was ~12 ms, the tiled replacement 1.2 ms, bit-identical). The split takes the best half of each. The width boundary 64 is right; `regime_c_rows` matters as much as the width.
+- **Negative results**: CUDA-graph replay of the ~1600-launch sequence is bit-identical and timing-neutral at every stage (the time is kernel-busy, not launch gaps); a tiled extend-add is neutral (~10 ms of scatter bandwidth is a floor); subtree classes on concurrent streams are neutral and break graph capture; `subtree_max_fronts` is neutral here (~3,300 subtrees hide the 188-front serial walk inside the occupancy waves; kept as an instrument for devices with more SMs); Float32 factorization runs 18% faster but κ ≈ 1e14 makes the factor unusable, with or without Jacobi scaling, and δ-regularization fails even in FP64 (relres 2.1), matching cuDSS's documented FP32 failures on condensed dumps.
+- **Remaining buckets** at 31.9 ms: subtrees ~8 ms, panel ~8, wide-root vendor ~8, extend-add ~9. All are in-src work: persistent or merged kernels for the subtree and panel buckets, batched processing of the wide fronts, and the scatter floor.
+- **The knobs are phase-coupled**: `regime_c_rows = 64` is right for the prototype factorization but puts ~300 fronts on the stock solve's per-front vendor path (215 ms per backsolve, a 6× end-to-end regression); 256 balances the stock phases. Once both phases run the prototype kernels the conflict disappears.
+- **`_factor_panel_c!` reportedly host-synchronizes per front** through its `info` check (#110); unverified in the thread, so it is an issue to measure, not a finding.
+
+**MadNLP end-to-end** (`bench/e2e/MadNLPSDS.jl`, a ~90-line `MadNLP.AbstractLinearSolver` over the public handle API, and `bench/e2e/SDSProto.jl`, which packages the prototype kernels for both vendors). Full interior-point runs on the 78k-bus ACOPF with `SparseCondensedKKTSystem`, tol 1e-6: identical 101 iterations, objective and inertia behaviour in every configuration.
+
+| | wall | analysis | iteration loop |
+| --- | --- | --- | --- |
+| cuDSS / GV100 | 16.9 s | 7.1 s | 9.8 s |
+| SDS stock / GV100 | 38.8 s | 12.7 s | 26.1 s |
+| SDS prototype / GV100 | 25.5 s | | **11.7 s** |
+| SDS stock / Radeon VII | 72.8 s | 9.6 s | 63.2 s |
+| SDS prototype / Radeon VII | 43.6 s | | **33.9 s** |
+
+The loop arithmetic closes (193 factorizations × ~36 ms + 202 solves × ~4 ms + wrapper synchronization ≈ 11.7 s): the remaining GV100 distance is the 31.9 vs 24.3 ms factorization gap plus the per-call synchronization of the wrapper, which an in-src integration does asynchronously. The analysis is 1.8× cuDSS with METIS (12 s) and 3.6 s under `user_perm`, so a cached or faster ordering (plan row 10) is worth as much as the numeric phases over a run. The AMD column is the first GPU-resident sparse direct ACOPF interior-point run on AMD hardware known to us; the full test suite on the AMD runner passes 29,724 of 29,898 tests without the AMDGPU extension, every failure being a missing ROC constructor forwarder (T23).
+
+**Criteria.** Experiment 6 (solve ≤ cuDSS): met in the prototype on this matrix, not on all harness matrices, and not in `src/`. Experiment 5 (≥ 3× fewer launches, refactor+solve faster than cuDSS for n ≤ 1e5): launches reduced far beyond 3× in the prototype, the time criterion not met (1.31× on this matrix, and n is 6.7e5); graph replay, the lever the row names, is neutral. Experiment 4 (iterations within ±2, same objective): met for the condensed system; K2 with LDLᵀ not run.
+
+**Revised priority.** The ordering comes first: it is a third of the remaining solve gap, a precondition for the fused solve, and the fix (#108: score the supernodal schedule depth, or prefer ND on GPU backends) is host code. Then experiment 6 in `src/`, then experiment 5 with #109 solved by placement, then the factorization buckets above. The T25 owner note in `TASKS.md` orders the deliverables.
+
 ## Recommendations: Prioritized Experiment Plan
 
 | # | Experiment | Payoff | Effort | Key measurement | Success criterion |
@@ -231,9 +288,9 @@ LDLᵀ refactorization, `main` → step 3:
 | 1 | **Parallel BK/APTP pivot search** in regimes B/C (warp/workgroup argmax, F₁₁ in local memory, blocked a-posteriori check) | Very high | Med | LDLᵀ refactor time vs SDS Cholesky on the same pattern; nperturbed, inertia vs reference | LDLᵀ within 1.5× of SDS Cholesky flops-time; inertia unchanged on all K2 dumps |
 | 2 | **Regime-C LDLᵀ via vendor BLAS**: KA pivoting of an F₁₁ panel (nb = 32–64), then cuBLAS trsm + gemm (L·D·Lᵀ update) for F₂₁/F₂₂; multi-workgroup per root front | Very high | Med | achieved TFLOP/s on fronts > 256; share of factor time in root fronts | ≥ 50% of cuBLAS DGEMM peak on fronts > 512; "C only" faster than reference on CPU and ≥ 5× on GPU |
 | 3 | **Matching + scaling (T21)**: MC64 max-product symmetric scaling cached per pattern; device Ruiz equilibration per iteration as a cheap variant | Very high (accuracy) | Med | max\|L\|, factor error, nperturbed, relres after 0/2/5 IR on case1354 K2 | relres ≤ cuDSS algo5 (≤ 4e-7) with ≤ 5 IR steps; nperturbed ≤ cuDSS's 0–14 [github](https://github.com/exanauts/SparseDirectSolver.jl/pull/73) |
-| 4 | **MadNLP end-to-end** (#28) on pglib via ExaModelsPower: K2 with SDS-LDLᵀ vs cuDSS-LDLᵀ, plus condensed/Lifted with SDS-Cholesky vs cuDSS-Cholesky | Essential | Low–Med | IPM iterations, inertia-correction count, time per iteration split (factor/solve/other) | iterations within ±2 of cuDSS, same objective to 1e-6 (the #28 criterion); [github](https://github.com/exanauts/SparseDirectSolver.jl/issues/28) fewer inertia corrections thanks to 2×2 pivots |
-| 5 | **Launch minimization**: level merging into persistent kernels with atomic dependency counters (regimes A/B); one graph for refactor+solve+IR, replayed via a cached exec (not `@captured`) | High at small/medium n | Med | launches/refactor, CPU-side time, GPU idle gaps (Nsight timeline) | ≥ 3× fewer launches; refactor+solve faster than cuDSS for n ≤ 1e5 |
-| 6 | **Solve path**: partitioned-inverse diagonal blocks (`solve_alg="algo1"`), batched GEMV for small supernodes, sync-free forward sweep; fused permute/scale/IR residual kernels | High | Med | solve latency (1 RHS and 2–6 RHS), backward error | solve ≤ cuDSS solve on all harness matrices; backward error unchanged within 10× |
+| 4 | **MadNLP end-to-end** (#28) on pglib via ExaModelsPower: K2 with SDS-LDLᵀ vs cuDSS-LDLᵀ, plus condensed/Lifted with SDS-Cholesky vs cuDSS-Cholesky. *Condensed part done in PR #107 (`bench/e2e/`, identical iterations on CUDA and AMD); K2 with LDLᵀ and the MadNLP task remain* | Essential | Low–Med | IPM iterations, inertia-correction count, time per iteration split (factor/solve/other) | iterations within ±2 of cuDSS, same objective to 1e-6 (the #28 criterion); [github](https://github.com/exanauts/SparseDirectSolver.jl/issues/28) fewer inertia corrections thanks to 2×2 pivots |
+| 5 | **Launch minimization**: level merging into persistent kernels with atomic dependency counters (regimes A/B); one graph for refactor+solve+IR, replayed via a cached exec (not `@captured`). *Prototyped in PR #107: segmented counters and split kernels reach 1.31× cuDSS; graph replay is neutral; needs #109; in-src adoption is T25* | High at small/medium n | Med | launches/refactor, CPU-side time, GPU idle gaps (Nsight timeline) | ≥ 3× fewer launches; refactor+solve faster than cuDSS for n ≤ 1e5 |
+| 6 | **Solve path**: partitioned-inverse diagonal blocks (`solve_alg="algo1"`), batched GEMV for small supernodes, sync-free forward sweep; fused permute/scale/IR residual kernels. *Prototyped in PR #107: criterion met on the 78k-bus condensed KKT (3.5 vs 3.8 ms), needs the ND ordering (#108); in-src adoption is T25* | High | Med | solve latency (1 RHS and 2–6 RHS), backward error | solve ≤ cuDSS solve on all harness matrices; backward error unchanged within 10× |
 | 7 | **Amalgamation and bin tuning**: sweep (max_width, zero_fraction, min_width), regime thresholds, local-memory budgets; size-sorted regime-A subtrees | Med | Low | flops vs time Pareto; stack memory/nnz(L) | 10–30% factor-time gain without > 15% nnz(L) growth |
 | 8 | **Mixed precision**: FP32 factor + FGMRES-IR (T18 first); enable by IPM phase or by condensed SPD | Med | Med | IR iterations, time to 1e-10 relres, failures near convergence | ≥ 1.3× factor speedup with no change in IPM iteration count |
 | 9 | **Uniform batching** (T17) for multi-scenario/MPC: shared symbolic, batched fronts across instances | Med–High for batch workloads | Med | throughput vs cuDSS uniform batch | ≥ cuDSS batch throughput |

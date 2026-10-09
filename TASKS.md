@@ -2859,6 +2859,16 @@ LDS 64 KiB; the CUDA CI runner compiled and ran a 64 KiB instance in run
 timing table of T11) is measured by the owner separately; #60 closes when both
 are done.
 
+**Owner note (PR #107)**: the `amdgpu` leg of `ci.yml` already runs the suite
+on AMD hardware (continue-on-error): 29 724 pass, 174 fail or error, all from
+the missing `DirectSolver(::ROCSparseMatrixCSR)`, `CSR(::ROCSparse…)` and
+`cholesky(::ROCSparseMatrixCSR)` forwarders. The AMDGPU extension's required
+core is therefore that constructor surface; the rocBLAS/rocSOLVER bindings are
+the second half (the KA fallbacks carried the dense path). Promote the leg to
+a required check when it is green. `bench/amd_proto.jl` shows the three shims
+the prototypes needed on ROCm (`ROCArray`, the raw-array constructor, a device
+fence through `Threads.atomic_fence`).
+
 Written by analogy with the CUDA extension (sparse adapters, vendor dense
 bindings, capability probes). Test on this machine: a temporary environment
 that adds AMDGPU and oneAPI and precompiles the extensions (no hardware
@@ -2870,7 +2880,42 @@ needed to load them on Linux); Metal only by review. Mark both as untested.
 encoding; test: importing the exported tree reproduces the same supernode
 partition and `nnz_L`.
 
+**Owner note (PR #107)**: the ordering study found that SDS's own ND
+(`reordering_alg = "algo4"`) matches the imported cuDSS ordering on the
+78k-bus KKT (schedule depth 29 vs 30), so the tree import is a compatibility
+feature, not a performance one. The ordering cache (analysis under a stored
+permutation ran in 3.6 s against 12 s for a fresh METIS analysis) is the part
+MadNLP benefits from.
+
 ### T25 — Performance pass   `[ ]`
+
+**Owner note (PR #107, issues #82, #108, #109, #110)**: experiments 5 and 6
+exist as bench-level prototypes measured on a Quadro GV100 against the 78k-bus
+pglib condensed KKT (`bench/solve_proto_*.jl`, `bench/fact_split.jl`,
+`bench/fact_fused.jl`, `bench/e2e/SDSProto.jl`): solve 18 → 3.5 ms (cuDSS
+3.8), refactorization 168 → 31.9 ms (cuDSS 24.3), per IPM iteration 185 → 35 ms
+(cuDSS 28), all cuDSS-free. The deliverables of this task follow from them, in
+this order: (1) the ordering chooser scores supernodal schedule depth, or GPU
+backends default to ND (#108; worth 2× schedule depth and 36% on the solve);
+(2) `solve_alg = "algo1"` as the partitioned-inverse solve with per-front
+`L₁₁` inverses and one fused dependency-counter kernel per direction for fronts
+of width ≤ 256, chosen per schedule (it regresses on lap3d_40 and apache2);
+(3) the split factorization: tiled 32×32 SYRK and chunked TRSM as separate
+many-block kernels for fronts with `m > 64`, the regime-C fronts narrower than
+64 through the same split kernels batched per level with the regular assembly
+kernels (vendor `potrf` only above width 64), longest-first regime-A launches;
+(4) the segmented fused factorization with dependency counters, segments split
+at the groups holding wide fronts (full overlap deadlocks, #109), which needs
+private contribution blocks or DAG-aware stack lifetimes (#109) and atomic
+extend-add of concurrent children; (5) an asynchronous vendor `potrf` whose
+`info` stays on the device if #110 is confirmed; (6) `subtree_budgets` default
+reconsidered for occupancy (16 KiB beat 48 KiB there) and `regime_c_rows` tuned
+per phase, since the knobs are phase-coupled (64 is right for the prototype
+factorization, 256 for the stock solve). Negative results to keep: CUDA-graph
+replay is neutral above n ≈ 5e4 (kernel-busy), tiled extend-add is at its
+scatter-bandwidth floor, packed-triangle iteration inside element loops loses,
+amalgamation changes regress, a 96-wide local-memory class loses to vendor
+`potrf`. `bench/e2e/MadNLPSDS.jl` is the end-to-end check.
 
 **Owner note (issue #75)**: the device LDLᵀ of T15 follows the reference
 pivot for pivot and pays for it in three places that are deliverables here:
@@ -2915,3 +2960,15 @@ Add a `SparseDirectSolver`-backed `AbstractLinearSolver` next to
 `CUDSSSolver` (after T15; batch support after T17); test: a pglib case solves
 with the same iteration count ±2 as with cuDSS and the same final objective
 to `1e-6`.
+
+**Owner note (PR #107)**: `bench/e2e/MadNLPSDS.jl` is a working prototype of
+this interface over the public handle API (device CSC read as the CSR of the
+upper triangle with view `'U'`, as `CUDSSSolver` does; values aliased with an
+`update!` fallback; Cholesky `info` mapped to inertia), backend-agnostic, run
+on the 78k-bus ACOPF with `SparseCondensedKKTSystem` on CUDA and AMD with the
+same 101 iterations and objective as cuDSS. Start from it. Known points: set
+`reordering_alg = "algo4"` (#108); the tuning knobs are phase-coupled
+(`regime_c_rows = 256` balances the stock factorization and solve); the 2×2
+pivot pairs of `"S"` are chosen from the values present at analysis, so
+analyse after the first KKT assembly; the per-call synchronization of the
+wrapper (`asynchronous = false`) is part of the measured gap.
