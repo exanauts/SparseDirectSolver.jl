@@ -62,12 +62,11 @@ end
         if j <= w && st[1] == 0
             li == 1 && (L11[_packed(j, j, W)] = sqrt(real(L11[_packed(j, j, W)])))
             r = w - j
-            for q in (li - 1):WG:(r * r - 1)
-                k = j + 1 + q ÷ r
-                i = j + 1 + q % r
-                if i >= k
-                    L11[_packed(i, k, W)] -= L11[_packed(i, j, W)] * conj(L11[_packed(k, j, W)])
-                end
+            for q in (li - 1):WG:(r * (r + 1) ÷ 2 - 1)
+                a, b = _tri_decode(q, r)
+                i = j + a
+                k = j + b
+                L11[_packed(i, k, W)] -= L11[_packed(i, j, W)] * conj(L11[_packed(k, j, W)])
             end
         end
     end

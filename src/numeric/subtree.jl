@@ -170,12 +170,11 @@ end
             lf = ctl[_ST_LF] - 1
             li == 1 && (buf[lf + _packed(j, j, f)] = sqrt(real(buf[lf + _packed(j, j, f)])))
             r = f - j
-            for q in (li - 1):WG:(r * r - 1)
-                k = j + 1 + q ÷ r
-                i = j + 1 + q % r
-                if i >= k
-                    buf[lf + _packed(i, k, f)] -= buf[lf + _packed(i, j, f)] * conj(buf[lf + _packed(k, j, f)])
-                end
+            for q in (li - 1):WG:(r * (r + 1) ÷ 2 - 1)
+                a, b = _tri_decode(q, r)
+                i = j + a
+                k = j + b
+                buf[lf + _packed(i, k, f)] -= buf[lf + _packed(i, j, f)] * conj(buf[lf + _packed(k, j, f)])
             end
         end
     end
