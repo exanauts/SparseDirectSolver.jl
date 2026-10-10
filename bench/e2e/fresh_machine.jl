@@ -12,7 +12,7 @@ import Pkg
 const BACKEND = get(ENV, "SDS_BACKEND", Sys.which("nvidia-smi") === nothing ? "amdgpu" : "cuda")
 Pkg.activate(joinpath(homedir(), ".sds-fresh-" * BACKEND))
 Pkg.add(["MadNLP", "MadNLPGPU", "ExaModels", "ExaModelsPower", "Metis"])
-Pkg.add(BACKEND == "cuda" ? ["CUDA"] : ["AMDGPU"])
+Pkg.add(BACKEND == "cuda" ? ["CUDA", "CUDSS"] : ["AMDGPU"])
 # SDS as a proper dev checkout (editable, canonical path), not a frozen Pkg.add
 const SDS_DEV = joinpath(homedir(), ".julia", "dev", "SparseDirectSolver")
 isdir(SDS_DEV) ||
@@ -23,8 +23,8 @@ Pkg.instantiate()
 using SparseDirectSolver, MadNLP, MadNLPGPU, ExaModels, ExaModelsPower
 using Metis
 if BACKEND == "cuda"
-    using CUDA
-else
+    using CUDA, CUDSS      # CUDSS must be LOADED: MadNLPGPU's CUDA extension (the GPU
+else                       # condensed-KKT constructors) activates only with it present
     using AMDGPU
 end
 
