@@ -35,9 +35,16 @@ Pkg.add(BACKEND == "cuda" ? ["CUDA", "CUDSS"] : ["AMDGPU"])
 const SDS_DEV = joinpath(homedir(), ".julia", "dev", "SparseDirectSolver")
 const SDS_REF = "custom-reordering"
 if isdir(SDS_DEV)
-    run(`git -C $SDS_DEV fetch origin $SDS_REF`)
-    run(`git -C $SDS_DEV checkout $SDS_REF`)
-    run(`git -C $SDS_DEV merge --ff-only FETCH_HEAD`)
+    # the checkout may be shared (NFS home) with a concurrent run: retry once on
+    # git lock contention, then proceed on the existing tree with a warning
+    ok = success(`git -C $SDS_DEV fetch origin $SDS_REF`) ||
+         (sleep(5); success(`git -C $SDS_DEV fetch origin $SDS_REF`))
+    if ok
+        run(`git -C $SDS_DEV checkout $SDS_REF`)
+        run(`git -C $SDS_DEV merge --ff-only FETCH_HEAD`)
+    else
+        @warn "could not update $SDS_DEV (concurrent run?); continuing on the existing checkout"
+    end
 else
     run(`git clone --branch $SDS_REF https://github.com/exanauts/SparseDirectSolver.jl $SDS_DEV`)
 end
