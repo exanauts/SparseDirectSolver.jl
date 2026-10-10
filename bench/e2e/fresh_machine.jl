@@ -1,6 +1,7 @@
 # MadNLP + SparseDirectSolver workflow on a fresh GPU machine, one file:
 #
-#   julia +1.13 fresh_machine.jl          (or:  julia +1.13 -i fresh_machine.jl)
+#   julia +1.13 --startup-file=no fresh_machine.jl
+#   julia +1.13 --startup-file=no -i fresh_machine.jl          (drop into a REPL after)
 #
 # Installs everything into its own environment (~/.sds-fresh-<backend>), downloads
 # the pglib case on first use, then solves the 78k-bus ACOPF with MadNLP on the
@@ -9,7 +10,18 @@
 # system ROCm installation.)
 
 import Pkg
-const BACKEND = get(ENV, "SDS_BACKEND", Sys.which("nvidia-smi") === nothing ? "amdgpu" : "cuda")
+# vendor detection must RUN the tool, not just find it: cluster nodes often have
+# nvidia-smi on PATH without an NVIDIA driver (and vice versa)
+_works(cmd) = try
+    success(pipeline(cmd; stdout = devnull, stderr = devnull))
+catch
+    false
+end
+const BACKEND = get(ENV, "SDS_BACKEND") do
+    _works(`nvidia-smi -L`) ? "cuda" :
+    (_works(`rocm-smi`) || _works(`rocminfo`)) ? "amdgpu" :
+    error("no working GPU tool found (nvidia-smi / rocm-smi); set SDS_BACKEND=cuda|amdgpu")
+end
 Pkg.activate(joinpath(homedir(), ".sds-fresh-" * BACKEND))
 Pkg.add(["MadNLP", "MadNLPGPU", "ExaModels", "ExaModelsPower", "Metis"])
 Pkg.add(BACKEND == "cuda" ? ["CUDA", "CUDSS"] : ["AMDGPU"])
