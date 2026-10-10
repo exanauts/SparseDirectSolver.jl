@@ -208,7 +208,7 @@ end
         P = SDS.SymmetricPattern(SDS.CSR(A), "S"; view = 'F')
         G = SparseMatrixCSC(P)
         amd = Vector{Int}(first(SDS.CliqueTrees.permutation(G; alg = SDS.CliqueTrees.AMD())))
-        nd = Vector{Int}(first(SDS.CliqueTrees.permutation(G; alg = SDS.ND_PROVIDER[](10, -1))))
+        nd = Vector{Int}(first(SDS.CliqueTrees.permutation(G; alg = SDS.ND_PROVIDER[](10, -1, -1))))
         for (s, ref) in (("algo1", amd), ("algo2", amd), ("algo3", amd), ("algo4", nd))
             ord = SDS.compute_ordering(P, Options(reordering_alg = s))
             @test ord.perm == ref
