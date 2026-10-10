@@ -49,6 +49,7 @@ include("symbolic/pairs.jl")
 include("symbolic/supernodes.jl")
 include("symbolic/schedule.jl")
 include("symbolic/layout.jl")
+include("symbolic/device.jl")
 include("symbolic/maps.jl")
 
 # matching and scaling (PLAN §1.3, milestone M9), host
