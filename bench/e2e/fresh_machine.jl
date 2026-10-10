@@ -38,8 +38,7 @@ println("device: ", BACKEND == "cuda" ? CUDA.name(CUDA.device()) : string(AMDGPU
 m, _ = ac_opf_model("pglib_opf_case78484_epigrids.m";
                     backend = BACKEND == "cuda" ? CUDABackend() : ROCBackend())
 
+# SparseCondensedKKTSystem is required (the SPD Cholesky path); MadNLP defaults
+# equality/fixed-variable treatment correctly for it. tol: condensed default is 1e-4.
 sol = madnlp(m; linear_solver = SDSProtoSolver,
-             kkt_system = MadNLP.SparseCondensedKKTSystem,
-             equality_treatment = MadNLP.RelaxEquality,
-             fixed_variable_treatment = MadNLP.RelaxBound,
-             tol = 1e-6)
+             kkt_system = MadNLP.SparseCondensedKKTSystem, tol = 1e-6)
