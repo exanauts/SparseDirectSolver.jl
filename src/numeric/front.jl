@@ -55,7 +55,7 @@ end
 end
 
 # column j, second half: rank-1 update of the trailing block with the scaled column
-# (multiply-add only; the divisions live in the first half as one reciprocal)
+# (multiply-add only; the packed-triangle enumeration replaces the guarded square)
 @inline function _front_chol_scale!(L11, st, piv, j, s, li, front_ncols, ::Val{W}, ::Val{WG}) where {W, WG}
     @inbounds begin
         w = front_ncols[s]
