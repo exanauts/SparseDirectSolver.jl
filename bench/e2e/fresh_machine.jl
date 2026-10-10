@@ -13,10 +13,17 @@ const BACKEND = get(ENV, "SDS_BACKEND", Sys.which("nvidia-smi") === nothing ? "a
 Pkg.activate(joinpath(homedir(), ".sds-fresh-" * BACKEND))
 Pkg.add(["MadNLP", "MadNLPGPU", "ExaModels", "ExaModelsPower", "Metis"])
 Pkg.add(BACKEND == "cuda" ? ["CUDA", "CUDSS"] : ["AMDGPU"])
-# SDS as a proper dev checkout (editable, canonical path), not a frozen Pkg.add
+# SDS as a proper dev checkout (editable, canonical path), not a frozen Pkg.add;
+# an existing checkout is updated to the branch head (local edits block the pull loudly)
 const SDS_DEV = joinpath(homedir(), ".julia", "dev", "SparseDirectSolver")
-isdir(SDS_DEV) ||
-    run(`git clone --branch divfree-chol https://github.com/exanauts/SparseDirectSolver.jl $SDS_DEV`)
+const SDS_REF = "divfree-chol"
+if isdir(SDS_DEV)
+    run(`git -C $SDS_DEV fetch origin $SDS_REF`)
+    run(`git -C $SDS_DEV checkout $SDS_REF`)
+    run(`git -C $SDS_DEV merge --ff-only FETCH_HEAD`)
+else
+    run(`git clone --branch $SDS_REF https://github.com/exanauts/SparseDirectSolver.jl $SDS_DEV`)
+end
 Pkg.develop(path = SDS_DEV)
 Pkg.instantiate()
 
