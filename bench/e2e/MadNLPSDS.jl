@@ -112,74 +112,11 @@ function _save_perm(cf, s)
     return nothing
 end
 
-mutable struct SDSSolver{T} <: MadNLP.AbstractLinearSolver{T}
-    inner::Any                                 # SDS.DirectSolver (type elided: backend-parametric)
-    tril::Any                                  # the device CSC whose nzVal MadNLP updates in place
-    x::Any
-    b::Any
-    factorized_once::Bool
-    last_info::Int
-    opt::SDSSolverOptions
-    logger::MadNLP.MadNLPLogger
-end
-
-function SDSSolver(
-        csc;
-        opt = SDSSolverOptions(),
-        logger = MadNLP.MadNLPLogger(),
-    )
-    T = eltype(csc.nzVal)
-    n = size(csc, 1)
-    s = SDS.DirectSolver(csc.colPtr, csc.rowVal, csc.nzVal, "SPD", 'U')
-    t = _resolve(something(opt.sds_tuning, default_tuning(KA.get_backend(csc.nzVal))),
-                 KA.get_backend(csc.nzVal))
-    s.options.regime_c_width = t.regime_c_width
-    s.options.regime_c_rows = max(t.regime_c_rows, 256)   # stock solve path wants rows >= 256
-    s.options.subtree_parallelism = t.subtree_parallelism
-    s.options.subtree_budgets = copy(t.subtree_budgets)
-    cf = _apply_reordering!(s, opt, t, csc)
-    x = similar(csc.nzVal, n)
-    b = similar(csc.nzVal, n)
-    SDS.execute!("analysis", s, x, b; asynchronous = false)
-    _save_perm(cf, s)
-    return SDSSolver{T}(s, csc, x, b, false, 0, opt, logger)
-end
-
-function MadNLP.factorize!(M::SDSSolver)
-    M.inner.A.nzval === M.tril.nzVal ||
-        SDS.update!(M.inner, M.tril.colPtr, M.tril.rowVal, M.tril.nzVal)
-    phase = M.factorized_once ? "refactorization" : "factorization"
-    SDS.execute!(phase, M.inner, M.x, M.b; asynchronous = false)
-    M.factorized_once = true
-    M.last_info = Int(SDS.getparam(M.inner, "info"))
-    return M
-end
-
-function MadNLP.solve_linear_system!(M::SDSSolver{T}, xb) where {T}
-    copyto!(M.b, xb)
-    SDS.execute!("solve", M.inner, M.x, M.b; asynchronous = false)
-    copyto!(xb, M.x)
-    return xb
-end
-
-# older MadNLP spellings route to the same implementation
-MadNLP.solve!(M::SDSSolver, xb::AbstractVector) = MadNLP.solve_linear_system!(M, xb)
-
-MadNLP.input_type(::Type{SDSSolver}) = :csc
-MadNLP.default_options(::Type{SDSSolver}) = SDSSolverOptions()
-MadNLP.is_inertia(::SDSSolver) = true
-function MadNLP.inertia(M::SDSSolver)
-    n = size(M.tril, 1)
-    return M.last_info == 0 ? (n, 0, 0) : (n - 2, 1, 1)
-end
-MadNLP.improve!(::SDSSolver) = false
-MadNLP.introduce(::SDSSolver) = "SparseDirectSolver.jl"
-MadNLP.is_supported(::Type{SDSSolver}, ::Type{Float32}) = true
-MadNLP.is_supported(::Type{SDSSolver}, ::Type{Float64}) = true
-
 # ---------------------------------------------------------------------------
-# prototype-kernel wrapper: fused factorization + algo1/fused solve (PR #107)
-mutable struct SDSProtoSolver{T} <: MadNLP.AbstractLinearSolver{T}
+# THE solver: fused factorization + partitioned-inverse/fused solve (PR #107 kernels,
+# October 2026 per-architecture tuning; the stock-library wrapper was retired after
+# the fused path won on every platform — see bench/PERFORMANCE-2026-10.md)
+mutable struct SDSSolver{T} <: MadNLP.AbstractLinearSolver{T}
     inner::Any
     tril::Any
     x::Any
@@ -195,7 +132,7 @@ mutable struct SDSProtoSolver{T} <: MadNLP.AbstractLinearSolver{T}
     logger::MadNLP.MadNLPLogger
 end
 
-function SDSProtoSolver(
+function SDSSolver(
         csc;
         opt = SDSSolverOptions(),
         logger = MadNLP.MadNLPLogger(),
@@ -239,18 +176,18 @@ function SDSProtoSolver(
     fz1 = SDSProto.build_fused(s; kstart = 1, wcap = 256)
     segs = [(fz1, 64)]
     fz = (segs, true)
-    M = SDSProtoSolver{T}(s, csc, x, b, nzval, fp, fz, inv11, inv_ptr, invertf, 0, opt, logger)
+    M = SDSSolver{T}(s, csc, x, b, nzval, fp, fz, inv11, inv_ptr, invertf, 0, opt, logger)
     MadNLP.factorize!(M)                       # prime the fused path once
     return M
 end
 
-function MadNLP.factorize!(M::SDSProtoSolver)
+function MadNLP.factorize!(M::SDSSolver)
     M.last_info = Int(SDSProto.refact_fused!(M.inner, M.nzval, M.fp))
     M.invert!()
     return M
 end
 
-function MadNLP.solve_linear_system!(M::SDSProtoSolver{T}, xb) where {T}
+function MadNLP.solve_linear_system!(M::SDSSolver{T}, xb) where {T}
     copyto!(M.b, xb)
     SDSProto.algo2_solve!(M.x, M.inner, M.b, M.inv11, M.inv_ptr, M.fz)
     copyto!(xb, M.x)
@@ -258,18 +195,20 @@ function MadNLP.solve_linear_system!(M::SDSProtoSolver{T}, xb) where {T}
     return xb
 end
 
-MadNLP.solve!(M::SDSProtoSolver, xb::AbstractVector) = MadNLP.solve_linear_system!(M, xb)
-MadNLP.input_type(::Type{SDSProtoSolver}) = :csc
-MadNLP.default_options(::Type{SDSProtoSolver}) = SDSSolverOptions()
-MadNLP.is_inertia(::SDSProtoSolver) = true
-function MadNLP.inertia(M::SDSProtoSolver)
+MadNLP.solve!(M::SDSSolver, xb::AbstractVector) = MadNLP.solve_linear_system!(M, xb)
+MadNLP.input_type(::Type{SDSSolver}) = :csc
+MadNLP.default_options(::Type{SDSSolver}) = SDSSolverOptions()
+MadNLP.is_inertia(::SDSSolver) = true
+function MadNLP.inertia(M::SDSSolver)
     n = size(M.tril, 1)
     return M.last_info == 0 ? (n, 0, 0) : (n - 2, 1, 1)
 end
-MadNLP.improve!(::SDSProtoSolver) = false
-MadNLP.introduce(::SDSProtoSolver) = "SparseDirectSolver.jl (PR #107 prototype kernels)"
-MadNLP.is_supported(::Type{SDSProtoSolver}, ::Type{Float32}) = true
-MadNLP.is_supported(::Type{SDSProtoSolver}, ::Type{Float64}) = true
+MadNLP.improve!(::SDSSolver) = false
+MadNLP.introduce(::SDSSolver) = "SparseDirectSolver.jl (PR #107 prototype kernels)"
+MadNLP.is_supported(::Type{SDSSolver}, ::Type{Float32}) = true
+MadNLP.is_supported(::Type{SDSSolver}, ::Type{Float64}) = true
+
+const SDSProtoSolver = SDSSolver     # the former name; the prototype is the solver now
 
 export SDSSolver, SDSSolverOptions, SDSProtoSolver
 
