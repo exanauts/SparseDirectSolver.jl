@@ -28,20 +28,52 @@ Base.@kwdef mutable struct SDSSolverOptions <: MadNLP.AbstractOptions
     sds_nd_seed::Int = 3
     sds_amalgamation::NamedTuple = (max_width = 48, zero_fraction = 0.25, min_width = 8)
     sds_user_perm::Union{Nothing, Vector{Int}} = nothing
+    # on-disk permutation cache: the tuned METIS ordering costs ~2x the default
+    # (tens of seconds at this size), so the computed permutation is cached keyed
+    # by the matrix pattern + ordering knobs and reloaded on any later solver
+    # construction with the same structure ("" disables)
+    sds_perm_cache::String = joinpath(homedir(), ".julia", "sds_perm_cache")
+end
+
+function _perm_cache_file(opt::SDSSolverOptions, csc)
+    (opt.sds_perm_cache == "" || opt.sds_user_perm !== nothing) && return nothing
+    n = size(csc, 1)
+    h = hash((n, length(csc.rowVal), hash(Array(csc.colPtr)), hash(Array(csc.rowVal)),
+              opt.sds_reordering, opt.sds_nd_nseps, opt.sds_nd_seed))
+    return joinpath(opt.sds_perm_cache, "perm-" * string(h, base = 16) * ".bin")
 end
 
 # shared solver construction knobs: the custom reordering (nd knobs or a user
 # permutation) and the amalgamation, applied before the analysis
-function _apply_reordering!(s, opt::SDSSolverOptions)
+# returns the cache file to WRITE after the analysis (nothing: no write needed)
+function _apply_reordering!(s, opt::SDSSolverOptions, csc)
     s.options.amalgamation = opt.sds_amalgamation
     if opt.sds_user_perm !== nothing
         SDS.setparam!(s, "user_perm", opt.sds_user_perm)
-    else
-        SDS.setparam!(s, "reordering_alg", opt.sds_reordering)
-        SDS.setparam!(s, "nd_nseps", opt.sds_nd_nseps)
-        SDS.setparam!(s, "nd_seed", opt.sds_nd_seed)
+        return nothing
     end
-    return s
+    cf = _perm_cache_file(opt, csc)
+    if cf !== nothing && isfile(cf)
+        n = size(csc, 1)
+        perm = Vector{Int32}(undef, n)
+        read!(cf, perm)
+        SDS.setparam!(s, "user_perm", Int.(perm))
+        return nothing
+    end
+    SDS.setparam!(s, "reordering_alg", opt.sds_reordering)
+    SDS.setparam!(s, "nd_nseps", opt.sds_nd_nseps)
+    SDS.setparam!(s, "nd_seed", opt.sds_nd_seed)
+    return cf
+end
+
+function _save_perm(cf, s)
+    cf === nothing && return nothing
+    perm = SDS.getparam(s, "perm_reorder_row")
+    mkpath(dirname(cf))
+    open(cf, "w") do io
+        write(io, Int32.(perm))
+    end
+    return nothing
 end
 
 mutable struct SDSSolver{T} <: MadNLP.AbstractLinearSolver{T}
@@ -67,10 +99,11 @@ function SDSSolver(
     s.options.regime_c_rows = opt.sds_regime_c_rows
     s.options.subtree_parallelism = opt.sds_subtree_parallelism
     s.options.subtree_budgets = copy(opt.sds_subtree_budgets)
-    _apply_reordering!(s, opt)
+    cf = _apply_reordering!(s, opt, csc)
     x = similar(csc.nzVal, n)
     b = similar(csc.nzVal, n)
     SDS.execute!("analysis", s, x, b; asynchronous = false)
+    _save_perm(cf, s)
     return SDSSolver{T}(s, csc, x, b, false, 0, opt, logger)
 end
 
@@ -138,10 +171,11 @@ function SDSProtoSolver(
     s.options.regime_c_rows = 64               # prototype kernels own BOTH phases: no coupling conflict
     s.options.subtree_parallelism = 16384
     s.options.subtree_budgets = [16384]
-    _apply_reordering!(s, opt)
+    cf = _apply_reordering!(s, opt, csc)
     x = similar(csc.nzVal, n)
     b = similar(csc.nzVal, n)
     SDS.execute!("analysis", s, x, b; asynchronous = false)
+    _save_perm(cf, s)
     SDS.execute!("factorization", s, x, b; asynchronous = false)
     SDS.execute!("solve", s, x, b; asynchronous = false)   # allocates the solve workspace
     nzval = SDS._factor_values(s)
