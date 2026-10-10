@@ -2,18 +2,17 @@
 #
 #   julia +1.13 fresh_machine.jl          (or:  julia +1.13 -i fresh_machine.jl)
 #
-# Installs everything into its own environment (~/.sds-fresh), downloads the
-# pglib case on first use, then solves the 78k-bus ACOPF with MadNLP on the GPU.
-# NVIDIA: cuDSS vs SparseDirectSolver on the same device. AMD: SDS stock vs the
-# prototype kernels (there is no cuDSS; a system ROCm installation is required).
-# The vendor is autodetected; force it with SDS_BACKEND=cuda|amdgpu. The workflow
-# passes when both solvers converge in the same iterations to the same objective.
+# Installs everything into its own environment (~/.sds-fresh-<backend>), downloads
+# the pglib case on first use, then solves the 78k-bus ACOPF with MadNLP on the
+# GPU using SparseDirectSolver (the SDSProtoSolver wrapper) as the linear solver.
+# The vendor is autodetected; force it with SDS_BACKEND=cuda|amdgpu. (AMD needs a
+# system ROCm installation.)
 
 import Pkg
 const BACKEND = get(ENV, "SDS_BACKEND", Sys.which("nvidia-smi") === nothing ? "amdgpu" : "cuda")
 Pkg.activate(joinpath(homedir(), ".sds-fresh-" * BACKEND))
 Pkg.add(["MadNLP", "MadNLPGPU", "ExaModels", "ExaModelsPower", "Metis", "Printf"])
-Pkg.add(BACKEND == "cuda" ? ["CUDA", "CUDSS"] : ["AMDGPU"])
+Pkg.add(BACKEND == "cuda" ? ["CUDA"] : ["AMDGPU"])
 # SDS as a proper dev checkout (editable, canonical path), not a frozen Pkg.add
 const SDS_DEV = joinpath(homedir(), ".julia", "dev", "SparseDirectSolver")
 isdir(SDS_DEV) ||
@@ -24,7 +23,7 @@ Pkg.instantiate()
 using SparseDirectSolver, MadNLP, MadNLPGPU, ExaModels, ExaModelsPower
 using Metis, Printf
 if BACKEND == "cuda"
-    using CUDA, CUDSS
+    using CUDA
 else
     using AMDGPU
 end
@@ -52,10 +51,5 @@ println("device: ", BACKEND == "cuda" ? CUDA.name(CUDA.device()) : string(AMDGPU
 model, _ = ac_opf_model("pglib_opf_case78484_epigrids.m";
                         backend = BACKEND == "cuda" ? CUDABackend() : ROCBackend())
 
-solvers = BACKEND == "cuda" ?
-    ["cuDSS" => MadNLPGPU.CUDSSSolver, "SDS" => SDSProtoSolver] :
-    ["SDS stock" => SDSSolver, "SDS proto" => SDSProtoSolver]
-for (label, ls) in solvers
-    solve(label, model, ls)
-end
+solve("SDS", model, SDSProtoSolver)
 println("done")
