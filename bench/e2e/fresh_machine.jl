@@ -17,8 +17,13 @@ _works(cmd) = try
 catch
     false
 end
+_has_nvidia_gpu() = try
+    occursin("GPU", read(`nvidia-smi -L`, String))   # exit 0 AND at least one device listed
+catch
+    false
+end
 const BACKEND = get(ENV, "SDS_BACKEND") do
-    _works(`nvidia-smi -L`) ? "cuda" :
+    _has_nvidia_gpu() ? "cuda" :
     (_works(`rocm-smi`) || _works(`rocminfo`)) ? "amdgpu" :
     error("no working GPU tool found (nvidia-smi / rocm-smi); set SDS_BACKEND=cuda|amdgpu")
 end
