@@ -953,7 +953,7 @@ end
             if li == 1
                 Threads.atomic_fence()
                 left = (Atomix.@atomic trsm_left[v] += Int32(-1))
-                if left == Int32(1) && tiles_left[v] == Int32(0)
+                if left == Int32(0) && tiles_left[v] == Int32(0)   # new-value semantics: 0 = last finisher
                     Atomix.@atomic cb_done[v] += Int32(1)
                     pv = Int(snparent[v])
                     pv > 0 && (Atomix.@atomic arrived[pv] += Int32(1))
@@ -1053,7 +1053,7 @@ end
             if li == 1
                 Threads.atomic_fence()
                 left = (Atomix.@atomic tiles_left[v] += Int32(-1))
-                if left == Int32(1)
+                if left == Int32(0)                  # Atomix += returns the NEW value: 0 = last finisher
                     Atomix.@atomic cb_done[v] += Int32(1)
                     pv = Int(snparent[v])
                     pv > 0 && (Atomix.@atomic arrived[pv] += Int32(1))
