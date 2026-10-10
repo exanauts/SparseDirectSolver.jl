@@ -17,15 +17,15 @@ _works(cmd) = try
 catch
     false
 end
-_has_nvidia_gpu() = try
-    occursin("GPU", read(`nvidia-smi -L`, String))   # exit 0 AND at least one device listed
-catch
-    false
-end
+# device files first: they answer correctly even when NVML/nvidia-smi is wedged
+# (driver updated under a loaded module — a real failure mode); tools as fallback
+_has_nvidia_gpu() = !isempty(filter(f -> occursin(r"^nvidia\d+$", f), readdir("/dev"))) ||
+    try occursin("GPU", read(`nvidia-smi -L`, String)) catch; false end
+_has_amd_gpu() = ispath("/dev/kfd") || _works(`rocm-smi`) || _works(`rocminfo`)
 const BACKEND = get(ENV, "SDS_BACKEND") do
     _has_nvidia_gpu() ? "cuda" :
-    (_works(`rocm-smi`) || _works(`rocminfo`)) ? "amdgpu" :
-    error("no working GPU tool found (nvidia-smi / rocm-smi); set SDS_BACKEND=cuda|amdgpu")
+    _has_amd_gpu() ? "amdgpu" :
+    error("no GPU found (/dev/nvidia*, /dev/kfd, nvidia-smi, rocm-smi all absent); set SDS_BACKEND=cuda|amdgpu")
 end
 Pkg.activate(joinpath(homedir(), ".sds-fresh-" * BACKEND))
 Pkg.add(["MadNLP", "MadNLPGPU", "ExaModels", "ExaModelsPower", "Metis"])
