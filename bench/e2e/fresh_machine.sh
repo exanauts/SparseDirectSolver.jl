@@ -6,7 +6,13 @@
 # (no cuDSS exists there). The vendor is auto-detected (nvidia-smi / rocm-smi), or
 # force it with SDS_BACKEND=cuda|amdgpu.
 #
-#   bash fresh_machine.sh
+# Everything is non-interactive (nothing reads the terminal), so the intended use
+# is detached from the login session (the suites + workflow run for an hour or more):
+#
+#   curl -fsSL https://raw.githubusercontent.com/exanauts/SparseDirectSolver.jl/divfree-chol/bench/e2e/fresh_machine.sh -o fresh_machine.sh
+#   nohup bash fresh_machine.sh > sds-fresh.log 2>&1 &     # then log out; tail -f sds-fresh.log
+#
+# or under Slurm:  sbatch -p <gpu-partition> --gres=gpu:1 -c 8 --mem=64G -t 120 --wrap "bash fresh_machine.sh"
 #
 # Knobs (env vars):
 #   SDS_BRANCH=divfree-chol   git ref to test (default: the division-free kernels PR)
@@ -20,6 +26,7 @@
 # by CUDA.jl/CUDSS.jl as artifacts, nothing to install. AMD: a system ROCm
 # installation is required (AMDGPU.jl uses the system ROCm, it is not an artifact).
 set -euo pipefail
+exec < /dev/null                     # never read the terminal: safe to detach
 
 SDS_BRANCH="${SDS_BRANCH:-divfree-chol}"
 SDS_DIR="${SDS_DIR:-$HOME/sds-test}"
