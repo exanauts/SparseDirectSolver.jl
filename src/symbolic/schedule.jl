@@ -113,6 +113,21 @@ packed_length(m::Integer) = Int(m) * (Int(m) + 1) ÷ 2
 # column j starts after (j - 1)(2m - j + 2)/2 entries
 @inline _packed(i, j, m) = (j - 1) * (2 * m - j + 2) ÷ 2 + i - j + 1
 
+# inverse of the packed lower-triangle enumeration: 0-based q in an r x r lower
+# triangle (col-major, n = r(r+1)/2 entries) -> 1-based (a, b), a >= b. Enumerating
+# only the triangle halves the work-item count of the guarded full-square loops.
+# The float sqrt can land one off at the boundary; the two fixups make it exact.
+@inline function _tri_decode(q, r)
+    n = r * (r + 1) ÷ 2
+    p = n - 1 - q
+    t = unsafe_trunc(Int, (sqrt(8.0 * p + 1.0) - 1.0) * 0.5)
+    t * (t + 1) ÷ 2 > p && (t -= 1)
+    (t + 1) * (t + 2) ÷ 2 <= p && (t += 1)
+    b = r - t
+    a = r - (p - t * (t + 1) ÷ 2)
+    return a, b
+end
+
 """
     takes_c_path(schedule, s) -> Bool
 

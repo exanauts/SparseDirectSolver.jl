@@ -11,13 +11,15 @@ using SparseDirectSolver
 using CliqueTrees
 using Metis
 
-# METIS_NodeND with `ufactor = nd_ubfactor` (-1: METIS default). `nd_nlevels` is
-# cuDSS' *minimum* number of dissection levels; METIS_NodeND dissects recursively
+# METIS_NodeND with `ufactor = nd_ubfactor` and `nseps = nd_nseps` (-1: METIS
+# defaults; values < 1 fall back to the default). `nd_nlevels` is cuDSS'
+# *minimum* number of dissection levels; METIS_NodeND dissects recursively
 # until the parts are small, so the minimum holds whenever the graph is large
 # enough to be split that often. CliqueTrees' level-capped `ND{S}` (AMD below the
 # cap) was 4–13× slower and gave 15–80% more fill on Laplacians (T05 Report).
-function nd_algorithm(nlevels::Integer, ubfactor::Integer)
-    return CliqueTrees.METIS(; ufactor = ubfactor)
+function nd_algorithm(nlevels::Integer, ubfactor::Integer, nseps::Integer, seed::Integer)
+    return CliqueTrees.METIS(; ufactor = ubfactor, nseps = nseps >= 1 ? nseps : -1,
+                             seed = seed >= 0 ? seed : -1)
 end
 
 function __init__()

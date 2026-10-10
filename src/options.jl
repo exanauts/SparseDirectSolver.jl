@@ -17,7 +17,7 @@ const CONFIG_PARAMETERS = ("reordering_alg", "factorization_alg", "solve_alg",
                            "hybrid_device_memory_limit", "use_cuda_register_memory", "host_nthreads",
                            "hybrid_execute_mode", "pivot_epsilon_alg", "nd_nlevels", "ubatch_size",
                            "ubatch_index", "use_superpanels", "device_count", "device_indices",
-                           "schur_mode", "deterministic_mode", "nd_ubfactor")
+                           "schur_mode", "deterministic_mode", "nd_ubfactor", "nd_nseps", "nd_seed")
 
 """
     DATA_PARAMETERS
@@ -127,6 +127,8 @@ defaults below. Keyword arguments are applied through [`setparam!`](@ref), so
 | `schur_mode` | `0` | off |
 | `deterministic_mode` | `0` | atomic forward solve allowed |
 | `nd_ubfactor` | `-1` | ordering library default |
+| `nd_nseps` | `-1` | ordering library default (1 separator per split) |
+| `nd_seed` | `-1` | ordering library default |
 | `ir_mode` | `IR_PLAIN` | plain iterative refinement |
 | `factor_precision` | `nothing` | factors in the input precision |
 | `amalgamation` | `(max_width = 32, zero_fraction = 0.25, min_width = 8)` | |
@@ -176,6 +178,8 @@ mutable struct Options
     schur_mode::Int
     deterministic_mode::Int
     nd_ubfactor::Int
+    nd_nseps::Int
+    nd_seed::Int
     # configuration parameters beyond cuDSS (PLAN §1.7)
     ir_mode::IRMode
     factor_precision::Union{Nothing, DataType}
@@ -202,7 +206,7 @@ mutable struct Options
         opts = new(
             REORDERING_DEFAULT, FACTORIZATION_DEFAULT, SOLVE_DEFAULT, MATCHING_NONE,
             0, 0, 0.0, PIVOT_AUTO, 0.01, nothing, PIVOT_EPSILON_DEFAULT, -1,
-            0, 0, 1, 0, 0, 10, 0, -1, 1, 0, 0, -1,
+            0, 0, 1, 0, 0, 10, 0, -1, 1, 0, 0, -1, -1, -1,
             IR_PLAIN, nothing, DEFAULT_AMALGAMATION, SCHEDULE_AUTO, PIVOT_PAIRS_DEFAULT, PIVOT_PAIR_TOLERANCE,
             64, 512, copy(DEFAULT_SUBTREE_BUDGETS), SUBTREE_PARALLELISM, 0, -1,
             nothing, nothing, nothing, nothing, nothing, nothing,
@@ -286,6 +290,8 @@ const PARAMETER_SPECS = Dict{String, ParameterSpec}(
     "schur_mode" => ParameterSpec(:config, :port, :schur_mode),
     "deterministic_mode" => ParameterSpec(:config, :port, :deterministic_mode),
     "nd_ubfactor" => ParameterSpec(:config, :port, :nd_ubfactor),
+    "nd_nseps" => ParameterSpec(:config, :port, :nd_nseps),
+    "nd_seed" => ParameterSpec(:config, :port, :nd_seed),
     # CUDSS.jl data parameters
     "info" => ParameterSpec(:data, :solver, :none),
     "lu_nnz" => ParameterSpec(:data, :output, :none),
@@ -415,6 +421,8 @@ for (field, lo, hi, expected) in (
         (:schur_mode, 0, 1, "0 or 1"),
         (:deterministic_mode, 0, 1, "0 or 1"),
         (:nd_ubfactor, -1, typemax(Int), "-1 (library default) or an integer ≥ 0"),
+        (:nd_nseps, -1, typemax(Int), "-1 (library default) or an integer ≥ 1"),
+        (:nd_seed, -1, typemax(Int), "-1 (library default) or an integer ≥ 0"),
     )
     @eval _parse_option(::Val{$(QuoteNode(field))}, value, _) =
         _parse_int($(String(field)), value, $lo, $hi, $expected)

@@ -111,8 +111,12 @@ end
             end
         end
     end
-    @test SDS.ND_PROVIDER[](10, 50).ufactor == 50
-    @test SDS.ND_PROVIDER[](0, -1).ufactor == -1
+    @test SDS.ND_PROVIDER[](10, 50, -1, -1).ufactor == 50
+    @test SDS.ND_PROVIDER[](0, -1, -1, -1).ufactor == -1
+    @test SDS.ND_PROVIDER[](10, -1, 4, -1).nseps == 4
+    @test SDS.ND_PROVIDER[](10, -1, 0, -1).nseps == -1
+    @test SDS.ND_PROVIDER[](10, -1, 4, 3).seed == 3
+    @test SDS.ND_PROVIDER[](10, -1, 4, -1).seed == -1
 
     @testset "user_perm" begin
         A = laplacian2d(7, 6)
@@ -206,7 +210,7 @@ end
         P = SDS.SymmetricPattern(SDS.CSR(A), "S"; view = 'F')
         G = SparseMatrixCSC(P)
         amd = Vector{Int}(first(SDS.CliqueTrees.permutation(G; alg = SDS.CliqueTrees.AMD())))
-        nd = Vector{Int}(first(SDS.CliqueTrees.permutation(G; alg = SDS.ND_PROVIDER[](10, -1))))
+        nd = Vector{Int}(first(SDS.CliqueTrees.permutation(G; alg = SDS.ND_PROVIDER[](10, -1, -1, -1))))
         for (s, ref) in (("algo1", amd), ("algo2", amd), ("algo3", amd), ("algo4", nd))
             ord = SDS.compute_ordering(P, Options(reordering_alg = s))
             @test ord.perm == ref

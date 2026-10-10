@@ -138,7 +138,10 @@ end
     return nothing
 end
 
-# column j, first half: check the pivot, rank-1 update of the trailing front with the scaled column
+# column j, first half: check the pivot and scale the column below the diagonal by it
+# (every work item recomputes `rd` from local memory: cheaper than sharing it through
+# a barrier, and it keeps the second half free of divisions; the diagonal itself is
+# written in the second half, so no work item reads a value another is overwriting)
 @inline function _subtree_chol_update!(buf, ctl, piv, j, li, ::Val{WG}) where {WG}
     @inbounds begin
         if ctl[_ST_STATUS] == 0
@@ -146,17 +149,9 @@ end
             lf = ctl[_ST_LF] - 1
             ajj = real(buf[lf + _packed(j, j, f)])
             if ajj > 0
-                d = sqrt(ajj)
-                li == 1 && (piv[1] = d)
-                r = f - j
-                for q in (li - 1):WG:(r * r - 1)
-                    k = j + 1 + q ÷ r
-                    i = j + 1 + q % r
-                    if i >= k
-                        lij = buf[lf + _packed(i, j, f)] / d
-                        lkj = buf[lf + _packed(k, j, f)] / d
-                        buf[lf + _packed(i, k, f)] -= lij * conj(lkj)
-                    end
+                rd = inv(sqrt(ajj))
+                for i in (j + li):WG:f
+                    buf[lf + _packed(i, j, f)] *= rd
                 end
             elseif li == 1
                 ctl[_ST_STATUS] = j % eltype(ctl)          # not positive (or NaN): stop, as LAPACK potrf
@@ -166,17 +161,23 @@ end
     return nothing
 end
 
-# column j, second half: scale the column below the diagonal by the pivot
+# column j, second half: rank-1 update of the trailing front with the scaled column
+# (multiply-add only: the former divide-in-the-update doubled the flop cost in f64
+# divisions; the packed-triangle enumeration halves the work items of the old
+# guarded full-square loop)
 @inline function _subtree_chol_scale!(buf, ctl, piv, j, li, ::Val{WG}) where {WG}
     @inbounds begin
         if ctl[_ST_STATUS] == 0
             f = ctl[_ST_F]
             lf = ctl[_ST_LF] - 1
-            d = piv[1]
-            for i in (j + li):WG:f
-                buf[lf + _packed(i, j, f)] /= d
+            li == 1 && (buf[lf + _packed(j, j, f)] = sqrt(real(buf[lf + _packed(j, j, f)])))
+            r = f - j
+            for q in (li - 1):WG:(r * (r + 1) ÷ 2 - 1)
+                a, b = _tri_decode(q, r)
+                i = j + a
+                k = j + b
+                buf[lf + _packed(i, k, f)] -= buf[lf + _packed(i, j, f)] * conj(buf[lf + _packed(k, j, f)])
             end
-            li == 1 && (buf[lf + _packed(j, j, f)] = d)
         end
     end
     return nothing

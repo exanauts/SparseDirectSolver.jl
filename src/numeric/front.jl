@@ -42,17 +42,9 @@ end
         if j <= w && st[1] == 0
             ajj = real(L11[_packed(j, j, W)])
             if ajj > 0
-                d = sqrt(ajj)
-                li == 1 && (piv[1] = d)
-                r = w - j
-                for q in (li - 1):WG:(r * r - 1)
-                    k = j + 1 + q ÷ r
-                    i = j + 1 + q % r
-                    if i >= k
-                        lij = L11[_packed(i, j, W)] / d
-                        lkj = L11[_packed(k, j, W)] / d
-                        L11[_packed(i, k, W)] -= lij * conj(lkj)
-                    end
+                rd = inv(sqrt(ajj))                  # recomputed per work item: no barrier needed;
+                for i in (j + li):WG:w               # strictly below the diagonal, since the diagonal
+                    L11[_packed(i, j, W)] *= rd      # is replaced in the second half
                 end
             elseif li == 1
                 st[1] = Int32(j)                     # not positive (or NaN): stop, as LAPACK potrf
@@ -62,16 +54,20 @@ end
     return nothing
 end
 
-# column j, second half: scale the column by the pivot stored by the first half
+# column j, second half: rank-1 update of the trailing block with the scaled column
+# (multiply-add only; the packed-triangle enumeration replaces the guarded square)
 @inline function _front_chol_scale!(L11, st, piv, j, s, li, front_ncols, ::Val{W}, ::Val{WG}) where {W, WG}
     @inbounds begin
         w = front_ncols[s]
         if j <= w && st[1] == 0
-            d = piv[1]
-            for i in (j + li):WG:w
-                L11[_packed(i, j, W)] /= d
+            li == 1 && (L11[_packed(j, j, W)] = sqrt(real(L11[_packed(j, j, W)])))
+            r = w - j
+            for q in (li - 1):WG:(r * (r + 1) ÷ 2 - 1)
+                a, b = _tri_decode(q, r)
+                i = j + a
+                k = j + b
+                L11[_packed(i, k, W)] -= L11[_packed(i, j, W)] * conj(L11[_packed(k, j, W)])
             end
-            li == 1 && (L11[_packed(j, j, W)] = d)
         end
     end
     return nothing

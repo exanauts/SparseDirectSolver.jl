@@ -454,6 +454,10 @@ function _check_analysis_supported(solver::DirectSolver{T}) where {T}
     return nothing
 end
 
+# the backend when the symbolic maps may be built on it (device.jl), else nothing
+_device_backend(solver::DirectSolver) =
+    solver.backend isa KernelAbstractions.GPU ? solver.backend : nothing
+
 function _reorder!(solver::DirectSolver{T}) where {T}
     _check_analysis_supported(solver)
     _poll_interrupt(solver.options.user_host_interrupt)
@@ -468,7 +472,7 @@ function _reorder!(solver::DirectSolver{T}) where {T}
     solver.analysis_colval = m === nothing || m.symmetric ? solver.host_colval :
                              matched_colval(m, solver.host_colval, A.index)
     P = SymmetricPattern(solver.host_rowptr, solver.analysis_colval, A.nrows, solver.structure;
-                         view = _stored_view(solver), index = A.index)
+                         view = _stored_view(solver), index = A.index, device = _device_backend(solver))
     if solver.options.schur_mode == 1
         # Schur complement mode: the Schur rows and columns last, no 2×2 pivot pairs
         flags = schur_flags(solver.options.user_schur_indices, A.nrows)
@@ -535,7 +539,7 @@ function _symbolic!(solver::DirectSolver{T, INT}) where {T, INT}
     A = solver.A
     ord = solver.ordering
     P = SymmetricPattern(solver.host_rowptr, solver.analysis_colval, A.nrows, solver.structure;
-                         view = _stored_view(solver), index = A.index)
+                         view = _stored_view(solver), index = A.index, device = _device_backend(solver))
     if solver.schur === nothing
         sp = supernode_partition(factor_pattern(P, ord), ord.perm, opts)
         schur = 0
@@ -548,7 +552,7 @@ function _symbolic!(solver::DirectSolver{T, INT}) where {T, INT}
                         max_local = max_local_bytes(solver.backend))
     layout = build_layout(sp, sc; ldlt = _is_ldlt_structure(solver.structure))
     Sh = Symbolic(sp, sc, layout, solver.host_rowptr, solver.analysis_colval, A.nrows, solver.structure;
-                  view = _stored_view(solver), index = A.index)
+                  view = _stored_view(solver), index = A.index, device = _device_backend(solver))
     nrhs = solver.workspace === nothing ? solver.nbatch : max_rhs(solver.workspace)
     Sd = adapt(solver.backend, Sh, INT)
     solver.host_symbolic = Sh
