@@ -51,7 +51,7 @@ if ! command -v juliaup >/dev/null 2>&1 && [ ! -x "$HOME/.juliaup/bin/juliaup" ]
 fi
 export PATH="$HOME/.juliaup/bin:$PATH"
 juliaup add 1.13 2>/dev/null || true
-JL="julia +1.13"
+JL="julia +1.13 --startup-file=no"
 $JL --version
 
 # --- 2. Repository ------------------------------------------------------------
