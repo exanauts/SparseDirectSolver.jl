@@ -18,7 +18,7 @@ DVEC(::Type{T}, v) where {T} = (out = KA.allocate(BACKEND[], T, length(v)); copy
 
 const WG = 32
 const MW = 256  # max front width on the inverse path
-const WGF = 128 # workgroup size of the fused kernels
+const WGF = 128 # default workgroup size; the fused kernel takes it per plan (fp.wgf)
 const CHWG = 1024 # workgroup size of the chain kernels
 const NSTRIP = 4  # strip parallelism of the chain kernels
 
@@ -290,14 +290,14 @@ end
         ip = Int(inv_ptr[v]) - 1
         if li == 1
             tgt = nchild[v]
-            pause = Int32(4)
+            pause = min(Int32(4), scap)
             while (Atomix.@atomic arrived[v] += Int32(0)) < tgt
                 z = 0.0
                 for _ in 1:pause
                     z += 1.0
                 end
                 z < 0 && (yb[1] = z)        # keep the backoff loop alive
-                pause = min(pause << 1, Int32(128))
+                pause = min(pause << 1, scap)
             end
         end
         @synchronize
@@ -351,14 +351,14 @@ end
         if li == 1
             pv = Int(snparent[root])
             if pv > 0
-                pause = Int32(4)
+                pause = min(Int32(4), scap)
                 while (Atomix.@atomic done[pv] += Int32(0)) == Int32(0)
                     z = 0.0
                     for _ in 1:pause
                         z += 1.0
                     end
                     z < 0 && (t[1] = z)
-                    pause = min(pause << 1, Int32(128))
+                    pause = min(pause << 1, scap)
                 end
             end
         end
@@ -402,14 +402,14 @@ end
         if li == 1
             pv = Int(snparent[v])
             if pv > 0
-                pause = Int32(4)
+                pause = min(Int32(4), scap)
                 while (Atomix.@atomic done[pv] += Int32(0)) == Int32(0)
                     z = 0.0
                     for _ in 1:pause
                         z += 1.0
                     end
                     z < 0 && (t[1] = z)
-                    pause = min(pause << 1, Int32(128))
+                    pause = min(pause << 1, scap)
                 end
             end
         end
@@ -752,15 +752,15 @@ const ROLE_WTILE = Int8(8)
 const ROLE_WSIG = Int8(9)
 
 # spin with backoff on an Int32 cell until pred(value) holds; thread 1 only
-@inline function _spin_until_eq!(arr, idx, target, scratch)
-    pause = Int32(4)
+@inline function _spin_until_eq!(arr, idx, target, scratch, scap)
+    pause = min(Int32(4), scap)
     while (Atomix.@atomic arr[idx] += Int32(0)) != target
         z = 0.0
         for _ in 1:pause
             z += 1.0
         end
         z < 0 && (scratch[1] = z)
-        pause = min(pause << 1, Int32(128))
+        pause = min(pause << 1, scap)
     end
     return nothing
 end
@@ -771,7 +771,7 @@ end
                                     cb_done, @Const(snparent), @Const(front_ptr), @Const(front_nrows),
                                     @Const(front_ncols), @Const(cb_ptr), @Const(child_ptr),
                                     @Const(child_list), @Const(relind_ptr), @Const(relind), base,
-                                    @Const(wbase), wupd, wpdone2, wtrsml, wcbl,
+                                    @Const(wbase), wupd, wpdone2, wtrsml, wcbl, scap,
                                     ::Val{WG}) where {WG}
     @uniform TT = eltype(factor)
     @uniform RT = real(eltype(factor))
@@ -788,7 +788,7 @@ end
             c = Int(rb[G])                          # child
             q0 = (Int(rc[G]) - 1) * 16384
             if li == 1
-                _spin_until_eq!(cb_done, c, Int32(1), fscr)
+                _spin_until_eq!(cb_done, c, Int32(1), fscr, scap)
             end
             @synchronize
             Threads.atomic_fence()
@@ -827,9 +827,9 @@ end
             v = Int(ra[G])
             if li == 1
                 if r == ROLE_PANEL_B
-                    _spin_until_eq!(arrived, v, nchild[v], fscr)
+                    _spin_until_eq!(arrived, v, nchild[v], fscr, scap)
                 else
-                    _spin_until_eq!(ea_left, v, Int32(0), fscr)
+                    _spin_until_eq!(ea_left, v, Int32(0), fscr, scap)
                 end
             end
             @synchronize
@@ -925,7 +925,7 @@ end
         elseif r == ROLE_TRSM
             v = Int(ra[G])
             if li == 1
-                _spin_until_eq!(panel_done, v, Int32(1), fscr)
+                _spin_until_eq!(panel_done, v, Int32(1), fscr, scap)
             end
             @synchronize
             Threads.atomic_fence()
@@ -971,7 +971,7 @@ end
         elseif r == ROLE_TILE
             v = Int(ra[G])
             if li == 1
-                _spin_until_eq!(trsm_left, v, Int32(0), fscr)
+                _spin_until_eq!(trsm_left, v, Int32(0), fscr, scap)
             end
             @synchronize
             Threads.atomic_fence()
@@ -1075,9 +1075,9 @@ end
             sl = Int(wbase[v]) + k
             if li == 1
                 if k == 1
-                    _spin_until_eq!(ea_left, v, Int32(0), fscr)
+                    _spin_until_eq!(ea_left, v, Int32(0), fscr, scap)
                 else
-                    _spin_until_eq!(wupd, sl, Int32(0), fscr)
+                    _spin_until_eq!(wupd, sl, Int32(0), fscr, scap)
                 end
             end
             @synchronize
@@ -1140,7 +1140,7 @@ end
             v = Int(ra[G]); ch = Int(rb[G]); k = Int(rc[G])
             sl = Int(wbase[v]) + k
             if li == 1
-                _spin_until_eq!(wpdone2, sl, Int32(1), fscr)
+                _spin_until_eq!(wpdone2, sl, Int32(1), fscr, scap)
             end
             @synchronize
             Threads.atomic_fence()
@@ -1184,7 +1184,7 @@ end
             k = Int(rc[G]) ÷ 1024; tjj = Int(rc[G]) % 1024
             sl = Int(wbase[v]) + k
             if li == 1
-                _spin_until_eq!(wtrsml, sl, Int32(0), fscr)
+                _spin_until_eq!(wtrsml, sl, Int32(0), fscr, scap)
             end
             @synchronize
             Threads.atomic_fence()
@@ -1264,9 +1264,9 @@ end
             v = Int(ra[G]); K = Int(rb[G])
             sl = Int(wbase[v]) + K
             if li == 1
-                _spin_until_eq!(wpdone2, sl, Int32(1), fscr)
-                _spin_until_eq!(wtrsml, sl, Int32(0), fscr)
-                _spin_until_eq!(wcbl, v, Int32(0), fscr)
+                _spin_until_eq!(wpdone2, sl, Int32(1), fscr, scap)
+                _spin_until_eq!(wtrsml, sl, Int32(0), fscr, scap)
+                _spin_until_eq!(wcbl, v, Int32(0), fscr, scap)
                 Threads.atomic_fence()
                 Atomix.@atomic cb_done[v] += Int32(1)
                 pv = Int(snparent[v])
@@ -1294,14 +1294,14 @@ end
 @kernel function waiter_kernel!(ea_left, v, fscr_unused)
     li = @index(Local, Linear)
     if li == 1
-        pause = Int32(4)
+        pause = min(Int32(4), scap)
         @inbounds while (Atomix.@atomic ea_left[v] += Int32(0)) != Int32(0)
             z = 0.0
             for _ in 1:pause
                 z += 1.0
             end
             z < 0 && (ea_left[v] = Int32(0))
-            pause = min(pause << 1, Int32(128))
+            pause = min(pause << 1, scap)
         end
     end
 end
@@ -1334,7 +1334,8 @@ end
 
 # ---------------------------------------------------------------------------
 # host: the topologically ordered role list + counter bases + stream-2 program
-function build_fused_plan(s; inkernel_wides::Bool = false, merge_segments::Bool = false)
+function build_fused_plan(s; inkernel_wides::Bool = false, merge_segments::Bool = false,
+                          wgf::Int = WGF, scap::Integer = 128)
     S = s.symbolic
     plan = s.numeric.plan
     nodes = S.schedule.group_nodes
@@ -1403,7 +1404,7 @@ function build_fused_plan(s; inkernel_wides::Bool = false, merge_segments::Bool 
     emit_split(v) = begin
         m = rows_h[v] - width_h[v]
         m > SYRK_IN || return nothing
-        for ch in 1:cld(m, WGF)
+        for ch in 1:cld(m, wgf)
             push!(role, ROLE_TRSM); push!(ra, Int32(v)); push!(rb, Int32(ch)); push!(rc, Int32(0))
             trsm_left[v] += 1
         end
@@ -1433,7 +1434,7 @@ function build_fused_plan(s; inkernel_wides::Bool = false, merge_segments::Bool 
             c0 = (k - 1) * 64
             kb = min(64, w - c0)
             nbelow = f - (c0 + kb)
-            nch = cld(nbelow, WGF)
+            nch = cld(nbelow, wgf)
             for ch in 1:nch
                 push!(role, ROLE_WTRSM); push!(ra, Int32(v)); push!(rb, Int32(ch)); push!(rc, Int32(k))
             end
@@ -1540,7 +1541,7 @@ function build_fused_plan(s; inkernel_wides::Bool = false, merge_segments::Bool 
             wbase = DVEC(wbase_h), wupd_b = DVEC(wupd_b), wtl_b = DVEC(wtl_b),
             wcb_b = DVEC(wcb_b), wupd = KA.zeros(BACKEND[], Int32, max(nwslots, 1)),
             wtl = KA.zeros(BACKEND[], Int32, max(nwslots, 1)), wpd = KA.zeros(BACKEND[], Int32, max(nwslots, 1)),
-            wcb = KA.zeros(BACKEND[], Int32, ns),
+            wcb = KA.zeros(BACKEND[], Int32, ns), wgf, scap = Int32(scap),
             s2 = nothing)
 end
 
@@ -1574,13 +1575,13 @@ function refact_fused!(s, nzval, fp; nstreams::Int = 1)
     end
     for (base, count, gwides) in fp.segments
         count > 0 &&
-            fused_fact_kernel!(backend, WGF)(N.factor, N.stack, fp.pcb, N.info, nzval, S.amap, S.amap_ptr,
+            fused_fact_kernel!(backend, fp.wgf)(N.factor, N.stack, fp.pcb, N.info, nzval, S.amap, S.amap_ptr,
                                              S.amap_src, fp.cb2, fp.wt, fp.role, fp.ra, fp.rb, fp.rc, fp.nchild,
                                              fp.arrived, fp.ea, fp.pdone, fp.trsm, fp.tiles, fp.cbd,
                                              S.snparent, S.front_ptr, S.front_nrows, S.front_ncols,
                                              S.cb_ptr, S.child_ptr, S.child_list, S.relind_ptr, S.relind,
                                              Int32(base), fp.wbase, fp.wupd, fp.wpd, fp.wtl, fp.wcb,
-                                             Val(WGF); ndrange = WGF * count)
+                                             fp.scap, Val(fp.wgf); ndrange = fp.wgf * count)
         if true
             for v in gwides
                 SDS._factor_panel_c!(N.factor, fp.pcb, N.work, N.info, v, S.layout.panel_ptr[v],
