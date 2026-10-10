@@ -14,7 +14,11 @@ const BACKEND = get(ENV, "SDS_BACKEND", Sys.which("nvidia-smi") === nothing ? "a
 Pkg.activate(joinpath(homedir(), ".sds-fresh-" * BACKEND))
 Pkg.add(["MadNLP", "MadNLPGPU", "ExaModels", "ExaModelsPower", "Metis", "Printf"])
 Pkg.add(BACKEND == "cuda" ? ["CUDA", "CUDSS"] : ["AMDGPU"])
-Pkg.add(url = "https://github.com/exanauts/SparseDirectSolver.jl", rev = "divfree-chol")
+# SDS as a proper dev checkout (editable, canonical path), not a frozen Pkg.add
+const SDS_DEV = joinpath(homedir(), ".julia", "dev", "SparseDirectSolver")
+isdir(SDS_DEV) ||
+    run(`git clone --branch divfree-chol https://github.com/exanauts/SparseDirectSolver.jl $SDS_DEV`)
+Pkg.develop(path = SDS_DEV)
 Pkg.instantiate()
 
 using SparseDirectSolver, MadNLP, MadNLPGPU, ExaModels, ExaModelsPower
