@@ -28,11 +28,27 @@ Base.@kwdef mutable struct SDSSolverOptions <: MadNLP.AbstractOptions
     sds_nd_seed::Int = 3
     sds_amalgamation::NamedTuple = (max_width = 48, zero_fraction = 0.25, min_width = 8)
     sds_user_perm::Union{Nothing, Vector{Int}} = nothing
+    # wide-front strategy: "auto" picks by device (merged in-kernel wides on parts with
+    # < 2048 threads/SM — sm_86/89, Blackwell workstation, AMD — measured 1.6-2.1x there;
+    # host vendor wides on sm_70/80/90 where they are ~1.7 ms faster); "host"/"merged" force
+    sds_wides::String = "auto"
     # on-disk permutation cache: the tuned METIS ordering costs ~2x the default
     # (tens of seconds at this size), so the computed permutation is cached keyed
     # by the matrix pattern + ordering knobs and reloaded on any later solver
     # construction with the same structure ("" disables)
     sds_perm_cache::String = joinpath(homedir(), ".julia", "sds_perm_cache")
+end
+
+# merged in-kernel wides win on parts with < 2048 threads/SM (and on AMD); the CUDA
+# module is reached through the backend's parent module, so this file stays backend-free
+function _prefer_merged(backend, opt::SDSSolverOptions)
+    opt.sds_wides == "merged" && return true
+    opt.sds_wides == "host" && return false
+    if occursin("CUDABackend", string(typeof(backend)))
+        M = parentmodule(typeof(backend))
+        return M.attribute(M.device(), M.DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR) < 2048
+    end
+    return true
 end
 
 function _perm_cache_file(opt::SDSSolverOptions, csc)
@@ -179,7 +195,8 @@ function SDSProtoSolver(
     SDS.execute!("factorization", s, x, b; asynchronous = false)
     SDS.execute!("solve", s, x, b; asynchronous = false)   # allocates the solve workspace
     nzval = SDS._factor_values(s)
-    fp = SDSProto.build_fused_plan(s)
+    merged = _prefer_merged(backend, opt)
+    fp = SDSProto.build_fused_plan(s; inkernel_wides = merged, merge_segments = merged)
     inv11, inv_ptr, invertf, _ = SDSProto.build_inverse(s)
     # solve-side plan state (module globals, single solver instance)
     plan0 = s.workspace.plan
