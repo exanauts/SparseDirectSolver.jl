@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# Fresh-machine test of the MadNLP + SparseDirectSolver workflow on an NVIDIA GPU box.
-# Installs Julia 1.13 (juliaup), clones the repo, runs the test suites (CPU + CUDA),
-# then the end-to-end MadNLP ACOPF solve (78k-bus pglib case, SparseCondensedKKTSystem)
-# with cuDSS and with SDS as the linear solver, on the same device.
+# Fresh-machine test of the MadNLP + SparseDirectSolver workflow on a GPU box.
+# Installs Julia 1.13 (juliaup), clones the repo, runs the test suites (CPU + GPU),
+# then the end-to-end MadNLP ACOPF solve (78k-bus pglib case, SparseCondensedKKTSystem).
+# NVIDIA: cuDSS vs SDS on the same device. AMD: SDS stock vs SDS prototype kernels
+# (no cuDSS exists there). The vendor is auto-detected (nvidia-smi / rocm-smi), or
+# force it with SDS_BACKEND=cuda|amdgpu.
 #
 #   bash fresh_machine.sh
 #
@@ -11,14 +13,30 @@
 #   SDS_DIR=$HOME/sds-test    checkout location
 #   SKIP_TESTS=1              skip the test suites, run only the MadNLP workflow
 #   CPU_ONLY_TESTS=1          run only the CPU suite (no functional GPU needed for it)
+#   SDS_BACKEND=cuda|amdgpu   override the GPU vendor autodetection
 #
-# Needs: git, curl, an NVIDIA GPU + driver for the CUDA suite and the workflow
-# (CUDA toolkit and cuDSS are downloaded by CUDA.jl/CUDSS.jl as artifacts),
-# network access (pglib case data is fetched by ExaModelsPower on first use).
+# Needs: git, curl, network access (pglib case data is fetched by ExaModelsPower on
+# first use), and a GPU + driver. NVIDIA: the CUDA toolkit and cuDSS are downloaded
+# by CUDA.jl/CUDSS.jl as artifacts, nothing to install. AMD: a system ROCm
+# installation is required (AMDGPU.jl uses the system ROCm, it is not an artifact).
 set -euo pipefail
 
 SDS_BRANCH="${SDS_BRANCH:-divfree-chol}"
 SDS_DIR="${SDS_DIR:-$HOME/sds-test}"
+
+if [ -z "${SDS_BACKEND:-}" ]; then
+    if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+        SDS_BACKEND=cuda
+    elif command -v rocm-smi >/dev/null 2>&1; then
+        SDS_BACKEND=amdgpu
+    else
+        echo "no GPU detected (nvidia-smi / rocm-smi); set SDS_BACKEND=cuda|amdgpu" >&2
+        SDS_BACKEND=cuda
+    fi
+fi
+echo "== backend: $SDS_BACKEND"
+GPU_PKG=CUDA; RUNNER=run_gv100.jl
+[ "$SDS_BACKEND" = "amdgpu" ] && GPU_PKG=AMDGPU && RUNNER=run_amd.jl
 
 # --- 1. Julia 1.13 via juliaup -----------------------------------------------
 if ! command -v juliaup >/dev/null 2>&1 && [ ! -x "$HOME/.juliaup/bin/juliaup" ]; then
@@ -45,19 +63,24 @@ if [ "${SKIP_TESTS:-0}" != "1" ]; then
     echo "== CPU suite"
     SDS_TEST_GPU=0 $JL --project=. -e 'using Pkg; Pkg.test()'
     if [ "${CPU_ONLY_TESTS:-0}" != "1" ]; then
-        echo "== CUDA suite"
-        $JL --project=test -e 'using Pkg; Pkg.add("CUDA")'   # as .github/workflows/ci.yml does
+        echo "== $GPU_PKG suite"
+        $JL --project=test -e "using Pkg; Pkg.add(\"$GPU_PKG\")"   # as .github/workflows/ci.yml does
         SDS_TEST_CPU=0 SDS_TEST_SKIP=test_aqua $JL --project=. -e 'using Pkg; Pkg.test()'
     fi
 fi
 
 # --- 4. MadNLP workflow: 78k-bus ACOPF, cuDSS vs SDS on the same GPU -----------
 # bench/e2e: MadNLPSDS.jl defines the MadNLP.AbstractLinearSolver wrappers
-# (SDSSolver = stock library; SDSProtoSolver = PR #107 prototype kernels);
-# run_gv100.jl solves the case with MadNLPGPU.CUDSSSolver and with SDSProtoSolver
-# and prints wall/solver/linear-solver times, iteration counts and objectives
+# (SDSSolver = stock library; SDSProtoSolver = PR #107 prototype kernels).
+# NVIDIA (run_gv100.jl): MadNLPGPU.CUDSSSolver vs SDSProtoSolver.
+# AMD (run_amd.jl): SDSSolver vs SDSProtoSolver.
+# Each prints wall/solver/linear-solver times, iteration counts and objectives
 # (convergence parity is the workflow test: same iterations, same objective).
-echo "== MadNLP + SDS workflow (downloads the pglib case on first use)"
+echo "== MadNLP + SDS workflow via $RUNNER (downloads the pglib case on first use)"
 $JL --project=bench/e2e -e "using Pkg; Pkg.develop(path = \"$SDS_DIR\"); Pkg.instantiate()"
-CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" $JL --project=bench/e2e bench/e2e/run_gv100.jl
+if [ "$SDS_BACKEND" = "cuda" ]; then
+    CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" $JL --project=bench/e2e "bench/e2e/$RUNNER"
+else
+    $JL --project=bench/e2e "bench/e2e/$RUNNER"
+fi
 echo "== fresh-machine run complete"
