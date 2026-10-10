@@ -416,6 +416,7 @@ end
                 end
             end
             pv[1] = dk
+            pv[2] = inv(dk)                           # reciprocal once: the update multiplies
             pv[5] = dk
             ctl[_LT_STEP] = one(IT)
         else
@@ -667,12 +668,12 @@ end
             kk = k + step - 1
             j0 = kk + 1                                   # the next column
             nt = w - kk
-            for q in (li - 1):WG:(nt * nt - 1)
-                i = kk + 1 + q % nt
-                j = kk + 1 + q ÷ nt
-                i >= j || continue
+            for q in (li - 1):WG:(nt * (nt + 1) ÷ 2 - 1)
+                a, b = _tri_decode(q, nt)             # packed triangle: no discarded work items
+                i = kk + a
+                j = kk + b
                 if step == 1
-                    l = _fget(F, i, k) / pv[1]
+                    l = _fget(F, i, k) * pv[2]
                     v = _fget(F, i, j) - l * _cj(_fget(F, j, k), h)
                 else
                     x1 = _fget(F, i, k)
@@ -695,7 +696,7 @@ end
             if m >= WG                                    # one row per work item, its multipliers formed once
                 for i in (w + li):WG:f
                     if step == 1
-                        l = _fget(F, i, k) / pv[1]
+                        l = _fget(F, i, k) * pv[2]
                         for j in (kk + 1):w
                             v = _fget(F, i, j) - l * _cj(_fget(F, j, k), h)
                             _fset!(F, i, j, v)
@@ -718,7 +719,7 @@ end
                     i = w + 1 + q % m
                     j = kk + 1 + q ÷ m
                     if step == 1
-                        l = _fget(F, i, k) / pv[1]
+                        l = _fget(F, i, k) * pv[2]
                         v = _fget(F, i, j) - l * _cj(_fget(F, j, k), h)
                     else
                         x1 = _fget(F, i, k)
@@ -751,26 +752,34 @@ end
         f = Int(ctl[_ST_F])
         w = Int(ctl[_ST_W])
         c0 = Int(ctl[_LT_C0])
-        for i in (1 + li):WG:f
-            jmax = min(i - 1, w)
-            j = 1
-            while j <= jmax
-                g = c0 + j - 1
-                if pivot_kind[g] == PIVOT_KIND_2X2_FIRST
-                    if j + 1 <= jmax
-                        a, b, c2 = d[g], d[n + g], d[g + 1]
-                        up = _cj(b, h)
-                        det = a * c2 - up * b
+        # column-outer: `d`/`pivot_kind` and the reciprocal are read/formed once per column
+        # (uniform, so the loads broadcast) and the row loops coalesce
+        j = 1
+        while j <= w
+            g = c0 + j - 1
+            if pivot_kind[g] == PIVOT_KIND_2X2_FIRST
+                if j + 1 <= w
+                    a, b, c2 = d[g], d[n + g], d[g + 1]
+                    up = _cj(b, h)
+                    det = a * c2 - up * b
+                    e11 = c2 / det
+                    e21 = -up / det
+                    e12 = -b / det
+                    e22 = a / det
+                    for i in (j + 1 + li):WG:f        # the zero below the 2×2 diagonal stays
                         x1 = _fget(F, i, j)
                         x2 = _fget(F, i, j + 1)
-                        _fset!(F, i, j, x1 * (c2 / det) + x2 * (-b / det))
-                        _fset!(F, i, j + 1, x1 * (-up / det) + x2 * (a / det))
+                        _fset!(F, i, j, x1 * e11 + x2 * e12)
+                        _fset!(F, i, j + 1, x1 * e21 + x2 * e22)
                     end
-                    j += 2
-                else
-                    _fset!(F, i, j, _fget(F, i, j) / d[g])
-                    j += 1
                 end
+                j += 2
+            else
+                rd = inv(d[g])
+                for i in (j + li):WG:f
+                    _fset!(F, i, j, _fget(F, i, j) * rd)
+                end
+                j += 1
             end
         end
     end
@@ -789,10 +798,8 @@ end
         if coff >= 0 && m > 0
             F = _lt_front(fa, ctl, pk)
             c0 = Int(ctl[_LT_C0])
-            for q in (li - 1):WG:(m * m - 1)
-                jj = q ÷ m + 1
-                ii = q - (jj - 1) * m + 1
-                ii >= jj || continue
+            for q in (li - 1):WG:(m * (m + 1) ÷ 2 - 1)
+                ii, jj = _tri_decode(q, m)            # packed triangle: no discarded work items
                 i = w + ii
                 j = w + jj
                 acc = zero(T)

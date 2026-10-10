@@ -319,7 +319,7 @@ end
                     x = kept ? lw[co + i] : _fget(F, i, k)
                     _fset!(F, i, k, x)
                     lw[wo + (t - 1) * f + i] = x
-                    lw[lo + (t - 1) * f + i] = x / pv[1]
+                    lw[lo + (t - 1) * f + i] = x * pv[2]
                 else
                     x1 = _fget(F, i, k)
                     x2 = _fget(F, i, k + 1)
