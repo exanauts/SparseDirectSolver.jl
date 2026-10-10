@@ -290,14 +290,14 @@ end
         ip = Int(inv_ptr[v]) - 1
         if li == 1
             tgt = nchild[v]
-            pause = min(Int32(4), scap)
+            pause = Int32(4)
             while (Atomix.@atomic arrived[v] += Int32(0)) < tgt
                 z = 0.0
                 for _ in 1:pause
                     z += 1.0
                 end
                 z < 0 && (yb[1] = z)        # keep the backoff loop alive
-                pause = min(pause << 1, scap)
+                pause = min(pause << 1, Int32(128))
             end
         end
         @synchronize
@@ -351,14 +351,14 @@ end
         if li == 1
             pv = Int(snparent[root])
             if pv > 0
-                pause = min(Int32(4), scap)
+                pause = Int32(4)
                 while (Atomix.@atomic done[pv] += Int32(0)) == Int32(0)
                     z = 0.0
                     for _ in 1:pause
                         z += 1.0
                     end
                     z < 0 && (t[1] = z)
-                    pause = min(pause << 1, scap)
+                    pause = min(pause << 1, Int32(128))
                 end
             end
         end
@@ -402,14 +402,14 @@ end
         if li == 1
             pv = Int(snparent[v])
             if pv > 0
-                pause = min(Int32(4), scap)
+                pause = Int32(4)
                 while (Atomix.@atomic done[pv] += Int32(0)) == Int32(0)
                     z = 0.0
                     for _ in 1:pause
                         z += 1.0
                     end
                     z < 0 && (t[1] = z)
-                    pause = min(pause << 1, scap)
+                    pause = min(pause << 1, Int32(128))
                 end
             end
         end
