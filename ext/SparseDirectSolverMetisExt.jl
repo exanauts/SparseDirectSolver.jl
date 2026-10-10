@@ -17,8 +17,9 @@ using Metis
 # until the parts are small, so the minimum holds whenever the graph is large
 # enough to be split that often. CliqueTrees' level-capped `ND{S}` (AMD below the
 # cap) was 4–13× slower and gave 15–80% more fill on Laplacians (T05 Report).
-function nd_algorithm(nlevels::Integer, ubfactor::Integer, nseps::Integer)
-    return CliqueTrees.METIS(; ufactor = ubfactor, nseps = nseps >= 1 ? nseps : -1)
+function nd_algorithm(nlevels::Integer, ubfactor::Integer, nseps::Integer, seed::Integer)
+    return CliqueTrees.METIS(; ufactor = ubfactor, nseps = nseps >= 1 ? nseps : -1,
+                             seed = seed >= 0 ? seed : -1)
 end
 
 function __init__()

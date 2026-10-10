@@ -20,6 +20,28 @@ Base.@kwdef mutable struct SDSSolverOptions <: MadNLP.AbstractOptions
     sds_regime_c_rows::Int = 256
     sds_subtree_parallelism::Int = 16384
     sds_subtree_budgets::Vector{Int} = [16384]
+    # custom reordering: nd_* tune the built-in METIS nested dissection (the defaults
+    # are the 78k-ACOPF champions: nseps = 4, seed = 3, amalgamation max_width = 48);
+    # sds_user_perm bypasses the reordering entirely with a user permutation (1-based,
+    # length n, same convention as SDS's "user_perm" parameter).
+    sds_nd_nseps::Int = 4
+    sds_nd_seed::Int = 3
+    sds_amalgamation::NamedTuple = (max_width = 48, zero_fraction = 0.25, min_width = 8)
+    sds_user_perm::Union{Nothing, Vector{Int}} = nothing
+end
+
+# shared solver construction knobs: the custom reordering (nd knobs or a user
+# permutation) and the amalgamation, applied before the analysis
+function _apply_reordering!(s, opt::SDSSolverOptions)
+    s.options.amalgamation = opt.sds_amalgamation
+    if opt.sds_user_perm !== nothing
+        SDS.setparam!(s, "user_perm", opt.sds_user_perm)
+    else
+        SDS.setparam!(s, "reordering_alg", opt.sds_reordering)
+        SDS.setparam!(s, "nd_nseps", opt.sds_nd_nseps)
+        SDS.setparam!(s, "nd_seed", opt.sds_nd_seed)
+    end
+    return s
 end
 
 mutable struct SDSSolver{T} <: MadNLP.AbstractLinearSolver{T}
@@ -45,7 +67,7 @@ function SDSSolver(
     s.options.regime_c_rows = opt.sds_regime_c_rows
     s.options.subtree_parallelism = opt.sds_subtree_parallelism
     s.options.subtree_budgets = copy(opt.sds_subtree_budgets)
-    SDS.setparam!(s, "reordering_alg", opt.sds_reordering)
+    _apply_reordering!(s, opt)
     x = similar(csc.nzVal, n)
     b = similar(csc.nzVal, n)
     SDS.execute!("analysis", s, x, b; asynchronous = false)
@@ -116,7 +138,7 @@ function SDSProtoSolver(
     s.options.regime_c_rows = 64               # prototype kernels own BOTH phases: no coupling conflict
     s.options.subtree_parallelism = 16384
     s.options.subtree_budgets = [16384]
-    SDS.setparam!(s, "reordering_alg", opt.sds_reordering)
+    _apply_reordering!(s, opt)
     x = similar(csc.nzVal, n)
     b = similar(csc.nzVal, n)
     SDS.execute!("analysis", s, x, b; asynchronous = false)

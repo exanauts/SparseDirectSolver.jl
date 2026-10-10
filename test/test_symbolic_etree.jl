@@ -111,10 +111,12 @@ end
             end
         end
     end
-    @test SDS.ND_PROVIDER[](10, 50, -1).ufactor == 50
-    @test SDS.ND_PROVIDER[](0, -1, -1).ufactor == -1
-    @test SDS.ND_PROVIDER[](10, -1, 4).nseps == 4
-    @test SDS.ND_PROVIDER[](10, -1, 0).nseps == -1
+    @test SDS.ND_PROVIDER[](10, 50, -1, -1).ufactor == 50
+    @test SDS.ND_PROVIDER[](0, -1, -1, -1).ufactor == -1
+    @test SDS.ND_PROVIDER[](10, -1, 4, -1).nseps == 4
+    @test SDS.ND_PROVIDER[](10, -1, 0, -1).nseps == -1
+    @test SDS.ND_PROVIDER[](10, -1, 4, 3).seed == 3
+    @test SDS.ND_PROVIDER[](10, -1, 4, -1).seed == -1
 
     @testset "user_perm" begin
         A = laplacian2d(7, 6)

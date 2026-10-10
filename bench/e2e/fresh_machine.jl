@@ -16,7 +16,7 @@ Pkg.add(BACKEND == "cuda" ? ["CUDA", "CUDSS"] : ["AMDGPU"])
 # SDS as a proper dev checkout (editable, canonical path), not a frozen Pkg.add;
 # an existing checkout is updated to the branch head (local edits block the pull loudly)
 const SDS_DEV = joinpath(homedir(), ".julia", "dev", "SparseDirectSolver")
-const SDS_REF = "divfree-chol"
+const SDS_REF = "custom-reordering"
 if isdir(SDS_DEV)
     run(`git -C $SDS_DEV fetch origin $SDS_REF`)
     run(`git -C $SDS_DEV checkout $SDS_REF`)
@@ -47,5 +47,10 @@ m, _ = ac_opf_model("pglib_opf_case78484_epigrids.m";
 
 # SparseCondensedKKTSystem is required (the SPD Cholesky path); MadNLP defaults
 # equality/fixed-variable treatment correctly for it. tol: condensed default is 1e-4.
+#
+# Custom reordering: the wrapper defaults to the tuned METIS ND (nseps = 4, seed = 3,
+# amalgamation max_width = 48). To tune it, pass e.g. sds_nd_nseps = 8, sds_nd_seed = 1;
+# to supply your own permutation (1-based, length n of the condensed KKT), pass
+# sds_user_perm = perm — it bypasses the built-in reordering entirely.
 sol = madnlp(m; linear_solver = SDSProtoSolver,
              kkt_system = MadNLP.SparseCondensedKKTSystem, tol = 1e-6)
