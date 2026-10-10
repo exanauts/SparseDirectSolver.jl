@@ -746,6 +746,10 @@ const ROLE_PANEL_C = Int8(2)
 const ROLE_TRSM = Int8(3)
 const ROLE_TILE = Int8(4)
 const ROLE_EA = Int8(5)
+const ROLE_WPANEL = Int8(6)       # wide fronts in-kernel: blocked 64-panel Cholesky
+const ROLE_WTRSM = Int8(7)        #   (rb = panel k | rb = chunk, rc = k | rc = k*1024 + tjj)
+const ROLE_WTILE = Int8(8)
+const ROLE_WSIG = Int8(9)
 
 # spin with backoff on an Int32 cell until pred(value) holds; thread 1 only
 @inline function _spin_until_eq!(arr, idx, target, scratch)
@@ -767,6 +771,7 @@ end
                                     cb_done, @Const(snparent), @Const(front_ptr), @Const(front_nrows),
                                     @Const(front_ncols), @Const(cb_ptr), @Const(child_ptr),
                                     @Const(child_list), @Const(relind_ptr), @Const(relind), base,
+                                    @Const(wbase), wupd, wpdone2, wtrsml, wcbl,
                                     ::Val{WG}) where {WG}
     @uniform TT = eltype(factor)
     @uniform RT = real(eltype(factor))
@@ -813,8 +818,9 @@ end
                 end
             end
             @synchronize
+            Threads.atomic_fence()      # ALL threads: each wave drains its own stores (gfx9)
+            @synchronize
             if li == 1
-                Threads.atomic_fence()
                 Atomix.@atomic ea_left[v] += Int32(-1)
             end
         elseif r == ROLE_PANEL_B || r == ROLE_PANEL_C
@@ -902,15 +908,17 @@ end
                 SDS._front_syrk!(factor, pcb, st, v, li, front_ptr, front_nrows, front_ncols, cb2,
                                  Val(WG))
                 @synchronize
+                Threads.atomic_fence()      # ALL threads: each wave drains its own stores (gfx9)
+                @synchronize
                 if li == 1
-                    Threads.atomic_fence()
                     Atomix.@atomic cb_done[v] += Int32(1)
                     pv = Int(snparent[v])
                     pv > 0 && (Atomix.@atomic arrived[pv] += Int32(1))
                 end
             else
+                Threads.atomic_fence()      # ALL threads (gfx9)
+                @synchronize
                 if li == 1
-                    Threads.atomic_fence()
                     Atomix.@atomic panel_done[v] += Int32(1)
                 end
             end
@@ -950,8 +958,9 @@ end
                 end
             end
             @synchronize
+            Threads.atomic_fence()      # ALL threads: each wave drains its own stores (gfx9)
+            @synchronize
             if li == 1
-                Threads.atomic_fence()
                 left = (Atomix.@atomic trsm_left[v] += Int32(-1))
                 if left == Int32(0) && tiles_left[v] == Int32(0)   # new-value semantics: 0 = last finisher
                     Atomix.@atomic cb_done[v] += Int32(1)
@@ -1050,8 +1059,9 @@ end
                 end
             end
             @synchronize
+            Threads.atomic_fence()      # ALL threads: each wave drains its own stores (gfx9)
+            @synchronize
             if li == 1
-                Threads.atomic_fence()
                 left = (Atomix.@atomic tiles_left[v] += Int32(-1))
                 if left == Int32(0)                  # Atomix += returns the NEW value: 0 = last finisher
                     Atomix.@atomic cb_done[v] += Int32(1)
@@ -1059,6 +1069,208 @@ end
                     pv > 0 && (Atomix.@atomic arrived[pv] += Int32(1))
                     Int(wt[v]) > 0 && (Atomix.@atomic ea_left[Int(wt[v])] += Int32(-1))
                 end
+            end
+        elseif r == ROLE_WPANEL
+            v = Int(ra[G]); k = Int(rb[G])
+            sl = Int(wbase[v]) + k
+            if li == 1
+                if k == 1
+                    _spin_until_eq!(ea_left, v, Int32(0), fscr)
+                else
+                    _spin_until_eq!(wupd, sl, Int32(0), fscr)
+                end
+            end
+            @synchronize
+            Threads.atomic_fence()
+            f = Int(front_nrows[v]); w = Int(front_ncols[v])
+            c0 = (k - 1) * 64
+            kb = min(64, w - c0)
+            p0 = Int(front_ptr[v])
+            li == 1 && (st[1] = Int32(0))
+            @synchronize
+            for q in (li - 1):WG:(kb * kb - 1)
+                jj = q ÷ kb + 1
+                ii = q - (jj - 1) * kb + 1
+                ii >= jj && (sh[SDS._packed(ii, jj, 64)] = factor[p0 + (c0 + jj - 1) * f + c0 + ii - 1])
+            end
+            @synchronize
+            for j in 1:kb
+                if li == 1
+                    d = real(sh[SDS._packed(j, j, 64)])
+                    if st[1] == Int32(0) && d > zero(RT)
+                        piv[1] = sqrt(d)
+                        sh[SDS._packed(j, j, 64)] = piv[1]
+                    elseif st[1] == Int32(0)
+                        st[1] = Int32(c0 + j)
+                        piv[1] = one(RT)
+                    end
+                end
+                @synchronize
+                pvt = piv[1]
+                if st[1] == Int32(0)
+                    for i in (j + li):WG:kb
+                        sh[SDS._packed(i, j, 64)] /= pvt
+                    end
+                end
+                @synchronize
+                if st[1] == Int32(0)
+                    for q in (li - 1):WG:(kb * kb - 1)
+                        jj = q ÷ kb + 1
+                        ii = q - (jj - 1) * kb + 1
+                        if ii >= jj && jj > j
+                            sh[SDS._packed(ii, jj, 64)] -= sh[SDS._packed(ii, j, 64)] * sh[SDS._packed(jj, j, 64)]
+                        end
+                    end
+                end
+                @synchronize
+            end
+            for q in (li - 1):WG:(kb * kb - 1)
+                jj = q ÷ kb + 1
+                ii = q - (jj - 1) * kb + 1
+                ii >= jj && (factor[p0 + (c0 + jj - 1) * f + c0 + ii - 1] = sh[SDS._packed(ii, jj, 64)])
+            end
+            li == 1 && (k == 1 || st[1] != Int32(0)) && (info[v] = st[1])
+            @synchronize
+            Threads.atomic_fence()      # ALL threads: each wave drains its own stores (gfx9)
+            @synchronize
+            if li == 1
+                Atomix.@atomic wpdone2[sl] += Int32(1)
+            end
+        elseif r == ROLE_WTRSM
+            v = Int(ra[G]); ch = Int(rb[G]); k = Int(rc[G])
+            sl = Int(wbase[v]) + k
+            if li == 1
+                _spin_until_eq!(wpdone2, sl, Int32(1), fscr)
+            end
+            @synchronize
+            Threads.atomic_fence()
+            f = Int(front_nrows[v]); w = Int(front_ncols[v])
+            c0 = (k - 1) * 64
+            kb = min(64, w - c0)
+            p0 = Int(front_ptr[v])
+            for q in li:WG:(kb * (kb + 1) ÷ 2)
+                j = 1
+                acc = kb
+                qq = q
+                while qq > acc
+                    qq -= acc
+                    acc -= 1
+                    j += 1
+                end
+                i = j + qq - 1
+                sh[SDS._packed(i, j, 64)] = factor[p0 + (c0 + j - 1) * f + c0 + i - 1]
+            end
+            @synchronize
+            if info[v] == Int32(0)
+                i = c0 + kb + (ch - 1) * WG + li
+                if i <= f
+                    for kk in 1:kb
+                        x = factor[p0 + (c0 + kk - 1) * f + i - 1]
+                        for j in 1:(kk - 1)
+                            x -= factor[p0 + (c0 + j - 1) * f + i - 1] * sh[SDS._packed(kk, j, 64)]
+                        end
+                        factor[p0 + (c0 + kk - 1) * f + i - 1] = x / sh[SDS._packed(kk, kk, 64)]
+                    end
+                end
+            end
+            @synchronize
+            Threads.atomic_fence()      # ALL threads: each wave drains its own stores (gfx9)
+            @synchronize
+            if li == 1
+                Atomix.@atomic wtrsml[sl] += Int32(-1)
+            end
+        elseif r == ROLE_WTILE
+            v = Int(ra[G]); tii = Int(rb[G])
+            k = Int(rc[G]) ÷ 1024; tjj = Int(rc[G]) % 1024
+            sl = Int(wbase[v]) + k
+            if li == 1
+                _spin_until_eq!(wtrsml, sl, Int32(0), fscr)
+            end
+            @synchronize
+            Threads.atomic_fence()
+            f = Int(front_nrows[v]); w = Int(front_ncols[v])
+            m = f - w
+            c0 = (k - 1) * 64
+            kb = min(64, w - c0)
+            p0 = Int(front_ptr[v])
+            rb0 = c0 + kb
+            i0 = rb0 + (tii - 1) * TILE
+            j0 = rb0 + (tjj - 1) * TILE
+            ok = info[v] == Int32(0)
+            acc1 = zero(TT); acc2 = zero(TT); acc3 = zero(TT); acc4 = zero(TT)
+            acc5 = zero(TT); acc6 = zero(TT); acc7 = zero(TT); acc8 = zero(TT)
+            kk0 = 0
+            while kk0 < kb
+                kbk = min(32, kb - kk0)
+                if ok
+                    for q in (li - 1):WG:(TILE * kbk - 1)
+                        rr = q % TILE + 1
+                        cc = q ÷ TILE + 1
+                        row = i0 + rr
+                        sh[rr + (cc - 1) * TILE] = row <= f ? factor[p0 + (c0 + kk0 + cc - 1) * f + row - 1] : zero(TT)
+                        row2 = j0 + rr
+                        sh[1024 + rr + (cc - 1) * TILE] =
+                            row2 <= f ? factor[p0 + (c0 + kk0 + cc - 1) * f + row2 - 1] : zero(TT)
+                    end
+                end
+                @synchronize
+                if ok
+                    for (slot, q) in enumerate((li - 1):WG:(TILE * TILE - 1))
+                        rr = q % TILE + 1
+                        cc = q ÷ TILE + 1
+                        a = zero(TT)
+                        for kk in 1:kbk
+                            a += sh[rr + (kk - 1) * TILE] * sh[1024 + cc + (kk - 1) * TILE]
+                        end
+                        slot == 1 && (acc1 += a); slot == 2 && (acc2 += a)
+                        slot == 3 && (acc3 += a); slot == 4 && (acc4 += a)
+                        slot == 5 && (acc5 += a); slot == 6 && (acc6 += a)
+                        slot == 7 && (acc7 += a); slot == 8 && (acc8 += a)
+                    end
+                end
+                @synchronize
+                kk0 += 32
+            end
+            if ok
+                c0cb = Int(cb2[v])
+                for (slot, q) in enumerate((li - 1):WG:(TILE * TILE - 1))
+                    rr = q % TILE + 1
+                    cc = q ÷ TILE + 1
+                    ii = i0 + rr
+                    jj = j0 + cc
+                    if ii <= f && ii >= jj
+                        a = slot == 1 ? acc1 : slot == 2 ? acc2 : slot == 3 ? acc3 : slot == 4 ? acc4 :
+                            slot == 5 ? acc5 : slot == 6 ? acc6 : slot == 7 ? acc7 : acc8
+                        if jj <= w
+                            Atomix.@atomic factor[p0 + (jj - 1) * f + ii - 1] -= a
+                        elseif c0cb > 0
+                            Atomix.@atomic pcb[c0cb + SDS._packed(ii - w, jj - w, m) - 1] -= a
+                        end
+                    end
+                end
+            end
+            @synchronize
+            Threads.atomic_fence()      # ALL threads: each wave drains its own stores (gfx9)
+            @synchronize
+            if li == 1
+                if j0 < w
+                    Atomix.@atomic wupd[Int(wbase[v]) + j0 ÷ 64 + 1] += Int32(-1)
+                end
+                if j0 + TILE > w
+                    Atomix.@atomic wcbl[v] += Int32(-1)
+                end
+            end
+        elseif r == ROLE_WSIG
+            v = Int(ra[G]); K = Int(rb[G])
+            sl = Int(wbase[v]) + K
+            if li == 1
+                _spin_until_eq!(wpdone2, sl, Int32(1), fscr)
+                _spin_until_eq!(wtrsml, sl, Int32(0), fscr)
+                _spin_until_eq!(wcbl, v, Int32(0), fscr)
+                Threads.atomic_fence()
+                Atomix.@atomic cb_done[v] += Int32(1)
+                pv = Int(snparent[v])
+                pv > 0 && (Atomix.@atomic arrived[pv] += Int32(1))
             end
         end
     end
@@ -1122,7 +1334,7 @@ end
 
 # ---------------------------------------------------------------------------
 # host: the topologically ordered role list + counter bases + stream-2 program
-function build_fused_plan(s)
+function build_fused_plan(s; inkernel_wides::Bool = false, merge_segments::Bool = false)
     S = s.symbolic
     plan = s.numeric.plan
     nodes = S.schedule.group_nodes
@@ -1205,6 +1417,41 @@ function build_fused_plan(s)
         return nothing
     end
 
+    # in-kernel wides: per-(front, panel) counter slots; host arithmetic MIRRORS the
+    # kernel's decrement conditions exactly (j0 < w -> wupd[kj]; j0 + TILE > w -> wcb[v])
+    wbase_h = zeros(Int32, ns)
+    wupd_b = Int32[]; wtl_b = Int32[]
+    wcb_b = zeros(Int32, ns)
+    nwslots = 0
+    emit_wide(v) = begin
+        f = rows_h[v]; w = width_h[v]
+        K = cld(w, 64)
+        wbase_h[v] = Int32(nwslots)
+        append!(wupd_b, zeros(Int32, K)); append!(wtl_b, zeros(Int32, K))
+        for k in 1:K
+            push!(role, ROLE_WPANEL); push!(ra, Int32(v)); push!(rb, Int32(k)); push!(rc, Int32(0))
+            c0 = (k - 1) * 64
+            kb = min(64, w - c0)
+            nbelow = f - (c0 + kb)
+            nch = cld(nbelow, WGF)
+            for ch in 1:nch
+                push!(role, ROLE_WTRSM); push!(ra, Int32(v)); push!(rb, Int32(ch)); push!(rc, Int32(k))
+            end
+            wtl_b[nwslots + k] = Int32(nch)
+            nt = cld(nbelow, TILE)
+            for tjj in 1:nt, tii in tjj:nt
+                push!(role, ROLE_WTILE); push!(ra, Int32(v)); push!(rb, Int32(tii))
+                push!(rc, Int32(k * 1024 + tjj))
+                j0 = c0 + kb + (tjj - 1) * TILE
+                j0 < w && (wupd_b[nwslots + j0 ÷ 64 + 1] += Int32(1))
+                j0 + TILE > w && (wcb_b[v] += Int32(1))
+            end
+        end
+        push!(role, ROLE_WSIG); push!(ra, Int32(v)); push!(rb, Int32(K)); push!(rc, Int32(0))
+        nwslots += K
+        return nothing
+    end
+
     segments = NTuple{3, Any}[]                  # (base, count, wides-at-boundary)
     seg_base = 0
     for k in eachindex(plan.group_first)
@@ -1234,8 +1481,14 @@ function build_fused_plan(s)
                 width_h[nodes[q]] <= 64 && emit_split(nodes[q])
             end
             if !isempty(gwides)
-                push!(segments, (seg_base, length(role) - seg_base, gwides))
-                seg_base = length(role)
+                if inkernel_wides
+                    foreach(emit_wide, gwides)
+                    gwides = Int[]
+                end
+                if !(inkernel_wides && merge_segments)   # merged: one launch, no split
+                    push!(segments, (seg_base, length(role) - seg_base, gwides))
+                    seg_base = length(role)
+                end
                 append!(wides, gwides)
             end
         end
@@ -1284,6 +1537,10 @@ function build_fused_plan(s)
             arrived = KA.zeros(BACKEND[], Int32, ns), ea = KA.zeros(BACKEND[], Int32, ns),
             trsm = KA.zeros(BACKEND[], Int32, ns), tiles = KA.zeros(BACKEND[], Int32, ns),
             pdone = KA.zeros(BACKEND[], Int32, ns), cbd = KA.zeros(BACKEND[], Int32, ns),
+            wbase = DVEC(wbase_h), wupd_b = DVEC(wupd_b), wtl_b = DVEC(wtl_b),
+            wcb_b = DVEC(wcb_b), wupd = KA.zeros(BACKEND[], Int32, max(nwslots, 1)),
+            wtl = KA.zeros(BACKEND[], Int32, max(nwslots, 1)), wpd = KA.zeros(BACKEND[], Int32, max(nwslots, 1)),
+            wcb = KA.zeros(BACKEND[], Int32, ns),
             s2 = nothing)
 end
 
@@ -1298,6 +1555,10 @@ function refact_fused!(s, nzval, fp; nstreams::Int = 1)
     copyto!(fp.tiles, fp.tiles_base)
     copyto!(fp.cbd, fp.cb_base)
     fill!(fp.pdone, Int32(0))
+    length(fp.wupd_b) > 0 && copyto!(fp.wupd, fp.wupd_b)
+    length(fp.wtl_b) > 0 && copyto!(fp.wtl, fp.wtl_b)
+    fill!(fp.wpd, Int32(0))
+    copyto!(fp.wcb, fp.wcb_b)
     for k in eachindex(plan.sub_first)
         launch_subtrees_sorted!(N, S, nzval, fp.ssub[k], plan.sub_local[k], backend)
     end
@@ -1318,7 +1579,8 @@ function refact_fused!(s, nzval, fp; nstreams::Int = 1)
                                              fp.arrived, fp.ea, fp.pdone, fp.trsm, fp.tiles, fp.cbd,
                                              S.snparent, S.front_ptr, S.front_nrows, S.front_ncols,
                                              S.cb_ptr, S.child_ptr, S.child_list, S.relind_ptr, S.relind,
-                                             Int32(base), Val(WGF); ndrange = WGF * count)
+                                             Int32(base), fp.wbase, fp.wupd, fp.wpd, fp.wtl, fp.wcb,
+                                             Val(WGF); ndrange = WGF * count)
         if true
             for v in gwides
                 SDS._factor_panel_c!(N.factor, fp.pcb, N.work, N.info, v, S.layout.panel_ptr[v],
