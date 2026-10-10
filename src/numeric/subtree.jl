@@ -138,7 +138,9 @@ end
     return nothing
 end
 
-# column j, first half: check the pivot, rank-1 update of the trailing front with the scaled column
+# column j, first half: check the pivot and scale the column below the diagonal by it
+# (every work item recomputes `d = sqrt(ajj)` from local memory: cheaper than sharing
+# it through a barrier, and it keeps the second half free of divisions)
 @inline function _subtree_chol_update!(buf, ctl, piv, j, li, ::Val{WG}) where {WG}
     @inbounds begin
         if ctl[_ST_STATUS] == 0
@@ -146,18 +148,10 @@ end
             lf = ctl[_ST_LF] - 1
             ajj = real(buf[lf + _packed(j, j, f)])
             if ajj > 0
-                d = sqrt(ajj)
-                li == 1 && (piv[1] = d)
-                r = f - j
-                for q in (li - 1):WG:(r * r - 1)
-                    k = j + 1 + q ÷ r
-                    i = j + 1 + q % r
-                    if i >= k
-                        lij = buf[lf + _packed(i, j, f)] / d
-                        lkj = buf[lf + _packed(k, j, f)] / d
-                        buf[lf + _packed(i, k, f)] -= lij * conj(lkj)
-                    end
-                end
+                rd = inv(sqrt(ajj))                        # strictly below the diagonal only:
+                for i in (j + li):WG:f                     # the diagonal is replaced in the second
+                    buf[lf + _packed(i, j, f)] *= rd       # half, so no work item reads a value
+                end                                        # another one is overwriting
             elseif li == 1
                 ctl[_ST_STATUS] = j % eltype(ctl)          # not positive (or NaN): stop, as LAPACK potrf
             end
@@ -166,17 +160,23 @@ end
     return nothing
 end
 
-# column j, second half: scale the column below the diagonal by the pivot
+# column j, second half: rank-1 update of the trailing front with the scaled column
+# (multiply-add only: the former divide-in-the-update doubled the flop cost in
+# f64 divisions, the bulk of the fused regime-A kernel's time)
 @inline function _subtree_chol_scale!(buf, ctl, piv, j, li, ::Val{WG}) where {WG}
     @inbounds begin
         if ctl[_ST_STATUS] == 0
             f = ctl[_ST_F]
             lf = ctl[_ST_LF] - 1
-            d = piv[1]
-            for i in (j + li):WG:f
-                buf[lf + _packed(i, j, f)] /= d
+            li == 1 && (buf[lf + _packed(j, j, f)] = sqrt(real(buf[lf + _packed(j, j, f)])))
+            r = f - j
+            for q in (li - 1):WG:(r * r - 1)
+                k = j + 1 + q ÷ r
+                i = j + 1 + q % r
+                if i >= k
+                    buf[lf + _packed(i, k, f)] -= buf[lf + _packed(i, j, f)] * conj(buf[lf + _packed(k, j, f)])
+                end
             end
-            li == 1 && (buf[lf + _packed(j, j, f)] = d)
         end
     end
     return nothing
@@ -305,10 +305,10 @@ function _launch_subtrees!(N::Numeric{T}, S::Symbolic, nzval, first, count, ::Va
 end
 
 # the local-memory size class as a compile-time constant (explicit branches: no dynamic dispatch, no allocation;
-# every branch is compiled with the first launch, hence the short list of sizes; branch 6 is the error)
+# every branch is compiled with the first launch, hence the short list of sizes; branch 5 is the error)
 @inline function _with_local_bytes(fn, nbytes::Int)
-    length(SUBTREE_LOCAL_SIZES) == 5 || error("update _with_local_bytes")
-    Base.Cartesian.@nif 6 d -> (nbytes == SUBTREE_LOCAL_SIZES[d]) d -> fn(Val(SUBTREE_LOCAL_SIZES[d])) d -> throw(
+    length(SUBTREE_LOCAL_SIZES) == 4 || error("update _with_local_bytes")
+    Base.Cartesian.@nif 5 d -> (nbytes == SUBTREE_LOCAL_SIZES[d]) d -> fn(Val(SUBTREE_LOCAL_SIZES[d])) d -> throw(
         InvalidValueError("no regime-A kernel with $nbytes bytes of local memory; sizes: $SUBTREE_LOCAL_SIZES"))
 end
 
