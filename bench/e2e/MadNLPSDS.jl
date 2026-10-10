@@ -45,7 +45,7 @@ function _prefer_merged(backend, opt::SDSSolverOptions)
     opt.sds_wides == "merged" && return true
     opt.sds_wides == "host" && return false
     if occursin("CUDABackend", string(typeof(backend)))
-        M = parentmodule(typeof(backend))
+        M = Base.moduleroot(parentmodule(typeof(backend)))   # CUDACore (CUDA 6 split) or CUDA
         return M.attribute(M.device(), M.DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR) < 2048
     end
     return true
