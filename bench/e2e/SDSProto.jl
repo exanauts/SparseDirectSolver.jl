@@ -716,6 +716,9 @@ function algo2_solve!(x, s, b, inv11, inv_ptr, fz; debug::Bool = false)
         fwd_entry(k); k += 1
     end
     debug && (KA.synchronize(BACKEND[]); println("  algo2: forward done"); flush(stdout))
+    if SDS._is_ldlt_structure(S.structure)      # LDL: apply D between the unit-triangular sweeps
+        Yv ./= view(N.d, 1:length(Yv))
+    end
     k = length(plan.kind)
     for (fzk, wg) in Iterators.reverse(segs)
         while k > fzk.i2
@@ -740,6 +743,201 @@ end
 const SYRK_IN = 64
 const TILE = 32
 const NL64 = 2080                 # packed 64x64 lower triangle
+
+# ---------------------------------------------------------------------------
+# no-pivot LDLᵀ mode of the fused kernel (real element types): the factor stores
+# the UNIT lower panels and D goes to `d` (global factor-column indexing), the
+# stock LDL layout, so the stock solve and the fused solve (one extra D pass
+# between the sweeps) both work on it. A zero pivot sets info[v] to the local
+# column and the front's consumers skip, exactly the Cholesky failure path;
+# NEGATIVE pivots factor through (inertia for MadNLP). The mode is a compile-time
+# `Val{LDL}` kernel parameter: the Cholesky instantiation is unchanged machine code.
+#
+# Panel convention while a front is in flight: the packed `sh` triangle keeps the
+# pivot d_j ON THE DIAGONAL (the unit is implied), so the in-panel TRSM both
+# reconstructs the unscaled column (`* sh[j,j]`) and divides by the pivot
+# (`/ sh[kk,kk]`) with the same reads as Cholesky; write-out emits the unit
+# diagonal. The TRSM role reloads the panel from the factor (diag = 1) and
+# restores d into the diagonal slots from `d`; the TILE roles stage the 32
+# pivots of each k-block in sh[2049:2080] (free: NL64 - 2*1024) and fold them
+# into the Ai tile only.
+
+# regime A: a dedicated no-pivot LDL variant of SDS.subtree_cholesky_kernel! (the stock
+# kernel stays untouched; its CPU-launch allocation budget is load-bearing in the tests).
+# Identical skeleton and assembly helpers; only the two column phases and the extension
+# slots differ: the whole trailing triangle (CB included) takes the d-folded rank-1, so
+# no separate finalize/CB pass exists, and d/piv/pivot_kind are filled as the stock LDL
+# path (identity pivot order; a zero pivot sets the front status, as Cholesky).
+const _SP_C0 = SDS._ST_CTL + 1
+const _SP_CTL = _SP_C0
+
+@inline function _subtree_ldl_update!(buf, ctl, pv, j, li, d, piv, pivot_kind, ::Val{WG}) where {WG}
+    @inbounds begin
+        T = eltype(buf)
+        IT = eltype(ctl)
+        f = ctl[SDS._ST_F]
+        lf = ctl[SDS._ST_LF] - 1
+        if ctl[SDS._ST_STATUS] == 0
+            dk = real(buf[lf + SDS._packed(j, j, f)])
+            if !iszero(dk)
+                if li == 1
+                    g = Int(ctl[_SP_C0]) + j - 1
+                    d[g] = dk
+                    piv[g] = Int32(g)
+                    pivot_kind[g] = SDS.PIVOT_KIND_1X1
+                    pv[1] = dk
+                end
+                rd = inv(dk)
+                for i in (j + li):WG:f
+                    buf[lf + SDS._packed(i, j, f)] *= rd
+                end
+            elseif li == 1
+                ctl[SDS._ST_STATUS] = j % IT
+            end
+        end
+    end
+    return nothing
+end
+
+@inline function _subtree_ldl_scale!(buf, ctl, pv, j, li, ::Val{WG}) where {WG}
+    @inbounds begin
+        if ctl[SDS._ST_STATUS] == 0
+            f = ctl[SDS._ST_F]
+            lf = ctl[SDS._ST_LF] - 1
+            dk = pv[1]
+            li == 1 && (buf[lf + SDS._packed(j, j, f)] = one(eltype(buf)))
+            r = f - j
+            for q in (li - 1):WG:(r * (r + 1) ÷ 2 - 1)
+                a, b = SDS._tri_decode(q, r)
+                i = j + a
+                k = j + b
+                buf[lf + SDS._packed(i, k, f)] -= buf[lf + SDS._packed(i, j, f)] * dk *
+                                                  buf[lf + SDS._packed(k, j, f)]
+            end
+        end
+    end
+    return nothing
+end
+
+@kernel function subtree_ldl_kernel!(factor, stack, info, d, piv, pivot_kind, @Const(nzval), @Const(amap),
+                                     @Const(amap_ptr), @Const(amap_src), @Const(trees), bm, @Const(subtree_ptr),
+                                     @Const(subtree_nodes), @Const(super_ptr), @Const(front_ptr),
+                                     @Const(front_nrows), @Const(front_ncols), @Const(cb_ptr),
+                                     @Const(local_front), @Const(local_cb), @Const(child_ptr),
+                                     @Const(child_list), @Const(relind_ptr), @Const(relind),
+                                     ::Val{NE}, ::Val{WG}) where {NE, WG}
+    @uniform TT = eltype(factor)
+    @uniform IT = eltype(subtree_nodes)
+    li = @index(Local, Linear)
+    G = @index(Group, Linear)
+    buf = @localmem TT (NE,)
+    ctl = @localmem IT (_SP_CTL,)
+    pv = @localmem TT (1,)
+    if li == 1
+        @inbounds t = trees[bm.first + SDS._bm_node(bm, G) - 1]
+        @inbounds ctl[SDS._ST_FIRST] = subtree_ptr[t]
+        @inbounds ctl[SDS._ST_COUNT] = subtree_ptr[t + 1] - subtree_ptr[t]
+    end
+    @synchronize
+    for k in 1:ctl[SDS._ST_COUNT]
+        if li == 1
+            SDS._subtree_setup!(ctl, k, subtree_nodes, front_nrows, front_ncols, local_front, local_cb,
+                                child_ptr)
+            @inbounds ctl[_SP_C0] = super_ptr[ctl[SDS._ST_NODE]] % IT
+        end
+        @synchronize
+        SDS._subtree_zero!(buf, ctl, li, Val(WG))
+        @synchronize
+        SDS._subtree_scatter!(buf, ctl, SDS._mview(nzval, SDS._bm_gmember(bm, G), bm.nbatch), amap, amap_ptr,
+                              amap_src, front_ptr, li, Val(WG))
+        @synchronize
+        for kc in 1:ctl[SDS._ST_NCHILD]
+            SDS._subtree_extend_add!(buf, ctl, kc, child_ptr, child_list, front_nrows, front_ncols, local_cb,
+                                     relind_ptr, relind, li, Val(WG))
+            @synchronize
+        end
+        for j in 1:ctl[SDS._ST_W]
+            _subtree_ldl_update!(buf, ctl, pv, j, li, SDS._mview(d, SDS._bm_gmember(bm, G), bm.nbatch),
+                                 SDS._mview(piv, SDS._bm_gmember(bm, G), bm.nbatch),
+                                 SDS._mview(pivot_kind, SDS._bm_gmember(bm, G), bm.nbatch), Val(WG))
+            @synchronize
+            _subtree_ldl_scale!(buf, ctl, pv, j, li, Val(WG))
+            @synchronize
+        end
+        mb = SDS._bm_gmember(bm, G)
+        SDS._subtree_write!(factor, SDS._mview(stack, mb, bm.nbatch), SDS._iview(info, mb, bm.nbatch), buf, ctl,
+                            SDS.member_panels(front_ptr, mb, bm.nbatch), cb_ptr, li, Val(WG))
+        @synchronize
+        for r in 1:ctl[SDS._ST_ROUNDS]
+            SDS._subtree_move!(buf, ctl, r, li, Val(WG))
+            @synchronize
+        end
+    end
+end
+
+@inline function _front_ldl_update!(sh, st, pv, j, v, li, front_ncols, d, g0, ::Val{WG}) where {WG}
+    @inbounds begin
+        w = Int(front_ncols[v])
+        if j <= w && st[1] == Int32(0)
+            dk = real(sh[SDS._packed(j, j, 64)])
+            if !iszero(dk)
+                if li == 1
+                    d[g0 + j] = dk
+                    pv[1] = dk
+                end
+                rd = inv(dk)
+                for i in (j + li):WG:w
+                    sh[SDS._packed(i, j, 64)] *= rd
+                end
+            elseif li == 1
+                st[1] = Int32(j)
+            end
+        end
+    end
+    return nothing
+end
+
+@inline function _front_ldl_scale!(sh, st, pv, j, v, li, front_ncols, ::Val{WG}) where {WG}
+    @inbounds begin
+        w = Int(front_ncols[v])
+        if j <= w && st[1] == Int32(0)
+            dk = pv[1]
+            r = w - j
+            for q in (li - 1):WG:(r * (r + 1) ÷ 2 - 1)
+                a, b = SDS._tri_decode(q, r)
+                i = j + a
+                k = j + b
+                sh[SDS._packed(i, k, 64)] -= sh[SDS._packed(i, j, 64)] * dk * sh[SDS._packed(k, j, 64)]
+            end
+        end
+    end
+    return nothing
+end
+
+# F22 ← F22 − (L21 D) L21ᵀ on the private CB; d_k read from the sh diagonal (still live)
+@inline function _front_ldl_syrk!(factor, pcb, sh, st, v, li, front_ptr, front_nrows, front_ncols, cb2,
+                                  ::Val{WG}) where {WG}
+    @inbounds begin
+        TT = eltype(factor)
+        c0 = Int(cb2[v])
+        if st[1] == Int32(0) && c0 > 0
+            f = Int(front_nrows[v])
+            w = Int(front_ncols[v])
+            m = f - w
+            p0 = Int(front_ptr[v]) + w - 1
+            for q in (li - 1):WG:(m * (m + 1) ÷ 2 - 1)
+                ii, jj = SDS._tri_decode(q, m)
+                acc = zero(TT)
+                for k in 1:w
+                    acc += factor[p0 + (k - 1) * f + ii] * real(sh[SDS._packed(k, k, 64)]) *
+                           factor[p0 + (k - 1) * f + jj]
+                end
+                pcb[c0 + SDS._packed(ii, jj, m) - 1] -= acc
+            end
+        end
+    end
+    return nothing
+end
 
 const ROLE_PANEL_B = Int8(1)
 const ROLE_PANEL_C = Int8(2)
@@ -771,8 +969,8 @@ end
                                     cb_done, @Const(snparent), @Const(front_ptr), @Const(front_nrows),
                                     @Const(front_ncols), @Const(cb_ptr), @Const(child_ptr),
                                     @Const(child_list), @Const(relind_ptr), @Const(relind), base,
-                                    @Const(wbase), wupd, wpdone2, wtrsml, wcbl, scap,
-                                    ::Val{WG}) where {WG}
+                                    @Const(wbase), wupd, wpdone2, wtrsml, wcbl, scap, d, @Const(super_ptr),
+                                    ::Val{LDL}, ::Val{WG}) where {LDL, WG}
     @uniform TT = eltype(factor)
     @uniform RT = real(eltype(factor))
     li = @index(Local, Linear)
@@ -877,10 +1075,19 @@ end
             SDS._front_load!(sh, st, factor, v, li, front_ptr, front_nrows, front_ncols, Val(64), Val(WG))
             @synchronize
             w = Int(front_ncols[v])
+            g0 = Int(super_ptr[v]) - 1
             for j in 1:w
-                SDS._front_chol_update!(sh, st, piv, j, v, li, front_ncols, Val(64), Val(WG))
+                if LDL
+                    _front_ldl_update!(sh, st, piv, j, v, li, front_ncols, d, g0, Val(WG))
+                else
+                    SDS._front_chol_update!(sh, st, piv, j, v, li, front_ncols, Val(64), Val(WG))
+                end
                 @synchronize
-                SDS._front_chol_scale!(sh, st, piv, j, v, li, front_ncols, Val(64), Val(WG))
+                if LDL
+                    _front_ldl_scale!(sh, st, piv, j, v, li, front_ncols, Val(WG))
+                else
+                    SDS._front_chol_scale!(sh, st, piv, j, v, li, front_ncols, Val(64), Val(WG))
+                end
                 @synchronize
             end
             f = Int(front_nrows[v])
@@ -888,7 +1095,8 @@ end
             for q in (li - 1):WG:(w * w - 1)
                 j = q ÷ w + 1
                 i = q - (j - 1) * w + 1
-                i >= j && (factor[p0 + (j - 1) * f + i - 1] = sh[SDS._packed(i, j, 64)])
+                i >= j && (factor[p0 + (j - 1) * f + i - 1] = (LDL && i == j) ? one(TT) :
+                                                              sh[SDS._packed(i, j, 64)])
             end
             m = f - w
             if st[1] == Int32(0) && m <= SYRK_IN
@@ -896,7 +1104,9 @@ end
                     for kk in 1:w
                         x = factor[p0 + (kk - 1) * f + i - 1]
                         for j in 1:(kk - 1)
-                            x -= factor[p0 + (j - 1) * f + i - 1] * sh[SDS._packed(kk, j, 64)]
+                            lij = factor[p0 + (j - 1) * f + i - 1]
+                            x -= LDL ? lij * (real(sh[SDS._packed(j, j, 64)]) * sh[SDS._packed(kk, j, 64)]) :
+                                       lij * sh[SDS._packed(kk, j, 64)]
                         end
                         factor[p0 + (kk - 1) * f + i - 1] = x / sh[SDS._packed(kk, kk, 64)]
                     end
@@ -905,8 +1115,13 @@ end
             li == 1 && (info[v] = st[1])
             @synchronize
             if m <= SYRK_IN
-                SDS._front_syrk!(factor, pcb, st, v, li, front_ptr, front_nrows, front_ncols, cb2,
-                                 Val(WG))
+                if LDL
+                    _front_ldl_syrk!(factor, pcb, sh, st, v, li, front_ptr, front_nrows, front_ncols, cb2,
+                                     Val(WG))
+                else
+                    SDS._front_syrk!(factor, pcb, st, v, li, front_ptr, front_nrows, front_ncols, cb2,
+                                     Val(WG))
+                end
                 @synchronize
                 Threads.atomic_fence()      # ALL threads: each wave drains its own stores (gfx9)
                 @synchronize
@@ -942,7 +1157,10 @@ end
                     j += 1
                 end
                 i = j + qq - 1
-                sh[SDS._packed(i, j, 64)] = factor[p0 + (j - 1) * f + i - 1]
+                # LDL: the factor diagonal is unit; restore d in the same loop (a second
+                # loop would race this one on the diagonal slots)
+                sh[SDS._packed(i, j, 64)] = (LDL && i == j) ? TT(d[Int(super_ptr[v]) - 1 + j]) :
+                                            factor[p0 + (j - 1) * f + i - 1]
             end
             @synchronize
             if info[v] == Int32(0)
@@ -951,7 +1169,9 @@ end
                     for kk in 1:w
                         x = factor[p0 + (kk - 1) * f + i - 1]
                         for j in 1:(kk - 1)
-                            x -= factor[p0 + (j - 1) * f + i - 1] * sh[SDS._packed(kk, j, 64)]
+                            lij = factor[p0 + (j - 1) * f + i - 1]
+                            x -= LDL ? lij * (real(sh[SDS._packed(j, j, 64)]) * sh[SDS._packed(kk, j, 64)]) :
+                                       lij * sh[SDS._packed(kk, j, 64)]
                         end
                         factor[p0 + (kk - 1) * f + i - 1] = x / sh[SDS._packed(kk, kk, 64)]
                     end
@@ -988,12 +1208,23 @@ end
             kk0 = 0
             while kk0 < w                           # k in two halves: Ai/Aj share sh (2 x 1024)
                 kb = min(32, w - kk0)
+                if LDL                              # stage the block's pivots; fold into Ai only
+                    if ok
+                        g0 = Int(super_ptr[v]) - 1
+                        for c in li:WG:kb
+                            sh[2048 + c] = TT(d[g0 + kk0 + c])
+                        end
+                    end
+                    @synchronize
+                end
                 if ok
                     for q in (li - 1):WG:(TILE * kb - 1)
                         rr = q % TILE + 1
                         cc = q ÷ TILE + 1
                         row = i0 + rr
-                        sh[rr + (cc - 1) * TILE] = row <= m ? factor[p0 + (kk0 + cc - 1) * f + row] : zero(TT)
+                        sh[rr + (cc - 1) * TILE] = row <= m ?
+                            (LDL ? factor[p0 + (kk0 + cc - 1) * f + row] * sh[2048 + cc] :
+                                   factor[p0 + (kk0 + cc - 1) * f + row]) : zero(TT)
                         row2 = j0 + rr
                         sh[1024 + rr + (cc - 1) * TILE] =
                             row2 <= m ? factor[p0 + (kk0 + cc - 1) * f + row2] : zero(TT)
@@ -1096,20 +1327,35 @@ end
             @synchronize
             for j in 1:kb
                 if li == 1
-                    d = real(sh[SDS._packed(j, j, 64)])
-                    if st[1] == Int32(0) && d > zero(RT)
-                        piv[1] = sqrt(d)
-                        sh[SDS._packed(j, j, 64)] = piv[1]
-                    elseif st[1] == Int32(0)
-                        st[1] = Int32(c0 + j)
-                        piv[1] = one(RT)
+                    dj = real(sh[SDS._packed(j, j, 64)])
+                    if LDL
+                        if st[1] == Int32(0) && !iszero(dj)
+                            piv[1] = dj                      # d stays on the diagonal
+                            d[Int(super_ptr[v]) - 1 + c0 + j] = dj
+                        elseif st[1] == Int32(0)
+                            st[1] = Int32(c0 + j)
+                            piv[1] = one(RT)
+                        end
+                    else
+                        if st[1] == Int32(0) && dj > zero(RT)
+                            piv[1] = sqrt(dj)
+                            sh[SDS._packed(j, j, 64)] = piv[1]
+                        elseif st[1] == Int32(0)
+                            st[1] = Int32(c0 + j)
+                            piv[1] = one(RT)
+                        end
                     end
                 end
                 @synchronize
                 pvt = piv[1]
                 if st[1] == Int32(0)
+                    rpv = inv(pvt)
                     for i in (j + li):WG:kb
-                        sh[SDS._packed(i, j, 64)] /= pvt
+                        if LDL
+                            sh[SDS._packed(i, j, 64)] *= rpv
+                        else
+                            sh[SDS._packed(i, j, 64)] /= pvt
+                        end
                     end
                 end
                 @synchronize
@@ -1118,7 +1364,9 @@ end
                         jj = q ÷ kb + 1
                         ii = q - (jj - 1) * kb + 1
                         if ii >= jj && jj > j
-                            sh[SDS._packed(ii, jj, 64)] -= sh[SDS._packed(ii, j, 64)] * sh[SDS._packed(jj, j, 64)]
+                            sh[SDS._packed(ii, jj, 64)] -= LDL ?
+                                sh[SDS._packed(ii, j, 64)] * pvt * sh[SDS._packed(jj, j, 64)] :
+                                sh[SDS._packed(ii, j, 64)] * sh[SDS._packed(jj, j, 64)]
                         end
                     end
                 end
@@ -1127,7 +1375,8 @@ end
             for q in (li - 1):WG:(kb * kb - 1)
                 jj = q ÷ kb + 1
                 ii = q - (jj - 1) * kb + 1
-                ii >= jj && (factor[p0 + (c0 + jj - 1) * f + c0 + ii - 1] = sh[SDS._packed(ii, jj, 64)])
+                ii >= jj && (factor[p0 + (c0 + jj - 1) * f + c0 + ii - 1] =
+                                 (LDL && ii == jj) ? one(TT) : sh[SDS._packed(ii, jj, 64)])
             end
             li == 1 && (k == 1 || st[1] != Int32(0)) && (info[v] = st[1])
             @synchronize
@@ -1158,7 +1407,10 @@ end
                     j += 1
                 end
                 i = j + qq - 1
-                sh[SDS._packed(i, j, 64)] = factor[p0 + (c0 + j - 1) * f + c0 + i - 1]
+                # LDL: the factor diagonal is unit; restore d in the same loop (a second
+                # loop would race this one on the diagonal slots)
+                sh[SDS._packed(i, j, 64)] = (LDL && i == j) ? TT(d[Int(super_ptr[v]) - 1 + c0 + j]) :
+                                            factor[p0 + (c0 + j - 1) * f + c0 + i - 1]
             end
             @synchronize
             if info[v] == Int32(0)
@@ -1167,7 +1419,9 @@ end
                     for kk in 1:kb
                         x = factor[p0 + (c0 + kk - 1) * f + i - 1]
                         for j in 1:(kk - 1)
-                            x -= factor[p0 + (c0 + j - 1) * f + i - 1] * sh[SDS._packed(kk, j, 64)]
+                            lij = factor[p0 + (c0 + j - 1) * f + i - 1]
+                            x -= LDL ? lij * (real(sh[SDS._packed(j, j, 64)]) * sh[SDS._packed(kk, j, 64)]) :
+                                       lij * sh[SDS._packed(kk, j, 64)]
                         end
                         factor[p0 + (c0 + kk - 1) * f + i - 1] = x / sh[SDS._packed(kk, kk, 64)]
                     end
@@ -1202,12 +1456,23 @@ end
             kk0 = 0
             while kk0 < kb
                 kbk = min(32, kb - kk0)
+                if LDL                              # stage the block's pivots; fold into Ai only
+                    if ok
+                        g0 = Int(super_ptr[v]) - 1 + c0
+                        for c in li:WG:kbk
+                            sh[2048 + c] = TT(d[g0 + kk0 + c])
+                        end
+                    end
+                    @synchronize
+                end
                 if ok
                     for q in (li - 1):WG:(TILE * kbk - 1)
                         rr = q % TILE + 1
                         cc = q ÷ TILE + 1
                         row = i0 + rr
-                        sh[rr + (cc - 1) * TILE] = row <= f ? factor[p0 + (c0 + kk0 + cc - 1) * f + row - 1] : zero(TT)
+                        sh[rr + (cc - 1) * TILE] = row <= f ?
+                            (LDL ? factor[p0 + (c0 + kk0 + cc - 1) * f + row - 1] * sh[2048 + cc] :
+                                   factor[p0 + (c0 + kk0 + cc - 1) * f + row - 1]) : zero(TT)
                         row2 = j0 + rr
                         sh[1024 + rr + (cc - 1) * TILE] =
                             row2 <= f ? factor[p0 + (c0 + kk0 + cc - 1) * f + row2 - 1] : zero(TT)
@@ -1317,27 +1582,42 @@ end
 end
 
 # subtree launcher with a custom (sorted) list, local memory sized by eltype
-function launch_subtrees_sorted!(N, S, nzval, list, lb, backend)
+function launch_subtrees_sorted!(N, S, nzval, list, lb, backend, ldl::Bool = false)
     SDS._with_local_bytes(Int(lb)) do LBv
-        _sorted_subtree_launch(N, S, nzval, list, LBv, Val(SDS.SUBTREE_WORKGROUP), backend)
+        _sorted_subtree_launch(N, S, nzval, list, Val(ldl), LBv, Val(SDS.SUBTREE_WORKGROUP), backend)
     end
 end
-function _sorted_subtree_launch(N::SDS.Numeric{T}, S, nzval, list, ::Val{LB}, ::Val{WG}, backend) where {T, LB, WG}
+function _sorted_subtree_launch(N::SDS.Numeric{T}, S, nzval, list, ::Val{LDL}, ::Val{LB}, ::Val{WG},
+                                backend) where {T, LDL, LB, WG}
     bm = SDS.batch_map(N; first = 1)
-    k! = SDS.subtree_cholesky_kernel!(backend, WG)
-    k!(N.factor, N.stack, N.info, nzval, S.amap, S.amap_ptr, S.amap_src, list, bm, S.subtree_ptr,
-       S.subtree_nodes, S.front_ptr, S.front_nrows, S.front_ncols, S.cb_ptr, S.local_front, S.local_cb,
-       S.child_ptr, S.child_list, S.relind_ptr, S.relind,
-       Val((LB - SDS.SUBTREE_LOCAL_RESERVE) ÷ sizeof(T)), Val(WG); ndrange = WG * length(list) * bm.nact)
+    if LDL
+        # the schedule sized the "S" budget classes with the LDLT reserve: match it
+        k! = subtree_ldl_kernel!(backend, WG)
+        k!(N.factor, N.stack, N.info, N.d, N.piv, N.pivot_kind, nzval, S.amap, S.amap_ptr, S.amap_src,
+           list, bm, S.subtree_ptr, S.subtree_nodes, S.super_ptr, S.front_ptr, S.front_nrows, S.front_ncols,
+           S.cb_ptr, S.local_front, S.local_cb, S.child_ptr, S.child_list, S.relind_ptr, S.relind,
+           Val((LB - SDS.SUBTREE_LOCAL_RESERVE_LDLT) ÷ sizeof(T)), Val(WG);
+           ndrange = WG * length(list) * bm.nact)
+    else
+        k! = SDS.subtree_cholesky_kernel!(backend, WG)
+        k!(N.factor, N.stack, N.info, nzval, S.amap, S.amap_ptr, S.amap_src, list, bm, S.subtree_ptr,
+           S.subtree_nodes, S.front_ptr, S.front_nrows, S.front_ncols, S.cb_ptr, S.local_front, S.local_cb,
+           S.child_ptr, S.child_list, S.relind_ptr, S.relind,
+           Val((LB - SDS.SUBTREE_LOCAL_RESERVE) ÷ sizeof(T)), Val(WG); ndrange = WG * length(list) * bm.nact)
+    end
     return nothing
 end
 
 # ---------------------------------------------------------------------------
 # host: the topologically ordered role list + counter bases + stream-2 program
 function build_fused_plan(s; inkernel_wides::Bool = false, merge_segments::Bool = false,
-                          wgf::Int = WGF, scap::Integer = 128)
+                          wgf::Int = WGF, scap::Integer = 128, ldl::Bool = false)
     S = s.symbolic
     plan = s.numeric.plan
+    if ldl
+        eltype(s.numeric.factor) <: Real || error("fused LDL mode: real element types only")
+        inkernel_wides = true                  # no vendor potrf for LDL: wide fronts stay in-kernel
+    end
     nodes = S.schedule.group_nodes
     rows_h = S.schedule.rows
     width_h = S.schedule.width
@@ -1541,7 +1821,7 @@ function build_fused_plan(s; inkernel_wides::Bool = false, merge_segments::Bool 
             wbase = DVEC(wbase_h), wupd_b = DVEC(wupd_b), wtl_b = DVEC(wtl_b),
             wcb_b = DVEC(wcb_b), wupd = KA.zeros(BACKEND[], Int32, max(nwslots, 1)),
             wtl = KA.zeros(BACKEND[], Int32, max(nwslots, 1)), wpd = KA.zeros(BACKEND[], Int32, max(nwslots, 1)),
-            wcb = KA.zeros(BACKEND[], Int32, ns), wgf, scap = Int32(scap),
+            wcb = KA.zeros(BACKEND[], Int32, ns), wgf, scap = Int32(scap), ldl,
             s2 = nothing)
 end
 
@@ -1561,7 +1841,7 @@ function refact_fused!(s, nzval, fp; nstreams::Int = 1)
     fill!(fp.wpd, Int32(0))
     copyto!(fp.wcb, fp.wcb_b)
     for k in eachindex(plan.sub_first)
-        launch_subtrees_sorted!(N, S, nzval, fp.ssub[k], plan.sub_local[k], backend)
+        launch_subtrees_sorted!(N, S, nzval, fp.ssub[k], plan.sub_local[k], backend, fp.ldl)
     end
     nodes = S.schedule.group_nodes
     fill!(fp.pcb, 0.0)
@@ -1581,7 +1861,8 @@ function refact_fused!(s, nzval, fp; nstreams::Int = 1)
                                              S.snparent, S.front_ptr, S.front_nrows, S.front_ncols,
                                              S.cb_ptr, S.child_ptr, S.child_list, S.relind_ptr, S.relind,
                                              Int32(base), fp.wbase, fp.wupd, fp.wpd, fp.wtl, fp.wcb,
-                                             fp.scap, Val(fp.wgf); ndrange = fp.wgf * count)
+                                             fp.scap, N.d, S.super_ptr, Val(fp.ldl), Val(fp.wgf);
+                                             ndrange = fp.wgf * count)
         if true
             for v in gwides
                 SDS._factor_panel_c!(N.factor, fp.pcb, N.work, N.info, v, S.layout.panel_ptr[v],
@@ -1593,7 +1874,7 @@ function refact_fused!(s, nzval, fp; nstreams::Int = 1)
         end
     end
     SDS.assemble_schur!(N, S, nzval)
-    SDS.cholesky_stats!(N, S)
+    fp.ldl || SDS.cholesky_stats!(N, S)        # LDL: inertia comes from the signs of d
     return SDS._numeric_info!(N, S, true)
 end
 
