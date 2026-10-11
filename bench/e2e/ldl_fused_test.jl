@@ -4,8 +4,8 @@
 using SparseDirectSolver, SparseArrays, LinearAlgebra, Random, Statistics, Printf
 using CUDA, CUDA.CUSPARSE
 const SDS = SparseDirectSolver
-include(joinpath(@__DIR__, "SDSProto.jl"))
-using .SDSProto
+include(joinpath(@__DIR__, "SDSFused.jl"))
+using .SDSFused
 
 const BD = joinpath(@__DIR__, "..")
 include(joinpath(BD, "matrices.jl"))
@@ -18,7 +18,7 @@ Lh = tril(A)
 Random.seed!(666)
 bh = rand(n)
 S3 = (p = Vector{Int32}(undef, n); read!(joinpath(BD, "perm_cand3.bin"), p); Int.(p))
-SDSProto.BACKEND[] = CUDA.CUDABackend()
+SDSFused.BACKEND[] = CUDA.CUDABackend()
 
 function setup(structure)
     bd = CuArray(bh); xd = similar(bd)
@@ -43,8 +43,8 @@ flush(stdout)
 
 # --- fused LDL on the same solver ---
 nzval = SDS._factor_values(s)
-fp = SDSProto.build_fused_plan(s; ldl = true, wgf = 128, scap = 128)
-info = SDSProto.refact_fused!(s, nzval, fp)
+fp = SDSFused.build_fused_plan(s; ldl = true, wgf = 128, scap = 128)
+info = SDSFused.refact_fused!(s, nzval, fp)
 CUDA.synchronize()
 fac1 = Array(s.numeric.factor)
 d1 = Array(s.numeric.d)
@@ -52,12 +52,12 @@ df = maximum(abs, fac1 - fac0) / maximum(abs, fac0)
 dd = maximum(abs, d1 - d0) / maximum(abs, d0)
 @printf "fused  S/N   info %d  Δfactor %.2e  Δd %.2e\n" info df dd
 (info == 0 && df < 1e-6 && dd < 1e-6) || error("fused LDL gate FAILED")
-tr_fused = median([CUDA.@elapsed SDSProto.refact_fused!(s, nzval, fp) for _ in 1:7])
+tr_fused = median([CUDA.@elapsed SDSFused.refact_fused!(s, nzval, fp) for _ in 1:7])
 @printf "fused  S/N   refact %8.2f ms\n" tr_fused*1e3
 flush(stdout)
 
 # --- fused solve (inverse path + D pass) ---
-inv11, inv_ptr, invertf, _ = SDSProto.build_inverse(s)
+inv11, inv_ptr, invertf, _ = SDSFused.build_inverse(s)
 plan0 = s.workspace.plan
 nodes0 = s.symbolic.schedule.group_nodes
 stp = Array(s.symbolic.subtree_ptr)
@@ -67,29 +67,29 @@ for k in eachindex(plan0.kind)
     append!(sub_ids, Int32.(nodes0[plan0.first[k]:plan0.last[k]]))
 end
 sort!(sub_ids; by = e -> stp[e + 1] - stp[e], rev = true)
-SDSProto.SSUB[] = SDSProto.DVEC(sub_ids)
-SDSProto.NSUB[] = length(sub_ids)
-SDSProto.INV11[] = inv11
-SDSProto.INVPTR[] = inv_ptr
-fz1 = SDSProto.build_fused(s; kstart = 1, wcap = 256)
+SDSFused.SSUB[] = SDSFused.DVEC(sub_ids)
+SDSFused.NSUB[] = length(sub_ids)
+SDSFused.INV11[] = inv11
+SDSFused.INVPTR[] = inv_ptr
+fz1 = SDSFused.build_fused(s; kstart = 1, wcap = 256)
 fz = ([(fz1, 64)], true)
 invertf()
 x2 = similar(bd)
-SDSProto.algo2_solve!(x2, s, bd, inv11, inv_ptr, fz)
+SDSFused.algo2_solve!(x2, s, bd, inv11, inv_ptr, fz)
 CUDA.synchronize()
 rel = norm(bh - A * Array(x2)) / norm(bh)
 @printf "fused  S/N   solve relres %.2e\n" rel
 rel < 1.0 || error("fused LDL solve gate FAILED")
-ts_fused = median([CUDA.@elapsed SDSProto.algo2_solve!(x2, s, bd, inv11, inv_ptr, fz) for _ in 1:7])
+ts_fused = median([CUDA.@elapsed SDSFused.algo2_solve!(x2, s, bd, inv11, inv_ptr, fz) for _ in 1:7])
 @printf "fused  S/N   solve %8.2f ms\n" ts_fused*1e3
 flush(stdout)
 
 # --- fused Cholesky control (fresh solver, same matrix as SPD) ---
 s2, ex2, bd2, xd2 = setup("SPD")
 nz2 = SDS._factor_values(s2)
-fp2 = SDSProto.build_fused_plan(s2; wgf = 128, scap = 128)
-info2 = SDSProto.refact_fused!(s2, nz2, fp2)
-tr_chol = median([CUDA.@elapsed SDSProto.refact_fused!(s2, nz2, fp2) for _ in 1:7])
+fp2 = SDSFused.build_fused_plan(s2; wgf = 128, scap = 128)
+info2 = SDSFused.refact_fused!(s2, nz2, fp2)
+tr_chol = median([CUDA.@elapsed SDSFused.refact_fused!(s2, nz2, fp2) for _ in 1:7])
 @printf "fused  SPD   refact %8.2f ms  info %d  (control)\n" tr_chol*1e3 info2
 @printf "RATIO fused LDL / fused Cholesky = %.3f\n" tr_fused / tr_chol
 say("done")

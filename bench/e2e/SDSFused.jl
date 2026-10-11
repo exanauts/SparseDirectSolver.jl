@@ -1,7 +1,7 @@
 # Prototype kernels of PR #107 assembled as a backend-portable module, so the
 # MadNLP wrapper can run the fused factorization and the algo1/fused solve on
 # CUDA and AMDGPU alike. Single-solver-instance (module-global plan state).
-module SDSProto
+module SDSFused
 
 using LinearAlgebra, SparseArrays, Statistics, Printf
 using SparseDirectSolver

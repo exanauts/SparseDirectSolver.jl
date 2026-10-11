@@ -3,8 +3,8 @@
 using SparseDirectSolver, SparseArrays, LinearAlgebra, Random, Statistics, Printf
 using CUDA, CUDA.CUSPARSE
 const SDS = SparseDirectSolver
-include(joinpath(@__DIR__, "SDSProto.jl"))
-using .SDSProto
+include(joinpath(@__DIR__, "SDSFused.jl"))
+using .SDSFused
 const BD = joinpath(@__DIR__, "..")
 include(joinpath(BD, "matrices.jl"))
 using .BenchMatrices: read_mtx
@@ -16,7 +16,7 @@ Lh = tril(A)
 Random.seed!(666)
 bh = rand(n)
 S3 = (p = Vector{Int32}(undef, n); read!(joinpath(BD, "perm_cand3.bin"), p); Int.(p))
-SDSProto.BACKEND[] = CUDA.CUDABackend()
+SDSFused.BACKEND[] = CUDA.CUDABackend()
 
 bd = CuArray(bh); xd = similar(bd)
 s = DirectSolver(CuSparseMatrixCSR(Lh), "S", 'L')
@@ -28,8 +28,8 @@ fac0 = Array(s.numeric.factor)
 d0 = Array(s.numeric.d)
 
 nzval = SDS._factor_values(s)
-fp = SDSProto.build_fused_plan(s; ldl = true, wgf = 128, scap = 128)
-info = SDSProto.refact_fused!(s, nzval, fp)
+fp = SDSFused.build_fused_plan(s; ldl = true, wgf = 128, scap = 128)
+info = SDSFused.refact_fused!(s, nzval, fp)
 CUDA.synchronize()
 fac1 = Array(s.numeric.factor)
 d1 = Array(s.numeric.d)

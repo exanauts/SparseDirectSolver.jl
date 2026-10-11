@@ -11,8 +11,8 @@ using SparseDirectSolver
 const SDS = SparseDirectSolver
 const KA = SDS.KernelAbstractions
 
-include("SDSProto.jl")
-using .SDSProto
+include("SDSFused.jl")
+using .SDSFused
 
 """
     SDSTuning
@@ -140,7 +140,7 @@ function SDSSolver(
     T = eltype(csc.nzVal)
     n = size(csc, 1)
     backend = KA.get_backend(csc.nzVal)
-    SDSProto.BACKEND[] = backend
+    SDSFused.BACKEND[] = backend
     t = _resolve(something(opt.sds_tuning, default_tuning(backend)), backend)
     s = SDS.DirectSolver(csc.colPtr, csc.rowVal, csc.nzVal, "SPD", 'U')
     s.options.regime_c_width = t.regime_c_width
@@ -156,9 +156,9 @@ function SDSSolver(
     SDS.execute!("solve", s, x, b; asynchronous = false)   # allocates the solve workspace
     nzval = SDS._factor_values(s)
     merged = t.wides === :merged
-    fp = SDSProto.build_fused_plan(s; inkernel_wides = merged, merge_segments = merged,
+    fp = SDSFused.build_fused_plan(s; inkernel_wides = merged, merge_segments = merged,
                                    wgf = t.workgroup, scap = t.spin_cap)
-    inv11, inv_ptr, invertf, _ = SDSProto.build_inverse(s)
+    inv11, inv_ptr, invertf, _ = SDSFused.build_inverse(s)
     # solve-side plan state (module globals, single solver instance)
     plan0 = s.workspace.plan
     nodes0 = s.symbolic.schedule.group_nodes
@@ -169,11 +169,11 @@ function SDSSolver(
         append!(sub_ids, Int32.(nodes0[plan0.first[k]:plan0.last[k]]))
     end
     sort!(sub_ids; by = e -> stp[e + 1] - stp[e], rev = true)
-    SDSProto.SSUB[] = SDSProto.DVEC(sub_ids)
-    SDSProto.NSUB[] = length(sub_ids)
-    SDSProto.INV11[] = inv11
-    SDSProto.INVPTR[] = inv_ptr
-    fz1 = SDSProto.build_fused(s; kstart = 1, wcap = 256)
+    SDSFused.SSUB[] = SDSFused.DVEC(sub_ids)
+    SDSFused.NSUB[] = length(sub_ids)
+    SDSFused.INV11[] = inv11
+    SDSFused.INVPTR[] = inv_ptr
+    fz1 = SDSFused.build_fused(s; kstart = 1, wcap = 256)
     segs = [(fz1, 64)]
     fz = (segs, true)
     M = SDSSolver{T}(s, csc, x, b, nzval, fp, fz, inv11, inv_ptr, invertf, 0, opt, logger)
@@ -182,14 +182,14 @@ function SDSSolver(
 end
 
 function MadNLP.factorize!(M::SDSSolver)
-    M.last_info = Int(SDSProto.refact_fused!(M.inner, M.nzval, M.fp))
+    M.last_info = Int(SDSFused.refact_fused!(M.inner, M.nzval, M.fp))
     M.invert!()
     return M
 end
 
 function MadNLP.solve_linear_system!(M::SDSSolver{T}, xb) where {T}
     copyto!(M.b, xb)
-    SDSProto.algo2_solve!(M.x, M.inner, M.b, M.inv11, M.inv_ptr, M.fz)
+    SDSFused.algo2_solve!(M.x, M.inner, M.b, M.inv11, M.inv_ptr, M.fz)
     copyto!(xb, M.x)
     KA.synchronize(KA.get_backend(xb))
     return xb

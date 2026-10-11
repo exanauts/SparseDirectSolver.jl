@@ -22,7 +22,7 @@ Baselines every later milestone is measured against (PLAN.md §5 M0, §7). The
 | `order_search.jl`, `get_cudss_perm.jl` | PR #107 ordering study: METIS knob sweep and schedule depth; extraction of cuDSS's reordering through the raw C API for replay under `user_perm` |
 | `ordering_chooser.jl` | T22 (issue #108): AMD vs ND per harness matrix and dump (schedule depth, fundamental and column-etree depth, nnz(L), flops) and the choice of the T22 and T05 cost models; host only, no GPU: `julia --project=bench bench/ordering_chooser.jl` (`SDS_BENCH_SUITESPARSE=0` skips MatrixDepot) |
 | `amd_proto.jl`, `amd/Project.toml` | the solve prototype on ROCm (ROCArray, raw-array constructor, `Threads.atomic_fence`); environment `bench/amd/` |
-| `e2e/MadNLPSDS.jl`, `e2e/SDSProto.jl`, `e2e/run_gv100.jl`, `e2e/run_amd.jl` | MadNLP `AbstractLinearSolver` over the public API (prototype of the External task) and the prototype kernels packaged backend-portably; full ACOPF interior-point runs on CUDA and AMD; environment `bench/e2e/` (MadNLP, MadNLPGPU, ExaModels, ExaModelsPower) |
+| `e2e/MadNLPSDS.jl`, `e2e/SDSFused.jl`, `e2e/run_gv100.jl`, `e2e/run_amd.jl` | MadNLP `AbstractLinearSolver` over the public API (prototype of the External task) and the prototype kernels packaged backend-portably; full ACOPF interior-point runs on CUDA and AMD; environment `bench/e2e/` (MadNLP, MadNLPGPU, ExaModels, ExaModelsPower) |
 | `pivot_pairs.jl` | 2×2 pivot pairs of the `S` analysis (issue #66): `pivot_pairs` = `none`/`default`/`all` on the K2 dumps and the KKT generators, with nnz(L), zero/perturbed/2×2 pivots, max abs L and factor error of the CPU reference LDLᵀ; package environment: `julia --project=. bench/pivot_pairs.jl [--only=case118,...] [--generators=false]` |
 
 ## Commands
