@@ -217,11 +217,12 @@ function CPUCtx(s)
     plan = N.plan
     maxloc = isempty(plan.sub_local) ? 0 : maximum(plan.sub_local)
     spool = Channel{Vector{T}}(nthreads())
-    wpool = Channel{Vector{T}}(nthreads())
-    for _ in 1:nthreads()
+    wpool = Channel{Vector{T}}(nthreads() + 1)         # +1: refact_cpu! holds one for the
+    for _ in 1:nthreads()                              # serial levels while tasks draw the rest
         put!(spool, Vector{T}(undef, cld(maxloc, sizeof(T))))
         put!(wpool, Vector{T}(undef, length(N.work)))
     end
+    put!(wpool, Vector{T}(undef, length(N.work)))
     return CPUCtx{T}(spool, wpool)
 end
 
