@@ -969,7 +969,7 @@ end
                                     cb_done, @Const(snparent), @Const(front_ptr), @Const(front_nrows),
                                     @Const(front_ncols), @Const(cb_ptr), @Const(child_ptr),
                                     @Const(child_list), @Const(relind_ptr), @Const(relind), base,
-                                    @Const(wbase), wupd, wpdone2, wtrsml, wcbl, scap, d, @Const(super_ptr),
+                                    @Const(wbase), wupd, wpdone2, wtrsml, wcbl, scap, eac, d, @Const(super_ptr),
                                     ::Val{LDL}, ::Val{WG}) where {LDL, WG}
     @uniform TT = eltype(factor)
     @uniform RT = real(eltype(factor))
@@ -984,7 +984,7 @@ end
         if r == ROLE_EA
             v = Int(ra[G])                          # parent
             c = Int(rb[G])                          # child
-            q0 = (Int(rc[G]) - 1) * 16384
+            q0 = (Int(rc[G]) - 1) * Int(eac)
             if li == 1
                 _spin_until_eq!(cb_done, c, Int32(1), fscr, scap)
             end
@@ -999,7 +999,7 @@ end
             pp = Int(front_ptr[v])
             cp = Int(cb2[v])                     # parent CB is always private
             r0 = Int(relind_ptr[c]) - 1
-            qe = min(q0 + 16384, mc * mc) - 1
+            qe = min(q0 + Int(eac), mc * mc) - 1
             for q in (q0 + li - 1):WG:qe
                 jj = q ÷ mc + 1
                 ii = q - (jj - 1) * mc + 1
@@ -1782,7 +1782,7 @@ end
 # host: the topologically ordered role list + counter bases + stream-2 program
 function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, Bool} = nothing,
                           wides_potrf::Bool = false, merge_segments::Bool = false,
-                          wgf::Int = WGF, scap::Integer = 128)
+                          wgf::Int = WGF, scap::Integer = 128, ea_chunk::Integer = 16384)
     S = s.symbolic
     plan = s.numeric.plan
     ldl && (eltype(s.numeric.factor) <: Real || error("fused LDL mode: real element types only"))
@@ -1849,7 +1849,7 @@ function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, B
             continue
         end
         mc = rows_h[c] - width_h[c]
-        for ch in 1:cld(mc * mc, 16384)
+        for ch in 1:cld(mc * mc, ea_chunk)
             push!(role, ROLE_EA); push!(ra, Int32(v)); push!(rb, Int32(c)); push!(rc, Int32(ch))
             ea_left[v] += 1
         end
@@ -1994,7 +1994,7 @@ function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, B
             wbase = DVEC(wbase_h), wupd_b = DVEC(wupd_b), wtl_b = DVEC(wtl_b),
             wcb_b = DVEC(wcb_b), wupd = KA.zeros(BACKEND[], Int32, max(nwslots, 1)),
             wtl = KA.zeros(BACKEND[], Int32, max(nwslots, 1)), wpd = KA.zeros(BACKEND[], Int32, max(nwslots, 1)),
-            wcb = KA.zeros(BACKEND[], Int32, ns), wgf, scap = Int32(scap), ldl,
+            wcb = KA.zeros(BACKEND[], Int32, ns), wgf, scap = Int32(scap), eac = Int32(ea_chunk), ldl,
             ldl_potrf = ldl && wides_potrf,
             sptr_h = Array(S.super_ptr),
             ldlw = KA.zeros(BACKEND[], Float64,
@@ -2040,7 +2040,7 @@ function refact_fused!(s, nzval, fp; nstreams::Int = 1)
                                              S.snparent, S.front_ptr, S.front_nrows, S.front_ncols,
                                              S.cb_ptr, S.child_ptr, S.child_list, S.relind_ptr, S.relind,
                                              Int32(base), fp.wbase, fp.wupd, fp.wpd, fp.wtl, fp.wcb,
-                                             fp.scap, N.d, S.super_ptr, Val(fp.ldl), Val(fp.wgf);
+                                             fp.scap, fp.eac, N.d, S.super_ptr, Val(fp.ldl), Val(fp.wgf);
                                              ndrange = fp.wgf * count)
         if true
             for v in gwides
