@@ -245,6 +245,30 @@ function refact_cpu!(s, nzval, ctx::CPUCtx = CPUCtx(s))
     nch = 8 * nt                                       # chunked tasks: spawn cost amortized
     tsub = 0.0; tblas = 0.0
     wk0 = take!(wpool)                                  # serial-level workspace
+    if nt == 1                                          # single-thread specialization: no tasks
+        buf0 = take!(spool)
+        try
+            BLAS.set_num_threads(1)
+            tsub = @elapsed for k in eachindex(plan.sub_first)
+                for q in plan.sub_first[k]:plan.sub_last[k]
+                    _subtree!(N.factor, N.stack, N.info, nzval, S, Int(S.group_nodes[q]), buf0)
+                end
+            end
+            tblas = @elapsed for k in eachindex(plan.group_first)
+                for q in plan.group_first[k]:plan.group_last[k]
+                    _front_blas!(N.factor, N.stack, wk0, N.info, S, nzval, Int(S.group_nodes[q]))
+                end
+            end
+        finally
+            put!(spool, buf0)
+            put!(wpool, wk0)
+            BLAS.set_num_threads(nblas)
+        end
+        haskey(ENV, "SDSCPU_STAGES") &&
+            @printf("  stages: subtrees %7.1f ms  fronts %7.1f ms\n", tsub * 1e3, tblas * 1e3)
+        SDS.assemble_schur!(N, S, nzval)
+        return maximum(Array(N.info)) == 0 ? 0 : 1
+    end
     try
         BLAS.set_num_threads(1)
         tsub = @elapsed for k in eachindex(plan.sub_first)
