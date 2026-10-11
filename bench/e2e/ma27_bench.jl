@@ -8,8 +8,9 @@ const BD = joinpath(@__DIR__, "..")
 include(joinpath(BD, "matrices.jl"))
 using .BenchMatrices: read_mtx
 
-A = SparseMatrixCSC{Float64, Int}(sparse(read_mtx(joinpath(BD, "data",
-    "kkt_pglib_opf_case78484_epigrids_condensed_10.mtx"))))
+MAT = get(ENV, "MA27_MAT", "kkt_pglib_opf_case78484_epigrids_condensed_10.mtx")
+A = SparseMatrixCSC{Float64, Int}(sparse(read_mtx(joinpath(BD, "data", MAT))))
+println("matrix: ", MAT, "  n ", size(A, 1), "  nnz(tril) ", nnz(tril(A)))
 n = Int32(size(A, 1))
 L = tril(A)
 nz = Int32(nnz(L))
@@ -70,7 +71,8 @@ for attempt in 1:4
     end
 end
 st >= 0 || error("ma27bd failed: info = $(info[1:4])")
-say("first factor ", round(tf * 1e3; digits = 1), " ms")
+say("first factor ", round(tf * 1e3; digits = 1), " ms  factor-real info[9] ", info[9],
+    "  factor-int info[10] ", info[10], "  ncmpa info[11] ", info[11], "  twos info[14] ", info[14])
 tr = median([(@elapsed factor!()) for _ in 1:5])
 
 w = Vector{Float64}(undef, Int(maxfrt[1]))
