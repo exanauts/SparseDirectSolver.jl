@@ -1629,6 +1629,43 @@ end
     end
 end
 
+# potrf-derived LDL of a positive-definite wide front: A = C Cᵀ = L D Lᵀ with
+# L = C diag(C)⁻¹ and d = diag(C)², and F21_chol = L21 D^½ makes the Cholesky
+# herk CB bit-identical to the LDL one — so the host path is the VERBATIM
+# Cholesky vendor sequence plus three micro-kernels. Valid only where the
+# front's pivots share a sign (always, for an SPD matrix factored as "S").
+@kernel function chol2ldl_d_kernel!(factor, d, p0, f, g0)
+    j = @index(Global, Linear)
+    @inbounds begin
+        c = real(factor[p0 + (j - 1) * f + j - 1])
+        d[g0 + j] = c * c
+    end
+end
+@kernel function chol2ldl_scale_kernel!(factor, p0, f, w)      # strict lower: /= diag of the column
+    q = @index(Global, Linear)
+    @inbounds begin
+        j = (Int(q) - 1) ÷ f + 1
+        i = Int(q) - (j - 1) * f
+        i > j && (factor[p0 + (j - 1) * f + i - 1] /= real(factor[p0 + (j - 1) * f + j - 1]))
+    end
+end
+@kernel function chol2ldl_diag_kernel!(factor, p0, f)
+    j = @index(Global, Linear)
+    @inbounds factor[p0 + (j - 1) * f + j - 1] = one(eltype(factor))
+end
+
+function _factor_panel_c_ldl_potrf!(N, S, fp, v, p, backend)
+    f = Int(S.schedule.rows[v])
+    w = Int(S.schedule.width[v])
+    p0 = Int(S.layout.panel_ptr[v])
+    g0 = fp.sptr_h[v] - 1
+    SDS._factor_panel_c!(N.factor, fp.pcb, N.work, N.info, v, p0, f, w, fp.cb2_h[v], p)
+    chol2ldl_d_kernel!(backend, 128)(N.factor, N.d, p0, f, g0; ndrange = w)
+    chol2ldl_scale_kernel!(backend, 128)(N.factor, p0, f, w; ndrange = f * w)
+    chol2ldl_diag_kernel!(backend, 128)(N.factor, p0, f; ndrange = w)
+    return nothing
+end
+
 # the host-wide front for LDL: blocked right-looking over 64-column panels, then one
 # D-scaled GEMM for the contribution block (the Cholesky path's trsm/herk shape)
 function _factor_panel_c_ldl!(N, S, fp, v, p, backend)
@@ -1744,7 +1781,8 @@ end
 # ---------------------------------------------------------------------------
 # host: the topologically ordered role list + counter bases + stream-2 program
 function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, Bool} = nothing,
-                          merge_segments::Bool = false, wgf::Int = WGF, scap::Integer = 128)
+                          wides_potrf::Bool = false, merge_segments::Bool = false,
+                          wgf::Int = WGF, scap::Integer = 128)
     S = s.symbolic
     plan = s.numeric.plan
     ldl && (eltype(s.numeric.factor) <: Real || error("fused LDL mode: real element types only"))
@@ -1752,7 +1790,7 @@ function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, B
     # correct but needs ~5 launches per 64-column block where Cholesky's potrf is one
     # vendor call -- measured SLOWER on the GV100 (55.5 vs 38.6 ms tuned). Pass
     # inkernel_wides = false explicitly to use it.
-    inkernel_wides = inkernel_wides === nothing ? ldl : inkernel_wides
+    inkernel_wides = inkernel_wides === nothing ? (ldl && !wides_potrf) : inkernel_wides
     nodes = S.schedule.group_nodes
     rows_h = S.schedule.rows
     width_h = S.schedule.width
@@ -1957,6 +1995,7 @@ function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, B
             wcb_b = DVEC(wcb_b), wupd = KA.zeros(BACKEND[], Int32, max(nwslots, 1)),
             wtl = KA.zeros(BACKEND[], Int32, max(nwslots, 1)), wpd = KA.zeros(BACKEND[], Int32, max(nwslots, 1)),
             wcb = KA.zeros(BACKEND[], Int32, ns), wgf, scap = Int32(scap), ldl,
+            ldl_potrf = ldl && wides_potrf,
             sptr_h = Array(S.super_ptr),
             ldlw = KA.zeros(BACKEND[], Float64,
                             ldl ? maximum(vcat([1], [max(rows_h[v] * 64,
@@ -2005,7 +2044,9 @@ function refact_fused!(s, nzval, fp; nstreams::Int = 1)
                                              ndrange = fp.wgf * count)
         if true
             for v in gwides
-                if fp.ldl
+                if fp.ldl && fp.ldl_potrf
+                    _factor_panel_c_ldl_potrf!(N, S, fp, v, p, backend)
+                elseif fp.ldl
                     _factor_panel_c_ldl!(N, S, fp, v, p, backend)
                 else
                     SDS._factor_panel_c!(N.factor, fp.pcb, N.work, N.info, v, S.layout.panel_ptr[v],

@@ -35,7 +35,7 @@ fac0 = Array(s.numeric.factor)
 d0 = Array(s.numeric.d)
 mref = maximum(abs, fac0)
 nz = SDS._factor_values(s)
-fp = SDSFused.build_fused_plan(s; ldl = true, wgf = 128, scap = 128)
+fp = SDSFused.build_fused_plan(s; ldl = true, wides_potrf = true, wgf = 128, scap = 128)
 nbad = 0
 for t in 1:20
     info = SDSFused.refact_fused!(s, nz, fp); CUDA.synchronize()
