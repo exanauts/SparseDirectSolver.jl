@@ -1541,6 +1541,139 @@ end
     end
 end
 
+# ---------------------------------------------------------------------------
+# host-wide LDL path: the Cholesky vendor sequence (potrf/trsm/herk) with the
+# diagonal blocks factored by a small kernel (no vendor no-pivot LDL exists),
+# the SAME vendor TRSM with the unit-triangular flag, broadcast column scalings
+# for D, and the CB through the SAME vendor GEMM against a D-scaled scratch.
+
+# one workgroup: no-pivot LDL of the kb×kb diagonal block at (c0b+1, c0b+1) of the
+# f×w panel at p0; unit-L written back (diag = 1), D to d[g0 + c0b + j]
+@kernel function wide_ldl_panel_kernel!(factor, d, info, v, p0, f, c0b, kb, g0, ::Val{WG}) where {WG}
+    li = @index(Local, Linear)
+    @uniform TT = eltype(factor)
+    sh = @localmem TT (NL64,)
+    st = @localmem Int32 (1,)
+    pv = @localmem TT (1,)
+    @inbounds begin
+        for q in li:WG:(kb * (kb + 1) ÷ 2)
+            j = 1
+            acc = kb
+            qq = q
+            while qq > acc
+                qq -= acc
+                acc -= 1
+                j += 1
+            end
+            i = j + qq - 1
+            sh[SDS._packed(i, j, 64)] = factor[p0 + (c0b + j - 1) * f + c0b + i - 1]
+        end
+        li == 1 && (st[1] = Int32(0))
+    end
+    @synchronize
+    for j in 1:kb
+        @inbounds begin
+            if li == 1
+                dk = real(sh[SDS._packed(j, j, 64)])
+                if st[1] == Int32(0) && !iszero(dk)
+                    pv[1] = dk
+                    d[g0 + c0b + j] = dk
+                elseif st[1] == Int32(0)
+                    st[1] = Int32(c0b + j)
+                    pv[1] = one(TT)
+                end
+            end
+        end
+        @synchronize
+        @inbounds begin
+            pvt = pv[1]
+            if st[1] == Int32(0)
+                rpv = inv(pvt)
+                for i in (j + li):WG:kb
+                    sh[SDS._packed(i, j, 64)] *= rpv
+                end
+            end
+        end
+        @synchronize
+        @inbounds begin
+            pvt = pv[1]
+            if st[1] == Int32(0)
+                for q in (li - 1):WG:(kb * kb - 1)
+                    jj = q ÷ kb + 1
+                    ii = q - (jj - 1) * kb + 1
+                    if ii >= jj && jj > j
+                        sh[SDS._packed(ii, jj, 64)] -= sh[SDS._packed(ii, j, 64)] * pvt * sh[SDS._packed(jj, j, 64)]
+                    end
+                end
+            end
+        end
+        @synchronize
+    end
+    @inbounds begin
+        for q in (li - 1):WG:(kb * kb - 1)
+            jj = q ÷ kb + 1
+            ii = q - (jj - 1) * kb + 1
+            ii >= jj && (factor[p0 + (c0b + jj - 1) * f + c0b + ii - 1] =
+                             ii == jj ? one(TT) : sh[SDS._packed(ii, jj, 64)])
+        end
+        li == 1 && st[1] != Int32(0) && info[v] == Int32(0) && (info[v] = st[1])
+    end
+end
+
+@kernel function zero_upper_kernel!(factor, p0, f, w)
+    q = @index(Global, Linear)
+    @inbounds begin
+        j = (q - 1) ÷ w + 1
+        i = q - (j - 1) * w
+        i < j && (factor[p0 + (j - 1) * f + i - 1] = zero(eltype(factor)))
+    end
+end
+
+# the host-wide front for LDL: blocked right-looking over 64-column panels, then one
+# D-scaled GEMM for the contribution block (the Cholesky path's trsm/herk shape)
+function _factor_panel_c_ldl!(N, S, fp, v, p, backend)
+    T = eltype(N.factor)
+    f = Int(S.schedule.rows[v])
+    w = Int(S.schedule.width[v])
+    p0 = Int(S.layout.panel_ptr[v])
+    c0 = fp.cb2_h[v]
+    g0 = fp.sptr_h[v] - 1
+    m = f - w
+    gi = SDS.select_impl(:gemm, N.factor, :auto)
+    P = reshape(view(N.factor, p0:(p0 + f * w - 1)), f, w)
+    for k in 1:cld(w, 64)
+        c0b = (k - 1) * 64
+        kb = min(64, w - c0b)
+        wide_ldl_panel_kernel!(backend, 128)(N.factor, N.d, N.info, v, p0, f, c0b, kb, g0, Val(128);
+                                             ndrange = 128)
+        r1 = c0b + kb + 1
+        r1 <= f || continue
+        Lblk = view(P, (c0b + 1):(c0b + kb), (c0b + 1):(c0b + kb))
+        R = view(P, r1:f, (c0b + 1):(c0b + kb))                     # A L1⁻ᵀ = W = L D
+        SDS._trsm_impl!(p.trsm, 'R', 'L', 'C', 'U', one(T), Lblk, R)
+        dvb = transpose(view(N.d, (g0 + c0b + 1):(g0 + c0b + kb)))
+        if r1 <= w                                                  # trailing panel columns
+            Wscr = reshape(view(fp.ldlw, 1:((f - r1 + 1) * kb)), f - r1 + 1, kb)
+            Wscr .= R                                               # keep W; R becomes final L
+            R ./= dvb
+            Lc = view(P, r1:w, (c0b + 1):(c0b + kb))
+            Ctr = view(P, r1:f, r1:w)
+            SDS._gemm_impl!(gi, 'N', 'T', -one(T), Wscr, Lc, one(T), Ctr)
+        else
+            R ./= dvb
+        end
+    end
+    zero_upper_kernel!(backend, 128)(N.factor, p0, f, w; ndrange = w * w)
+    (m > 0 && c0 > 0) || return nothing
+    L21 = view(P, (w + 1):f, 1:w)
+    W21 = reshape(view(fp.ldlw, 1:(m * w)), m, w)
+    W21 .= L21 .* transpose(view(N.d, (g0 + 1):(g0 + w)))
+    C = reshape(view(N.work, 1:(m * m)), m, m)
+    SDS._gemm_impl!(gi, 'N', 'T', -one(T), W21, L21, zero(T), C)
+    SDS.pack_add!(fp.pcb, c0, N.work, m)
+    return nothing
+end
+
 @kernel function panel_zero_kernel!(factor, @Const(list), @Const(front_ptr), @Const(front_nrows),
                                     @Const(front_ncols), ::Val{WG}) where {WG}
     li = @index(Local, Linear)
@@ -1610,14 +1743,16 @@ end
 
 # ---------------------------------------------------------------------------
 # host: the topologically ordered role list + counter bases + stream-2 program
-function build_fused_plan(s; inkernel_wides::Bool = false, merge_segments::Bool = false,
-                          wgf::Int = WGF, scap::Integer = 128, ldl::Bool = false)
+function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, Bool} = nothing,
+                          merge_segments::Bool = false, wgf::Int = WGF, scap::Integer = 128)
     S = s.symbolic
     plan = s.numeric.plan
-    if ldl
-        eltype(s.numeric.factor) <: Real || error("fused LDL mode: real element types only")
-        inkernel_wides = true                  # no vendor potrf for LDL: wide fronts stay in-kernel
-    end
+    ldl && (eltype(s.numeric.factor) <: Real || error("fused LDL mode: real element types only"))
+    # LDL defaults to in-kernel wides: the host-wide LDL path (_factor_panel_c_ldl!) is
+    # correct but needs ~5 launches per 64-column block where Cholesky's potrf is one
+    # vendor call -- measured SLOWER on the GV100 (55.5 vs 38.6 ms tuned). Pass
+    # inkernel_wides = false explicitly to use it.
+    inkernel_wides = inkernel_wides === nothing ? ldl : inkernel_wides
     nodes = S.schedule.group_nodes
     rows_h = S.schedule.rows
     width_h = S.schedule.width
@@ -1822,6 +1957,11 @@ function build_fused_plan(s; inkernel_wides::Bool = false, merge_segments::Bool 
             wcb_b = DVEC(wcb_b), wupd = KA.zeros(BACKEND[], Int32, max(nwslots, 1)),
             wtl = KA.zeros(BACKEND[], Int32, max(nwslots, 1)), wpd = KA.zeros(BACKEND[], Int32, max(nwslots, 1)),
             wcb = KA.zeros(BACKEND[], Int32, ns), wgf, scap = Int32(scap), ldl,
+            sptr_h = Array(S.super_ptr),
+            ldlw = KA.zeros(BACKEND[], Float64,
+                            ldl ? maximum(vcat([1], [max(rows_h[v] * 64,
+                                                         (rows_h[v] - width_h[v]) * width_h[v])
+                                                for v in wides])) : 1),
             s2 = nothing)
 end
 
@@ -1865,8 +2005,12 @@ function refact_fused!(s, nzval, fp; nstreams::Int = 1)
                                              ndrange = fp.wgf * count)
         if true
             for v in gwides
-                SDS._factor_panel_c!(N.factor, fp.pcb, N.work, N.info, v, S.layout.panel_ptr[v],
-                                     S.schedule.rows[v], S.schedule.width[v], fp.cb2_h[v], p)
+                if fp.ldl
+                    _factor_panel_c_ldl!(N, S, fp, v, p, backend)
+                else
+                    SDS._factor_panel_c!(N.factor, fp.pcb, N.work, N.info, v, S.layout.panel_ptr[v],
+                                         S.schedule.rows[v], S.schedule.width[v], fp.cb2_h[v], p)
+                end
                 signal_kernel!(backend, 32)(fp.cbd, fp.arrived, S.snparent, v; ndrange = 32)
             end
         elseif false
