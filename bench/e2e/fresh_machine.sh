@@ -77,7 +77,7 @@ if [ "${SKIP_TESTS:-0}" != "1" ]; then
 fi
 
 # --- 4. MadNLP workflow: 78k-bus ACOPF, cuDSS vs SDS on the same GPU -----------
-# bench/e2e: MadNLPSDS.jl defines the MadNLP.AbstractLinearSolver wrappers
+# ext/SparseDirectSolverMadNLPExt.jl defines the MadNLP.AbstractLinearSolver wrapper
 # (SDSSolver = stock library; SDSProtoSolver = PR #107 prototype kernels).
 # NVIDIA (run_gv100.jl): MadNLPGPU.CUDSSSolver vs SDSProtoSolver.
 # AMD (run_amd.jl): SDSSolver vs SDSProtoSolver.

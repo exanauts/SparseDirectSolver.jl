@@ -82,6 +82,36 @@ include("solve/refinement.jl")
 include("solver.jl")
 include("generic.jl")
 
+# the fused pipeline (factorization mega-kernel + partitioned-inverse solve)
+# and its per-architecture tuning bundle; consumed by the MadNLP extension
+include("fused.jl")
+
+"""
+    madnlp_solver() -> Type
+
+The MadNLP linear-solver type backed by the fused pipeline (`SDSSolver` in the
+`SparseDirectSolverMadNLPExt` package extension). Available once MadNLP is
+loaded in the same session:
+
+    using MadNLP, SparseDirectSolver
+    madnlp(model; linear_solver = SparseDirectSolver.madnlp_solver(),
+           kkt_system = MadNLP.SparseCondensedKKTSystem)
+
+Options type: [`madnlp_solver_options`](@ref); tuning bundle:
+`SparseDirectSolver.Fused.SDSTuning` (per-architecture defaults are selected
+automatically).
+"""
+function madnlp_solver end
+
+"""
+    madnlp_solver_options() -> Type
+
+The options type of [`madnlp_solver`](@ref) (`SDSSolverOptions`: reordering,
+tuning bundle, user permutation, on-disk permutation cache). Requires MadNLP
+to be loaded.
+"""
+function madnlp_solver_options end
+
 __init__() = _init_log_level()
 
 end # module SparseDirectSolver
