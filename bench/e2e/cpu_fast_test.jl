@@ -19,6 +19,10 @@ S3 = (p = Vector{Int32}(undef, n); read!(joinpath(BD, "perm_cand3.bin"), p); Int
 s = DirectSolver(Vector{Int}(Lt.colptr), Vector{Int}(Lt.rowval), Vector{Float64}(Lt.nzval), "SPD", 'L')
 s.options.subtree_parallelism = 16384
 s.options.subtree_budgets = [16384]
+# CPU wants wider supernodes than the GPU champion (48): amal 96 = -17% at 24t,
+# interleaved (fewer, bigger fronts = fewer memory passes + BLAS3-friendlier)
+s.options.amalgamation = (max_width = parse(Int, get(ENV, "SDSCPU_AMAL", "96")),
+                          zero_fraction = 0.25, min_width = 8)
 SDS.setparam!(s, "user_perm", S3)
 x = zeros(n); b = copy(bh)
 ex(ph) = SDS.execute!(ph, s, x, b; asynchronous = false)
