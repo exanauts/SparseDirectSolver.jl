@@ -18,7 +18,8 @@ export nodend_hybrid
 # arrays stay resident across levels (each level's contraction output feeds
 # the next level's matching directly); only the per-level host GraphT copies
 # needed by the host refinement are downloaded.
-function coarsen_gpu!(backend, ctrl::ME.CtrlT, graph::ME.GraphT; seed::Integer = 1)
+function coarsen_gpu!(backend, ctrl::ME.CtrlT, graph::ME.GraphT; seed::Integer = 1,
+                      keep_levels::Union{Nothing, Vector{Any}} = nothing)
     ctrl.maxvwgt = trunc(Int, 1.5 * graph.tvwgt / ctrl.CoarsenTo)
     dev(x, T) = (y = KA.allocate(backend, T, length(x)); copyto!(y, T.(x)); y)
     n = graph.nvtxs
@@ -31,6 +32,9 @@ function coarsen_gpu!(backend, ctrl::ME.CtrlT, graph::ME.GraphT; seed::Integer =
         match = GpuND.gpu_match(backend, dx, da, dw, dv, ctrl.maxvwgt;
                                 seed = seed + level)
         cn, cx, ca, cw, cv, cmap = GpuND.gpu_contract(backend, dx, da, dw, dv, match)
+        # the finer level's CSR + its fine->coarse map, for device uncoarsening
+        keep_levels === nothing ||
+            push!(keep_levels, (dx = dx, da = da, dv = dv, n = graph.nvtxs, cmap = cmap))
         cgraph = ME.CreateGraph()
         cgraph.nvtxs = cn
         cgraph.nedges = length(ca)
@@ -57,6 +61,71 @@ end
 # device, and the deep recursion has thousands of them
 const GPU_MIN_NVTXS = Ref(50_000)
 
+# device uncoarsening: project + round-based parallel refinement per level
+# (GpuRefine.jl) instead of the host FM walk. Off by default until the fill
+# quality gate passes on the benchmark set.
+const GPU_REFINE = Ref(false)
+# :rounds — device wavefront refinement at every level;
+# :project — device projection only, one exact host balance+FM at the finest
+const GPU_REFINE_MODE = Ref(:rounds)
+const GPU_REFINE_TRACE = Ref(false)      # print per-level separator weights
+
+function refine_chain_gpu!(backend, ctrl::ME.CtrlT, graph::ME.GraphT, cgraph::ME.GraphT,
+                           levels::Vector{Any})
+    # chain[k] is the graph whose CSR/cmap is levels[k]; chain[end] = cgraph
+    chain = ME.GraphT[graph]
+    while chain[end] !== cgraph
+        push!(chain, chain[end].coarser::ME.GraphT)
+    end
+    # coarse half: EXACT host project/balance/refine below the size threshold
+    # (serial FM wins where graphs are tiny and every vertex is an aggregate;
+    # job_35: device rounds left the n=108 level at sides 90k/55k)
+    k = length(chain) - 1
+    while k >= 1 && chain[k].nvtxs < REFINE_HOST_BELOW[]
+        g = chain[k]
+        ME.Project2WayNodePartition!(ctrl, g)
+        ME.FM_2WayNodeBalance!(ctrl, g)
+        ME.FM_2WayNodeRefine1Sided!(ctrl, g, ctrl.niter)
+        GPU_REFINE_TRACE[] &&
+            println("    host  n=", g.nvtxs, "  sep=", g.pwgts[3], "  sides=",
+                    g.pwgts[1], "/", g.pwgts[2])
+        k -= 1
+    end
+    k == 0 && return nothing                   # whole chain refined on host
+    # fine half: device projection + balance + wavefront rounds
+    src = chain[k + 1]
+    cw = KA.allocate(backend, Int32, src.nvtxs)
+    copyto!(cw, Int32.(view(src.where_, 1:src.nvtxs)))
+    for j in k:-1:1
+        L = levels[j]
+        fw = KA.allocate(backend, Int32, L.n)
+        Main.GpuRefine.project_where!(backend, fw, cw, L.cmap, L.n)
+        if GPU_REFINE_MODE[] == :rounds
+            Main.GpuRefine.balance_rounds!(backend, L.dx, L.da, L.dv, fw, L.n,
+                                           Float64(ctrl.ubfactors))
+            pw, np = Main.GpuRefine.refine_rounds!(backend, L.dx, L.da, L.dv, fw, L.n,
+                                                   Float64(ctrl.ubfactors); niter = ctrl.niter)
+            GPU_REFINE_TRACE[] &&
+                println("    dev   n=", L.n, "  sep=", pw[3], "  sides=", pw[1], "/", pw[2],
+                        "  passes=", np)
+        end
+        cw = fw
+    end
+    ME.Allocate2WayNodePartitionMemory!(graph)
+    copyto!(view(graph.where_, 1:graph.nvtxs), Int.(Array(cw)))
+    graph.coarser = nothing
+    ME.Compute2WayNodePartitionParams!(ctrl, graph)
+    if GPU_REFINE_MODE[] == :project
+        ME.FM_2WayNodeBalance!(ctrl, graph)
+        ME.FM_2WayNodeRefine1Sided!(ctrl, graph, ctrl.niter)
+    end
+    return nothing
+end
+
+# device refinement runs only at levels at least this large; smaller levels
+# use the exact serial walk above (they cost microseconds on the host)
+const REFINE_HOST_BELOW = Ref(50_000)
+
 # L1-shaped bisection with the device coarsening
 function node_bisection!(backend, ctrl::ME.CtrlT, graph::ME.GraphT, niparts::Int)
     if graph.nvtxs < GPU_MIN_NVTXS[]
@@ -66,10 +135,15 @@ function node_bisection!(backend, ctrl::ME.CtrlT, graph::ME.GraphT, niparts::Int
     ctrl.CoarsenTo = graph.nvtxs ÷ 8
     ctrl.CoarsenTo > 100 && (ctrl.CoarsenTo = 100)
     ctrl.CoarsenTo < 40 && (ctrl.CoarsenTo = 40)
-    cgraph = coarsen_gpu!(backend, ctrl, graph)
+    levels = GPU_REFINE[] ? Any[] : nothing
+    cgraph = coarsen_gpu!(backend, ctrl, graph; keep_levels = levels)
     niparts = max(1, cgraph.nvtxs <= ctrl.CoarsenTo ? niparts ÷ 2 : niparts)
     ME.InitSeparator!(ctrl, cgraph, niparts)
-    ME.Refine2WayNode!(ctrl, graph, cgraph)
+    if levels === nothing
+        ME.Refine2WayNode!(ctrl, graph, cgraph)
+    else
+        refine_chain_gpu!(backend, ctrl, graph, cgraph, levels)
+    end
     return nothing
 end
 

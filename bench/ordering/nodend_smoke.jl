@@ -37,7 +37,15 @@ ph, _ = Hybrid.nodend_hybrid(KA.CPU(), A)
 
 le = nnzL(A, pe)
 lh = nnzL(A, ph)
-ratio = lh / le
-@printf "nnz_L exact %d  hybrid %d  ratio %.4f\n" le lh ratio
-@assert ratio < 1.05 "hybrid fill regressed beyond the 5% alarm threshold"
+@printf "nnz_L exact %d  hybrid %d  ratio %.4f\n" le lh lh / le
+@assert lh / le < 1.05 "hybrid fill regressed beyond the 5% alarm threshold"
+
+# device-refinement path (only engages above Hybrid.GPU_MIN_NVTXS)
+Hybrid.GPU_REFINE[] = true
+pg, _ = Hybrid.nodend_hybrid(KA.CPU(), A)
+Hybrid.GPU_REFINE[] = false
+@assert isperm(pg)
+lg = nnzL(A, pg)
+@printf "nnz_L gpu-refine %d  ratio vs exact %.4f  (engaged: %s)\n" lg lg / le (n >= Hybrid.GPU_MIN_NVTXS[] ? "yes" : "no — below threshold")
+n >= Hybrid.GPU_MIN_NVTXS[] && @assert lg / le < 1.08 "gpu-refine fill beyond alarm threshold"
 println("SMOKE OK")
