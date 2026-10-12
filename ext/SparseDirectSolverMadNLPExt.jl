@@ -16,6 +16,9 @@ const Fused = SDS.Fused
 const SDSTuning = Fused.SDSTuning
 
 Base.@kwdef mutable struct SDSSolverOptions <: MadNLP.AbstractOptions
+    # :cholesky (SPD; the condensed-KKT default) or :ldl (no-pivot LDL^T: factors
+    # indefinite matrices and reports TRUE inertia from the signs of D)
+    sds_factorization::Symbol = :cholesky
     sds_reordering::String = "algo4"          # native ND
     # ALL performance knobs live in the tuning bundle; nothing (the default)
     # selects the measured per-architecture profile from Fused.default_tuning
@@ -100,7 +103,9 @@ function SDSSolver(
     n = size(csc, 1)
     backend = KA.get_backend(csc.nzVal)
     t = Fused.resolve_tuning(something(opt.sds_tuning, Fused.default_tuning(backend)), backend)
-    s = SDS.DirectSolver(csc.colPtr, csc.rowVal, csc.nzVal, "SPD", 'U')
+    ldl = opt.sds_factorization === :ldl
+    s = SDS.DirectSolver(csc.colPtr, csc.rowVal, csc.nzVal, ldl ? "S" : "SPD", 'U')
+    ldl && SDS.setparam!(s, "pivot_type", 'N')
     s.options.regime_c_width = t.regime_c_width
     s.options.regime_c_rows = t.regime_c_rows  # the fused kernels own BOTH phases: no coupling conflict
     s.options.subtree_parallelism = t.subtree_parallelism
@@ -114,8 +119,10 @@ function SDSSolver(
     SDS.execute!("solve", s, x, b; asynchronous = false)   # allocates the solve workspace
     nzval = SDS._factor_values(s)
     merged = t.wides === :merged
-    fp = Fused.build_fused_plan(s; inkernel_wides = merged, merge_segments = merged,
-                                wgf = t.workgroup, scap = t.spin_cap)
+    # LDL wide fronts run the verbatim Cholesky vendor path (wides_potrf): valid while a
+    # front's pivots share a sign; a sign flip fails potrf -> info != 0 -> MadNLP regularizes
+    fp = Fused.build_fused_plan(s; ldl, inkernel_wides = merged, merge_segments = merged,
+                                wides_potrf = !merged, wgf = t.workgroup, scap = t.spin_cap)
     inv11, inv_ptr, invertf, _ = Fused.build_inverse(s)
     # the solve plan: one merged dependency-counter sweep over the whole tree
     fz1 = Fused.build_fused(s; kstart = 1, wcap = 256)
@@ -151,6 +158,11 @@ MadNLP.is_inertia(::SDSSolver) = true
 # regularizes and factorizes again
 function MadNLP.inertia(M::SDSSolver)
     n = size(M.tril, 1)
+    if M.opt.sds_factorization === :ldl
+        M.last_info == 0 || return (0, 1, n)
+        l = count(x -> x < zero(x), view(M.inner.numeric.d, 1:n))   # true inertia from D
+        return (n - l, 0, l)
+    end
     return M.last_info == 0 ? (n, 0, 0) : (n - 2, 1, 1)
 end
 MadNLP.improve!(::SDSSolver) = false
