@@ -143,7 +143,10 @@ validated configuration each; all gated.
 | 2x Xeon 8160, 8 threads | 106 | - | - / MA86 151 |
 | 2x Xeon 8160, 1 thread | 449 | - | CHOLMOD 966 / MA86 963 |
 
-More 1-thread references: MA57 1909 ms, MA27 2798 ms (both LDL^T, libcoinhsl;
+More 1-thread references: MA57 1909 ms, MA27 2798 ms (both LDL^T, libcoinhsl,
+committed drivers `e2e/ma27_bench.jl` / `e2e/ma57_bench.jl`; the MA86 numbers
+came from a one-off HSL.jl raw-wrapper driver with MadNLP-matching controls,
+not shipped;
 MA27 on the augmented k2 system of the same problem: 3709 ms at n = 2.09M).
 *Projected from the measured interleaved -16.8% (amalgamation 96) on the
 quiet-box 101.5 ms; every other entry is directly measured. Solve times where
@@ -160,6 +163,8 @@ info = 0. Validated 0-failure on all seven platforms after the fix. Gate on
 factor deltas, not info alone.
 
 ## Reproduction
+
+<!-- flip consolidated-prs -> main in both URLs when PR 126 merges -->
 
 One command on a fresh GPU machine (NVIDIA or AMD, autodetected). The shell route
 builds the `@sds` named project environment (everything from

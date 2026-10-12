@@ -45,14 +45,17 @@ for t in 1:20
     flush(stdout)
 end
 println("bad: ", nbad, " of 20")
+nbad == 0 || error("fused LDL race gate FAILED: $nbad of 20 runs bad")   # a gate must exit nonzero
 
-# Cholesky with the SAME wide strategy (in-kernel), isolating the LDL-math cost
+# Cholesky with the SAME wide strategy as the LDL plan above (wides_potrf forces
+# HOST wides, so the matching control is the host-wides Cholesky plan -- the
+# in-kernel plan used before was a different strategy and confounded the ratio)
 s2 = setup("SPD")
 nz2 = SDS._factor_values(s2)
-fp2i = SDSFused.build_fused_plan(s2; inkernel_wides = true, wgf = 128, scap = 128)
-SDSFused.refact_fused!(s2, nz2, fp2i)
-tr_chol_ik = median([CUDA.@elapsed SDSFused.refact_fused!(s2, nz2, fp2i) for _ in 1:7])
+fp2h = SDSFused.build_fused_plan(s2; wgf = 128, scap = 128)   # host wides (default)
+SDSFused.refact_fused!(s2, nz2, fp2h)
+tr_chol_host = median([CUDA.@elapsed SDSFused.refact_fused!(s2, nz2, fp2h) for _ in 1:7])
 tr_ldl = median([CUDA.@elapsed SDSFused.refact_fused!(s, nz, fp) for _ in 1:7])
-@printf "fused SPD (in-kernel wides) refact %8.2f ms\n" tr_chol_ik*1e3
-@printf "fused S/N (in-kernel wides) refact %8.2f ms   ratio same-strategy %.3f\n" tr_ldl*1e3 tr_ldl/tr_chol_ik
+@printf "fused SPD (host wides) refact %8.2f ms\n" tr_chol_host*1e3
+@printf "fused S/N (host wides) refact %8.2f ms   ratio same-strategy %.3f\n" tr_ldl*1e3 tr_ldl/tr_chol_host
 println("done")

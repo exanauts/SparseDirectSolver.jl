@@ -86,7 +86,8 @@ for f in propertynames(sol.counters)
         println("   ", f, " = ", round(v; digits = 2), " s")
 end
 # the honest speed is the warm number: same process, nothing cached between the
-# two solves except compiled code (and the on-disk permutation of this pattern)
+# two solves except compiled code -- the reordering and symbolic analysis run in
+# full both times (the extension caches nothing)
 t2 = @elapsed sol2 = solve()
 println("== second solve (warm): ", round(t2; digits = 1), " s",
         "  iters = ", sol2.counters.k, "  obj = ", sol2.objective)

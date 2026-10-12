@@ -17,7 +17,7 @@ champions. Workload throughout: the 78k-bus ACOPF condensed KKT
    A/B/A/B in one process is the only defensible comparison. Three pairs
    minimum; treat sub-2% differences as noise.
 3. **Correctness before speed on a new chip.** Run 20 gated refactorizations
-   (`bench/race_repro.jl 20`) before believing any timing. This is what caught
+   (`bench/e2e/ldl_fused_race.jl`) before believing any timing. This is what caught
    the sm_86/89/Blackwell/gfx906 completion-signal race that sm_70/80/90 hide.
 4. **Occupancy arithmetic before submitting sweeps.** Most structural knobs are
    decided by `blocks/SM = min(smem_per_SM ÷ smem_per_block,
@@ -34,13 +34,13 @@ champions. Workload throughout: the 78k-bus ACOPF condensed KKT
 | ordering (`nd_nseps`, `nd_seed`, `user_perm`) | solver/wrapper | runtime | fill/flops; arch-independent; every instance recomputes (no caching); pin with `user_perm` |
 | panel width (`pw`) | plan + kernel `Val` | runtime per-plan | fronts ≤ pw factor in-kernel; packed panel = pw(pw+1)/2 · 8B of shared memory **for every block of the kernel** (one kernel = one shared size) |
 | tile size (`tl`) | plan + kernel `Val` | runtime per-plan | syrk tile; shared halves = 2·32·tl · 8B; accumulators = tl²/WGF registers per thread |
-| workgroup size (`SDS_WGF`) | env (const at include) | per-process | waves per workgroup; latency hiding on wave64 AMD; occupancy on 1536-thread parts |
-| spin backoff cap (`SDS_SPIN_CAP`) | env (const at include) | per-process | dependency-counter wake-up latency vs polling traffic |
+| workgroup size (`SDSTuning.workgroup`) | tuning bundle | runtime (>= 128, multiple of 32: the tile roles' register accumulators) | waves per workgroup; latency hiding on wave64 AMD; occupancy on 1536-thread parts |
+| spin backoff cap (`SDSTuning.spin_cap`) | tuning bundle | runtime | dependency-counter wake-up latency vs polling traffic |
 | CUDA graph replay (`graph`) | run_fused kwarg | runtime | whole refactorization captured once, replayed as one launch |
 
 ## Procedure for a new architecture
 
-1. **Correctness:** `race_repro.jl 20` (kernel-level, <2 GB device memory).
+1. **Correctness:** `bench/e2e/ldl_fused_race.jl` (20 gated refactorizations).
    Any failure: stop, bisect kernel-vs-src-vs-config before timing anything.
 2. **Phase profile:** `profile_refact()` — sync-inflated but reveals the split
    (resets / subtrees / mega kernel / host wides / stats). The dominant phase
@@ -55,8 +55,8 @@ champions. Workload throughout: the 78k-bus ACOPF condensed KKT
 5. **Structural (only where shared memory allows):** `pw_ab.jl`, `tl_ab.jl`.
    Run the occupancy arithmetic first; on ≤100 KB/SM parts pw=96/tl=64 lose by
    construction, on 228 KB (Hopper) they are free.
-6. **Process knobs:** `SDS_WGF` ∈ {128, 256} and `SDS_SPIN_CAP` ∈ {128, 16}
-   (one process per value). WGF=256 was −20% on wave64 AMD, flat-to-pending on
+6. **Bundle knobs:** `SDSTuning.workgroup` ∈ {128, 256} and `SDSTuning.spin_cap`
+   ∈ {128, 16} (runtime, per plan; workgroup has a hard 128 floor). WGF=256 was −20% on wave64 AMD, flat-to-pending on
    NVIDIA; the spin cap matters only on residency-thin parts.
 7. **Graphs:** `graph_ab.jl` — small (~1%) and free; keep it on everywhere.
 8. **Stack and re-validate:** combine the winners, three gated interleaved
@@ -96,8 +96,12 @@ compile-time or environment-dependent in the wrapper path.
 
 ## Scripts
 
-`race_repro.jl` (gated correctness), `profile_refact` in `fact_lib.jl` (phase
-split), `mseg_ab.jl` / `pw_ab.jl` / `tl_ab.jl` / `graph_ab.jl` / `combo_ab.jl`
-(paired A/Bs), `tune_platform.jl` (knob sweep), `h200_matrix.jl` (structural
-matrix), `e2e/amd_tune.jl` (AMD sweep). All print per-trial gates; all take the
+The campaign's one-off sweep drivers (`race_repro.jl`, `fact_lib.jl`'s
+`profile_refact`, `mseg_ab.jl`, `pw_ab.jl`, `tl_ab.jl`, `graph_ab.jl`,
+`combo_ab.jl`, `tune_platform.jl`, `h200_matrix.jl`, `e2e/amd_tune.jl`) were
+not shipped; the committed equivalents are `e2e/ldl_fused_race.jl` (gated
+correctness), `e2e/ldl_fused_test.jl` (fused vs stock + same-strategy ratio)
+and `e2e/amd_sweep.jl` (knob sweep). Read the procedure above with those
+substitutions; CUDA-graph replay (step 7's `graph_ab.jl`) retired with the
+consolidation cleanup (no graph kwarg at HEAD). All gates take the
 matrix from `bench/data/` and the tuned permutation from `bench/perm_cand3.bin`.

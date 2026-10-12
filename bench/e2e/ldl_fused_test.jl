@@ -64,7 +64,11 @@ SDSFused.algo2_solve!(x2, s, bd, inv11, inv_ptr, fz)
 CUDA.synchronize()
 rel = norm(bh - A * Array(x2)) / norm(bh)
 @printf "fused  S/N   solve relres %.2e\n" rel
-rel < 1.0 || error("fused LDL solve gate FAILED")
+# gate against the stock solve's residual on the same system (x holds the stock
+# solution at this point), not an absolute threshold a zero vector nearly meets
+rel_stock = norm(bh - A * Array(xd)) / norm(bh)
+rel <= 10 * rel_stock + 1e-12 ||
+    error("fused LDL solve gate FAILED: relres $rel vs stock $rel_stock")
 ts_fused = median([CUDA.@elapsed SDSFused.algo2_solve!(x2, s, bd, inv11, inv_ptr, fz) for _ in 1:7])
 @printf "fused  S/N   solve %8.2f ms\n" ts_fused*1e3
 flush(stdout)
