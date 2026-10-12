@@ -421,11 +421,20 @@ for (field, lo, hi, expected) in (
         (:schur_mode, 0, 1, "0 or 1"),
         (:deterministic_mode, 0, 1, "0 or 1"),
         (:nd_ubfactor, -1, typemax(Int), "-1 (library default) or an integer ≥ 0"),
-        (:nd_nseps, -1, typemax(Int), "-1 (library default) or an integer ≥ 1"),
+        # nd_nseps has a dedicated method below: 0 is in [-1, typemax] but invalid
         (:nd_seed, -1, typemax(Int), "-1 (library default) or an integer ≥ 0"),
     )
     @eval _parse_option(::Val{$(QuoteNode(field))}, value, _) =
         _parse_int($(String(field)), value, $lo, $hi, $expected)
+end
+
+# nd_nseps = 0 lies inside the plain [-1, typemax] range but is not a METIS value;
+# the documented domain is -1 (library default) or >= 1, so reject it loudly
+# instead of silently coercing (the ordering code maps "< 1" to the default)
+function _parse_option(::Val{:nd_nseps}, value, _)
+    v = _parse_int("nd_nseps", value, -1, typemax(Int), "-1 (library default) or an integer ≥ 1")
+    v == 0 && throw(InvalidValueError("nd_nseps = 0; expected -1 (library default) or an integer ≥ 1"))
+    return v
 end
 
 for field in (:ir_tol, :pivot_threshold, :pivot_pair_tolerance)

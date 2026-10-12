@@ -310,11 +310,11 @@ end
             tgt = nchild[v]
             pause = Int32(4)
             while (Atomix.@atomic arrived[v] += Int32(0)) < tgt
-                z = 0.0
+                z = Int32(0)
                 for _ in 1:pause
-                    z += 1.0
+                    z += Int32(1)
                 end
-                z < 0 && (yb[1] = TT(z))        # keep the backoff loop alive
+                z < Int32(0) && (yb[1] = TT(z))        # keep the backoff loop alive
                 pause = min(pause << 1, Int32(128))
             end
         end
@@ -372,11 +372,11 @@ end
             if pv > 0
                 pause = Int32(4)
                 while (Atomix.@atomic done[pv] += Int32(0)) == Int32(0)
-                    z = 0.0
+                    z = Int32(0)
                     for _ in 1:pause
-                        z += 1.0
+                        z += Int32(1)
                     end
-                    z < 0 && (t[1] = TT(z))
+                    z < Int32(0) && (t[1] = TT(z))
                     pause = min(pause << 1, Int32(128))
                 end
             end
@@ -423,11 +423,11 @@ end
             if pv > 0
                 pause = Int32(4)
                 while (Atomix.@atomic done[pv] += Int32(0)) == Int32(0)
-                    z = 0.0
+                    z = Int32(0)
                     for _ in 1:pause
-                        z += 1.0
+                        z += Int32(1)
                     end
-                    z < 0 && (t[1] = TT(z))
+                    z < Int32(0) && (t[1] = TT(z))
                     pause = min(pause << 1, Int32(128))
                 end
             end
@@ -975,11 +975,11 @@ const ROLE_WSIG = Int8(9)
 @inline function _spin_until_eq!(arr, idx, target, scratch, scap)
     pause = min(Int32(4), scap)
     while (Atomix.@atomic arr[idx] += Int32(0)) != target
-        z = 0.0
+        z = Int32(0)                    # integer backoff: no Float64 in kernels (Metal)
         for _ in 1:pause
-            z += 1.0
+            z += Int32(1)
         end
-        z < 0 && (scratch[1] = z)
+        z < Int32(0) && (scratch[1] = z)
         pause = min(pause << 1, scap)
     end
     return nothing
@@ -1001,7 +1001,7 @@ end
     sh = @localmem TT (NL64,)
     st = @localmem Int32 (1,)
     piv = @localmem RT (1,)
-    fscr = @localmem Float64 (1,)
+    fscr = @localmem Int32 (1,)   # spin-backoff scratch (integer: no Float64 in kernels)
     @inbounds begin
         r = role[G]
         if r == ROLE_EA

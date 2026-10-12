@@ -116,11 +116,12 @@ packed_length(m::Integer) = Int(m) * (Int(m) + 1) ÷ 2
 # inverse of the packed lower-triangle enumeration: 0-based q in an r x r lower
 # triangle (col-major, n = r(r+1)/2 entries) -> 1-based (a, b), a >= b. Enumerating
 # only the triangle halves the work-item count of the guarded full-square loops.
-# The float sqrt can land one off at the boundary; the two fixups make it exact.
+# Integer isqrt (exact, and no Float64 in kernels: Metal has no fp64); the two
+# boundary fixups are kept as a belt against any isqrt implementation quirk.
 @inline function _tri_decode(q, r)
     n = r * (r + 1) ÷ 2
     p = n - 1 - q
-    t = unsafe_trunc(Int, (sqrt(8.0 * p + 1.0) - 1.0) * 0.5)
+    t = (isqrt(8 * p + 1) - 1) ÷ 2
     t * (t + 1) ÷ 2 > p && (t -= 1)
     (t + 1) * (t + 2) ÷ 2 <= p && (t += 1)
     b = r - t

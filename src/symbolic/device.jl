@@ -29,7 +29,9 @@ function device_maps_supported(backend, structure, view, n::Integer, nnz::Intege
     (s == STRUCTURE_SPD || s == STRUCTURE_HPD || s == STRUCTURE_SYMMETRIC ||
      s == STRUCTURE_HERMITIAN) || return false
     _matrix_view(view) == VIEW_FULL && return false
-    return n < 2^32 && nnz < 2^32 && factor_len < 2^31
+    # the maps store values up to nnz + 1 / n / factor_len + 1 in Int32; admit only
+    # what Int32 holds (the host route serves the rest)
+    return n + 1 <= typemax(Int32) && nnz + 1 <= typemax(Int32) && factor_len + 1 <= typemax(Int32)
 end
 
 # device vector of `x` as `I`
@@ -71,9 +73,12 @@ function device_symmetric_pattern(backend, rowptr, colval, n::Integer, view, ind
     m = length(colval)
     base = _index_base(index) == INDEX_ONE ? Int32(1) : Int32(0)
     upper = _matrix_view(view) == VIEW_UPPER
+    hrp = Array(rowptr)
+    hcv = Array(colval)
+    _host_pattern(hrp, hcv, n, index)   # validation only: same errors as the host route
     I = m + 1 <= typemax(Int32) && n + 1 <= typemax(Int32) ? Int32 : Int64
-    drp = _device_vec(backend, I, Array(rowptr))
-    dcv = _device_vec(backend, I, Array(colval))
+    drp = _device_vec(backend, I, hrp)
+    dcv = _device_vec(backend, I, hcv)
     keys = KernelAbstractions.allocate(backend, UInt64, 2m)
     n > 0 && _pattern_keys_kernel!(backend)(keys, drp, dcv, base, upper; ndrange = Int(n))
     KernelAbstractions.synchronize(backend)
@@ -132,8 +137,14 @@ end
                     b = mid
                 end
             end
-            off = Int(panelptr[s]) + (j - Int(superptr[s])) * f + (a - lo + 1) - 1
-            amap[p] = T(flip && neg ? -off : off)
+            if a <= hi && Int(snrowval[a]) == i
+                off = Int(panelptr[s]) + (j - Int(superptr[s])) * f + (a - lo + 1) - 1
+                amap[p] = T(flip && neg ? -off : off)
+            else
+                # the host route throws "outside the symbolic factor" here; a kernel
+                # cannot, so it writes a sentinel the host wrapper checks once
+                amap[p] = typemax(T)
+            end
         else
             amap[p] = zero(T)
         end
@@ -167,7 +178,11 @@ function device_assembly_map(backend, sp::SupernodePartition, layout::Layout,
                                     base, v == VIEW_UPPER,
                                     _is_hermitian(s); ndrange = Int(n))
     KernelAbstractions.synchronize(backend)
-    return Vector{Int}(Array(amap))
+    h = Vector{Int}(Array(amap))
+    bad = findfirst(==(Int(typemax(I))), h)
+    bad === nothing ||
+        throw(InvalidValueError("entry at stored position $bad is outside the symbolic factor (pattern changed?)"))
+    return h
 end
 
 # ---------------------------------------------------------------------------
