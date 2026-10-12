@@ -1,49 +1,28 @@
 #!/usr/bin/env bash
-# Fresh-machine test of the MadNLP + SparseDirectSolver workflow on a GPU box.
-# Installs Julia 1.13 (juliaup), clones the repo, runs the test suites (CPU + GPU),
-# then the end-to-end MadNLP ACOPF solve (78k-bus pglib case, SparseCondensedKKTSystem).
-# NVIDIA: cuDSS vs SDS on the same device. AMD: SDS stock vs SDS prototype kernels
-# (no cuDSS exists there). The vendor is auto-detected (nvidia-smi / rocm-smi), or
-# force it with SDS_BACKEND=cuda|amdgpu.
+# Fresh-machine test of the MadNLP + SparseDirectSolver workflow, on the @sds named
+# PROJECT environment — no ad-hoc Pkg.add: the environment's Project.toml is generated
+# from bench/e2e/Project.toml with SparseDirectSolver wired to the local checkout, and
+# Pkg.instantiate() provides everything from the project file.
 #
-# Everything is non-interactive (nothing reads the terminal), so the intended use
-# is detached from the login session (the suites + workflow run for an hour or more):
+#   curl -fsSL https://raw.githubusercontent.com/exanauts/SparseDirectSolver.jl/consolidated-prs/bench/e2e/fresh_machine.sh | bash
 #
-#   curl -fsSL https://raw.githubusercontent.com/exanauts/SparseDirectSolver.jl/consolidated-prs/bench/e2e/fresh_machine.sh -o fresh_machine.sh
-#   nohup bash fresh_machine.sh > sds-fresh.log 2>&1 &     # then log out; tail -f sds-fresh.log
+# After one run the environment is reusable from anywhere on the machine:
 #
-# or under Slurm:  sbatch -p <gpu-partition> --gres=gpu:1 -c 8 --mem=64G -t 120 --wrap "bash fresh_machine.sh"
+#   julia +1.13 --startup-file=no --project=@sds bench/e2e/workflow.jl
 #
 # Knobs (env vars):
-#   SDS_BRANCH=main           git ref to test
-#   SDS_DIR=$HOME/sds-test    checkout location
-#   SKIP_TESTS=1              skip the test suites, run only the MadNLP workflow
-#   CPU_ONLY_TESTS=1          run only the CPU suite (no functional GPU needed for it)
-#   SDS_BACKEND=cuda|amdgpu   override the GPU vendor autodetection
+#   SDS_BRANCH=consolidated-prs   git ref to test
+#   SDS_DIR=$HOME/sds-test        checkout location
+#   SDS_BACKEND=cuda|amdgpu       GPU vendor override (autodetected in workflow.jl)
+#   RUN_TESTS=1                   also run the package test suite first (long)
 #
-# Needs: git, curl, network access (pglib case data is fetched by ExaModelsPower on
-# first use), and a GPU + driver. NVIDIA: the CUDA toolkit and cuDSS are downloaded
-# by CUDA.jl/CUDSS.jl as artifacts, nothing to install. AMD: a system ROCm
-# installation is required (AMDGPU.jl uses the system ROCm, it is not an artifact).
+# Needs: git, curl, network, and a GPU + driver. NVIDIA: CUDA toolkit and cuDSS come
+# as artifacts. AMD: a system ROCm installation is required.
 set -euo pipefail
 exec < /dev/null                     # never read the terminal: safe to detach
 
 SDS_BRANCH="${SDS_BRANCH:-consolidated-prs}"   # flip to main when PR 126 merges
 SDS_DIR="${SDS_DIR:-$HOME/sds-test}"
-
-if [ -z "${SDS_BACKEND:-}" ]; then
-    if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
-        SDS_BACKEND=cuda
-    elif command -v rocm-smi >/dev/null 2>&1; then
-        SDS_BACKEND=amdgpu
-    else
-        echo "no GPU detected (nvidia-smi / rocm-smi); set SDS_BACKEND=cuda|amdgpu" >&2
-        SDS_BACKEND=cuda
-    fi
-fi
-echo "== backend: $SDS_BACKEND"
-GPU_PKG=CUDA; RUNNER=run_gv100.jl
-[ "$SDS_BACKEND" = "amdgpu" ] && GPU_PKG=AMDGPU && RUNNER=run_amd.jl
 
 # --- 1. Julia 1.13 via juliaup -----------------------------------------------
 if ! command -v juliaup >/dev/null 2>&1 && [ ! -x "$HOME/.juliaup/bin/juliaup" ]; then
@@ -56,38 +35,34 @@ $JL --version
 
 # --- 2. Repository ------------------------------------------------------------
 if [ ! -d "$SDS_DIR/.git" ]; then
-    git clone https://github.com/exanauts/SparseDirectSolver.jl.git "$SDS_DIR"
+    git clone --branch "$SDS_BRANCH" https://github.com/exanauts/SparseDirectSolver.jl.git "$SDS_DIR"
 fi
 cd "$SDS_DIR"
 git fetch origin "$SDS_BRANCH"
 git checkout "$SDS_BRANCH"
-git pull --ff-only origin "$SDS_BRANCH" || true
+git merge --ff-only "origin/$SDS_BRANCH" || true
 echo "== testing $(git log --oneline -1)"
 
-# --- 3. Test suites -----------------------------------------------------------
-if [ "${SKIP_TESTS:-0}" != "1" ]; then
-    $JL --project=. -e 'using Pkg; Pkg.instantiate()'
-    echo "== CPU suite"
-    SDS_TEST_GPU=0 $JL --project=. -e 'using Pkg; Pkg.test()'
-    if [ "${CPU_ONLY_TESTS:-0}" != "1" ]; then
-        echo "== $GPU_PKG suite"
-        $JL --project=test -e "using Pkg; Pkg.add(\"$GPU_PKG\")"   # as .github/workflows/ci.yml does
-        SDS_TEST_CPU=0 SDS_TEST_SKIP=test_aqua $JL --project=. -e 'using Pkg; Pkg.test()'
-    fi
+# --- 3. The @sds environment, generated from the project file (no Pkg.add) -----
+$JL -e '
+using TOML
+dir = pwd()
+proj = TOML.parsefile(joinpath(dir, "bench", "e2e", "Project.toml"))
+get!(proj, "sources", Dict{String, Any}())["SparseDirectSolver"] = Dict("path" => dir)
+env = joinpath(DEPOT_PATH[1], "environments", "sds")
+mkpath(env)
+open(io -> TOML.print(io, proj), joinpath(env, "Project.toml"), "w")
+println("== @sds environment: SparseDirectSolver -> ", dir)
+'
+$JL --project=@sds -e 'using Pkg; Pkg.instantiate()'
+
+# --- 4. Optional: the package test suite ---------------------------------------
+if [ "${RUN_TESTS:-0}" = "1" ]; then
+    echo "== package test suite"
+    $JL --project=. -e 'using Pkg; Pkg.instantiate(); Pkg.test()'
 fi
 
-# --- 4. MadNLP workflow: 78k-bus ACOPF, cuDSS vs SDS on the same GPU -----------
-# ext/SparseDirectSolverMadNLPExt.jl defines the MadNLP.AbstractLinearSolver wrapper
-# (SparseDirectSolver.madnlp_solver(): the fused pipeline).
-# NVIDIA (run_gv100.jl): MadNLPGPU.CUDSSSolver vs SparseDirectSolver.
-# AMD (run_amd.jl): SparseDirectSolver.
-# Each prints wall/solver/linear-solver times, iteration counts and objectives
-# (convergence parity is the workflow test: same iterations, same objective).
-echo "== MadNLP + SDS workflow via $RUNNER (downloads the pglib case on first use)"
-$JL --project=bench/e2e -e "using Pkg; Pkg.develop(path = \"$SDS_DIR\"); Pkg.instantiate()"
-if [ "$SDS_BACKEND" = "cuda" ]; then
-    CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" $JL --project=bench/e2e "bench/e2e/$RUNNER"
-else
-    $JL --project=bench/e2e "bench/e2e/$RUNNER"
-fi
+# --- 5. The workflow: 78k-bus ACOPF, two solves, timing split ------------------
+echo "== MadNLP + SDS workflow (downloads the pglib case on first use)"
+$JL --project=@sds bench/e2e/workflow.jl
 echo "== fresh-machine run complete"

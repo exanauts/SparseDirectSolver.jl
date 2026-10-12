@@ -160,7 +160,16 @@ factor deltas, not info alone.
 
 ## Reproduction
 
-One command on a fresh GPU machine (NVIDIA or AMD, autodetected):
+One command on a fresh GPU machine (NVIDIA or AMD, autodetected). The shell route
+builds the `@sds` named project environment (everything from
+`bench/e2e/Project.toml`, no ad-hoc `Pkg.add`) and is reusable afterwards with
+`julia +1.13 --project=@sds bench/e2e/workflow.jl`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/exanauts/SparseDirectSolver.jl/consolidated-prs/bench/e2e/fresh_machine.sh | bash
+```
+
+No shell / no checkout wanted? The self-contained Julia variant:
 
 ```bash
 julia +1.13 --startup-file=no -i -e 'include(download("https://raw.githubusercontent.com/exanauts/SparseDirectSolver.jl/consolidated-prs/bench/e2e/fresh_machine.jl"))'
