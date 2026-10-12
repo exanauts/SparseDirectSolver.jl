@@ -6,7 +6,9 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/exanauts/SparseDirectSolver.jl/consolidated-prs/bench/e2e/fresh_machine.sh | bash
 #
-# After one run the environment is reusable from anywhere on the machine:
+# When a terminal is attached, the workflow ends in an interactive REPL (julia -i)
+# with `m`, `sol`, `sol2` and `solve()` defined; detached (nohup/sbatch, no tty) it
+# just runs and exits. After one run the environment is reusable from anywhere:
 #
 #   julia +1.13 --startup-file=no --project=@sds bench/e2e/workflow.jl
 #
@@ -18,15 +20,18 @@
 #
 # Needs: git, curl, network, and a GPU + driver. NVIDIA: CUDA toolkit and cuDSS come
 # as artifacts. AMD: a system ROCm installation is required.
+# NO `exec < /dev/null` here: under `curl | bash` the script itself arrives on stdin,
+# and redirecting it away silently discards the rest of the script (measured: bash
+# executes only its first read-ahead buffer and exits 0). Children that might read
+# stdin get a per-command `< /dev/null` instead.
 set -euo pipefail
-exec < /dev/null                     # never read the terminal: safe to detach
 
 SDS_BRANCH="${SDS_BRANCH:-consolidated-prs}"   # flip to main when PR 126 merges
 SDS_DIR="${SDS_DIR:-$HOME/sds-test}"
 
 # --- 1. Julia 1.13 via juliaup -----------------------------------------------
 if ! command -v juliaup >/dev/null 2>&1 && [ ! -x "$HOME/.juliaup/bin/juliaup" ]; then
-    curl -fsSL https://install.julialang.org | sh -s -- --yes
+    curl -fsSL https://install.julialang.org | sh -s -- --yes < /dev/null
 fi
 export PATH="$HOME/.juliaup/bin:$PATH"
 juliaup add 1.13 2>/dev/null || true
@@ -59,10 +64,15 @@ $JL --project=@sds -e 'using Pkg; Pkg.instantiate()'
 # --- 4. Optional: the package test suite ---------------------------------------
 if [ "${RUN_TESTS:-0}" = "1" ]; then
     echo "== package test suite"
-    $JL --project=. -e 'using Pkg; Pkg.instantiate(); Pkg.test()'
+    $JL --project=. -e 'using Pkg; Pkg.instantiate(); Pkg.test()' < /dev/null
 fi
 
 # --- 5. The workflow: 78k-bus ACOPF, two solves, timing split ------------------
+# with a terminal attached, end in a REPL (m, sol, sol2, solve() are defined)
 echo "== MadNLP + SDS workflow (downloads the pglib case on first use)"
-$JL --project=@sds bench/e2e/workflow.jl
-echo "== fresh-machine run complete"
+if [ -e /dev/tty ] && [ -t 1 ]; then
+    exec $JL -i --project=@sds bench/e2e/workflow.jl < /dev/tty
+else
+    $JL --project=@sds bench/e2e/workflow.jl
+    echo "== fresh-machine run complete"
+fi
