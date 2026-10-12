@@ -75,5 +75,19 @@ m, _ = ac_opf_model("pglib_opf_case78484_epigrids.m";
 # All performance knobs live in one bundle: pass sds_tuning = SparseDirectSolver.Fused.SDSTuning(; ...)
 # to override the measured per-architecture defaults (see bench/ARCH-TUNING.md);
 # sds_user_perm = perm (1-based, length n) bypasses the built-in reordering entirely.
-sol = madnlp(m; linear_solver = SDSSolver,
-             kkt_system = MadNLP.SparseCondensedKKTSystem, tol = 1e-6)
+solve() = madnlp(m; linear_solver = SDSSolver,
+                 kkt_system = MadNLP.SparseCondensedKKTSystem, tol = 1e-6)
+
+t1 = @elapsed sol = solve()
+println("\n== first solve (pays Julia compilation): ", round(t1; digits = 1), " s")
+println("   status = ", sol.status, "  iters = ", sol.counters.k, "  obj = ", sol.objective)
+for f in propertynames(sol.counters)
+    v = getfield(sol.counters, f)
+    v isa Real && endswith(String(f), "_time") && f !== :start_time &&
+        println("   ", f, " = ", round(v; digits = 2), " s")
+end
+# the honest speed is the warm number: same process, nothing cached between the
+# two solves except compiled code (and the on-disk permutation of this pattern)
+t2 = @elapsed sol2 = solve()
+println("== second solve (warm): ", round(t2; digits = 1), " s",
+        "  iters = ", sol2.counters.k, "  obj = ", sol2.objective)
