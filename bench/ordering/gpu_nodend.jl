@@ -26,5 +26,6 @@ include(joinpath(@__DIR__, "MetisExact.jl"))
 include(joinpath(@__DIR__, "GpuND.jl"))
 include(joinpath(@__DIR__, "GpuRefine.jl"))
 include(joinpath(@__DIR__, "Hybrid.jl"))
+include(joinpath(@__DIR__, "GpuBatch.jl"))
 
 MetisExact.init_libmetis!(Metis.libmetis)
