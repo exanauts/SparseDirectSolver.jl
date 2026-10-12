@@ -80,7 +80,11 @@ times on L40S and Blackwell are nearly identical (15.2 vs 15.8).
 - Everywhere: division-free scale-first Cholesky column step and packed-triangle
   trailing-update enumeration (PR #125: 29.3 → 24.4 ms on GV100 alone); the
   nseps = 4 / seed = 3 METIS ordering (−6%, PR #124) with an on-disk
-  permutation cache so METIS runs once per matrix pattern.
+  permutation cache so METIS runs once per matrix pattern. Every GPU number in
+  this document was measured with nseps = 4. The shipped default is nseps = 1
+  since 2026-10-12 (first-touch reordering is ~2x faster: 5 s versus 11.5 s on
+  the 78k; owner call) — reproduce the scoreboard with
+  `sds_tuning = SDSTuning(; nd_nseps = 4)`.
 
 Tried and rejected with measurements: inverse-based TRSM (2×), multi-stream
 wides, subtree/mega-kernel overlap, spin-cap tuning on NVIDIA, tile-64 on every

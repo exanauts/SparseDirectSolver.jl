@@ -31,7 +31,10 @@ Base.@kwdef struct SDSTuning
     amalgamation::NamedTuple = (max_width = 48, zero_fraction = 0.25, min_width = 8)
     workgroup::Int = 128                      # fused-kernel workgroup size
     spin_cap::Int = 128                       # dependency-counter backoff cap
-    nd_nseps::Int = 4                         # METIS knobs (78k-ACOPF champions)
+    # METIS knobs. nseps = 1 by default: first-touch reordering latency wins (owner call,
+    # 2026-10-12); nseps = 4 is the 78k champion (-6% refactorization via lower fill, PR #124)
+    # at ~2x the reordering time -- opt in through `sds_tuning` when factor time dominates.
+    nd_nseps::Int = 1
     nd_seed::Int = 3
 end
 
