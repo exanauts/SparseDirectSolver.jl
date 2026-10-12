@@ -1868,8 +1868,9 @@ function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, B
             trsm_left[v] += 1
         end
         if cbp[v] > 0
-            T = cld(m, TILE)
-            for tjj in 1:T, tii in tjj:T
+            # ntl, not T: this closure assigns in function scope, and T is the element type
+            ntl = cld(m, TILE)
+            for tjj in 1:ntl, tii in tjj:ntl
                 push!(role, ROLE_TILE); push!(ra, Int32(v)); push!(rb, Int32(tii)); push!(rc, Int32(tjj))
                 tiles_left[v] += 1
             end
