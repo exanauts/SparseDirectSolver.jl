@@ -14,4 +14,7 @@ jobs:
         with:
           version: '1'
       - name: Aqua.jl
-        run: julia --color=yes -e 'using Pkg; Pkg.add("Aqua"); Pkg.develop(path="."); using Aqua, SparseDirectSolver; Aqua.test_all(SparseDirectSolver, ambiguities=false)'
+        # MadNLP is loaded so the SparseDirectSolverMadNLPExt extension assigns the
+        # exported SDSSolver/SDSSolverOptions globals: the undefined-exports check
+        # then validates them for real instead of flagging the declared-only state
+        run: julia --color=yes -e 'using Pkg; Pkg.add(["Aqua", "MadNLP"]); Pkg.develop(path="."); using Aqua, MadNLP, SparseDirectSolver; Aqua.test_all(SparseDirectSolver, ambiguities=false)'
