@@ -159,10 +159,10 @@ factor deltas, not info alone.
 One command on a fresh GPU machine (NVIDIA or AMD, autodetected):
 
 ```bash
-julia +1.13 --startup-file=no -i -e 'include(download("https://raw.githubusercontent.com/exanauts/SparseDirectSolver.jl/custom-reordering/bench/e2e/fresh_machine.jl"))'
+julia +1.13 --startup-file=no -i -e 'include(download("https://raw.githubusercontent.com/exanauts/SparseDirectSolver.jl/main/bench/e2e/fresh_machine.jl"))'
 ```
 
 Kernel-level benchmarks: the scripts listed in `bench/ARCH-TUNING.md` against
 `bench/data/kkt_pglib_opf_case78484_epigrids_condensed_10.mtx`. Per-arch
-defaults: `MadNLPSDS.default_tuning`; override any knob with
-`madnlp(m; sds_tuning = MadNLPSDS.SDSTuning(; ...))`.
+defaults: `SparseDirectSolver.Fused.default_tuning`; override any knob with
+`madnlp(m; sds_tuning = SparseDirectSolver.Fused.SDSTuning(; ...))`.

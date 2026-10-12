@@ -1,32 +1,27 @@
 # Symbolic step 2 (PLAN §2.3): fill-reducing ordering through CliqueTrees.jl,
 # user permutations, and the automatic AMD/ND choice by a cost model.
 #
-# AMD and MMD are always available (CliqueTrees + AMD.jl). Nested dissection
-# needs Metis.jl: `ext/SparseDirectSolverMetisExt.jl` stores the function that
-# builds the CliqueTrees algorithm object in `ND_PROVIDER` when Metis is loaded.
+# AMD and MMD come from CliqueTrees + AMD.jl, nested dissection from CliqueTrees'
+# METIS extension (Metis.jl is a dependency of the package).
 
 """
-    ND_PROVIDER
+    nd_algorithm(nd_nlevels, nd_ubfactor, nd_nseps, nd_seed) -> CliqueTrees.METIS
 
-`Ref` holding `nothing` or a function `(nd_nlevels, nd_ubfactor, nd_nseps, nd_seed) -> alg` that
-returns the CliqueTrees nested-dissection algorithm. Set by the Metis extension.
+The CliqueTrees nested-dissection algorithm object of the `nd_*` parameters:
+`METIS_NodeND` with `ufactor = nd_ubfactor`, `nseps = nd_nseps` and
+`seed = nd_seed` (`-1`: METIS defaults; `nseps < 1` and `seed < 0` fall back to
+the defaults). `nd_nlevels` is cuDSS' *minimum* number of dissection levels;
+`METIS_NodeND` dissects recursively until the parts are small, so the minimum
+holds whenever the graph is large enough to be split that often. CliqueTrees'
+level-capped `ND{S}` (AMD below the cap) was 4–13× slower and gave 15–80% more
+fill on Laplacians (T05 Report).
 """
-const ND_PROVIDER = Ref{Any}(nothing)
-
-"""
-    nd_available() -> Bool
-
-Whether nested dissection can be used (Metis.jl is loaded, which activates
-`SparseDirectSolverMetisExt`).
-"""
-nd_available() = ND_PROVIDER[] !== nothing
-
-function _nd_algorithm(opts::Options)
-    nd_available() ||
-        throw(NotSupportedError("nested dissection (reordering_alg = \"algo4\") needs Metis.jl; " *
-                                "run `using Metis` to load SparseDirectSolverMetisExt"))
-    return ND_PROVIDER[](opts.nd_nlevels, opts.nd_ubfactor, opts.nd_nseps, opts.nd_seed)
+function nd_algorithm(nlevels::Integer, ubfactor::Integer, nseps::Integer, seed::Integer)
+    return CliqueTrees.METIS(; ufactor = ubfactor, nseps = nseps >= 1 ? nseps : -1,
+                             seed = seed >= 0 ? seed : -1)
 end
+
+_nd_algorithm(opts::Options) = nd_algorithm(opts.nd_nlevels, opts.nd_ubfactor, opts.nd_nseps, opts.nd_seed)
 
 """
     OrderingCandidate
@@ -51,8 +46,7 @@ Result of [`compute_ordering`](@ref):
   `sdepth` (supernodal schedule depth), `nsupernodes`, `cost` of the chosen
   ordering, `candidates::Vector{OrderingCandidate}` (every ordering evaluated,
   the chosen one included), `auto::Bool` (whether the automatic choice ran),
-  `level_flops` (the depth weight of [`ordering_cost`](@ref) used) and
-  `nd_available::Bool`;
+  `level_flops` (the depth weight of [`ordering_cost`](@ref) used);
 * `pairs::Vector{Tuple{Int,Int}}`: the 2×2 pivot candidate pairs `(partner,
   candidate)` the ordering was computed with (empty for no pair): `perm` puts
   each candidate right after its partner, and the symbolic factorization runs on
@@ -66,7 +60,7 @@ struct Ordering
     alg_used::Symbol
     stats::@NamedTuple{nnz_L::Int, flops::Float64, nlevels::Int, sdepth::Int, nsupernodes::Int, cost::Float64,
                        candidates::Vector{OrderingCandidate}, auto::Bool, level_flops::Float64,
-                       nd_available::Bool, pair_rounds::Int}
+                       pair_rounds::Int}
     pairs::Vector{Tuple{Int, Int}}
 end
 
@@ -219,15 +213,14 @@ Fill-reducing ordering of the pattern `P` (PLAN §2.3 step 2):
 * `opts.user_perm` set: that permutation, validated, accepted 0- or 1-based and
   returned 1-based (`alg_used = :user`);
 * `reordering_alg = "algo5"`: natural ordering; `"algo3"`: AMD
-  (`CliqueTrees.AMD()`); `"algo4"`: nested dissection with Metis (needs
-  `using Metis`, otherwise [`NotSupportedError`](@ref)): `METIS_NodeND` with
-  `ufactor = nd_ubfactor`, `nseps = nd_nseps` and `seed = nd_seed` (`-1`: METIS defaults; on
-  fill-bound problems `nd_nseps = 4` trades a slower ordering for less fill);
-  `nd_nlevels` is the cuDSS
-  *minimum* number of dissection levels, which METIS' full recursion meets on
-  every graph large enough to be split that often;
+  (`CliqueTrees.AMD()`); `"algo4"`: nested dissection ([`nd_algorithm`](@ref)):
+  `METIS_NodeND` with `ufactor = nd_ubfactor`, `nseps = nd_nseps` and
+  `seed = nd_seed` (`-1`: METIS defaults; on fill-bound problems `nd_nseps = 4`
+  trades a slower ordering for less fill); `nd_nlevels` is the cuDSS *minimum*
+  number of dissection levels, which METIS' full recursion meets on every graph
+  large enough to be split that often;
   `"algo1"`/`"algo2"`: AMD on the symmetric pattern;
-* `"default"`: AMD and, if Metis is loaded, ND are both evaluated with
+* `"default"`: AMD and ND are both evaluated with
   [`evaluate_ordering`](@ref) and the one with the lower
   [`ordering_cost`](@ref) `flops + level_flops × sdepth` (supernodal schedule
   depth) is chosen; `stats.candidates` lists both with their schedule depths.
@@ -291,8 +284,7 @@ function compute_ordering(P::SymmetricPattern, opts::Options; T::Type = Float64,
         opts.user_perm === nothing && throw(InvalidValueError("alg = :user needs opts.user_perm"))
         perms = [(:user, _validate_user_perm(opts.user_perm, P.n), fixed_pairs, 0)]
     elseif requested === :auto
-        algs = nd_available() ? (:amd, :nd) : (:amd,)
-        perms = [order_on(a) for a in algs]
+        perms = [order_on(a) for a in (:amd, :nd)]
     else
         perms = [order_on(requested)]
     end
@@ -313,7 +305,7 @@ function compute_ordering(P::SymmetricPattern, opts::Options; T::Type = Float64,
     c = evaluated[best]
     stats = (nnz_L = c.nnz_L, flops = c.flops, nlevels = c.nlevels, sdepth = c.sdepth, nsupernodes = c.nsupernodes,
              cost = c.cost, candidates = evaluated, auto = requested === :auto, level_flops = Float64(level_flops),
-             nd_available = nd_available(), pair_rounds = rounds)
+             pair_rounds = rounds)
     return Ordering(perm, invperm(perm), alg_used, stats, used_pairs)
 end
 
@@ -397,7 +389,7 @@ function compute_schur_ordering(P::SymmetricPattern, opts::Options, schur::Abstr
     e = evaluate_ordering(P, perm; T, level_flops, amalgamation = _amalgamation(opts))
     stats = (nnz_L = e.nnz_L, flops = e.flops, nlevels = e.nlevels, sdepth = e.sdepth, nsupernodes = e.nsupernodes,
              cost = e.cost, candidates = candidates, auto = auto, level_flops = Float64(level_flops),
-             nd_available = nd_available(), pair_rounds = 0)
+             pair_rounds = 0)
     return Ordering(perm, invperm(perm), alg_used, stats, Tuple{Int, Int}[])
 end
 

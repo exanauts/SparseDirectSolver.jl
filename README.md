@@ -12,8 +12,8 @@ oneAPI, Metal and the KernelAbstractions CPU backend.
 **Status: v0.1 under construction.** Working today, on the CPU backend, on
 CUDA and on AMDGPU (ROCm):
 
-* host symbolic analysis: AMD or nested dissection (METIS through the Metis
-  extension) ordering, elimination tree, supernodes with GPU-tuned
+* host symbolic analysis: AMD or nested dissection (METIS) ordering,
+  elimination tree, supernodes with GPU-tuned
   amalgamation, static factor layout and device assembly maps; for symmetric
   indefinite matrices the analysis pairs structurally zero pivots with a
   partner (`pivot_pairs`, MA57-style compressed-graph ordering) so that the
@@ -108,8 +108,7 @@ Pkg.add(url = "https://github.com/exanauts/SparseDirectSolver.jl")
 Loading CUDA.jl enables the CUDA extension (`CuSparseMatrixCSR`/`CuSparseMatrixCSC`
 constructors, cuBLAS/cuSOLVER dense kernels); loading AMDGPU.jl enables the
 AMDGPU extension (`ROCSparseMatrixCSR`/`ROCSparseMatrixCSC` constructors,
-rocBLAS/rocSOLVER dense kernels; ROCm must be found by AMDGPU.jl). Loading Metis.jl enables nested
-dissection ordering; without it the ordering is AMD.
+rocBLAS/rocSOLVER dense kernels; ROCm must be found by AMDGPU.jl).
 
 ## Usage
 

@@ -9,13 +9,13 @@
 # Everything is non-interactive (nothing reads the terminal), so the intended use
 # is detached from the login session (the suites + workflow run for an hour or more):
 #
-#   curl -fsSL https://raw.githubusercontent.com/exanauts/SparseDirectSolver.jl/divfree-chol/bench/e2e/fresh_machine.sh -o fresh_machine.sh
+#   curl -fsSL https://raw.githubusercontent.com/exanauts/SparseDirectSolver.jl/main/bench/e2e/fresh_machine.sh -o fresh_machine.sh
 #   nohup bash fresh_machine.sh > sds-fresh.log 2>&1 &     # then log out; tail -f sds-fresh.log
 #
 # or under Slurm:  sbatch -p <gpu-partition> --gres=gpu:1 -c 8 --mem=64G -t 120 --wrap "bash fresh_machine.sh"
 #
 # Knobs (env vars):
-#   SDS_BRANCH=divfree-chol   git ref to test (default: the division-free kernels PR)
+#   SDS_BRANCH=main           git ref to test
 #   SDS_DIR=$HOME/sds-test    checkout location
 #   SKIP_TESTS=1              skip the test suites, run only the MadNLP workflow
 #   CPU_ONLY_TESTS=1          run only the CPU suite (no functional GPU needed for it)
@@ -28,7 +28,7 @@
 set -euo pipefail
 exec < /dev/null                     # never read the terminal: safe to detach
 
-SDS_BRANCH="${SDS_BRANCH:-divfree-chol}"
+SDS_BRANCH="${SDS_BRANCH:-main}"
 SDS_DIR="${SDS_DIR:-$HOME/sds-test}"
 
 if [ -z "${SDS_BACKEND:-}" ]; then
@@ -78,9 +78,9 @@ fi
 
 # --- 4. MadNLP workflow: 78k-bus ACOPF, cuDSS vs SDS on the same GPU -----------
 # ext/SparseDirectSolverMadNLPExt.jl defines the MadNLP.AbstractLinearSolver wrapper
-# (SDSSolver = stock library; SDSProtoSolver = PR #107 prototype kernels).
-# NVIDIA (run_gv100.jl): MadNLPGPU.CUDSSSolver vs SDSProtoSolver.
-# AMD (run_amd.jl): SDSSolver vs SDSProtoSolver.
+# (SparseDirectSolver.madnlp_solver(): the fused pipeline).
+# NVIDIA (run_gv100.jl): MadNLPGPU.CUDSSSolver vs SparseDirectSolver.
+# AMD (run_amd.jl): SparseDirectSolver.
 # Each prints wall/solver/linear-solver times, iteration counts and objectives
 # (convergence parity is the workflow test: same iterations, same objective).
 echo "== MadNLP + SDS workflow via $RUNNER (downloads the pglib case on first use)"

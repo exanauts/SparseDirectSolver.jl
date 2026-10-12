@@ -99,7 +99,6 @@ function SDSSolver(
     T = eltype(csc.nzVal)
     n = size(csc, 1)
     backend = KA.get_backend(csc.nzVal)
-    Fused.BACKEND[] = backend
     t = Fused.resolve_tuning(something(opt.sds_tuning, Fused.default_tuning(backend)), backend)
     s = SDS.DirectSolver(csc.colPtr, csc.rowVal, csc.nzVal, "SPD", 'U')
     s.options.regime_c_width = t.regime_c_width
@@ -118,23 +117,10 @@ function SDSSolver(
     fp = Fused.build_fused_plan(s; inkernel_wides = merged, merge_segments = merged,
                                 wgf = t.workgroup, scap = t.spin_cap)
     inv11, inv_ptr, invertf, _ = Fused.build_inverse(s)
-    # solve-side plan state (module globals, single solver instance)
-    plan0 = s.workspace.plan
-    nodes0 = s.symbolic.schedule.group_nodes
-    stp = Array(s.symbolic.subtree_ptr)
-    sub_ids = Int32[]
-    for k in eachindex(plan0.kind)
-        plan0.kind[k] == SDS.SOLVE_SUBTREES || continue
-        append!(sub_ids, Int32.(nodes0[plan0.first[k]:plan0.last[k]]))
-    end
-    sort!(sub_ids; by = e -> stp[e + 1] - stp[e], rev = true)
-    Fused.SSUB[] = Fused.DVEC(sub_ids)
-    Fused.NSUB[] = length(sub_ids)
-    Fused.INV11[] = inv11
-    Fused.INVPTR[] = inv_ptr
+    # the solve plan: one merged dependency-counter sweep over the whole tree
     fz1 = Fused.build_fused(s; kstart = 1, wcap = 256)
-    segs = [(fz1, 64)]
-    fz = (segs, true)
+    fz1 === nothing && throw(SDS.NotSupportedError("fused solve: no plan entry with fronts of width <= 256"))
+    fz = ([(fz1, 64)], true)
     M = SDSSolver{T}(s, csc, x, b, nzval, fp, fz, inv11, inv_ptr, invertf, 0, opt, logger)
     MadNLP.factorize!(M)                       # prime the fused path once
     return M
@@ -161,6 +147,8 @@ isdefined(MadNLP, :solve_linear_system!) &&
 MadNLP.input_type(::Type{SDSSolver}) = :csc
 MadNLP.default_options(::Type{SDSSolver}) = SDSSolverOptions()
 MadNLP.is_inertia(::SDSSolver) = true
+# a failed factorization is reported as an indefinite inertia, so that MadNLP
+# regularizes and factorizes again
 function MadNLP.inertia(M::SDSSolver)
     n = size(M.tril, 1)
     return M.last_info == 0 ? (n, 0, 0) : (n - 2, 1, 1)

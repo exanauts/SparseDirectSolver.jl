@@ -25,8 +25,8 @@ oneAPI, Metal and the KernelAbstractions CPU backend.
 
 ## Features
 
-* **Analysis on the host**: AMD or nested dissection (METIS, through the Metis
-  extension) ordering, elimination tree, supernodes with GPU-tuned
+* **Analysis on the host**: AMD or nested dissection (METIS) ordering,
+  elimination tree, supernodes with GPU-tuned
   amalgamation, a static factor layout and device assembly maps. For symmetric
   indefinite matrices the analysis pairs structurally zero pivots with a
   partner so that the in-front pivoting can form the 2×2 blocks of KKT systems.
@@ -59,8 +59,8 @@ Pkg.add(url = "https://github.com/exanauts/SparseDirectSolver.jl")
 Loading CUDA.jl enables the CUDA extension (`CuSparseMatrixCSR` and
 `CuSparseMatrixCSC` inputs, cuBLAS and cuSOLVER dense kernels); loading
 AMDGPU.jl enables the AMDGPU extension (`ROCSparseMatrixCSR` and
-`ROCSparseMatrixCSC` inputs, rocBLAS and rocSOLVER dense kernels). Loading Metis.jl
-enables nested dissection ordering; Krylov.jl enables FGMRES refinement.
+`ROCSparseMatrixCSC` inputs, rocBLAS and rocSOLVER dense kernels); loading
+Krylov.jl enables FGMRES refinement.
 
 ## Where to go next
 

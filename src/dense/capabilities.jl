@@ -99,6 +99,16 @@ per workgroup, 64 KiB on CDNA).
 max_local_bytes(backend) = 49152
 max_local_bytes(::KernelAbstractions.CPU) = typemax(Int)
 
+"""
+    max_threads_per_multiprocessor(backend) -> Int
+
+Resident work items per compute unit of the device `backend` runs on, `0` when
+the backend does not report it. The CUDA extension reads the device attribute
+(2048 on sm_70/80/90, 1536 on sm_86/89/120); the fused pipeline's
+per-architecture tuning (`Fused.default_tuning`) keys on it.
+"""
+max_threads_per_multiprocessor(backend) = 0
+
 # ---------------------------------------------------------------------------
 # probes
 

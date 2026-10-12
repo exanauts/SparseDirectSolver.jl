@@ -60,7 +60,6 @@ end
     lap2 = laplacian2d(30, 30)
     lap3 = laplacian3d(10, 10, 10)
     kkt = kkt_matrix(300, 100, 1.0e-8)
-    @test SDS.nd_available()
     for (name, A) in (("lap2d", lap2), ("lap3d", lap3), ("kkt", kkt))
         n = size(A, 1)
         P = SDS.SymmetricPattern(SDS.CSR(A), "S"; view = 'F')
@@ -111,12 +110,12 @@ end
             end
         end
     end
-    @test SDS.ND_PROVIDER[](10, 50, -1, -1).ufactor == 50
-    @test SDS.ND_PROVIDER[](0, -1, -1, -1).ufactor == -1
-    @test SDS.ND_PROVIDER[](10, -1, 4, -1).nseps == 4
-    @test SDS.ND_PROVIDER[](10, -1, 0, -1).nseps == -1
-    @test SDS.ND_PROVIDER[](10, -1, 4, 3).seed == 3
-    @test SDS.ND_PROVIDER[](10, -1, 4, -1).seed == -1
+    @test SDS.nd_algorithm(10, 50, -1, -1).ufactor == 50
+    @test SDS.nd_algorithm(0, -1, -1, -1).ufactor == -1
+    @test SDS.nd_algorithm(10, -1, 4, -1).nseps == 4
+    @test SDS.nd_algorithm(10, -1, 0, -1).nseps == -1
+    @test SDS.nd_algorithm(10, -1, 4, 3).seed == 3
+    @test SDS.nd_algorithm(10, -1, 4, -1).seed == -1
 
     @testset "user_perm" begin
         A = laplacian2d(7, 6)
@@ -135,24 +134,6 @@ end
         @test thrown(() -> SDS.compute_ordering(P, Options(user_perm = p .+ 1))) isa InvalidValueError
         @test thrown(() -> SDS.compute_ordering(P, Options(); alg = :user)) isa InvalidValueError
         @test thrown(() -> SDS.compute_ordering(P, Options(); alg = :colamd)) isa InvalidValueError
-    end
-
-    @testset "without Metis" begin
-        A = laplacian2d(12, 12)
-        P = SDS.SymmetricPattern(SDS.CSR(A), "SPD"; view = 'F')
-        saved = SDS.ND_PROVIDER[]
-        try
-            SDS.ND_PROVIDER[] = nothing
-            @test !SDS.nd_available()
-            @test thrown(() -> SDS.compute_ordering(P, Options(reordering_alg = "algo4"))) isa NotSupportedError
-            ord = SDS.compute_ordering(P, Options())
-            @test ord.alg_used === :amd
-            @test [c.alg for c in ord.stats.candidates] == [:amd]
-            @test !ord.stats.nd_available
-        finally
-            SDS.ND_PROVIDER[] = saved
-        end
-        @test SDS.nd_available()
     end
 
     @testset "empty and tiny patterns" begin
@@ -210,7 +191,7 @@ end
         P = SDS.SymmetricPattern(SDS.CSR(A), "S"; view = 'F')
         G = SparseMatrixCSC(P)
         amd = Vector{Int}(first(SDS.CliqueTrees.permutation(G; alg = SDS.CliqueTrees.AMD())))
-        nd = Vector{Int}(first(SDS.CliqueTrees.permutation(G; alg = SDS.ND_PROVIDER[](10, -1, -1, -1))))
+        nd = Vector{Int}(first(SDS.CliqueTrees.permutation(G; alg = SDS.nd_algorithm(10, -1, -1, -1))))
         for (s, ref) in (("algo1", amd), ("algo2", amd), ("algo3", amd), ("algo4", nd))
             ord = SDS.compute_ordering(P, Options(reordering_alg = s))
             @test ord.perm == ref

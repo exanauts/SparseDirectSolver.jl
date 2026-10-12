@@ -88,7 +88,7 @@ champions. Workload throughout: the 78k-bus ACOPF condensed KKT
 | RTX 3080 | sm_86 | 1536 | merged | 32.4 ms (10 GB: kernel-level only) | — |
 | Radeon VII | gfx906 | wave64 | merged, bud 8K, WGF 256, cap 16 | **40.0 ms** | — |
 
-All of this is bundled: `MadNLPSDS.SDSTuning` holds every knob as a runtime
+All of this is bundled: `SparseDirectSolver.Fused.SDSTuning` holds every knob as a runtime
 field, `default_tuning(backend)` is the single per-architecture defaults table,
 and `madnlp(m; ..., sds_tuning = SDSTuning(; workgroup = 256))` overrides it.
 The portable kernel takes workgroup size and spin cap per plan — nothing is

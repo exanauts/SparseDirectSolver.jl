@@ -16,7 +16,6 @@ Lh = tril(A)
 Random.seed!(666)
 bh = rand(n)
 S3 = (p = Vector{Int32}(undef, n); read!(joinpath(BD, "perm_cand3.bin"), p); Int.(p))
-SDSFused.BACKEND[] = AMDGPU.ROCBackend()
 sync() = AMDGPU.synchronize()
 say(x...) = (println(x...); flush(stdout))
 

@@ -294,7 +294,7 @@ end
                                                    opts = Options(pivot_pairs = "none", user_perm = opts.user_perm,
                                                                   reordering_alg = opts.reordering_alg)))
     end
-    # nested dissection (Metis is loaded by the test driver) and MMD also order the compressed graph
+    # nested dissection and MMD also order the compressed graph
     P, _, _ = pairs_ordering(A)
     pairs = SDS.pivot_pairs(P, C, sym_structure(T); view = 'L')
     for alg in (:nd, :mmd, :auto)

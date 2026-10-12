@@ -16,8 +16,10 @@ using KernelAbstractions
 using LinearAlgebra
 using SparseArrays
 
-# AMD.jl activates CliqueTrees' AMD extension (`CliqueTrees.AMD()` orderings)
+# AMD.jl and Metis.jl activate CliqueTrees' AMD and METIS extensions
+# (`CliqueTrees.AMD()` and `CliqueTrees.METIS()` orderings)
 import AMD
+import Metis
 
 export SparseDirectSolverError, NotSupportedError, InvalidValueError, FactorizationError, InterruptedError
 export CONFIG_PARAMETERS, DATA_PARAMETERS, CUDSS08_DATA_PARAMETERS, EXTRA_PARAMETERS

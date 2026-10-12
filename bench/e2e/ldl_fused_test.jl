@@ -17,7 +17,6 @@ Lh = tril(A)
 Random.seed!(666)
 bh = rand(n)
 S3 = (p = Vector{Int32}(undef, n); read!(joinpath(BD, "perm_cand3.bin"), p); Int.(p))
-SDSFused.BACKEND[] = CUDA.CUDABackend()
 
 function setup(structure)
     bd = CuArray(bh); xd = similar(bd)
@@ -57,19 +56,6 @@ flush(stdout)
 
 # --- fused solve (inverse path + D pass) ---
 inv11, inv_ptr, invertf, _ = SDSFused.build_inverse(s)
-plan0 = s.workspace.plan
-nodes0 = s.symbolic.schedule.group_nodes
-stp = Array(s.symbolic.subtree_ptr)
-sub_ids = Int32[]
-for k in eachindex(plan0.kind)
-    plan0.kind[k] == SDS.SOLVE_SUBTREES || continue
-    append!(sub_ids, Int32.(nodes0[plan0.first[k]:plan0.last[k]]))
-end
-sort!(sub_ids; by = e -> stp[e + 1] - stp[e], rev = true)
-SDSFused.SSUB[] = SDSFused.DVEC(sub_ids)
-SDSFused.NSUB[] = length(sub_ids)
-SDSFused.INV11[] = inv11
-SDSFused.INVPTR[] = inv_ptr
 fz1 = SDSFused.build_fused(s; kstart = 1, wcap = 256)
 fz = ([(fz1, 64)], true)
 invertf()
