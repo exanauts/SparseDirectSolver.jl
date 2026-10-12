@@ -33,7 +33,7 @@ Pkg.add(BACKEND == "cuda" ? ["CUDA", "CUDSS"] : ["AMDGPU"])
 # SDS as a proper dev checkout (editable, canonical path), not a frozen Pkg.add;
 # an existing checkout is updated to the branch head (local edits block the pull loudly)
 const SDS_DEV = joinpath(homedir(), ".julia", "dev", "SparseDirectSolver")
-const SDS_REF = "custom-reordering"
+const SDS_REF = "consolidated-prs"   # flip to main when PR 126 merges
 if isdir(SDS_DEV)
     # the checkout may be shared (NFS home) with a concurrent run: retry once on
     # git lock contention, then proceed on the existing tree with a warning

@@ -9,7 +9,7 @@
 # Everything is non-interactive (nothing reads the terminal), so the intended use
 # is detached from the login session (the suites + workflow run for an hour or more):
 #
-#   curl -fsSL https://raw.githubusercontent.com/exanauts/SparseDirectSolver.jl/main/bench/e2e/fresh_machine.sh -o fresh_machine.sh
+#   curl -fsSL https://raw.githubusercontent.com/exanauts/SparseDirectSolver.jl/consolidated-prs/bench/e2e/fresh_machine.sh -o fresh_machine.sh
 #   nohup bash fresh_machine.sh > sds-fresh.log 2>&1 &     # then log out; tail -f sds-fresh.log
 #
 # or under Slurm:  sbatch -p <gpu-partition> --gres=gpu:1 -c 8 --mem=64G -t 120 --wrap "bash fresh_machine.sh"
@@ -28,7 +28,7 @@
 set -euo pipefail
 exec < /dev/null                     # never read the terminal: safe to detach
 
-SDS_BRANCH="${SDS_BRANCH:-main}"
+SDS_BRANCH="${SDS_BRANCH:-consolidated-prs}"   # flip to main when PR 126 merges
 SDS_DIR="${SDS_DIR:-$HOME/sds-test}"
 
 if [ -z "${SDS_BACKEND:-}" ]; then
