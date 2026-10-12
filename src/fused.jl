@@ -801,7 +801,7 @@ const _SP_CTL = _SP_C0
         lf = ctl[SDS._ST_LF] - 1
         if ctl[SDS._ST_STATUS] == 0
             dk = real(buf[lf + SDS._packed(j, j, f)])
-            if !iszero(dk)
+            if isfinite(dk) && !iszero(dk)   # NaN/Inf must fail like potrf, not "factor"
                 if li == 1
                     g = Int(ctl[_SP_C0]) + j - 1
                     d[g] = dk
@@ -902,7 +902,7 @@ end
         w = Int(front_ncols[v])
         if j <= w && st[1] == Int32(0)
             dk = real(sh[SDS._packed(j, j, 64)])
-            if !iszero(dk)
+            if isfinite(dk) && !iszero(dk)   # NaN/Inf must fail like potrf, not "factor"
                 if li == 1
                     d[g0 + j] = dk
                     pv[1] = dk
@@ -988,6 +988,7 @@ end
 @kernel function fused_fact_kernel!(factor, stack, pcb, info, @Const(nzval), @Const(amap), @Const(amap_ptr),
                                     @Const(amap_src), @Const(cb2), @Const(wt), @Const(role), @Const(ra), @Const(rb), @Const(rc),
                                     @Const(nchild), arrived, ea_left, panel_done, trsm_left, tiles_left,
+                                    @Const(tiles_base),
                                     cb_done, @Const(snparent), @Const(front_ptr), @Const(front_nrows),
                                     @Const(front_ncols), @Const(cb_ptr), @Const(child_ptr),
                                     @Const(child_list), @Const(relind_ptr), @Const(relind), base,
@@ -1204,7 +1205,12 @@ end
             @synchronize
             if li == 1
                 left = (Atomix.@atomic trsm_left[v] += Int32(-1))
-                if left == Int32(0) && tiles_left[v] == Int32(0)   # new-value semantics: 0 = last finisher
+                # tiles_base, not the live tiles_left: the live counter can reach 0 while
+                # this (stalled) last TRSM is between its decrement and this read, and the
+                # last tile signals too -- a double signal overshoots cb_done/arrived and
+                # the != spin loops of the consumers never terminate. The static "front
+                # has no tiles" predicate is what this check means.
+                if left == Int32(0) && tiles_base[v] == Int32(0)   # new-value semantics: 0 = last finisher
                     Atomix.@atomic cb_done[v] += Int32(1)
                     pv = Int(snparent[v])
                     pv > 0 && (Atomix.@atomic arrived[pv] += Int32(1))
@@ -1351,7 +1357,7 @@ end
                 if li == 1
                     dj = real(sh[SDS._packed(j, j, 64)])
                     if LDL
-                        if st[1] == Int32(0) && !iszero(dj)
+                        if st[1] == Int32(0) && isfinite(dj) && !iszero(dj)
                             piv[1] = dj                      # d stays on the diagonal
                             d[Int(super_ptr[v]) - 1 + c0 + j] = dj
                         elseif st[1] == Int32(0)
@@ -1597,7 +1603,7 @@ end
         @inbounds begin
             if li == 1
                 dk = real(sh[SDS._packed(j, j, 64)])
-                if st[1] == Int32(0) && !iszero(dk)
+                if st[1] == Int32(0) && isfinite(dk) && !iszero(dk)
                     pv[1] = dk
                     d[g0 + c0b + j] = dk
                 elseif st[1] == Int32(0)
@@ -1795,6 +1801,10 @@ function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, B
     backend = KA.get_backend(s.numeric.factor)
     T = eltype(s.numeric.factor)
     ldl && (T <: Real || throw(SDS.NotSupportedError("fused LDL mode: real element types only")))
+    # the tile roles keep cld(TILE*TILE, wgf) partial sums in exactly 8 registers per
+    # thread; a smaller workgroup needs more than 8 and would silently drop/reuse slots
+    (wgf >= 128 && wgf % 32 == 0) ||
+        throw(SDS.InvalidValueError("fused plan: workgroup size $wgf; expected a multiple of 32, >= 128"))
     # LDL defaults to in-kernel wides: the host-wide LDL path (_factor_panel_c_ldl!) is
     # correct but needs ~5 launches per 64-column block where Cholesky's potrf is one
     # vendor call -- measured SLOWER on the GV100 (55.5 vs 38.6 ms tuned). Pass
@@ -1903,6 +1913,11 @@ function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, B
             end
             wtl_b[nwslots + k] = Int32(nch)
             nt = cld(nbelow, TILE)
+            # the WTILE role packs rc = k * 1024 + tjj, so tjj must fit in 10 bits;
+            # beyond that the tile would silently decode as a different panel
+            nt <= 1023 ||
+                throw(SDS.NotSupportedError("fused plan: wide front with $nbelow rows below " *
+                                            "the panel; the WTILE encoding holds cld(rows, $TILE) <= 1023"))
             for tjj in 1:nt, tii in tjj:nt
                 push!(role, ROLE_WTILE); push!(ra, Int32(v)); push!(rb, Int32(tii))
                 push!(rc, Int32(k * 1024 + tjj))
@@ -2019,6 +2034,11 @@ function refact_fused!(s, nzval, fp)
     plan = N.plan
     backend = KA.get_backend(N.factor)
     p = SDS._front_impls(N, S, :auto)
+    # per-front statuses start clean every refactorization: the narrow-panel kernels
+    # overwrite info[v] unconditionally, but the host-wide LDL kernels only SET it on
+    # failure -- without this reset one failed refactorization stays failed forever.
+    # (Before the subtree launches: kernels on this stream would otherwise be clobbered.)
+    fill!(view(N.info, 1:SDS.nsupernodes(S)), Int32(0))
     copyto!(fp.arrived, fp.arrived_base)
     copyto!(fp.ea, fp.ea_base)
     copyto!(fp.trsm, fp.trsm_base)
@@ -2046,7 +2066,7 @@ function refact_fused!(s, nzval, fp)
         count > 0 &&
             fused_fact_kernel!(backend, fp.wgf)(N.factor, N.stack, fp.pcb, N.info, nzval, S.amap, S.amap_ptr,
                                              S.amap_src, fp.cb2, fp.wt, fp.role, fp.ra, fp.rb, fp.rc, fp.nchild,
-                                             fp.arrived, fp.ea, fp.pdone, fp.trsm, fp.tiles, fp.cbd,
+                                             fp.arrived, fp.ea, fp.pdone, fp.trsm, fp.tiles, fp.tiles_base, fp.cbd,
                                              S.snparent, S.front_ptr, S.front_nrows, S.front_ncols,
                                              S.cb_ptr, S.child_ptr, S.child_list, S.relind_ptr, S.relind,
                                              Int32(base), fp.wbase, fp.wupd, fp.wpd, fp.wtl, fp.wcb,
@@ -2065,7 +2085,13 @@ function refact_fused!(s, nzval, fp)
         end
     end
     SDS.assemble_schur!(N, S, nzval)
-    fp.ldl || SDS.cholesky_stats!(N, S)        # LDL: inertia comes from the signs of d
+    # the stats kernel ALSO reduces the per-front info into info[ns + 1], which
+    # _numeric_info! reads -- LDL needs that reduction too: without it a zero/NaN
+    # pivot sets a front's info while the reduced slot keeps reporting the stale
+    # success of an earlier factorization. In LDL mode N.stats' positive-pivot
+    # fields are Cholesky-interpretation garbage; inertia comes from the signs of
+    # d (the MadNLP extension), never from these stats.
+    SDS.cholesky_stats!(N, S)
     return SDS._numeric_info!(N, S, true)
 end
 

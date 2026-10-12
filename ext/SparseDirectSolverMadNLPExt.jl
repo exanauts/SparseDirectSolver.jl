@@ -132,7 +132,8 @@ MadNLP.is_inertia(::SDSSolver) = true
 function MadNLP.inertia(M::SDSSolver)
     n = size(M.tril, 1)
     if M.opt.sds_factorization === :ldl
-        M.last_info == 0 || return (0, 1, n)
+        # failure tuple must sum to n (the inertia contract), same as the Cholesky branch
+        M.last_info == 0 || return (n - 2, 1, 1)
         l = count(x -> x < zero(x), view(M.inner.numeric.d, 1:n))   # true inertia from D
         return (n - l, 0, l)
     end
