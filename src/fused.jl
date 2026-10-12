@@ -1,14 +1,61 @@
-# Prototype kernels of PR #107 assembled as a backend-portable module, so the
-# MadNLP wrapper can run the fused factorization and the algo1/fused solve on
-# CUDA and AMDGPU alike. Single-solver-instance (module-global plan state).
-module SDSFused
+# The fused pipeline (PR #107 kernels + the October 2026 campaign), assembled
+# as a backend-portable submodule: the fused factorization (Cholesky and
+# no-pivot LDL^T) and the partitioned-inverse/fused solve, on CUDA and AMDGPU
+# alike. Single-solver-instance (module-global plan state). Consumed by the
+# MadNLP package extension (ext/SparseDirectSolverMadNLPExt.jl); the tuning
+# bundle `SDSTuning` / `default_tuning` lives here because it parameterizes
+# these kernels, not the MadNLP glue.
+module Fused
 
-using LinearAlgebra, SparseArrays, Statistics, Printf
-using SparseDirectSolver
-const SDS = SparseDirectSolver
+using LinearAlgebra, SparseArrays
+const SDS = Base.parentmodule(@__MODULE__)    # the enclosing SparseDirectSolver module
 const KA = SDS.KernelAbstractions
 const Atomix = SDS.Atomix
 using .KA: @kernel, @index, @localmem, @synchronize, @Const, @uniform
+
+"""
+    SDSTuning
+
+Every performance knob of the fused pipeline in one immutable bundle, so a
+platform's tuning is a single value (see bench/ARCH-TUNING.md for how each
+field was measured and the per-architecture champions). All fields are
+runtime parameters — no environment variables, no recompilation.
+"""
+Base.@kwdef struct SDSTuning
+    wides::Symbol = :auto                     # :auto | :host | :merged
+    subtree_budgets::Vector{Int} = [16384]    # regime-A local-memory class(es)
+    subtree_parallelism::Int = 16384
+    regime_c_width::Int = 32
+    regime_c_rows::Int = 64
+    amalgamation::NamedTuple = (max_width = 48, zero_fraction = 0.25, min_width = 8)
+    workgroup::Int = 128                      # fused-kernel workgroup size
+    spin_cap::Int = 128                       # dependency-counter backoff cap
+    nd_nseps::Int = 4                         # METIS knobs (78k-ACOPF champions)
+    nd_seed::Int = 3
+end
+
+"""
+    default_tuning(backend) -> SDSTuning
+
+The measured per-architecture defaults — the single place they live.
+2048-threads/SM NVIDIA parts (sm_70/80/90): host wides, 16K budgets.
+1536-thread parts (sm_86/89, Blackwell workstation): merged wides, 8K budgets.
+AMD (gfx906-measured): merged, 8K, workgroup 256, spin cap 16.
+"""
+function default_tuning(backend)
+    if occursin("CUDABackend", string(typeof(backend)))
+        M = Base.moduleroot(parentmodule(typeof(backend)))   # CUDACore under the CUDA 6 split
+        small = M.attribute(M.device(), M.DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR) < 2048
+        return small ? SDSTuning(; wides = :merged, subtree_budgets = [8192]) :
+                       SDSTuning(; wides = :host)
+    end
+    return SDSTuning(; wides = :merged, subtree_budgets = [8192], workgroup = 256, spin_cap = 16)
+end
+
+resolve_tuning(t::SDSTuning, backend) = t.wides === :auto ?
+    SDSTuning(t; wides = default_tuning(backend).wides) : t
+SDSTuning(t::SDSTuning; wides) = SDSTuning(wides, t.subtree_budgets, t.subtree_parallelism,
+    t.regime_c_width, t.regime_c_rows, t.amalgamation, t.workgroup, t.spin_cap, t.nd_nseps, t.nd_seed)
 
 const BACKEND = Ref{Any}(nothing)
 DVEC(v) = (out = KA.allocate(BACKEND[], eltype(v), size(v)); copyto!(out, v); out)
@@ -612,7 +659,7 @@ function build_fused(s; kstart::Int = 1, wcap::Int = MW, merged::Bool = (kstart 
         arrived_base_h[v] = Int32(cnt)
     end
     done_base_h = Int32[in_range[v] ? 0 : 1 for v in 1:ns]
-    @printf "fused: entries %d:%d of %d, %d fronts\n" i1 i2 length(plan.kind) length(flist_h)
+    println("fused: entries ", i1, ":", i2, " of ", length(plan.kind), ", ", length(flist_h), " fronts")
     return (; i1, i2, flist = DVEC(flist_h), arrived = KA.zeros(BACKEND[], Int32, ns),
             arrived_base = DVEC(arrived_base_h), done = KA.zeros(BACKEND[], Int32, ns),
             done_base = DVEC(done_base_h), nchild = DVEC(nchild_h), nfused = length(flist_h))

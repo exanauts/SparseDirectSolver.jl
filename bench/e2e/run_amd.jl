@@ -8,8 +8,9 @@ using AMDGPU
 using MadNLP, MadNLPGPU
 using ExaModels, ExaModelsPower
 
-include(joinpath(@__DIR__, "MadNLPSDS.jl"))
-using .MadNLPSDS
+using SparseDirectSolver
+# the MadNLP interface is the SparseDirectSolverMadNLPExt package extension
+const SDSSolver = SparseDirectSolver.madnlp_solver()
 
 const CASE = "pglib_opf_case78484_epigrids.m"
 

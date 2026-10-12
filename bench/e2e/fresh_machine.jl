@@ -61,8 +61,8 @@ end
 
 # the MadNLP linear-solver wrapper (SDSSolver: the fused kernels with per-arch
 # tuning), shipped with the package under bench/e2e
-include(joinpath(pkgdir(SparseDirectSolver), "bench", "e2e", "MadNLPSDS.jl"))
-using .MadNLPSDS
+# the MadNLP interface is the SparseDirectSolverMadNLPExt package extension
+const SDSSolver = SparseDirectSolver.madnlp_solver()
 
 println("device: ", BACKEND == "cuda" ? CUDA.name(CUDA.device()) : string(AMDGPU.device()))
 
@@ -72,7 +72,7 @@ m, _ = ac_opf_model("pglib_opf_case78484_epigrids.m";
 # SparseCondensedKKTSystem is required (the SPD Cholesky path); MadNLP defaults
 # equality/fixed-variable treatment correctly for it. tol: condensed default is 1e-4.
 #
-# All performance knobs live in one bundle: pass sds_tuning = MadNLPSDS.SDSTuning(; ...)
+# All performance knobs live in one bundle: pass sds_tuning = SparseDirectSolver.Fused.SDSTuning(; ...)
 # to override the measured per-architecture defaults (see bench/ARCH-TUNING.md);
 # sds_user_perm = perm (1-based, length n) bypasses the built-in reordering entirely.
 sol = madnlp(m; linear_solver = SDSSolver,

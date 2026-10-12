@@ -4,8 +4,7 @@
 using SparseDirectSolver, SparseArrays, LinearAlgebra, Random, Statistics, Printf
 using AMDGPU
 const SDS = SparseDirectSolver
-include(joinpath(@__DIR__, "SDSFused.jl"))
-using .SDSFused
+const SDSFused = SparseDirectSolver.Fused
 const BD = joinpath(@__DIR__, "..")
 include(joinpath(BD, "matrices.jl"))
 using .BenchMatrices: read_mtx
