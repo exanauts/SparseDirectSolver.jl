@@ -31,7 +31,7 @@ champions. Workload throughout: the 78k-bus ACOPF condensed KKT
 | wide-front strategy (`wk`/`mseg`) | plan builder | runtime | host vendor calls vs in-kernel blocked wides + single merged launch; trades ~100 host launches against in-kernel spin residency |
 | subtree budget (`subtree_budgets`) | solver option | runtime | regime-A local-memory class; smaller class = more subtree workgroups resident per SM/CU |
 | subtree parallelism / amalgamation | solver options | runtime | subtree formation and supernode merging; saturated on every tested arch except amal 32→48 (small win on big-SM parts) |
-| ordering (`nd_nseps`, `nd_seed`, `user_perm` + on-disk perm cache) | solver/wrapper | runtime | fill/flops; arch-independent; pay METIS once, cache the permutation |
+| ordering (`nd_nseps`, `nd_seed`, `user_perm`) | solver/wrapper | runtime | fill/flops; arch-independent; every instance recomputes (no caching); pin with `user_perm` |
 | panel width (`pw`) | plan + kernel `Val` | runtime per-plan | fronts ≤ pw factor in-kernel; packed panel = pw(pw+1)/2 · 8B of shared memory **for every block of the kernel** (one kernel = one shared size) |
 | tile size (`tl`) | plan + kernel `Val` | runtime per-plan | syrk tile; shared halves = 2·32·tl · 8B; accumulators = tl²/WGF registers per thread |
 | workgroup size (`SDS_WGF`) | env (const at include) | per-process | waves per workgroup; latency hiding on wave64 AMD; occupancy on 1536-thread parts |

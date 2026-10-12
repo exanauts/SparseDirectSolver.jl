@@ -32,11 +32,8 @@ m, _ = ac_opf_model("pglib_opf_case78484_epigrids.m";
 # SparseCondensedKKTSystem is required (the SPD Cholesky path). All performance
 # knobs live in one bundle: sds_tuning = SparseDirectSolver.Fused.SDSTuning(; ...)
 # overrides the per-architecture defaults (bench/ARCH-TUNING.md).
-# SDS_PERM_CACHE=0 disables the on-disk permutation cache, so every solve pays the
-# full METIS reordering (for timing it); default: cached under ~/.julia/sds_perm_cache
 solve() = madnlp(m; linear_solver = SDSSolver,
-                 kkt_system = MadNLP.SparseCondensedKKTSystem, tol = 1e-6,
-                 (get(ENV, "SDS_PERM_CACHE", "1") == "0" ? (; sds_perm_cache = "") : (;))...)
+                 kkt_system = MadNLP.SparseCondensedKKTSystem, tol = 1e-6)
 
 t1 = @elapsed sol = solve()
 println("\n== first solve (pays Julia compilation): ", round(t1; digits = 1), " s")
@@ -46,8 +43,9 @@ for f in propertynames(sol.counters)
     v isa Real && endswith(String(f), "_time") && f !== :start_time &&
         println("   ", f, " = ", round(v; digits = 2), " s")
 end
-# the honest speed is the warm number: same process, nothing cached between the
-# two solves except compiled code (and the on-disk permutation of this pattern)
+# the honest speed is the warm number: same process, nothing carried between the
+# two solves except compiled code — the reordering and symbolic analysis run in full
+# both times (the extension caches nothing)
 t2 = @elapsed sol2 = solve()
 println("== second solve (warm): ", round(t2; digits = 1), " s",
         "  iters = ", sol2.counters.k, "  obj = ", sol2.objective)

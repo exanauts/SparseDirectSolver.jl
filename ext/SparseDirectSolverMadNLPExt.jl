@@ -25,48 +25,21 @@ Base.@kwdef mutable struct SDSSolverOptions <: MadNLP.AbstractOptions
     sds_tuning::Union{Nothing, SDSTuning} = nothing
     # a user permutation bypasses the reordering entirely (1-based, length n)
     sds_user_perm::Union{Nothing, Vector{Int}} = nothing
-    # on-disk permutation cache keyed by pattern + ordering knobs ("" disables)
-    sds_perm_cache::String = joinpath(homedir(), ".julia", "sds_perm_cache")
-end
-
-function _perm_cache_file(opt::SDSSolverOptions, t::SDSTuning, csc)
-    (opt.sds_perm_cache == "" || opt.sds_user_perm !== nothing) && return nothing
-    n = size(csc, 1)
-    h = hash((n, length(csc.rowVal), hash(Array(csc.colPtr)), hash(Array(csc.rowVal)),
-              opt.sds_reordering, t.nd_nseps, t.nd_seed))
-    return joinpath(opt.sds_perm_cache, "perm-" * string(h, base = 16) * ".bin")
 end
 
 # shared solver construction knobs: the custom reordering (nd knobs or a user
-# permutation) and the amalgamation, applied before the analysis;
-# returns the cache file to WRITE after the analysis (nothing: no write needed)
-function _apply_reordering!(s, opt::SDSSolverOptions, t::SDSTuning, csc)
+# permutation) and the amalgamation, applied before the analysis. No caching of
+# any kind: every solver instance recomputes its ordering (owner call, 2026-10-12);
+# pin one explicitly with sds_user_perm.
+function _apply_reordering!(s, opt::SDSSolverOptions, t::SDSTuning)
     s.options.amalgamation = t.amalgamation
     if opt.sds_user_perm !== nothing
         SDS.setparam!(s, "user_perm", opt.sds_user_perm)
         return nothing
     end
-    cf = _perm_cache_file(opt, t, csc)
-    if cf !== nothing && isfile(cf)
-        n = size(csc, 1)
-        perm = Vector{Int32}(undef, n)
-        read!(cf, perm)
-        SDS.setparam!(s, "user_perm", Int.(perm))
-        return nothing
-    end
     SDS.setparam!(s, "reordering_alg", opt.sds_reordering)
     SDS.setparam!(s, "nd_nseps", t.nd_nseps)
     SDS.setparam!(s, "nd_seed", t.nd_seed)
-    return cf
-end
-
-function _save_perm(cf, s)
-    cf === nothing && return nothing
-    perm = SDS.getparam(s, "perm_reorder_row")
-    mkpath(dirname(cf))
-    open(cf, "w") do io
-        write(io, Int32.(perm))
-    end
     return nothing
 end
 
@@ -110,11 +83,10 @@ function SDSSolver(
     s.options.regime_c_rows = t.regime_c_rows  # the fused kernels own BOTH phases: no coupling conflict
     s.options.subtree_parallelism = t.subtree_parallelism
     s.options.subtree_budgets = copy(t.subtree_budgets)
-    cf = _apply_reordering!(s, opt, t, csc)
+    _apply_reordering!(s, opt, t)
     x = similar(csc.nzVal, n)
     b = similar(csc.nzVal, n)
     SDS.execute!("analysis", s, x, b; asynchronous = false)
-    _save_perm(cf, s)
     SDS.execute!("factorization", s, x, b; asynchronous = false)
     SDS.execute!("solve", s, x, b; asynchronous = false)   # allocates the solve workspace
     nzval = SDS._factor_values(s)
