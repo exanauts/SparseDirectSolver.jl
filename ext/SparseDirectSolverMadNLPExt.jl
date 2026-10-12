@@ -80,6 +80,10 @@ function SDSSolver(
     ldl = opt.sds_factorization === :ldl
     s = SDS.DirectSolver(csc.colPtr, csc.rowVal, csc.nzVal, ldl ? "S" : "SPD", 'U')
     ldl && SDS.setparam!(s, "pivot_type", 'N')
+    # no-pivot LDL never consumes 2x2 pivot pairs, and "S" analysis pays dearly for
+    # detecting them on saddle systems (augmented 78k KKT, n = 2.09M: analysis 316 s
+    # with the default pair detection, 64 s without -- measured on a GV100)
+    ldl && SDS.setparam!(s, "pivot_pairs", "none")
     s.options.regime_c_width = t.regime_c_width
     s.options.regime_c_rows = t.regime_c_rows  # the fused kernels own BOTH phases: no coupling conflict
     s.options.subtree_parallelism = t.subtree_parallelism
