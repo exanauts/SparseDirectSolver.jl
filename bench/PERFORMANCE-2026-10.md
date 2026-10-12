@@ -164,7 +164,6 @@ factor deltas, not info alone.
 
 ## Reproduction
 
-<!-- flip consolidated-prs -> main in both URLs when PR 126 merges -->
 
 One command on a fresh GPU machine (NVIDIA or AMD, autodetected). The shell route
 builds the `@sds` named project environment (everything from
@@ -172,13 +171,13 @@ builds the `@sds` named project environment (everything from
 `julia +1.13 --project=@sds bench/e2e/workflow.jl`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/exanauts/SparseDirectSolver.jl/consolidated-prs/bench/e2e/fresh_machine.sh | bash
+curl -fsSL https://raw.githubusercontent.com/exanauts/SparseDirectSolver.jl/main/bench/e2e/fresh_machine.sh | bash
 ```
 
 No shell / no checkout wanted? The self-contained Julia variant:
 
 ```bash
-julia +1.13 --startup-file=no -i -e 'include(download("https://raw.githubusercontent.com/exanauts/SparseDirectSolver.jl/consolidated-prs/bench/e2e/fresh_machine.jl"))'
+julia +1.13 --startup-file=no -i -e 'include(download("https://raw.githubusercontent.com/exanauts/SparseDirectSolver.jl/main/bench/e2e/fresh_machine.jl"))'
 ```
 
 Kernel-level benchmarks: the scripts listed in `bench/ARCH-TUNING.md` against

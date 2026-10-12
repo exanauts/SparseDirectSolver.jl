@@ -4,7 +4,7 @@
 # from bench/e2e/Project.toml with SparseDirectSolver wired to the local checkout, and
 # Pkg.instantiate() provides everything from the project file.
 #
-#   curl -fsSL https://raw.githubusercontent.com/exanauts/SparseDirectSolver.jl/consolidated-prs/bench/e2e/fresh_machine.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/exanauts/SparseDirectSolver.jl/main/bench/e2e/fresh_machine.sh | bash
 #
 # When a terminal is attached, the workflow ends in an interactive REPL (julia -i)
 # with `m`, `sol`, `sol2` and `solve()` defined; detached (nohup/sbatch, no tty) it
@@ -13,7 +13,7 @@
 #   julia +1.13 --startup-file=no --project=@sds bench/e2e/workflow.jl
 #
 # Knobs (env vars):
-#   SDS_BRANCH=consolidated-prs   git ref to test
+#   SDS_BRANCH=main              git ref to test
 #   SDS_DIR=$HOME/sds-test        checkout location
 #   SDS_BACKEND=cuda|amdgpu       GPU vendor override (autodetected in workflow.jl)
 #   RUN_TESTS=1                   also run the package test suite first (long)
@@ -26,7 +26,7 @@
 # stdin get a per-command `< /dev/null` instead.
 set -euo pipefail
 
-SDS_BRANCH="${SDS_BRANCH:-consolidated-prs}"   # flip to main when PR 126 merges
+SDS_BRANCH="${SDS_BRANCH:-main}"
 SDS_DIR="${SDS_DIR:-$HOME/sds-test}"
 
 # --- 1. Julia 1.13 via juliaup -----------------------------------------------
