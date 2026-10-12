@@ -4,7 +4,8 @@
 # rocSPARSE.ROCSparseMatrixCSC) whose colPtr/rowVal/nzVal are device vectors.
 # The CSC arrays of MadNLP's lower-triangular KKT matrix are read as the CSR
 # of the upper triangle, exactly as MadNLPGPU's CUDSSSolver does (view 'U').
-# Access from user code: SparseDirectSolver.madnlp_solver().
+# Access from user code: SparseDirectSolver.SDSSolver (a declared global of the
+# parent package this extension assigns in its __init__, the MadNLPGPU idiom).
 module SparseDirectSolverMadNLPExt
 
 using LinearAlgebra, SparseArrays
@@ -48,8 +49,8 @@ end
 
 The MadNLP linear solver backed by the fused SparseDirectSolver pipeline
 (factorization mega-kernel + partitioned-inverse solve), with per-architecture
-tuning from `Fused.default_tuning`. Obtain the type with
-`SparseDirectSolver.madnlp_solver()`.
+tuning from `Fused.default_tuning`. Available as `SparseDirectSolver.SDSSolver`
+(exported) once MadNLP is loaded.
 """
 mutable struct SDSSolver{T} <: MadNLP.AbstractLinearSolver{T}
     inner::Any
@@ -142,7 +143,10 @@ MadNLP.introduce(::SDSSolver) = "SparseDirectSolver.jl (fused pipeline)"
 MadNLP.is_supported(::Type{SDSSolver}, ::Type{Float32}) = true
 MadNLP.is_supported(::Type{SDSSolver}, ::Type{Float64}) = true
 
-SparseDirectSolver.madnlp_solver() = SDSSolver
-SparseDirectSolver.madnlp_solver_options() = SDSSolverOptions
+function __init__()
+    setglobal!(SparseDirectSolver, :SDSSolver, SDSSolver)
+    setglobal!(SparseDirectSolver, :SDSSolverOptions, SDSSolverOptions)
+    return nothing
+end
 
 end # module

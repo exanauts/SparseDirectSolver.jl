@@ -10,7 +10,6 @@ using ExaModels, ExaModelsPower
 
 using SparseDirectSolver
 # the MadNLP interface is the SparseDirectSolverMadNLPExt package extension
-const SDSSolver = SparseDirectSolver.madnlp_solver()
 
 const CASE = "pglib_opf_case78484_epigrids.m"
 

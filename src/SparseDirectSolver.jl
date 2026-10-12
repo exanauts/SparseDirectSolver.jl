@@ -88,31 +88,23 @@ include("generic.jl")
 # and its per-architecture tuning bundle; consumed by the MadNLP extension
 include("fused.jl")
 
-"""
-    madnlp_solver() -> Type
-
-The MadNLP linear-solver type backed by the fused pipeline (`SDSSolver` in the
-`SparseDirectSolverMadNLPExt` package extension). Available once MadNLP is
-loaded in the same session:
-
-    using MadNLP, SparseDirectSolver
-    madnlp(model; linear_solver = SparseDirectSolver.madnlp_solver(),
-           kkt_system = MadNLP.SparseCondensedKKTSystem)
-
-Options type: [`madnlp_solver_options`](@ref); tuning bundle:
-`SparseDirectSolver.Fused.SDSTuning` (per-architecture defaults are selected
-automatically).
-"""
-function madnlp_solver end
-
-"""
-    madnlp_solver_options() -> Type
-
-The options type of [`madnlp_solver`](@ref) (`SDSSolverOptions`: reordering,
-tuning bundle, user permutation, on-disk permutation cache). Requires MadNLP
-to be loaded.
-"""
-function madnlp_solver_options end
+# The MadNLP linear-solver type (SDSSolver) and its options type live in the
+# SparseDirectSolverMadNLPExt package extension (they subtype MadNLP types, so
+# they cannot be defined here). The standard idiom — as MadNLPGPU does for
+# CUDSSSolver — is a declared global the extension assigns in its __init__:
+# once MadNLP is loaded in the session,
+#
+#     using MadNLP, SparseDirectSolver
+#     madnlp(model; linear_solver = SDSSolver,
+#            kkt_system = MadNLP.SparseCondensedKKTSystem)
+#
+# Options go as madnlp keywords (sds_factorization = :ldl, sds_reordering,
+# sds_tuning = SparseDirectSolver.Fused.SDSTuning(; ...), sds_user_perm).
+# Before MadNLP is loaded the names exist but are unassigned (UndefVarError
+# on use), exactly like MadNLPGPU.CUDSSSolver without CUDA.
+global SDSSolver
+global SDSSolverOptions
+export SDSSolver, SDSSolverOptions
 
 __init__() = _init_log_level()
 

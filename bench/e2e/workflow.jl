@@ -23,7 +23,6 @@ else                       # condensed-KKT constructors) activates only with it 
     using AMDGPU
 end
 
-const SDSSolver = SparseDirectSolver.madnlp_solver()
 println("device: ", BACKEND == "cuda" ? CUDA.name(CUDA.device()) : string(AMDGPU.device()))
 
 m, _ = ac_opf_model("pglib_opf_case78484_epigrids.m";

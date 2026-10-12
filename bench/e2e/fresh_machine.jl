@@ -62,7 +62,6 @@ end
 # the MadNLP linear-solver wrapper (SDSSolver: the fused kernels with per-arch
 # tuning), shipped with the package under bench/e2e
 # the MadNLP interface is the SparseDirectSolverMadNLPExt package extension
-const SDSSolver = SparseDirectSolver.madnlp_solver()
 
 println("device: ", BACKEND == "cuda" ? CUDA.name(CUDA.device()) : string(AMDGPU.device()))
 
