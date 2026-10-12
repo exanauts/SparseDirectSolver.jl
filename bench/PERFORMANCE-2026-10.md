@@ -87,6 +87,64 @@ wides, subtree/mega-kernel overlap, spin-cap tuning on NVIDIA, tile-64 on every
 chip, 96-panels on ≤100 KB/SM parts, nseps beyond 4, Scotch ordering (+20–60%
 fill), cuDSS-extracted orderings.
 
+## LDL^T in the fused pipeline (added 2026-10-11)
+
+The mega-kernel gained a no-pivot LDL^T mode (real element types; the MadNLP
+case): a compile-time `Val` switches the column phases, D stays on the shared
+diagonal in flight, the factor keeps the stock LDL layout (unit-lower panels +
+separate D), and the solve applies D between the unit-triangular sweeps. Wide
+fronts factor through the VERBATIM Cholesky vendor path where the front's
+pivots share a sign (A = CC^T = LDL^T with L = C diag(C)^-1, d = diag(C)^2;
+the herk contribution block is bit-identical), with the in-kernel wide roles
+as the mixed-sign fallback. Gated against stock pivot-N (info 0, factor
+~1e-7, D ~5e-10, 20/20 repeats):
+
+| device | fused LDL | fused Cholesky | LDL multiplier | cuDSS LDL |
+|---|---|---|---|---|
+| Quadro GV100 | 28.6 ms | 25.8 ms | **1.106** | 33.8 ms (1.25x of its own Cholesky) |
+| AMD Radeon VII | 41.6 ms | 39.6 ms | **1.051** | n/a |
+
+## CPU: the fast path (added 2026-10-11)
+
+`bench/e2e/SDSCPU.jl`: a task-parallel CPU refactorization over the stock
+schedule - subtree groups as chunked tasks running the regime-A algorithm in
+plain scalar Julia, regime-B/C fronts assembling themselves per task (cache
+local) then LAPACK potrf + BLAS trsm/syrk with BLAS pinned to one thread, and
+a single-thread specialization with no task machinery at all. CPU-specific
+amalgamation: max_width 96 (-17% at 24 threads vs the GPU champion 48; the
+GPU prefers 48 by +39%). Measured and ruled out with the reasons recorded:
+DAG scheduling (correct, 6x slower: the CB stack's slot reuse IS the cache
+locality) and single-socket NUMA pinning (2.5x slower: the fronts phase wants
+both sockets' bandwidth). The phase is memory-bound past ~8 threads.
+MA27/MA57 reference numbers come via libcoinhsl: the libHSL 2025 build STUBS
+the HSL Archive codes (its ma27 symbols return success with zeroed output;
+the subset build returns -26).
+
+## The full picture
+
+Refactorization of the 78k condensed KKT; one row per hardware; best
+validated configuration each; all gated.
+
+| hardware | SDS LL^T | SDS LDL^T | best alternative (LL^T / LDL^T) |
+|---|---|---|---|
+| NVIDIA H200 | 12.0 | - | cuDSS 11.1 / - |
+| NVIDIA L40S | 15.2 | - | cuDSS 12.2 / - |
+| RTX Pro 6000 | 15.8 | - | cuDSS 13.5 / - |
+| NVIDIA A100 | 19-21 | - | cuDSS 17.3-18.7 / - |
+| Quadro GV100 | 24.1 | 28.6 | cuDSS 24.3 / 33.8 |
+| RTX 3080 (kernel-level, 10 GB) | 32.4 | - | - |
+| AMD Radeon VII | 39.6 | 41.6 | no vendor solver exists |
+| 2x Xeon 8160, 24 threads | ~85* | - | - / MA86 76.5 |
+| 2x Xeon 8160, 8 threads | 106 | - | - / MA86 151 |
+| 2x Xeon 8160, 1 thread | 449 | - | CHOLMOD 966 / MA86 963 |
+
+More 1-thread references: MA57 1909 ms, MA27 2798 ms (both LDL^T, libcoinhsl;
+MA27 on the augmented k2 system of the same problem: 3709 ms at n = 2.09M).
+*Projected from the measured interleaved -16.8% (amalgamation 96) on the
+quiet-box 101.5 ms; every other entry is directly measured. Solve times where
+they matter: SDS GPU 3.4-3.6 ms, cuDSS 3.7-4.1 ms, SDS CPU 81 ms at 24
+threads, MA86 168 ms at 24 threads.
+
 ## Correctness note
 
 All of the above sits on the completion-signal fix (`left == 0`): the fused
