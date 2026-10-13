@@ -271,12 +271,20 @@ kernel launches whose `@localmem` buffers total `localmem_bytes`, on top of
 the 1024 B allowed to an allocation-free phase (PLAN §3.9). Measured (T09
 review round 1): 0 without coverage (the local runs, Julia ≥ 1.13 is required);
 with `--code-coverage` (CI's `julia-runtest`) the `@localmem` `MArray`s are
-heap-allocated, hence `localmem_bytes` plus 64 B of header per launch. (Julia
+heap-allocated, hence `localmem_bytes` plus 64 B of header per launch. Under
+KernelAbstractions ≥ 0.10 the CPU backend heap-allocates on every launch
+(~230 B measured), hence 320 B per launch on that version only. (Julia
 ≤ 1.11 also boxed the arguments of every launch behind KA's `__run` inference
 barrier; that allowance went with the Julia 1.10 support.)
 """
 function ka_cpu_alloc_budget(launches::Integer, localmem_bytes::Integer)
     b = 1024
+    # KernelAbstractions 0.10's CPU backend heap-allocates per launch (~230 B measured
+    # with a trivial precompiled kernel; the new backend's task machinery), where 0.9
+    # was allocation-free. 320 B of per-launch headroom keeps the budgets meaningful --
+    # they still scale with the phase's launch count -- until the upstream allocation
+    # is fixed; the 0.9 contract stays exact.
+    pkgversion(KernelAbstractions) >= v"0.10" && (b += 320 * launches)
     Base.JLOptions().code_coverage != 0 && (b += localmem_bytes + 64 * launches)
     return b
 end
@@ -505,16 +513,45 @@ only on generators without element growth).
 d_error(Nh, Nr) = maximum(abs, Nh.d - Nr.d) / maximum(abs, Nr.d)
 
 """
-    ldlt_alloc_budget(S) -> Int
+    ldlt_alloc_budget(S, N; nb = SparseDirectSolver.LDLT_C_NB, lu = false) -> Int
 
-[`ka_cpu_alloc_budget`](@ref) for one LDLᵀ/LDLᴴ `factorize!` on the CPU
-backend: one launch per launch group, the `max |aᵢⱼ|` and statistics
-reductions; `@localmem` of the largest regime-A kernel (48 KiB) per group plus
-the two reductions (T15).
+[`ka_cpu_alloc_budget`](@ref) for one LDLᵀ/LDLᴴ `factorize!` of the numeric
+storage `N` (its launch plan `N.plan`) on the CPU backend, counting the
+launches the driver makes: one per subtree launch and per fused regime-A/B
+launch group; for a group on the blocked path (`ldlt_blocked_path`) the three
+assembly launches and, per chunk (`ldlt_c_chunk_end`) and batch member, one
+`panel_ldlt_kernel!` and up to two GEMMs per front per block of `nb` pivot
+columns, the finish kernel and one contribution-block pack per front; plus the
+`max |aᵢⱼ|` and statistics reductions. `lu = true` budgets `factorize_lu!`
+instead: every launch group is one fused launch, plus the two Schur assembly
+launches. `@localmem` (heap-allocated only under `--code-coverage` on KA 0.9):
+the largest regime-A kernel (48 KiB) per subtree launch and per launch group,
+blocked groups included as before, plus the two reductions (T15).
 """
-function ldlt_alloc_budget(S)
-    launches = length(S.schedule.groups) + 2
-    localmem = launches * maximum(SparseDirectSolver.SUBTREE_LOCAL_SIZES) +
+function ldlt_alloc_budget(S, N; nb::Integer = SparseDirectSolver.LDLT_C_NB, lu::Bool = false)
+    plan, sc = N.plan, S.schedule
+    members = N.nbatch
+    fused = length(plan.sub_first)
+    blocked = lu ? 2 : 0
+    nblocked = 0
+    for k in eachindex(plan.group_first)
+        a, b = plan.group_first[k], plan.group_last[k]
+        if !lu && (plan.group_width[k] == 0 || SparseDirectSolver.ldlt_blocked_path(sc, sc.group_nodes[a]))
+            blocked += 3
+            nblocked += 1
+            q = a
+            while q <= b
+                e = SparseDirectSolver.ldlt_c_chunk_end(sc, S.layout.cb_len, q, b, S.layout.work_len)
+                nblocks = maximum(cld(sc.width[sc.group_nodes[r]], nb) for r in q:e)
+                blocked += members * (nblocks * (1 + 2 * (e - q + 1)) + 1 + (e - q + 1))
+                q = e + 1
+            end
+        else
+            fused += 1
+        end
+    end
+    launches = fused + blocked + 2
+    localmem = (fused + nblocked + 2) * maximum(SparseDirectSolver.SUBTREE_LOCAL_SIZES) +
                SparseDirectSolver.STATS_WORKGROUP * SparseDirectSolver.FRONT_STATS_FIELDS * sizeof(Int64)
     return ka_cpu_alloc_budget(launches, localmem)
 end

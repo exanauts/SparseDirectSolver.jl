@@ -210,7 +210,7 @@ end
     # no allocation in the numeric phase and the solve (CPU backend)
     if backend isa CPU
         SDS.factorize!(Nd, Sd, nz; opts)
-        @test (@allocated SDS.factorize!(Nd, Sd, nz; opts)) <= ldlt_alloc_budget(S)
+        @test (@allocated SDS.factorize!(Nd, Sd, nz; opts)) <= ldlt_alloc_budget(S, Nd; lu = true)
         x = similar(b)
         for transpose in (false, true)
             SDS.sweep_solve!(x, ws, Sd, Nd, b; transpose)
