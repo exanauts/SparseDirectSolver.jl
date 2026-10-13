@@ -182,7 +182,10 @@ end
     Ct = csr_of_transpose(tril(A))
     C = CSR(to_device(backend, Ct.rowptr), to_device(backend, Ct.colval), to_device(backend, Ct.nzval), n, n;
             transposed = true)
-    for structure in (spd_structure(T), sym_structure(T)), mode in 0:2, steps in (0, 2)
+    # a covering subset of the former structure × mode × steps cross: every mode with and without
+    # refinement, both structures seeing all three modes (test-suite diet)
+    for (structure, mode, steps) in ((spd_structure(T), 0, 0), (spd_structure(T), 1, 2), (spd_structure(T), 2, 0),
+                                     (sym_structure(T), 0, 2), (sym_structure(T), 1, 0), (sym_structure(T), 2, 2))
         solver = DirectSolver(C, structure, 'L')
         setparam!(solver, "solve_mode", mode)
         setparam!(solver, "ir_n_steps", steps)

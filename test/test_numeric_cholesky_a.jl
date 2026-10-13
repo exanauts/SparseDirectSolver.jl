@@ -65,7 +65,11 @@ RUN_SHARED && @testset "plan: regime-A groups" begin
     @test S32.elsize == sizeof(Float32) && SDS.nsubtrees(S32.schedule) > 0
     @test thrown(() -> SDS.factorize!(SDS.allocate_numeric(S32, Float64), S32, Float64.(C.nzval))) isa
           InvalidValueError
-    S64 = SDS.symbolic_analysis(SDS.CSR(tril(laplacian2d(Float64, 10, 10))), "SPD", 'L'; opts = NUMERIC_A_OPTS)
+    # narrower elements are accepted; the acceptance run uses a regime-C-only analysis so this Float64 part
+    # does not compile the whole Float32 regime-A/B kernel family for one elsize check (test-suite diet;
+    # measured ~3 minutes of Float32 kernel compilation under the former NUMERIC_A_OPTS)
+    S64 = SDS.symbolic_analysis(SDS.CSR(tril(laplacian2d(Float64, 10, 10))), "SPD", 'L';
+                                opts = Options(subtree_budgets = Int[], factorization_alg = "algo2"))
     @test SDS.factorize!(SDS.allocate_numeric(S64, Float32), S64, Float32.(C.nzval)) == 0
 end
 

@@ -189,18 +189,18 @@ function ported_generic_sym(backend, ::Type{T}, ::Type{INT}, view) where {T, INT
 end
 
 @testset "Unsymmetric -- Non-Hermitian ($(backend_name(backend)), $T, $INT)" for backend in BACKENDS, T in ELTYPES,
-                                                                                 INT in INTTYPES
+                                                                                 INT in PORTED_INTTYPES
     ported_generic_lu(backend, T, INT)
 end
 
 @testset "Symmetric -- Hermitian ($(backend_name(backend)), $T, $INT)" for backend in BACKENDS, T in ELTYPES,
-                                                                           INT in INTTYPES
+                                                                           INT in PORTED_INTTYPES
     @testset "view = $view" for view in ('F', 'L', 'U')
         ported_generic_sym(backend, T, INT, view)
     end
 end
 
-@testset "SPD -- HPD ($(backend_name(backend)), $T, $INT)" for backend in BACKENDS, T in ELTYPES, INT in INTTYPES
+@testset "SPD -- HPD ($(backend_name(backend)), $T, $INT)" for backend in BACKENDS, T in ELTYPES, INT in PORTED_INTTYPES
     @testset "view = $view" for view in ('F', 'L', 'U')
         ported_generic_spd(backend, T, INT, view)
     end

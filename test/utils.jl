@@ -44,6 +44,30 @@ eltypes_among(S::Type) = eltypes_among(filter(T -> T <: S, ALL_ELTYPES))
 const INTTYPES = (Int32, Int64)
 
 """
+    INT64_ELTYPES
+
+The element types whose parts carry the `Int64` legs of the `INT` loops of the numeric and API testsets:
+the first selected real and the first selected complex type (so the pull-request selection
+`Float64,ComplexF32` runs every leg it ran before). An `Int64` kernel instance differs from its `Int32`
+twin in the index type, not in the precision of `T`, so one part per element-type class covers it while
+the other parts skip a second compilation of every kernel family for `Int64` maps (test-suite diet).
+Host-only index-type tests (`test_matrix.jl`, the symbolic files) still loop the full `INTTYPES`.
+"""
+const INT64_ELTYPES = let
+    reals = filter(T -> T <: Real, SELECTED_ELTYPES)
+    comps = filter(T -> T <: Complex, SELECTED_ELTYPES)
+    (first(reals), (isempty(comps) ? () : (first(comps),))...)
+end
+
+"""
+    int_types(T) -> Tuple
+
+`INTTYPES` when `T` is in [`INT64_ELTYPES`](@ref), `(Int32,)` otherwise: the index types a per-eltype
+numeric/API testset loops over.
+"""
+int_types(::Type{T}) where {T} = T in INT64_ELTYPES ? INTTYPES : (Int32,)
+
+"""
     tol(T)
 
 Residual tolerance on well-conditioned generators: `sqrt(eps(real(T)))`.

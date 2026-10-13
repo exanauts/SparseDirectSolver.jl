@@ -131,26 +131,26 @@ function ported_execution_lu(backend, ::Type{T}, ::Type{INT}, pivot) where {T, I
     return nothing
 end
 
+# Covering subsets of CUDSS.jl's full view × pivot cross (test-suite diet): 'C' and 'R' take the same
+# rejected-pivot branch (`NotSupportedError`, then the run continues with the default pivot type), so each
+# view runs once and every pivot value appears once across the views.
+
 @testset "Unsymmetric -- Non-Hermitian ($(backend_name(backend)), $T, $INT)" for backend in BACKENDS, T in ELTYPES,
-                                                                                 INT in INTTYPES
-    @testset "Pivoting = $pivot" for pivot in ('C', 'R', 'N')
+                                                                                 INT in PORTED_INTTYPES
+    @testset "Pivoting = $pivot" for pivot in ('C', 'N')
         ported_execution_lu(backend, T, INT, pivot)
     end
 end
 
 @testset "Symmetric -- Hermitian ($(backend_name(backend)), $T, $INT)" for backend in BACKENDS, T in ELTYPES,
-                                                                           INT in INTTYPES
-    @testset "view = $view" for view in ('F', 'L', 'U')
-        @testset "Pivoting = $pivot" for pivot in ('C', 'R', 'N')
-            ported_execution_sym(backend, T, INT, view, pivot)
-        end
+                                                                           INT in PORTED_INTTYPES
+    @testset "view = $view, Pivoting = $pivot" for (view, pivot) in (('F', 'N'), ('L', 'R'), ('U', 'C'))
+        ported_execution_sym(backend, T, INT, view, pivot)
     end
 end
 
-@testset "SPD -- HPD ($(backend_name(backend)), $T, $INT)" for backend in BACKENDS, T in ELTYPES, INT in INTTYPES
-    @testset "view = $view" for view in ('F', 'L', 'U')
-        @testset "Pivoting = $pivot" for pivot in ('C', 'R', 'N')
-            ported_execution_spd(backend, T, INT, view, pivot)
-        end
+@testset "SPD -- HPD ($(backend_name(backend)), $T, $INT)" for backend in BACKENDS, T in ELTYPES, INT in PORTED_INTTYPES
+    @testset "view = $view, Pivoting = $pivot" for (view, pivot) in (('F', 'N'), ('L', 'R'), ('U', 'C'))
+        ported_execution_spd(backend, T, INT, view, pivot)
     end
 end

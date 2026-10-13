@@ -16,7 +16,7 @@ function ported_llt(backend, ::Type{T}, ::Type{INT}, A_cpu, x_cpu, b_cpu, uplo) 
     return relres(A_cpu, to_host(x_gpu), b_cpu)
 end
 
-@testset "LLᵀ / LLᴴ ($(backend_name(backend)), $T, $INT)" for backend in BACKENDS, T in ELTYPES, INT in INTTYPES
+@testset "LLᵀ / LLᴴ ($(backend_name(backend)), $T, $INT)" for backend in BACKENDS, T in ELTYPES, INT in PORTED_INTTYPES
     @testset "Size of the linear system: $n" for n in 1:16
         A_cpu = random_spd(T, n, 0.01)
         x_cpu = zeros(T, n)

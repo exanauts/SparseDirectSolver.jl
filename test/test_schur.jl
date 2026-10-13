@@ -34,7 +34,10 @@ schur_ldlt(structure) = structure in ("S", "H")
     flags = schur_test_flags(n)
     s, r = findall(flags), findall(!, flags)
     ns = length(s)
-    INT = rname == "B/C" ? Int64 : Int32
+    # Int64 maps on the "G" B/C cell only: compiling every kernel family a second time for Int64 set the
+    # cost of this file, and the non-Schur Int64 coverage of each family lives in its numeric file
+    # (test-suite diet)
+    INT = rname == "B/C" && structure == "G" ? Int64 : Int32
     solver = schur_solver(backend, A, structure, flags, INT; opts)
     sc = solver.host_symbolic.schedule
     @test sc.schur == SDS.nsupernodes(solver.host_symbolic) && sc.regime[sc.schur] == SDS.REGIME_C

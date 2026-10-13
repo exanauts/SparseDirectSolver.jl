@@ -8,7 +8,7 @@
 # matrix is `random_spd(T, n, 0.4)` (CUDSS.jl: `B + Bᴴ + 2n I`).
 
 @testset "inertia under matching ($(backend_name(backend)), $T, $INT)" for backend in BACKENDS, T in ELTYPES,
-                                                                            INT in INTTYPES
+                                                                            INT in PORTED_INTTYPES
     n = 16
     A_cpu = random_spd(T, n, 0.4)
     A_gpu = api_matrix(backend, A_cpu, INT)

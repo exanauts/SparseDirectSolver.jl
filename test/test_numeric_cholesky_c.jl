@@ -32,11 +32,13 @@ RUN_SHARED && @testset "storage and plan" begin
         append!(seen, nodes)
     end
     @test sort(seen) == 1:SDS.nsupernodes(S)
-    # regime-A analyses run since T11 (the subtree kernels, test_numeric_cholesky_a); wrong sizes are rejected
+    # regime-A analyses run since T11: the default analysis schedules subtrees here; factorizing them is
+    # test_numeric_cholesky_a's job (the former `factorize!` of this default analysis compiled the whole
+    # regime-A/B kernel family inside this regime-C file, ~4 minutes per element type; test-suite diet).
+    # Wrong sizes are rejected below.
     C = SDS.CSR(tril(A))
     SA = SDS.symbolic_analysis(C, "SPD", 'L')
     @test SDS.nsubtrees(SA.schedule) > 0
-    @test SDS.factorize!(SDS.allocate_numeric(SA, Float64), SA, C.nzval) == 0
     S0 = SDS.symbolic_analysis(C, "SPD", 'L'; opts = NUMERIC_C_OPTS)
     N0 = SDS.allocate_numeric(S0, Float64)
     @test thrown(() -> SDS.factorize!(N0, S0, C.nzval[1:(end - 1)])) isa InvalidValueError

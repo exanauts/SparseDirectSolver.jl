@@ -168,7 +168,7 @@ function ported_ubatch_lu(backend, ::Type{T}, ::Type{INT}, generic::Bool, stride
 end
 
 @testset "uniform batch LU ($(backend_name(backend)), $T, $INT)" for backend in BACKENDS, T in ELTYPES,
-                                                                     INT in INTTYPES
+                                                                     INT in PORTED_INTTYPES
     for generic in (false, true), strided in (false, true)
         @testset "$(generic ? "Generic" : "cuDSS") API, strided = $strided" begin
             ported_ubatch_lu(backend, T, INT, generic, strided)
@@ -178,7 +178,7 @@ end
 
 for (name, cholesky_case) in (("LDLᵀ and LDLᴴ", false), ("Cholesky", true))
     @testset "uniform batch $name ($(backend_name(backend)), $T, $INT)" for backend in BACKENDS, T in ELTYPES,
-                                                                            INT in INTTYPES
+                                                                            INT in PORTED_INTTYPES
         for generic in (false, true), strided in (false, true), uplo in ('L', 'U', 'F')
             @testset "$(generic ? "Generic" : "cuDSS") API, strided = $strided, view = $uplo" begin
                 ported_ubatch(backend, T, INT, uplo, generic, strided, cholesky_case)

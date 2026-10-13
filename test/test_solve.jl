@@ -82,7 +82,8 @@ end
             S, Sd, Nd, ws = solve_setup(backend, A, INT; opts = SOLVE_OPTS)
             @test nregime(S, SDS.REGIME_A) > 0 && nregime(S, SDS.REGIME_B) > 0 && nregime(S, SDS.REGIME_C) > 0
             Nh = SDS.host_numeric(Nd)
-            for nrhs in (1, 2, 5), deterministic in (false, true)
+            # nrhs = 2 exercised the same multi-RHS path as 5 (test-suite diet)
+            for nrhs in (1, 5), deterministic in (false, true)
                 b = solve_rhs(T, size(A, 1), nrhs)
                 x = device_solve(backend, ws, Sd, Nd, b; deterministic)
                 @test relres(A, x, b) <= tol(T)
@@ -156,8 +157,9 @@ end
     bd = to_device(backend, b)
     SDS.sweep_solve!(bd, ws, Sd, Nd, bd; deterministic = true)
     @test to_host(bd) == x
-    # the n × nrhs matrix equals the columns solved one at a time (vector and n × 1 matrix)
-    for r in 1:5
+    # the n × nrhs matrix equals the columns solved one at a time (vector and n × 1 matrix);
+    # the first and the last column stand for the five (test-suite diet)
+    for r in (1, 5)
         xr = device_solve(backend, ws, Sd, Nd, b[:, r]; deterministic = true)
         @test norm(xr - x[:, r]) <= variant_tol(T) * norm(x[:, r])
         @test device_solve(backend, ws, Sd, Nd, b[:, r:r]; deterministic = true) == reshape(xr, n, 1)
