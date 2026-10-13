@@ -207,6 +207,7 @@ mutable struct DirectSolver{T, INT, M <: CSR{T, INT}, B <: KernelAbstractions.Ba
     schur::Union{Nothing, SchurState}
     host_matching::Union{Nothing, Matching}
     analysis_colval::Vector{INT}
+    host_pattern::Union{Nothing, SymmetricPattern}
     matching::Union{Nothing, MS}
     # explicit parameters only: the default outer constructor would leave SY, NU, WS, RF, MS unbound
     # (they occur only in `Union{Nothing, …}` fields; Aqua on Julia 1.10)
@@ -214,13 +215,13 @@ mutable struct DirectSolver{T, INT, M <: CSR{T, INT}, B <: KernelAbstractions.Ba
                                                             fresh_factorization, info, stage, host_rowptr,
                                                             host_colval, ordering, host_symbolic, symbolic,
                                                             numeric, workspace, refinement, ir_steps, schur,
-                                                            host_matching, analysis_colval,
+                                                            host_matching, analysis_colval, host_pattern,
                                                             matching) where {T, INT, M, B, SY, NU, WS, RF, MS}
         return new{T, INT, M, B, SY, NU, WS, RF, MS}(A, structure, view, options, backend, nbatch,
                                                      fresh_factorization, info, stage, host_rowptr, host_colval,
                                                      ordering, host_symbolic, symbolic, numeric, workspace,
                                                      refinement, ir_steps, schur, host_matching, analysis_colval,
-                                                     matching)
+                                                     host_pattern, matching)
     end
 end
 
@@ -244,7 +245,7 @@ function DirectSolver(A::CSR{T, INT}, structure, view; index = A.index) where {T
     MS = _matching_type(backend, T, INT)
     return DirectSolver{T, INT, typeof(A), typeof(backend), SY, NU, WS, RF, MS}(
         A, s, v, Options(), backend, nb, true, zeros(Int, nb), STAGE_NONE, INT[], INT[], nothing, nothing, nothing,
-        nothing, nothing, nothing, -1, nothing, nothing, INT[], nothing)
+        nothing, nothing, nothing, -1, nothing, nothing, INT[], nothing, nothing)
 end
 
 function DirectSolver(rowptr::AbstractVector{<:Integer}, colval::AbstractVector{<:Integer}, nzval::AbstractVecOrMat,
@@ -473,6 +474,7 @@ function _reorder!(solver::DirectSolver{T}) where {T}
                              matched_colval(m, solver.host_colval, A.index)
     P = SymmetricPattern(solver.host_rowptr, solver.analysis_colval, A.nrows, solver.structure;
                          view = _stored_view(solver), index = A.index, device = _device_backend(solver))
+    solver.host_pattern = P                 # reused by _symbolic! (same arrays, same analysis)
     if solver.options.schur_mode == 1
         # Schur complement mode: the Schur rows and columns last, no 2×2 pivot pairs
         flags = schur_flags(solver.options.user_schur_indices, A.nrows)
@@ -538,10 +540,12 @@ function _symbolic!(solver::DirectSolver{T, INT}) where {T, INT}
     opts = solver.options
     A = solver.A
     ord = solver.ordering
-    P = SymmetricPattern(solver.host_rowptr, solver.analysis_colval, A.nrows, solver.structure;
-                         view = _stored_view(solver), index = A.index, device = _device_backend(solver))
+    P = solver.host_pattern                 # built by _reorder! from the same arrays
+    P === nothing &&
+        (P = SymmetricPattern(solver.host_rowptr, solver.analysis_colval, A.nrows, solver.structure;
+                              view = _stored_view(solver), index = A.index, device = _device_backend(solver)))
     if solver.schur === nothing
-        sp = supernode_partition(factor_pattern(P, ord), ord.perm, opts)
+        sp = supernode_partition(factor_pattern(P, ord), ord.perm, opts; etree_hint = ord.etree_hint)
         schur = 0
     else
         sp = schur_supernode_partition(factor_pattern(P, ord), ord.perm, length(solver.schur.indices), opts)

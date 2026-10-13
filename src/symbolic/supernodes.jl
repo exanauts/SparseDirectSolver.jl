@@ -344,17 +344,32 @@ function SupernodePartition(P::SymmetricPattern, perm::AbstractVector{<:Integer}
 end
 
 """
-    supernode_partition(P::SymmetricPattern, perm, opts::Options = Options()) -> SupernodePartition
+    supernode_partition(P::SymmetricPattern, perm, opts::Options = Options();
+                        etree_hint = nothing) -> SupernodePartition
 
 The whole supernode step for the ordering `perm` (e.g. `compute_ordering(P, opts).perm`):
 [`etree`](@ref), [`postorder`](@ref), [`colcounts`](@ref),
 [`fundamental_supernodes`](@ref), [`amalgamate`](@ref) with `opts.amalgamation`
 unless `opts.use_superpanels == 0`, and the supernodal symbolic factorization.
+
+`etree_hint` is the `(parent, post, counts)` triple of `A[perm, perm]` when the
+caller already computed it on the same pattern — [`compute_ordering`](@ref)
+carries the chosen candidate's triple on the [`Ordering`](@ref) — so the
+elimination tree, postorder and column counts are not recomputed. The triple
+must match `(P, perm)`; the length is checked, the content is trusted.
 """
-function supernode_partition(P::SymmetricPattern, perm::AbstractVector{<:Integer}, opts::Options = Options())
-    parent = etree(P, perm)
-    post = postorder(parent)
-    counts = colcounts(P, perm, parent, post)
+function supernode_partition(P::SymmetricPattern, perm::AbstractVector{<:Integer}, opts::Options = Options();
+                             etree_hint::Union{Nothing, Tuple{Vector{Int}, Vector{Int}, Vector{Int}}} = nothing)
+    if etree_hint === nothing
+        parent = etree(P, perm)
+        post = postorder(parent)
+        counts = colcounts(P, perm, parent, post)
+    else
+        parent, post, counts = etree_hint
+        length(parent) == P.n && length(post) == P.n && length(counts) == P.n ||
+            throw(InvalidValueError("etree_hint arrays have lengths " *
+                                    "$(length(parent))/$(length(post))/$(length(counts)), expected n = $(P.n)"))
+    end
     cp = fundamental_supernodes(parent, post, counts)
     amalgamated = opts.use_superpanels != 0
     amalgamated && (cp = amalgamate(cp, parent, counts, opts.amalgamation))
