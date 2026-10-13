@@ -247,6 +247,12 @@ barrier; that allowance went with the Julia 1.10 support.)
 """
 function ka_cpu_alloc_budget(launches::Integer, localmem_bytes::Integer)
     b = 1024
+    # KernelAbstractions 0.10's CPU backend heap-allocates per launch (~230 B measured
+    # with a trivial precompiled kernel; the new backend's task machinery), where 0.9
+    # was allocation-free. 320 B of per-launch headroom keeps the budgets meaningful --
+    # they still scale with the phase's launch count -- until the upstream allocation
+    # is fixed; the 0.9 contract stays exact.
+    pkgversion(KernelAbstractions) >= v"0.10" && (b += 320 * launches)
     Base.JLOptions().code_coverage != 0 && (b += localmem_bytes + 64 * launches)
     return b
 end
@@ -483,7 +489,10 @@ reductions; `@localmem` of the largest regime-A kernel (48 KiB) per group plus
 the two reductions (T15).
 """
 function ldlt_alloc_budget(S)
-    launches = length(S.schedule.groups) + 2
+    # ~3 launches per group measured on the LDL path (subtree kernel + per-group pivot
+    # and statistics passes), not 1: the undercount was invisible while KA 0.9 launches
+    # were allocation-free, and surfaced through the 0.10 per-launch allowance
+    launches = 3 * length(S.schedule.groups) + 2
     localmem = launches * maximum(SparseDirectSolver.SUBTREE_LOCAL_SIZES) +
                SparseDirectSolver.STATS_WORKGROUP * SparseDirectSolver.FRONT_STATS_FIELDS * sizeof(Int64)
     return ka_cpu_alloc_budget(launches, localmem)
