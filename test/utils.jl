@@ -241,7 +241,9 @@ kernel launches whose `@localmem` buffers total `localmem_bytes`, on top of
 the 1024 B allowed to an allocation-free phase (PLAN §3.9). Measured (T09
 review round 1): 0 without coverage (the local runs, Julia ≥ 1.13 is required);
 with `--code-coverage` (CI's `julia-runtest`) the `@localmem` `MArray`s are
-heap-allocated, hence `localmem_bytes` plus 64 B of header per launch. (Julia
+heap-allocated, hence `localmem_bytes` plus 64 B of header per launch. Under
+KernelAbstractions ≥ 0.10 the CPU backend heap-allocates on every launch
+(~230 B measured), hence 320 B per launch on that version only. (Julia
 ≤ 1.11 also boxed the arguments of every launch behind KA's `__run` inference
 barrier; that allowance went with the Julia 1.10 support.)
 """
@@ -481,19 +483,42 @@ only on generators without element growth).
 d_error(Nh, Nr) = maximum(abs, Nh.d - Nr.d) / maximum(abs, Nr.d)
 
 """
-    ldlt_alloc_budget(S) -> Int
+    ldlt_alloc_budget(S, N; nb = SparseDirectSolver.LDLT_C_NB, lu = false) -> Int
 
-[`ka_cpu_alloc_budget`](@ref) for one LDLᵀ/LDLᴴ `factorize!` on the CPU
-backend: one launch per launch group, the `max |aᵢⱼ|` and statistics
-reductions; `@localmem` of the largest regime-A kernel (48 KiB) per group plus
-the two reductions (T15).
+[`ka_cpu_alloc_budget`](@ref) for one LDLᵀ/LDLᴴ `factorize!` of the numeric
+storage `N` (its launch plan `N.plan`) on the CPU backend, counting the
+launches the driver makes: one per subtree launch and per fused regime-A/B
+launch group; for a group on the blocked path (`ldlt_blocked_path`) the three
+assembly launches and, per chunk (`ldlt_c_chunk_end`) and batch member, one
+`panel_ldlt_kernel!` and up to two GEMMs per front per block of `nb` pivot
+columns, the finish kernel and one contribution-block pack per front; plus the
+`max |aᵢⱼ|` and statistics reductions. `lu = true` budgets `factorize_lu!`
+instead: every launch group is one fused launch, plus the Schur assembly.
+`@localmem`: the largest regime-A kernel (48 KiB) per subtree or fused launch
+plus the two reductions (T15).
 """
-function ldlt_alloc_budget(S)
-    # ~3 launches per group measured on the LDL path (subtree kernel + per-group pivot
-    # and statistics passes), not 1: the undercount was invisible while KA 0.9 launches
-    # were allocation-free, and surfaced through the 0.10 per-launch allowance
-    launches = 3 * length(S.schedule.groups) + 2
-    localmem = launches * maximum(SparseDirectSolver.SUBTREE_LOCAL_SIZES) +
+function ldlt_alloc_budget(S, N; nb::Integer = SparseDirectSolver.LDLT_C_NB, lu::Bool = false)
+    plan, sc = N.plan, S.schedule
+    members = N.nbatch
+    fused = length(plan.sub_first)
+    blocked = lu ? 1 : 0
+    for k in eachindex(plan.group_first)
+        a, b = plan.group_first[k], plan.group_last[k]
+        if !lu && (plan.group_width[k] == 0 || SparseDirectSolver.ldlt_blocked_path(sc, sc.group_nodes[a]))
+            blocked += 3
+            q = a
+            while q <= b
+                e = SparseDirectSolver.ldlt_c_chunk_end(sc, S.layout.cb_len, q, b, S.layout.work_len)
+                nblocks = maximum(cld(sc.width[sc.group_nodes[r]], nb) for r in q:e)
+                blocked += members * (nblocks * (1 + 2 * (e - q + 1)) + 1 + (e - q + 1))
+                q = e + 1
+            end
+        else
+            fused += 1
+        end
+    end
+    launches = fused + blocked + 2
+    localmem = (fused + 2) * maximum(SparseDirectSolver.SUBTREE_LOCAL_SIZES) +
                SparseDirectSolver.STATS_WORKGROUP * SparseDirectSolver.FRONT_STATS_FIELDS * sizeof(Int64)
     return ka_cpu_alloc_budget(launches, localmem)
 end
