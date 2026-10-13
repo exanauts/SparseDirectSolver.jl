@@ -67,7 +67,9 @@ RUN_SHARED && @testset "plan: regime-A groups" begin
           InvalidValueError
     # narrower elements are accepted; the acceptance run uses a regime-C-only analysis so this Float64 part
     # does not compile the whole Float32 regime-A/B kernel family for one elsize check (test-suite diet;
-    # measured ~3 minutes of Float32 kernel compilation under the former NUMERIC_A_OPTS)
+    # measured ~3 minutes of Float32 kernel compilation under the former NUMERIC_A_OPTS). Side effect
+    # knowingly given up: narrower-storage numerics no longer execute A/B kernels on an elsize = 8
+    # schedule anywhere (the acceptance check itself is regime-independent, factorize.jl:73)
     S64 = SDS.symbolic_analysis(SDS.CSR(tril(laplacian2d(Float64, 10, 10))), "SPD", 'L';
                                 opts = Options(subtree_budgets = Int[], factorization_alg = "algo2"))
     @test SDS.factorize!(SDS.allocate_numeric(S64, Float32), S64, Float32.(C.nzval)) == 0

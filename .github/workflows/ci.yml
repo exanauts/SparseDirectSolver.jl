@@ -17,9 +17,9 @@ on:
         default: 'Float32,Float64,ComplexF32,ComplexF64'
         type: string
 
-# Element types under test (test/backends.jl, issue #91): pull requests and pushes run one real and one complex
-# type, the two that differ most in storage; the weekly schedule runs all four (the empty string), a manual run
-# what its input says (default all four). Kernel compilation per element type sets the test time.
+# Element types under test (test/backends.jl, issue #91): every run tests all four (owner call,
+# 2026-10-13; the empty string selects them) — a manual run can narrow via its input. Kernel
+# compilation per element type sets the test time.
 env:
   SDS_TEST_ELTYPES: ${{ inputs.eltypes }}   # empty: all four element types, every run (owner call, 2026-10-13)
 

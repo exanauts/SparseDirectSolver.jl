@@ -14,9 +14,9 @@ host_matching(A::SparseMatrixCSC, structure, alg; view = 'F') =
 
 RUN_SHARED && @testset "MC64 jobs against brute force" begin
     Random.seed!(666)
-    # this testset is about variability of the random pattern, so it keeps several draws — but 4 seeded
-    # draws of the same (n, density) find the same defects as 12 did (test-suite diet)
-    for trial in 1:4
+    # 12 draws kept: this brute-force fuzz is the only one of the six MC64 jobs, the testset is
+    # host-only and compile-dominated (the draws cost milliseconds), so cutting them saved nothing
+    for trial in 1:12
         n = 6
         A = sprand(n, n, 0.4) + sparse(randperm(n), 1:n, rand(n) .+ 0.5)   # structurally nonsingular
         W = abs.(Matrix(A))

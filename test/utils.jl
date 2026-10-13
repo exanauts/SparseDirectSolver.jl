@@ -46,17 +46,23 @@ const INTTYPES = (Int32, Int64)
 """
     INT64_ELTYPES
 
-The element types whose parts carry the `Int64` legs of the `INT` loops of the numeric and API testsets:
-the first selected real and the first selected complex type (so the pull-request selection
-`Float64,ComplexF32` runs every leg it ran before). An `Int64` kernel instance differs from its `Int32`
-twin in the index type, not in the precision of `T`, so one part per element-type class covers it while
-the other parts skip a second compilation of every kernel family for `Int64` maps (test-suite diet).
-Host-only index-type tests (`test_matrix.jl`, the symbolic files) still loop the full `INTTYPES`.
+The element types whose parts carry the `Int64` legs of the `INT` loops of the API-level testsets:
+one real and one complex carrier, preferring the 8-byte types (`Float64`, `ComplexF64`) when selected
+so the historically tested 8-byte-`T` x `Int64` handle-layer pairs survive the default all-four
+selection. An `Int64` kernel instance differs from its `Int32` twin in the index type, not in the
+precision of `T`, so one part per element-type class covers the API layer while the other parts skip
+a second compilation of every kernel family for `Int64` maps (test-suite diet). The deep numeric
+Int64 x every-`T` coverage lives in the dedicated "regime-A groups and Int64 maps" testsets and the
+cholesky/solve files; host-only index-type tests (`test_matrix.jl`, the symbolic files) still loop
+the full `INTTYPES`.
 """
 const INT64_ELTYPES = let
     reals = filter(T -> T <: Real, SELECTED_ELTYPES)
     comps = filter(T -> T <: Complex, SELECTED_ELTYPES)
-    (first(reals), (isempty(comps) ? () : (first(comps),))...)
+    isempty(reals) && error("SDS_TEST_ELTYPES selected no real type (backends.jl should have refused)")
+    creal = Float64 in reals ? Float64 : first(reals)
+    ccomp = isempty(comps) ? () : (ComplexF64 in comps ? ComplexF64 : first(comps),)
+    (creal, ccomp...)
 end
 
 """

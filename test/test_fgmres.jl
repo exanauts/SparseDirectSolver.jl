@@ -9,7 +9,8 @@ fgmres_stall_matrix() = kkt_matrix(Float64, 150, 5, 0.0)
 
 # Int32 only: the Int64 leg recompiled the factorization, residual and solve kernels for Int64 maps in this
 # worker (~80 s per run) while exercising no FGMRES-specific code — IR with Int64 maps is covered by
-# test_refinement's "refinement with static pivot perturbation" INTTYPES loop (test-suite diet).
+# test_refinement's "refinement with static pivot perturbation" INTTYPES loop, and the FGMRES Krylov
+# extension itself is INT-agnostic (it sees only the solve callback) (test-suite diet).
 RUN_SHARED && @testset "FGMRES-IR where plain IR stalls ($(backend_name(backend)), $INT)" for backend in BACKENDS,
                                                                                                INT in (Int32,)
     Random.seed!(666)

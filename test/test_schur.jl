@@ -36,7 +36,9 @@ schur_ldlt(structure) = structure in ("S", "H")
     ns = length(s)
     # Int64 maps on the "G" B/C cell only: compiling every kernel family a second time for Int64 set the
     # cost of this file, and the non-Schur Int64 coverage of each family lives in its numeric file
-    # (test-suite diet)
+    # (test-suite diet). The "G" cell keeps _schur_meta_kernel! and the one Schur-specific assembly
+    # kernel under Int64; the symmetric export instances (_schur_csr/_schur_dense) and the symmetric
+    # schur_pattern host path are INT-independent mirroring and run Int32-only
     INT = rname == "B/C" && structure == "G" ? Int64 : Int32
     solver = schur_solver(backend, A, structure, flags, INT; opts)
     sc = solver.host_symbolic.schedule

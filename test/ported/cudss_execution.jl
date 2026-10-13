@@ -132,8 +132,10 @@ function ported_execution_lu(backend, ::Type{T}, ::Type{INT}, pivot) where {T, I
 end
 
 # Covering subsets of CUDSS.jl's full view × pivot cross (test-suite diet): 'C' and 'R' take the same
-# rejected-pivot branch (`NotSupportedError`, then the run continues with the default pivot type), so each
-# view runs once and every pivot value appears once across the views.
+# structure-independent rejected-pivot branch (`NotSupportedError` in the options parse, then the run
+# continues with the default pivot type), so each view runs once and every pivot value appears once
+# across the sym/spd views ('R' is dropped from the LU testset entirely on the same ground). The lost
+# (view 'U', pivot 'N') interaction is vacuous: assembly canonicalizes the view before any pivot code.
 
 @testset "Unsymmetric -- Non-Hermitian ($(backend_name(backend)), $T, $INT)" for backend in BACKENDS, T in ELTYPES,
                                                                                  INT in PORTED_INTTYPES

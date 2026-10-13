@@ -58,7 +58,8 @@ const LDLT_ALL_REGIME_CASES = ("kkt(300,100,1e-8)", "kkt 1e-3 H, δ = 0, interle
             herm && eig && @test (st.npos, st.nneg) == eigen_npos_nneg(A)
             herm && @test st.npos + st.nneg == size(A, 1)
             # device solve: forward (local pivot orders), diagonal, backward sweeps; a covering pair of
-            # (nrhs, deterministic) cells — the full cross lives in test_solve (test-suite diet)
+            # (nrhs, deterministic) cells — det and ldl are the only compile-time axes and both retained
+            # cells cover them; nrhs is a runtime scalar (test-suite diet)
             ws = SDS.allocate_solve(Sd, T, backend, 5)
             for (nrhs, det) in ((1, false), (5, true))
                 b = nrhs == 1 ? rand(T, size(A, 1)) : rand(T, size(A, 1), nrhs)

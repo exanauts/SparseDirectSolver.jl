@@ -189,10 +189,10 @@ package (write plain backticks for anything else).
 `SDS_TEST_CPU` (in `test/backends.jl`) and `SDS_TEST_SKIP` were added for CI: the
 CUDA jobs run with `SDS_TEST_CPU=0 SDS_TEST_SKIP=test_aqua`, since the CPU-only
 jobs already cover the CPU backend and Aqua. `SDS_TEST_ELTYPES` (in
-`test/backends.jl`, issue #91) selects the element types: pull-request and push CI
-runs `Float64,ComplexF32`, the weekly scheduled run (and a manual run, by default)
-all four. A task's "passes on CPU and CUDA" still means the default run (both
-backends, all four element types) on the owner's machine.
+`test/backends.jl`, issue #91) selects the element types: every CI run (pull
+request, push, weekly, and a manual run by default) tests all four; a manual
+run can narrow via its input. A task's "passes on CPU and CUDA" still means
+the default run (both backends, all four element types) on the owner's machine.
 
 The test files run in parallel through ParallelTestRunner.jl: each `test_*.jl` is
 evaluated in its own module on a pool of worker processes, after the packages,
@@ -243,8 +243,8 @@ name their types).
   tolerances inside individual test files.
 * Every numeric test loops over `BACKENDS` and over `ELTYPES` unless the task
   says otherwise. `ELTYPES` is the set selected by `SDS_TEST_ELTYPES` (default
-  all four; pull-request CI runs `Float64,ComplexF32`, the weekly run all four),
-  so a test passing on a pull request has seen two element types; a task's
+  all four; every CI run tests all four since 2026-10-13), so a test passing
+  on a pull request has seen every element type; a task's
   "passes on CPU and CUDA" means the full set on the owner's machine. Seed with `Random.seed!(666)`. Tolerance is `tol(T) =
   sqrt(eps(real(T)))` on well-conditioned generators. Elementwise
   device-vs-reference panel checks use `panel_tol(T)` only on well-conditioned
