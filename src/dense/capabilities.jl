@@ -116,6 +116,8 @@ _backend_schedule_options(backend, structure::Structure, opts::Options, nbatch::
 _allow_batched_dense(backend) = true
 _serial_cholesky_stats(backend, nbatch::Integer) = false
 _host_reduce_cholesky_info(backend, nbatch::Integer) = false
+_dense_solve_front(backend, schedule, s::Integer) = takes_c_path(schedule, s)
+_solve_workgroup(backend) = 64
 
 # ---------------------------------------------------------------------------
 # probes
