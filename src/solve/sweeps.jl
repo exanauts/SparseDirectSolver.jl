@@ -87,6 +87,7 @@ end
 
 function SolvePlan(S::Symbolic)
     sc = S.schedule
+    backend = KernelAbstractions.get_backend(S.rowval)
     kind, first, last, step = Int[], Int[], Int[], Int[]
     maxm = 0
     for g in sc.groups
@@ -95,7 +96,7 @@ function SolvePlan(S::Symbolic)
         elseif sc.schur > 0 && sc.group_nodes[g.first] == sc.schur
             k = SOLVE_SCHUR
         else
-            k = takes_c_path(sc, sc.group_nodes[g.first]) ? SOLVE_DENSE : SOLVE_FRONTS
+            k = _dense_solve_front(backend, sc, sc.group_nodes[g.first]) ? SOLVE_DENSE : SOLVE_FRONTS
             if k == SOLVE_DENSE
                 for q in g.first:g.last
                     s = sc.group_nodes[q]
@@ -653,7 +654,7 @@ end
 
 function _launch_fwd!(ws::SolveWorkspace, S::Symbolic, N::Numeric, first::Int, count::Int, nrhs::Int, sub::Val,
                       det::Val, ldl::Val, factor::AbstractVector = N.factor)
-    WG = SOLVE_WORKGROUP
+    WG = _solve_workgroup(KernelAbstractions.get_backend(ws.Y))
     solve_fwd_kernel!(KernelAbstractions.get_backend(ws.Y), WG)(
         ws.Y, ws.U, factor, N.piv, S.group_nodes, batch_map(N; first, nrhs), count, S.subtree_ptr, S.subtree_nodes,
         S.super_ptr, S.rowptr, S.rowval, S.front_ptr, S.front_nrows, S.front_ncols, S.child_ptr, S.child_list,
@@ -663,7 +664,7 @@ end
 
 function _launch_bwd!(ws::SolveWorkspace, S::Symbolic, N::Numeric, first::Int, count::Int, nrhs::Int, sub::Val,
                       ldl::Val, cj::Val, factor::AbstractVector = N.factor)
-    WG = SOLVE_WORKGROUP
+    WG = _solve_workgroup(KernelAbstractions.get_backend(ws.Y))
     solve_bwd_kernel!(KernelAbstractions.get_backend(ws.Y), WG)(
         ws.Y, ws.U, factor, N.piv, S.group_nodes, batch_map(N; first, nrhs), count, S.subtree_ptr, S.subtree_nodes,
         S.super_ptr, S.rowptr, S.rowval, S.front_ptr, S.front_nrows, S.front_ncols, S.child_ptr, sub, ldl, cj, Val(WG);
@@ -724,7 +725,7 @@ end
 
 # LDLᵀ regime-C path: local pivot order of front s on the columns of Y (each with its member's order)
 function _piv_dense!(ws::SolveWorkspace, S::Symbolic, N::Numeric, s::Int, nrhs::Int, forward::Bool)
-    WG = SOLVE_WORKGROUP
+    WG = _solve_workgroup(KernelAbstractions.get_backend(ws.Y))
     kernel! = _sv_piv_kernel!(KernelAbstractions.get_backend(ws.Y), WG)
     args = (ws.Y, ws.U, N.piv, s, S.super_ptr, S.rowptr, S.front_ptr, S.front_nrows, S.front_ncols, S.child_ptr,
             batch_map(N; nrhs))
@@ -901,13 +902,14 @@ function forward_sweep!(ws::SolveWorkspace, S::Symbolic, N::Numeric; nrhs::Integ
         a, b = plan.first[k], plan.last[k]
         if plan.kind[k] == SOLVE_SCHUR
             # the Schur block stays as the children left it: Y₂ − L₂₁ Y₁ (the condensed right-hand side)
-            det && _sv_pull_kernel!(KernelAbstractions.get_backend(ws.Y), SOLVE_WORKGROUP)(
+            WG = _solve_workgroup(KernelAbstractions.get_backend(ws.Y))
+            det && _sv_pull_kernel!(KernelAbstractions.get_backend(ws.Y), WG)(
                 ws.Y, ws.U, S.group_nodes, a, b - a + 1, S.rowptr, S.super_ptr, S.front_ptr, S.front_nrows,
-                S.front_ncols, S.child_ptr, S.child_list, S.relind_ptr, S.relind, Val(SOLVE_WORKGROUP);
-                ndrange = SOLVE_WORKGROUP * (b - a + 1) * _ncols(N, nrhs))
+                S.front_ncols, S.child_ptr, S.child_list, S.relind_ptr, S.relind, Val(WG);
+                ndrange = WG * (b - a + 1) * _ncols(N, nrhs))
         elseif plan.kind[k] == SOLVE_DENSE
             if det
-                WG = SOLVE_WORKGROUP
+                WG = _solve_workgroup(KernelAbstractions.get_backend(ws.Y))
                 _sv_pull_kernel!(KernelAbstractions.get_backend(ws.Y), WG)(
                     ws.Y, ws.U, S.group_nodes, a, b - a + 1, S.rowptr, S.super_ptr, S.front_ptr, S.front_nrows,
                     S.front_ncols, S.child_ptr, S.child_list, S.relind_ptr, S.relind, Val(WG);

@@ -31,13 +31,14 @@ SparseDirectSolver.max_local_bytes(::MetalBackend) = 32768
 SparseDirectSolver._allow_batched_dense(::MetalBackend) = false
 SparseDirectSolver._serial_cholesky_stats(::MetalBackend, nbatch::Integer) = nbatch > 1
 SparseDirectSolver._host_reduce_cholesky_info(::MetalBackend, nbatch::Integer) = nbatch > 1
+SparseDirectSolver._dense_solve_front(::MetalBackend, schedule::SparseDirectSolver.Schedule, s::Integer) = false
+SparseDirectSolver._solve_workgroup(::MetalBackend) = 128
 
 # Metal.jl's MPS Cholesky and triangular solves work on full MtlMatrix objects,
-# but panel views dispatch to host LAPACK/BLAS. Mixing MPS commands with KA
-# launches also does not preserve the per-front dependency order required by
-# uniform batches. Keep the solver's dense operations on one KA command stream.
+# but panel views dispatch to host LAPACK/BLAS. Panel GEMM/SYRK are supported
+# and faster; POTRF/TRSM stay on KA. Uniform batches use only KA dense kernels.
 function SparseDirectSolver._allow_generic_dense(op::Symbol, ::MetalBackend, ::Type{T}) where {T}
-    return false
+    return op === :gemm || op === :syrk
 end
 
 function SparseDirectSolver._backend_schedule_options(backend::MetalBackend, structure::SparseDirectSolver.Structure,
