@@ -8,8 +8,8 @@ using CUDA, CUDSS
 using MadNLP, MadNLPGPU
 using ExaModels, ExaModelsPower
 
-include(joinpath(@__DIR__, "MadNLPSDS.jl"))
-using .MadNLPSDS
+using SparseDirectSolver
+# the MadNLP interface is the SparseDirectSolverMadNLPExt package extension
 
 const CASE = "pglib_opf_case78484_epigrids.m"
 
@@ -24,7 +24,6 @@ function run_one(label, model, linear_solver; warm = true)
     c = sol.counters
     @printf "%-16s status %-22s iters %3d  obj %.8e\n" label string(sol.status) c.k sol.objective
     @printf "    wall %7.2f s   solver %7.2f s   linsolve %7.2f s   eval %7.2f s   init %7.2f s\n" c.total_time c.solver_time c.linear_solver_time c.eval_function_time c.init_time
-    @printf "    factorizations %d   backsolves %d\n" c.factorization_cnt c.backsolve_cnt
     flush(stdout)
     return sol
 end
@@ -32,5 +31,5 @@ end
 println("building model on CUDA…"); flush(stdout)
 model, _ = ac_opf_model(CASE; backend = CUDABackend())
 run_one("cuDSS", model, MadNLPGPU.CUDSSSolver)
-run_one("SDS-proto", model, SDSProtoSolver)
+run_one("SDS", model, SDSSolver)
 println("done")

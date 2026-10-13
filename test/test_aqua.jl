@@ -6,4 +6,8 @@
 # CUDA job), so give it more headroom; a real persistent task still
 # fails, it just takes longer to report.
 
-Aqua.test_all(SparseDirectSolver; ambiguities = false, persistent_tasks = (tmax = 120,))
+# undefined_exports is excluded HERE only: SDSSolver/SDSSolverOptions are declared
+# globals the MadNLP extension assigns, and MadNLP is not in the test environment.
+# CI's Aqua workflow loads MadNLP and runs that check with the exports assigned.
+Aqua.test_all(SparseDirectSolver; ambiguities = false, undefined_exports = false,
+              persistent_tasks = (tmax = 120,))

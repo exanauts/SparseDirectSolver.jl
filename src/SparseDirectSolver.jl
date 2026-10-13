@@ -16,8 +16,10 @@ using KernelAbstractions
 using LinearAlgebra
 using SparseArrays
 
-# AMD.jl activates CliqueTrees' AMD extension (`CliqueTrees.AMD()` orderings)
+# AMD.jl and Metis.jl activate CliqueTrees' AMD and METIS extensions
+# (`CliqueTrees.AMD()` and `CliqueTrees.METIS()` orderings)
 import AMD
+import Metis
 
 export SparseDirectSolverError, NotSupportedError, InvalidValueError, FactorizationError, InterruptedError
 export CONFIG_PARAMETERS, DATA_PARAMETERS, CUDSS08_DATA_PARAMETERS, EXTRA_PARAMETERS
@@ -49,6 +51,7 @@ include("symbolic/pairs.jl")
 include("symbolic/supernodes.jl")
 include("symbolic/schedule.jl")
 include("symbolic/layout.jl")
+include("symbolic/device.jl")
 include("symbolic/maps.jl")
 
 # matching and scaling (PLAN §1.3, milestone M9), host
@@ -80,6 +83,28 @@ include("solve/refinement.jl")
 # public API (PLAN §3.1): handle-style layer and LinearAlgebra layer
 include("solver.jl")
 include("generic.jl")
+
+# the fused pipeline (factorization mega-kernel + partitioned-inverse solve)
+# and its per-architecture tuning bundle; consumed by the MadNLP extension
+include("fused.jl")
+
+# The MadNLP linear-solver type (SDSSolver) and its options type live in the
+# SparseDirectSolverMadNLPExt package extension (they subtype MadNLP types, so
+# they cannot be defined here). The standard idiom — as MadNLPGPU does for
+# CUDSSSolver — is a declared global the extension assigns in its __init__:
+# once MadNLP is loaded in the session,
+#
+#     using MadNLP, SparseDirectSolver
+#     madnlp(model; linear_solver = SDSSolver,
+#            kkt_system = MadNLP.SparseCondensedKKTSystem)
+#
+# Options go as madnlp keywords (sds_factorization = :ldl, sds_reordering,
+# sds_tuning = SparseDirectSolver.Fused.SDSTuning(; ...), sds_user_perm).
+# Before MadNLP is loaded the names exist but are unassigned (UndefVarError
+# on use), exactly like MadNLPGPU.CUDSSSolver without CUDA.
+global SDSSolver
+global SDSSolverOptions
+export SDSSolver, SDSSolverOptions
 
 __init__() = _init_log_level()
 

@@ -24,7 +24,7 @@ present).
 
     SymmetricPattern(n, colptr, rowval)
     SymmetricPattern(A::CSR, structure; view = 'F')
-    SymmetricPattern(rowptr, colval, n, structure; view = 'F', index = 'O')
+    SymmetricPattern(rowptr, colval, n, structure; view = 'F', index = 'O', device = nothing)
 
 The first form wraps arrays that already satisfy the invariants (checked). The
 others build the pattern from a CSR pattern, following PLAN §2.3 step 1:
@@ -148,9 +148,13 @@ function _selected_entries(rp, cv, n, structure, view)
 end
 
 function SymmetricPattern(rowptr::AbstractVector{<:Integer}, colval::AbstractVector{<:Integer}, n::Integer,
-                          structure; view = VIEW_FULL, index = INDEX_ONE)
+                          structure; view = VIEW_FULL, index = INDEX_ONE, device = nothing)
     s = _structure(structure)
     v = _matrix_view(view)
+    if device !== nothing && device_maps_supported(device, s, v, n, length(colval), 0)
+        colptr_d, rowval_d = device_symmetric_pattern(device, rowptr, colval, n, v, index)
+        return SymmetricPattern(Int(n), colptr_d, rowval_d)
+    end
     rp, cv = _host_pattern(rowptr, colval, n, index)
     rows, cols, _ = _selected_entries(rp, cv, n, s, v)
     # off-diagonal entries in both orientations, then column-sort and deduplicate

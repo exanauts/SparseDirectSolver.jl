@@ -15,7 +15,7 @@ const CUDSS_JL_CONFIG_PARAMETERS = ("reordering_alg", "factorization_alg", "solv
                                     "hybrid_device_memory_limit", "use_cuda_register_memory", "host_nthreads",
                                     "hybrid_execute_mode", "pivot_epsilon_alg", "nd_nlevels", "ubatch_size",
                                     "ubatch_index", "use_superpanels", "device_count", "device_indices",
-                                    "schur_mode", "deterministic_mode", "nd_ubfactor")
+                                    "schur_mode", "deterministic_mode", "nd_ubfactor", "nd_nseps", "nd_seed")
 
 # Configuration parameters PLAN §1.3/§1.7 mark port or reinterpret:
 # name => (valid value, value of the wrong type).
@@ -41,6 +41,8 @@ const PORTED_CONFIG_VALUES = Dict{String, Tuple{Any, Any}}(
     "schur_mode" => (1, "on"),
     "deterministic_mode" => (1, 1.0),
     "nd_ubfactor" => (30, 0.3),
+    "nd_nseps" => (4, 0.25),
+    "nd_seed" => (3, 0.3),
     # PLAN §1.7
     "pivot_sign" => (Int8[1, -1, 0, 1], [1.0, -1.0]),
     "ir_mode" => ("fgmres", :fgmres),
@@ -118,7 +120,7 @@ end
                           ("reordering_alg", "algo6"), ("reordering_alg", 6), ("factorization_alg", "algo3"),
                           ("solve_alg", "algo2"), ("matching_alg", "algo7"), ("pivot_epsilon_alg", "algo3"),
                           ("use_superpanels", 2), ("ubatch_index", -2), ("ubatch_size", -1),
-                          ("nd_ubfactor", -2), ("schedule", "fast"), ("ir_mode", "gmres"),
+                          ("nd_ubfactor", -2), ("nd_nseps", -2), ("nd_seed", -2), ("schedule", "fast"), ("ir_mode", "gmres"),
                           ("amalgamation", (min_width = 64,)), ("amalgamation", (zero_fraction = -0.1,)),
                           ("amalgamation", (foo = 1,)), ("pivot_sign", [2, 0]),
                           ("user_schur_indices", [0, 2]), ("ubatch_mask", [1, -1]))

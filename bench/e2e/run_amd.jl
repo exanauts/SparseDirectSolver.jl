@@ -8,8 +8,8 @@ using AMDGPU
 using MadNLP, MadNLPGPU
 using ExaModels, ExaModelsPower
 
-include(joinpath(@__DIR__, "MadNLPSDS.jl"))
-using .MadNLPSDS
+using SparseDirectSolver
+# the MadNLP interface is the SparseDirectSolverMadNLPExt package extension
 
 const CASE = "pglib_opf_case78484_epigrids.m"
 
@@ -31,6 +31,5 @@ end
 
 println("building model on ROCm…"); flush(stdout)
 model, _ = ac_opf_model(CASE; backend = ROCBackend())
-run_one("SDS/AMD stock", model, SDSSolver)
-run_one("SDS/AMD proto", model, SDSProtoSolver)
+run_one("SDS/AMD", model, SDSSolver)
 println("done")

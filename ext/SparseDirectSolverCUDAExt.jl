@@ -79,6 +79,14 @@ therefore stop at the 48 KiB class on CUDA (issue #60).
 """
 SparseDirectSolver.max_local_bytes(::CUDABackend) = 49152
 
+"""
+    max_threads_per_multiprocessor(::CUDABackend) -> Int
+
+`CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR` of the current device.
+"""
+SparseDirectSolver.max_threads_per_multiprocessor(::CUDABackend) =
+    Int(CUDACore.attribute(CUDACore.device(), CUDACore.DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR))
+
 # ---------------------------------------------------------------------------
 # public API (T13, PLAN §3.1): solver constructors, update!, the LinearAlgebra layer
 
