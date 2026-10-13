@@ -136,7 +136,9 @@ end
             A[j, j] = d
             S, Nr, info_ref, Sd, Nd, nz = numeric_c_setup(backend, A; opts)
             @test info_ref == j
-            @test SDS.factorize!(Nd, Sd, nz) == j
+            # pivot_epsilon = 0: failure REPORTING is under test; the default epsilon's
+            # input-diagonal clamp would lift the stored-zero pivot before potrf (#127)
+            @test SDS.factorize!(Nd, Sd, nz; opts = Options(pivot_epsilon = 0.0)) == j
             s = S.partition.col2sn[S.partition.iperm[j]]
             stats = to_host(Nd.stats)
             @test stats[s * SDS.FRONT_STATS_FIELDS] == Nr.stats[s * SDS.FRONT_STATS_FIELDS] ==

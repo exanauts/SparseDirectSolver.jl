@@ -41,8 +41,10 @@ end
         w = front_ncols[s]
         if j <= w && st[1] == 0
             ajj = real(L11[_packed(j, j, W)])
-            # pivots in (0, epsc] are statically perturbed to epsc (cuDSS pivot_epsilon
-            # semantics; epsc = 0 restores plain potrf acceptance); negative or NaN stops
+            # pivots in [0, epsc] are statically perturbed to epsc (cuDSS pivot_epsilon
+            # semantics; epsc = 0 restores plain potrf acceptance); negative or NaN stops.
+            # Deviation from cuDSS's |pivot| rule: a NEGATIVE pivot is never perturbed --
+            # MadNLP needs the failure signal for its inertia-driven regularization
             if ajj > epsc || (epsc > 0 && ajj >= 0)
                 rd = inv(sqrt(max(ajj, epsc)))       # recomputed per work item: no barrier needed;
                 for i in (j + li):WG:w               # strictly below the diagonal, since the diagonal

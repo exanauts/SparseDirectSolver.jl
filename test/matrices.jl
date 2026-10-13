@@ -239,8 +239,9 @@ Symmetric (Hermitian for complex `T`) `n × n` matrix whose row and column `j`
 are zero: an SPD pentadiagonal matrix (diagonal 6, couplings of modulus ≤ 1)
 on the other `n - 1` indices, and a structurally zero pivot at `j` (stored as
 an explicit zero when `stored_zero = true`). Any elimination order meets a zero
-pivot at column `j`, so Cholesky reports `info = j` and LDLᵀ must perturb that
-pivot; `b = A x` is a consistent right-hand side. Setting `A[j, j]` to a
+pivot at column `j`, so Cholesky reports `info = j` under `pivot_epsilon = 0`
+(the default epsilon statically perturbs a zero pivot, #127) and LDLᵀ must
+perturb that pivot; `b = A x` is a consistent right-hand side. Setting `A[j, j]` to a
 positive value makes the matrix SPD, a negative value makes Cholesky fail at `j`.
 """
 function singular_block_matrix(::Type{T}, n::Integer, j::Integer; stored_zero::Bool = false) where {T}

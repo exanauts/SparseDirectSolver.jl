@@ -1,3 +1,7 @@
+# NOTE (#127): the reference Cholesky is the UNPERTURBED ground truth -- it does not
+# apply pivot_epsilon (the device default statically perturbs pivots in [0, epsilon]).
+# Tests that plant near-zero pivots pin pivot_epsilon = 0 on the device side, and the
+# panel comparisons only use generators whose pivots sit far above the defaults.
 # CPU reference multifrontal Cholesky (PLAN §7, the oracle): plain Julia on
 # host arrays with BLAS/LAPACK, processing the supernodes of a `Symbolic` in
 # postorder with the same maps the device path uses (`amap_ptr`/`amap_src` for

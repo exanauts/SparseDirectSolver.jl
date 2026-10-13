@@ -112,7 +112,7 @@ defaults below. Keyword arguments are applied through [`setparam!`](@ref), so
 | `ir_tol` | `0.0` | no early exit |
 | `pivot_type` | `PIVOT_AUTO` | Bunch–Kaufman for `S`/`H`, none for `SPD`/`HPD` |
 | `pivot_threshold` | `0.01` | pivot acceptance threshold; with `pivot_pairs = "default"` also the partner threshold of the 2×2 pairs chosen at analysis (a value set after `"analysis"` changes the in-front test, not the pairs already chosen) |
-| `pivot_epsilon` | `nothing` | [`default_pivot_epsilon`](@ref)`(T)`; LDLᵀ/LDLᴴ/LU static pivot perturbation, and on the Cholesky path (issue #127) the threshold below which a positive pivot is raised to it (nonpositive/NaN still fails the front); `0` disables |
+| `pivot_epsilon` | `nothing` | [`default_pivot_epsilon`](@ref)`(T)`; LDLᵀ/LDLᴴ/LU static pivot perturbation, and on the Cholesky path (issue #127) the threshold: a pivot in `[0, pivot_epsilon]` is raised to it (negative or NaN still fails the front); `0` disables |
 | `pivot_epsilon_alg` | `PIVOT_EPSILON_DEFAULT` | |
 | `max_lu_nnz` | `-1` | no limit (any negative value) |
 | `hybrid_memory_mode` | `0` | device memory only |

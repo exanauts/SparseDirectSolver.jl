@@ -1365,8 +1365,10 @@ end
                             piv[1] = one(RT)
                         end
                     else
-                        if st[1] == Int32(0) && dj > zero(RT)
-                            piv[1] = sqrt(dj)
+                        # same pivot-epsilon semantics as the narrow kernels (#127):
+                        # [0, epsc] perturbs to epsc, negative/NaN fails the front
+                        if st[1] == Int32(0) && (dj > epsc || (epsc > zero(RT) && dj >= zero(RT)))
+                            piv[1] = sqrt(max(dj, epsc))
                             sh[SDS._packed(j, j, 64)] = piv[1]
                         elseif st[1] == Int32(0)
                             st[1] = Int32(c0 + j)
@@ -2021,6 +2023,8 @@ function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, B
             wcb_b = _dvec(backend, wcb_b), wupd = KA.zeros(backend, Int32, max(nwslots, 1)),
             wtl = KA.zeros(backend, Int32, max(nwslots, 1)), wpd = KA.zeros(backend, Int32, max(nwslots, 1)),
             wcb = KA.zeros(backend, Int32, ns), wgf, scap = Int32(scap), eac = Int32(ea_chunk), ldl,
+            # captured at plan build: a later setparam!("pivot_epsilon") changes the stock
+            # path but not an already-built fused plan (rebuild the plan to change it)
             chol_eps = ldl ? 0.0 : Float64(SDS.resolved_pivot_epsilon(s.options, real(T))),
             ldl_potrf = ldl && wides_potrf,
             sptr_h = Array(S.super_ptr),

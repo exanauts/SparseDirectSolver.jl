@@ -201,7 +201,10 @@ end
             s = S.partition.col2sn[S.partition.iperm[j]]
             @test S.schedule.regime[s] == SDS.REGIME_A  # the failing front is in a subtree
             @test info_ref == j
-            @test SDS.factorize!(Nd, Sd, nz) == j
+            # pivot_epsilon = 0: this testset is about FAILURE REPORTING, and the default
+            # epsilon would statically perturb the d = 0 pivot (cuDSS semantics, #127 --
+            # covered by the pivot_epsilon testset below); the reference is unperturbed
+            @test SDS.factorize!(Nd, Sd, nz; opts = Options(pivot_epsilon = 0.0)) == j
             stats = to_host(Nd.stats)
             @test stats[s * SDS.FRONT_STATS_FIELDS] == Nr.stats[s * SDS.FRONT_STATS_FIELDS] ==
                   S.partition.iperm[j] - S.partition.super_ptr[s] + 1
@@ -223,7 +226,16 @@ end
     # pivot_epsilon = 0 the factorization stops there, and a negative pivot always stops.
     # "algo2" + no subtree budgets forces regime C (the vendor-potrf clamp); the default
     # options exercise the kernel paths (regime A here: tiny subtree front).
-    A = sparse(T[1 1; 1 1])
+    # elimination makes pivot 2 of [1 1; 1 1 + d] exactly d: d = 0 (zero pivot) and
+    # d = epsilon/4 (tiny positive pivot, the near-singular-KKT mechanism of #127).
+    # The KERNEL routes statically perturb pivots in (0, epsilon] to epsilon (cuDSS
+    # semantics) and perturb/accept the zero pivot; the vendor-POTRF route cannot
+    # perturb mid-elimination, so it DETECTS instead: potrf rejects the nonpositive
+    # pivot itself, and the sqrt(epsilon) factor-diagonal floor converts a silently
+    # accepted tiny pivot into a nonzero info. Either way MadNLP gets a signal.
+    Random.seed!(666)
+    epsd = SparseDirectSolver.default_pivot_epsilon(T)
+    dt = T(epsd / 4)
     b = T[1, 0]
     mk(M, alg_c; eps0 = false) = begin
         solver = DirectSolver(api_matrix(backend, tril(M), Int32), spd_structure(T), 'L')
@@ -232,28 +244,49 @@ end
         eps0 && setparam!(solver, "pivot_epsilon", 0.0)
         solver
     end
-    for (rname, alg_c) in (("kernel regimes", false), ("regime C / potrf", true))
+    fact(M, alg_c; eps0 = false) = begin
+        solver = mk(M, alg_c; eps0)
+        x = to_device(backend, zeros(T, 2))
+        bd = to_device(backend, copy(b))
+        execute!("analysis", solver, x, bd; asynchronous = false)
+        execute!("factorization", solver, x, bd; asynchronous = false)
+        info = getparam(solver, "info")
+        info == 0 && execute!("solve", solver, x, bd; asynchronous = false)
+        (info, to_host(x))
+    end
+    Az = sparse(T[1 1; 1 1])              # pivot 2 = 0 (emerges during elimination)
+    At = sparse(T[1 1; 1 1 + dt])         # pivot 2 = dt in (0, epsilon] (during elimination)
+    As = sparse(T[1 0; 0 dt])             # tiny pivot STORED on the input diagonal
+    An = sparse(T[1 2; 2 1])              # pivot 2 < 0
+    for (rname, alg_c, perturbs) in (("kernel regimes", false, true), ("regime C / potrf", true, false))
         @testset "$rname" begin
-            solver = mk(A, alg_c)
-            x = to_device(backend, zeros(T, 2))
-            bd = to_device(backend, copy(b))
-            execute!("analysis", solver, x, bd; asynchronous = false)
-            execute!("factorization", solver, x, bd; asynchronous = false)
-            @test getparam(solver, "info") == 0                      # zero pivot perturbed
-            execute!("solve", solver, x, bd; asynchronous = false)
-            # the perturbed system is conditioned at ~1/epsilon by construction, so the
-            # checks are success + bounded growth, not a tol(T) residual
-            @test all(isfinite, to_host(x))
-            # pivot_epsilon = 0: plain potrf acceptance, the zero pivot fails the front
-            solver0 = mk(A, alg_c; eps0 = true)
-            execute!("analysis", solver0, x, bd; asynchronous = false)
-            execute!("factorization", solver0, x, bd; asynchronous = false)
-            @test getparam(solver0, "info") != 0
+            it, xt = fact(At, alg_c)
+            if perturbs
+                @test it == 0                                        # tiny pivot perturbed
+                @test all(isfinite, xt)                              # bounded growth (system is ~1/eps conditioned)
+                iz, xz = fact(Az, alg_c)
+                @test iz == 0                                        # zero pivot perturbed
+                @test all(isfinite, xz)
+            else
+                @test it != 0                                        # tiny pivot DETECTED by the epsilon floor
+                iz, _ = fact(Az, alg_c)
+                @test iz != 0                                        # zero pivot rejected by potrf itself
+            end
+            # a tiny pivot stored on the INPUT diagonal: the kernel routes perturb it, and
+            # the potrf route's pre-clamp lifts it so potrf succeeds with the factored
+            # diagonal exactly sqrt(epsilon) -- which the floor must accept (equality edge)
+            is_, xs = fact(As, alg_c)
+            @test is_ == 0
+            @test all(isfinite, xs)
+            # pivot_epsilon = 0 restores plain acceptance: the tiny positive pivot passes
+            # silently (the pre-#127 behavior), the zero pivot fails
+            i0t, _ = fact(At, alg_c; eps0 = true)
+            @test i0t == 0
+            i0z, _ = fact(Az, alg_c; eps0 = true)
+            @test i0z != 0
             # a negative pivot is never perturbed, with or without the epsilon
-            solvern = mk(sparse(T[1 2; 2 1]), alg_c)
-            execute!("analysis", solvern, x, bd; asynchronous = false)
-            execute!("factorization", solvern, x, bd; asynchronous = false)
-            @test getparam(solvern, "info") != 0
+            inn, _ = fact(An, alg_c)
+            @test inn != 0
         end
     end
 end

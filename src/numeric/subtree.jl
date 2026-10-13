@@ -148,8 +148,10 @@ end
             f = ctl[_ST_F]
             lf = ctl[_ST_LF] - 1
             ajj = real(buf[lf + _packed(j, j, f)])
-            # pivots in (0, epsc] are statically perturbed to epsc (cuDSS pivot_epsilon
-            # semantics; epsc = 0 restores plain potrf acceptance); negative or NaN stops
+            # pivots in [0, epsc] are statically perturbed to epsc (cuDSS pivot_epsilon
+            # semantics; epsc = 0 restores plain potrf acceptance); negative or NaN stops.
+            # Deviation from cuDSS's |pivot| rule: a NEGATIVE pivot is never perturbed --
+            # MadNLP needs the failure signal for its inertia-driven regularization
             if ajj > epsc || (epsc > 0 && ajj >= 0)
                 rd = inv(sqrt(max(ajj, epsc)))
                 for i in (j + li):WG:f

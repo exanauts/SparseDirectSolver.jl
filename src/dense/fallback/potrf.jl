@@ -113,7 +113,7 @@ function ka_chol_diag_info!(info::AbstractVector{Int32}, L::AbstractArray)
     return info
 end
 
-@kernel function _ka_chol_check_kernel!(info, A, n, idx)
+@kernel function _ka_chol_check_kernel!(info, A, n, idx, dmin)
     li = @index(Local, Linear)
     b = @index(Group, Linear)
     if li == 1
@@ -121,7 +121,11 @@ end
             st = Int32(0)
             for j in 1:n
                 d = _get(A, j, j, b)
-                if !(isfinite(real(d)) && real(d) > 0 && iszero(imag(d)))
+                # dmin > 0: the Cholesky pivot-epsilon floor (issue #127) — potrf accepts
+                # any positive pivot, so a pivot that became tiny DURING elimination is
+                # only visible here, as a factor diagonal at or below sqrt(epsilon)
+                ok = dmin > zero(dmin) ? real(d) >= dmin : real(d) > zero(real(d))
+                if !(isfinite(real(d)) && ok && iszero(imag(d)))
                     st = Int32(j)
                     break
                 end
@@ -140,10 +144,10 @@ the first `j` whose diagonal entry `L[j, j]` is not a finite positive real
 (still 0 if there is none); a nonzero `info[idx]` is kept. Asynchronous (see
 [`potrf_info!`](@ref)).
 """
-function ka_chol_check_info!(info::AbstractVector{Int32}, idx::Integer, L::AbstractMatrix)
+function ka_chol_check_info!(info::AbstractVector{Int32}, idx::Integer, L::AbstractMatrix, dmin::Real = 0.0)
     1 <= idx <= length(info) || throw(DimensionMismatch("info index $idx outside 1:$(length(info))"))
     kernel! = _ka_chol_check_kernel!(KernelAbstractions.get_backend(L), 1)
-    kernel!(info, L, size(L, 1), Int(idx); ndrange = 1)
+    kernel!(info, L, size(L, 1), Int(idx), real(eltype(L))(dmin); ndrange = 1)
     return info
 end
 
@@ -153,12 +157,13 @@ end
 Batched form: the check of `ka_chol_check_info!(info, offset + b, L[:, :, b])`
 for every member `b` of the 3-D strided batch `L`, one launch.
 """
-function ka_chol_check_info!(info::AbstractVector{Int32}, offset::Integer, L::AbstractArray{<:Any, 3})
+function ka_chol_check_info!(info::AbstractVector{Int32}, offset::Integer, L::AbstractArray{<:Any, 3},
+                             dmin::Real = 0.0)
     nb = size(L, 3)
     0 <= offset && offset + nb <= length(info) ||
         throw(DimensionMismatch("info has length $(length(info)) < offset $offset + batch count $nb"))
     nb == 0 && return info
     kernel! = _ka_chol_check_kernel!(KernelAbstractions.get_backend(L), 1)
-    kernel!(info, L, size(L, 1), Int(offset) + 1; ndrange = nb)
+    kernel!(info, L, size(L, 1), Int(offset) + 1, real(eltype(L))(dmin); ndrange = nb)
     return info
 end
