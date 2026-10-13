@@ -215,3 +215,45 @@ end
     @test info_ref == 4
     @test SDS.factorize!(Nd, Sd, nz) == 4
 end
+
+@testset "pivot_epsilon static perturbation ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
+    # Cholesky pivot 2 of [1 1; 1 1] is exactly zero: with pivot_epsilon = eps it is
+    # statically perturbed to eps and the factorization succeeds with bounded growth
+    # (issue #127, the cuDSS semantics the LDL/LU paths already follow); with
+    # pivot_epsilon = 0 the factorization stops there, and a negative pivot always stops.
+    # "algo2" + no subtree budgets forces regime C (the vendor-potrf clamp); the default
+    # options exercise the kernel paths (regime A here: tiny subtree front).
+    A = sparse(T[1 1; 1 1])
+    b = T[1, 0]
+    mk(M, alg_c; eps0 = false) = begin
+        solver = DirectSolver(api_matrix(backend, tril(M), Int32), spd_structure(T), 'L')
+        alg_c && setparam!(solver, "factorization_alg", "algo2")
+        alg_c && (solver.options.subtree_budgets = Int[])            # no regime A: potrf path
+        eps0 && setparam!(solver, "pivot_epsilon", 0.0)
+        solver
+    end
+    for (rname, alg_c) in (("kernel regimes", false), ("regime C / potrf", true))
+        @testset "$rname" begin
+            solver = mk(A, alg_c)
+            x = to_device(backend, zeros(T, 2))
+            bd = to_device(backend, copy(b))
+            execute!("analysis", solver, x, bd; asynchronous = false)
+            execute!("factorization", solver, x, bd; asynchronous = false)
+            @test getparam(solver, "info") == 0                      # zero pivot perturbed
+            execute!("solve", solver, x, bd; asynchronous = false)
+            # the perturbed system is conditioned at ~1/epsilon by construction, so the
+            # checks are success + bounded growth, not a tol(T) residual
+            @test all(isfinite, to_host(x))
+            # pivot_epsilon = 0: plain potrf acceptance, the zero pivot fails the front
+            solver0 = mk(A, alg_c; eps0 = true)
+            execute!("analysis", solver0, x, bd; asynchronous = false)
+            execute!("factorization", solver0, x, bd; asynchronous = false)
+            @test getparam(solver0, "info") != 0
+            # a negative pivot is never perturbed, with or without the epsilon
+            solvern = mk(sparse(T[1 2; 2 1]), alg_c)
+            execute!("analysis", solvern, x, bd; asynchronous = false)
+            execute!("factorization", solvern, x, bd; asynchronous = false)
+            @test getparam(solvern, "info") != 0
+        end
+    end
+end

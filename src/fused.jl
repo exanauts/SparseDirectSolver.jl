@@ -992,7 +992,7 @@ end
                                     cb_done, @Const(snparent), @Const(front_ptr), @Const(front_nrows),
                                     @Const(front_ncols), @Const(cb_ptr), @Const(child_ptr),
                                     @Const(child_list), @Const(relind_ptr), @Const(relind), base,
-                                    @Const(wbase), wupd, wpdone2, wtrsml, wcbl, scap, eac, d, @Const(super_ptr),
+                                    @Const(wbase), wupd, wpdone2, wtrsml, wcbl, scap, eac, epsc, d, @Const(super_ptr),
                                     ::Val{LDL}, ::Val{WG}) where {LDL, WG}
     @uniform TT = eltype(factor)
     @uniform RT = real(eltype(factor))
@@ -1103,13 +1103,13 @@ end
                 if LDL
                     _front_ldl_update!(sh, st, piv, j, v, li, front_ncols, d, g0, Val(WG))
                 else
-                    SDS._front_chol_update!(sh, st, piv, j, v, li, front_ncols, Val(64), Val(WG))
+                    SDS._front_chol_update!(sh, st, piv, j, v, li, front_ncols, epsc, Val(64), Val(WG))
                 end
                 @synchronize
                 if LDL
                     _front_ldl_scale!(sh, st, piv, j, v, li, front_ncols, Val(WG))
                 else
-                    SDS._front_chol_scale!(sh, st, piv, j, v, li, front_ncols, Val(64), Val(WG))
+                    SDS._front_chol_scale!(sh, st, piv, j, v, li, front_ncols, epsc, Val(64), Val(WG))
                 end
                 @synchronize
             end
@@ -1765,13 +1765,13 @@ end
 end
 
 # subtree launcher with a custom (sorted) list, local memory sized by eltype
-function launch_subtrees_sorted!(N, S, nzval, list, lb, backend, ldl::Bool = false)
+function launch_subtrees_sorted!(N, S, nzval, list, lb, backend, ldl::Bool = false, epsc::Real = 0.0)
     SDS._with_local_bytes(Int(lb)) do LBv
-        _sorted_subtree_launch(N, S, nzval, list, Val(ldl), LBv, Val(SDS.SUBTREE_WORKGROUP), backend)
+        _sorted_subtree_launch(N, S, nzval, list, Val(ldl), LBv, Val(SDS.SUBTREE_WORKGROUP), backend, epsc)
     end
 end
 function _sorted_subtree_launch(N::SDS.Numeric{T}, S, nzval, list, ::Val{LDL}, ::Val{LB}, ::Val{WG},
-                                backend) where {T, LDL, LB, WG}
+                                backend, epsc::Real = 0.0) where {T, LDL, LB, WG}
     bm = SDS.batch_map(N; first = 1)
     if LDL
         # the schedule sized the "S" budget classes with the LDLT reserve: match it
@@ -1785,7 +1785,7 @@ function _sorted_subtree_launch(N::SDS.Numeric{T}, S, nzval, list, ::Val{LDL}, :
         k! = SDS.subtree_cholesky_kernel!(backend, WG)
         k!(N.factor, N.stack, N.info, nzval, S.amap, S.amap_ptr, S.amap_src, list, bm, S.subtree_ptr,
            S.subtree_nodes, S.front_ptr, S.front_nrows, S.front_ncols, S.cb_ptr, S.local_front, S.local_cb,
-           S.child_ptr, S.child_list, S.relind_ptr, S.relind,
+           S.child_ptr, S.child_list, S.relind_ptr, S.relind, real(T)(epsc),
            Val((LB - SDS.SUBTREE_LOCAL_RESERVE) ÷ sizeof(T)), Val(WG); ndrange = WG * length(list) * bm.nact)
     end
     return nothing
@@ -2021,6 +2021,7 @@ function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, B
             wcb_b = _dvec(backend, wcb_b), wupd = KA.zeros(backend, Int32, max(nwslots, 1)),
             wtl = KA.zeros(backend, Int32, max(nwslots, 1)), wpd = KA.zeros(backend, Int32, max(nwslots, 1)),
             wcb = KA.zeros(backend, Int32, ns), wgf, scap = Int32(scap), eac = Int32(ea_chunk), ldl,
+            chol_eps = ldl ? 0.0 : Float64(SDS.resolved_pivot_epsilon(s.options, real(T))),
             ldl_potrf = ldl && wides_potrf,
             sptr_h = Array(S.super_ptr),
             ldlw = KA.zeros(backend, T,
@@ -2050,7 +2051,7 @@ function refact_fused!(s, nzval, fp)
     fill!(fp.wpd, Int32(0))
     copyto!(fp.wcb, fp.wcb_b)
     for k in eachindex(plan.sub_first)
-        launch_subtrees_sorted!(N, S, nzval, fp.ssub[k], plan.sub_local[k], backend, fp.ldl)
+        launch_subtrees_sorted!(N, S, nzval, fp.ssub[k], plan.sub_local[k], backend, fp.ldl, fp.chol_eps)
     end
     nodes = S.schedule.group_nodes
     fill!(fp.pcb, zero(eltype(fp.pcb)))
@@ -2070,7 +2071,8 @@ function refact_fused!(s, nzval, fp)
                                              S.snparent, S.front_ptr, S.front_nrows, S.front_ncols,
                                              S.cb_ptr, S.child_ptr, S.child_list, S.relind_ptr, S.relind,
                                              Int32(base), fp.wbase, fp.wupd, fp.wpd, fp.wtl, fp.wcb,
-                                             fp.scap, fp.eac, N.d, S.super_ptr, Val(fp.ldl), Val(fp.wgf);
+                                             fp.scap, fp.eac, real(eltype(N.factor))(fp.chol_eps), N.d,
+                                             S.super_ptr, Val(fp.ldl), Val(fp.wgf);
                                              ndrange = fp.wgf * count)
         for v in gwides                              # host-wide fronts at the segment boundary
             if fp.ldl && fp.ldl_potrf
@@ -2079,7 +2081,7 @@ function refact_fused!(s, nzval, fp)
                 _factor_panel_c_ldl!(N, S, fp, v, p, backend)
             else
                 SDS._factor_panel_c!(N.factor, fp.pcb, N.work, N.info, v, S.layout.panel_ptr[v],
-                                     S.schedule.rows[v], S.schedule.width[v], fp.cb2_h[v], p)
+                                     S.schedule.rows[v], S.schedule.width[v], fp.cb2_h[v], p, fp.chol_eps)
             end
             signal_kernel!(backend, 32)(fp.cbd, fp.arrived, S.snparent, v; ndrange = 32)
         end
