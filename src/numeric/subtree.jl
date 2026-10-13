@@ -142,14 +142,18 @@ end
 # (every work item recomputes `rd` from local memory: cheaper than sharing it through
 # a barrier, and it keeps the second half free of divisions; the diagonal itself is
 # written in the second half, so no work item reads a value another is overwriting)
-@inline function _subtree_chol_update!(buf, ctl, piv, j, li, ::Val{WG}) where {WG}
+@inline function _subtree_chol_update!(buf, ctl, piv, j, li, epsc, ::Val{WG}) where {WG}
     @inbounds begin
         if ctl[_ST_STATUS] == 0
             f = ctl[_ST_F]
             lf = ctl[_ST_LF] - 1
             ajj = real(buf[lf + _packed(j, j, f)])
-            if ajj > 0
-                rd = inv(sqrt(ajj))
+            # pivots in [0, epsc] are statically perturbed to epsc (cuDSS pivot_epsilon
+            # semantics; epsc = 0 restores plain potrf acceptance); negative or NaN stops.
+            # Deviation from cuDSS's |pivot| rule: a NEGATIVE pivot is never perturbed --
+            # MadNLP needs the failure signal for its inertia-driven regularization
+            if ajj > epsc || (epsc > 0 && ajj >= 0)
+                rd = inv(sqrt(max(ajj, epsc)))
                 for i in (j + li):WG:f
                     buf[lf + _packed(i, j, f)] *= rd
                 end
@@ -165,12 +169,13 @@ end
 # (multiply-add only: the former divide-in-the-update doubled the flop cost in f64
 # divisions; the packed-triangle enumeration halves the work items of the old
 # guarded full-square loop)
-@inline function _subtree_chol_scale!(buf, ctl, piv, j, li, ::Val{WG}) where {WG}
+@inline function _subtree_chol_scale!(buf, ctl, piv, j, li, epsc, ::Val{WG}) where {WG}
     @inbounds begin
         if ctl[_ST_STATUS] == 0
             f = ctl[_ST_F]
             lf = ctl[_ST_LF] - 1
-            li == 1 && (buf[lf + _packed(j, j, f)] = sqrt(real(buf[lf + _packed(j, j, f)])))
+            # max(., epsc) mirrors the update half's static perturbation (no-op when epsc = 0)
+            li == 1 && (buf[lf + _packed(j, j, f)] = sqrt(max(real(buf[lf + _packed(j, j, f)]), epsc)))
             r = f - j
             for q in (li - 1):WG:(r * (r + 1) ÷ 2 - 1)
                 a, b = _tri_decode(q, r)
@@ -247,7 +252,7 @@ write it to the update stack (packed lower triangle).
 @kernel function subtree_cholesky_kernel!(factor, stack, info, nzval, amap, amap_ptr, amap_src, trees, bm,
                                           subtree_ptr, subtree_nodes, front_ptr, front_nrows, front_ncols, cb_ptr,
                                           local_front, local_cb, child_ptr, child_list, relind_ptr, relind,
-                                          ::Val{NE}, ::Val{WG}) where {NE, WG}
+                                          epsc, ::Val{NE}, ::Val{WG}) where {NE, WG}
     @uniform TT = eltype(factor)
     @uniform RT = real(eltype(factor))
     @uniform IT = eltype(subtree_nodes)
@@ -278,9 +283,9 @@ write it to the update stack (packed lower triangle).
             @synchronize
         end
         for j in 1:ctl[_ST_W]
-            _subtree_chol_update!(buf, ctl, piv, j, li, Val(WG))
+            _subtree_chol_update!(buf, ctl, piv, j, li, epsc, Val(WG))
             @synchronize
-            _subtree_chol_scale!(buf, ctl, piv, j, li, Val(WG))
+            _subtree_chol_scale!(buf, ctl, piv, j, li, epsc, Val(WG))
             @synchronize
         end
         mb = _bm_gmember(bm, G)
@@ -294,13 +299,13 @@ write it to the update stack (packed lower triangle).
     end
 end
 
-function _launch_subtrees!(N::Numeric{T}, S::Symbolic, nzval, first, count, ::Val{LB}, ::Val{WG}) where {T, LB, WG}
+function _launch_subtrees!(N::Numeric{T}, S::Symbolic, nzval, first, count, epsc, ::Val{LB}, ::Val{WG}) where {T, LB, WG}
     _ilog2(WG)
     bm = batch_map(N; first)
     kernel! = subtree_cholesky_kernel!(KernelAbstractions.get_backend(N.factor), WG)
     kernel!(N.factor, N.stack, N.info, nzval, S.amap, S.amap_ptr, S.amap_src, S.group_nodes, bm,
             S.subtree_ptr, S.subtree_nodes, S.front_ptr, S.front_nrows, S.front_ncols, S.cb_ptr, S.local_front,
-            S.local_cb, S.child_ptr, S.child_list, S.relind_ptr, S.relind,
+            S.local_cb, S.child_ptr, S.child_list, S.relind_ptr, S.relind, real(T)(epsc),
             Val((LB - SUBTREE_LOCAL_RESERVE) ÷ sizeof(T)), Val(WG); ndrange = WG * count * bm.nact)
     return nothing
 end
@@ -325,10 +330,10 @@ are written, and each subtree root's contribution block goes to the update
 stack. Asynchronous.
 """
 function factorize_subtrees!(N::Numeric, S::Symbolic, nzval::AbstractVector, first::Integer, count::Integer,
-                             local_bytes::Integer)
+                             local_bytes::Integer, epsc::Real = 0.0)
     count > 0 || return N
     _with_local_bytes(Int(local_bytes)) do lb
-        _launch_subtrees!(N, S, nzval, first, count, lb, Val(SUBTREE_WORKGROUP))
+        _launch_subtrees!(N, S, nzval, first, count, epsc, lb, Val(SUBTREE_WORKGROUP))
     end
     return N
 end

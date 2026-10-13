@@ -287,16 +287,19 @@ function potrf_info!(uplo, A::AbstractMatrix, info::AbstractVector{Int32}, idx::
 end
 
 # `potrf_info!` with an already resolved implementation `p` (no capability lookup)
-function _potrf_info_impl!(p::Symbol, ul::Char, A::AbstractMatrix, info::AbstractVector{Int32}, idx::Integer)
+function _potrf_info_impl!(p::Symbol, ul::Char, A::AbstractMatrix, info::AbstractVector{Int32}, idx::Integer,
+                           dmin::Real = 0.0)
     if p === :vendor
         vendor_potrf_info!(ul, A, info, idx)
-        ka_chol_check_info!(info, idx, A)
+        ka_chol_check_info!(info, idx, A, dmin)
     elseif p === :generic
         cholesky!(Hermitian(A, ul == 'L' ? :L : :U), NoPivot(); check = false)
         fill!(view(info, idx:idx), Int32(0))
-        ka_chol_check_info!(info, idx, A)
+        ka_chol_check_info!(info, idx, A, dmin)
     else
         ka_potrf!(ul, A, info; offset = idx - 1)
+        # ka_potrf validates its own pivots at > 0; the epsilon floor needs the pass too
+        dmin > 0 && ka_chol_check_info!(info, idx, A, dmin)
     end
     return info
 end

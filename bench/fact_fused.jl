@@ -411,6 +411,7 @@ function _sorted_subtree_launch(N::SDS.Numeric{T}, S, nzval, list, ::Val{LB}, ::
     k!(N.factor, N.stack, N.info, nzval, S.amap, S.amap_ptr, S.amap_src, list, bm, S.subtree_ptr,
        S.subtree_nodes, S.front_ptr, S.front_nrows, S.front_ncols, S.cb_ptr, S.local_front, S.local_cb,
        S.child_ptr, S.child_list, S.relind_ptr, S.relind,
+       real(T)(SDS.resolved_pivot_epsilon(SDS.Options(), real(T))),   # production default (#127)
        Val((LB - SDS.SUBTREE_LOCAL_RESERVE) ÷ sizeof(T)), Val(WG); ndrange = WG * length(list) * bm.nact)
     return nothing
 end

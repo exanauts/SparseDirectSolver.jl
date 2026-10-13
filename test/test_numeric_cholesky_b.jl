@@ -211,7 +211,9 @@ end
             s = S.partition.col2sn[S.partition.iperm[j]]
             @test S.schedule.regime[s] == SDS.REGIME_B  # the failing front is a fused one
             @test info_ref == j
-            @test SDS.factorize!(Nd, Sd, nz) == j
+            # pivot_epsilon = 0: failure REPORTING is under test; the default epsilon
+            # statically perturbs the d = 0 pivot (#127; see cholesky_a's epsilon testset)
+            @test SDS.factorize!(Nd, Sd, nz; opts = Options(pivot_epsilon = 0.0)) == j
             stats = to_host(Nd.stats)
             @test stats[s * SDS.FRONT_STATS_FIELDS] == Nr.stats[s * SDS.FRONT_STATS_FIELDS] ==
                   S.partition.iperm[j] - S.partition.super_ptr[s] + 1

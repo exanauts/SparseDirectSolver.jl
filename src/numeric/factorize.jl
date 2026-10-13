@@ -109,11 +109,11 @@ end
 
 # regime-C dense kernels of front `s` (assembled panel + contribution block) of every active batch member,
 # `p` from `_front_impls`
-function _factor_front_c!(N::Numeric{T}, S::Symbolic, s::Int, p::NamedTuple) where {T}
+function _factor_front_c!(N::Numeric{T}, S::Symbolic, s::Int, p::NamedTuple, epsc::Real = 0.0) where {T}
     L, sc = S.layout, S.schedule
     if N.nbatch == 1
         _factor_panel_c!(N.factor, N.stack, N.work, N.info, s, L.panel_ptr[s], sc.rows[s], sc.width[s], L.cb_ptr[s],
-                         p)
+                         p, epsc)
         return nothing
     end
     plan = N.plan
@@ -125,10 +125,19 @@ function _factor_front_c!(N::Numeric{T}, S::Symbolic, s::Int, p::NamedTuple) whe
             for j in j0:j1
                 k = Int(plan.members_host[j])
                 _factor_panel_c!(N.factor, _mview(N.stack, k, nb), N.work, N.info, (s - 1) * nb + k,
-                                 panel_offset(L.panel_ptr, s, k, nb), sc.rows[s], sc.width[s], L.cb_ptr[s], p)
+                                 panel_offset(L.panel_ptr, s, k, nb), sc.rows[s], sc.width[s], L.cb_ptr[s], p, epsc)
             end
         else
-            _factor_panels_c_batched!(N, S, s, j0, j1 - j0 + 1, p)
+            if epsc > 0
+                backend = KernelAbstractions.get_backend(N.factor)
+                for j in j0:j1
+                    k = Int(plan.members_host[j])
+                    _chol_diag_clamp_kernel!(backend, 64)(N.factor, panel_offset(L.panel_ptr, s, k, nb),
+                                                          sc.rows[s], sc.width[s], real(T)(epsc);
+                                                          ndrange = sc.width[s])
+                end
+            end
+            _factor_panels_c_batched!(N, S, s, j0, j1 - j0 + 1, p, epsc)
         end
     end
     return nothing
@@ -138,7 +147,7 @@ end
 # are one `f×w×count` strided batch (interleaved layout), factored by strided-batched `potrf`, `trsm` and `gemm`
 # (`F21 F21ᴴ` into `count` blocks of the workspace), then packed into the members' contribution blocks
 function _factor_panels_c_batched!(N::Numeric{T}, S::Symbolic, s::Int, j0::Int, count::Int,
-                                   p::NamedTuple) where {T}
+                                   p::NamedTuple, epsc::Real = 0.0) where {T}
     L, sc = S.layout, S.schedule
     nb = N.nbatch
     f, w = sc.rows[s], sc.width[s]
@@ -149,12 +158,14 @@ function _factor_panels_c_batched!(N::Numeric{T}, S::Symbolic, s::Int, j0::Int, 
     F11 = view(P3, 1:w, 1:w, :)
     ioff = (s - 1) * nb + k0 - 1                              # info of front s, member k0 (interleaved)
     ptrs = N.plan.vendor_ptrs[s]                              # (F11, F21) member pointers, or nothing
+    dmin = sqrt(real(T)(epsc))                                # epsilon floor (#127); 0 keeps today's check
     if p.bpotrf === :vendor && ptrs !== nothing
         vendor_potrf_batched_ptrs!('L', w, view(ptrs[1], k0:(k0 + count - 1)), f,
                                    view(N.info, (ioff + 1):(ioff + count)), count)
-        ka_chol_check_info!(N.info, ioff, F11)
+        ka_chol_check_info!(N.info, ioff, F11, dmin)
     else
         _potrf_batched_impl!(p.bpotrf, F11, N.info, ioff)
+        epsc > 0 && ka_chol_check_info!(N.info, ioff, F11, dmin)
     end
     m > 0 || return nothing
     F21 = view(P3, (w + 1):f, 1:w, :)
@@ -175,13 +186,36 @@ end
 # `potrf`/`trsm`/`syrk` (`herk`) on the `f×w` panel at `factor[p0]`; the `syrk` result goes to the
 # `m×m` workspace `work[1:m^2]` and is added to the packed contribution block at `stack[c0]`
 # (`c0 = 0`: none); status into `info[s]` (also used by bench/front_bins.jl)
+# pivots in [0, epsc] of the still-unfactored panel diagonal are raised to epsc before
+# potrf (the cuDSS pivot_epsilon static perturbation on the vendor/host Cholesky path);
+# nonpositive diagonals are left for potrf to reject, as in the kernel paths
+@kernel function _chol_diag_clamp_kernel!(factor, p0::Int, f::Int, w::Int, epsc)
+    j = @index(Global)
+    @inbounds if j <= w
+        idx = p0 + (j - 1) * f + j - 1
+        d = real(factor[idx])
+        # [0, epsc]: the kernel routes perturb an exact zero too (cuDSS semantics)
+        (d >= zero(d)) & (d <= epsc) && (factor[idx] = epsc)
+    end
+end
+
 function _factor_panel_c!(factor::AbstractVector{T}, stack::AbstractVector{T}, work::AbstractVector{T},
                           info::AbstractVector{Int32}, s::Int, p0::Int, f::Int, w::Int, c0::Int,
-                          p::NamedTuple) where {T}
+                          p::NamedTuple, epsc::Real = 0.0) where {T}
     m = f - w
     P = reshape(view(factor, p0:(p0 + f * w - 1)), f, w)
     F11 = view(P, 1:w, 1:w)
-    _potrf_info_impl!(p.potrf, 'L', F11, info, s)
+    if epsc > 0
+        # same-queue ordering covers every potrf impl (the CPU backend already ran
+        # LAPACK straight after the assembly kernels before this PR): no host sync
+        _chol_diag_clamp_kernel!(KernelAbstractions.get_backend(factor), 64)(factor, p0, f, w, real(T)(epsc);
+                                                                             ndrange = w)
+    end
+    # the clamp handles input-diagonal tininess; a pivot that becomes tiny DURING the
+    # elimination is caught after the fact by the sqrt(epsilon) factor-diagonal floor
+    # inside _potrf_info_impl!, reported through info (the potrf route DETECTS where the
+    # kernel routes perturb -- either way MadNLP gets its regularization signal, #127)
+    _potrf_info_impl!(p.potrf, 'L', F11, info, s, sqrt(real(T)(epsc)))
     m > 0 || return nothing
     F21 = view(P, (w + 1):f, 1:w)
     _trsm_impl!(p.trsm, 'R', 'L', 'C', 'N', one(T), F11, F21)
@@ -255,23 +289,27 @@ function factorize_cholesky!(N::Numeric{T}, S::Symbolic, nzval::AbstractVector; 
     plan = N.plan
     nodes = S.schedule.group_nodes
     flag = opts.user_host_interrupt
+    # cuDSS pivot_epsilon semantics on the Cholesky path (issue #127): pivots in
+    # (0, epsc] are statically perturbed to epsc so a near-singular SPD system
+    # factors with bounded growth; nonpositive/NaN pivots still fail the front
+    epsc = resolved_pivot_epsilon(opts, real(T))
     for k in eachindex(plan.sub_first)
         _poll_interrupt(flag)
         a, b = plan.sub_first[k], plan.sub_last[k]
-        factorize_subtrees!(N, S, nzval, a, b - a + 1, plan.sub_local[k])
+        factorize_subtrees!(N, S, nzval, a, b - a + 1, plan.sub_local[k], epsc)
     end
     for k in eachindex(plan.group_first)
         _poll_interrupt(flag)
         a, b = plan.group_first[k], plan.group_last[k]
         W = plan.group_width[k]
         if W > 0
-            factorize_fronts_b!(N, S, nzval, a, b - a + 1, plan.group_maxchild[k], W)
+            factorize_fronts_b!(N, S, nzval, a, b - a + 1, plan.group_maxchild[k], W, epsc)
         else
             zero_fronts!(N, S, a, b - a + 1)
             scatter_A!(N, S, nzval, a, b - a + 1)
             extend_add!(N, S, a, b - a + 1, plan.group_maxchild[k])
             for q in a:b
-                _factor_front_c!(N, S, nodes[q], p)
+                _factor_front_c!(N, S, nodes[q], p, epsc)
             end
         end
     end

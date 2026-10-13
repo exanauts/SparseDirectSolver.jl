@@ -36,13 +36,17 @@ end
 # column j of the unblocked Cholesky, first half: check the pivot and apply the
 # rank-1 update of the trailing block with the scaled column (column j itself is
 # not written, so every work item reads the same unscaled values)
-@inline function _front_chol_update!(L11, st, piv, j, s, li, front_ncols, ::Val{W}, ::Val{WG}) where {W, WG}
+@inline function _front_chol_update!(L11, st, piv, j, s, li, front_ncols, epsc, ::Val{W}, ::Val{WG}) where {W, WG}
     @inbounds begin
         w = front_ncols[s]
         if j <= w && st[1] == 0
             ajj = real(L11[_packed(j, j, W)])
-            if ajj > 0
-                rd = inv(sqrt(ajj))                  # recomputed per work item: no barrier needed;
+            # pivots in [0, epsc] are statically perturbed to epsc (cuDSS pivot_epsilon
+            # semantics; epsc = 0 restores plain potrf acceptance); negative or NaN stops.
+            # Deviation from cuDSS's |pivot| rule: a NEGATIVE pivot is never perturbed --
+            # MadNLP needs the failure signal for its inertia-driven regularization
+            if ajj > epsc || (epsc > 0 && ajj >= 0)
+                rd = inv(sqrt(max(ajj, epsc)))       # recomputed per work item: no barrier needed;
                 for i in (j + li):WG:w               # strictly below the diagonal, since the diagonal
                     L11[_packed(i, j, W)] *= rd      # is replaced in the second half
                 end
@@ -56,11 +60,13 @@ end
 
 # column j, second half: rank-1 update of the trailing block with the scaled column
 # (multiply-add only; the packed-triangle enumeration replaces the guarded square)
-@inline function _front_chol_scale!(L11, st, piv, j, s, li, front_ncols, ::Val{W}, ::Val{WG}) where {W, WG}
+@inline function _front_chol_scale!(L11, st, piv, j, s, li, front_ncols, epsc, ::Val{W}, ::Val{WG}) where {W, WG}
     @inbounds begin
         w = front_ncols[s]
         if j <= w && st[1] == 0
-            li == 1 && (L11[_packed(j, j, W)] = sqrt(real(L11[_packed(j, j, W)])))
+            # max(., epsc) mirrors the update half's static perturbation (no-op when epsc = 0:
+            # the update half already stopped on any pivot this would change)
+            li == 1 && (L11[_packed(j, j, W)] = sqrt(max(real(L11[_packed(j, j, W)]), epsc)))
             r = w - j
             for q in (li - 1):WG:(r * (r + 1) ÷ 2 - 1)
                 a, b = _tri_decode(q, r)
@@ -147,7 +153,7 @@ Without `ASM` the panels and contribution blocks must already be assembled.
 """
 @kernel function front_cholesky_kernel!(factor, stack, info, nzval, amap, amap_ptr, amap_src, nodes, bm,
                                         front_ptr, front_nrows, front_ncols, cb_ptr, child_ptr, child_list,
-                                        relind_ptr, relind, maxchild, ::Val{ASM}, ::Val{W}, ::Val{NL},
+                                        relind_ptr, relind, maxchild, epsc, ::Val{ASM}, ::Val{W}, ::Val{NL},
                                         ::Val{WG}) where {ASM, W, NL, WG}
     @uniform TT = eltype(factor)
     @uniform RT = real(eltype(factor))
@@ -184,10 +190,10 @@ Without `ASM` the panels and contribution blocks must already be assembled.
     @synchronize
     for j in 1:W
         @inbounds s = nodes[bm.first + _bm_node(bm, G) - 1]
-        _front_chol_update!(L11, st, piv, j, s, li, front_ncols, Val(W), Val(WG))
+        _front_chol_update!(L11, st, piv, j, s, li, front_ncols, epsc, Val(W), Val(WG))
         @synchronize
         @inbounds s = nodes[bm.first + _bm_node(bm, G) - 1]
-        _front_chol_scale!(L11, st, piv, j, s, li, front_ncols, Val(W), Val(WG))
+        _front_chol_scale!(L11, st, piv, j, s, li, front_ncols, epsc, Val(W), Val(WG))
         @synchronize
     end
     @inbounds s = nodes[bm.first + _bm_node(bm, G) - 1]
@@ -203,11 +209,11 @@ end
 
 function _launch_front_cholesky!(factor, stack, info, nzval, amap, amap_ptr, amap_src, nodes, bm::BatchMap, count,
                                  front_ptr, front_nrows, front_ncols, cb_ptr, child_ptr, child_list, relind_ptr,
-                                 relind, maxchild, asm::Val, ::Val{W}, ::Val{WG}) where {W, WG}
+                                 relind, maxchild, epsc, asm::Val, ::Val{W}, ::Val{WG}) where {W, WG}
     _ilog2(WG)
     kernel! = front_cholesky_kernel!(KernelAbstractions.get_backend(factor), WG)
     kernel!(factor, stack, info, nzval, amap, amap_ptr, amap_src, nodes, bm, front_ptr, front_nrows,
-            front_ncols, cb_ptr, child_ptr, child_list, relind_ptr, relind, Int(maxchild), asm, Val(W),
+            front_ncols, cb_ptr, child_ptr, child_list, relind_ptr, relind, Int(maxchild), epsc, asm, Val(W),
             Val(W * (W + 1) ÷ 2), Val(WG); ndrange = WG * count * bm.nact)
     return nothing
 end
@@ -230,13 +236,13 @@ Regime-B launch: assemble and factor the `count` fronts
 batch member with one [`front_cholesky_kernel!`](@ref) launch, one workgroup
 per (front, member); `info[s]` receives each front's status. Asynchronous.
 """
-function factorize_fronts_b!(N::Numeric, S::Symbolic, nzval::AbstractVector, first::Integer, count::Integer,
-                             maxchild::Integer, W::Integer)
+function factorize_fronts_b!(N::Numeric{T}, S::Symbolic, nzval::AbstractVector, first::Integer, count::Integer,
+                             maxchild::Integer, W::Integer, epsc::Real = 0.0) where {T}
     count > 0 || return N
     _with_width_class(Int(W)) do w
         _launch_front_cholesky!(N.factor, N.stack, N.info, nzval, S.amap, S.amap_ptr, S.amap_src, S.group_nodes,
                                 batch_map(N; first), count, S.front_ptr, S.front_nrows, S.front_ncols, S.cb_ptr, S.child_ptr,
-                                S.child_list, S.relind_ptr, S.relind, maxchild, Val(true), w,
+                                S.child_list, S.relind_ptr, S.relind, maxchild, real(T)(epsc), Val(true), w,
                                 Val(FRONT_WORKGROUP))
     end
     return N
@@ -257,13 +263,14 @@ triangle, skipped when `cb_ptr[s] == 0`): `F11 = L11 L11ᴴ`, `F21 ← F21 L11�
 function front_cholesky!(factor::AbstractVector, stack::AbstractVector, info::AbstractVector{Int32},
                          nodes::AbstractVector, first::Integer, count::Integer, front_ptr::AbstractVector,
                          front_nrows::AbstractVector, front_ncols::AbstractVector, cb_ptr::AbstractVector;
-                         width::Integer = REGIME_B_MAX_WIDTH, workgroup::Val = Val(FRONT_WORKGROUP))
+                         width::Integer = REGIME_B_MAX_WIDTH, workgroup::Val = Val(FRONT_WORKGROUP),
+                         epsc::Real = 0.0)
     count > 0 || return info
     _with_width_class(Int(width)) do w
         _launch_front_cholesky!(factor, stack, info, factor, nodes, nodes, nodes, nodes, single_batch(; first), count,
                                 front_ptr,
-                                front_nrows, front_ncols, cb_ptr, nodes, nodes, nodes, nodes, 0, Val(false), w,
-                                workgroup)
+                                front_nrows, front_ncols, cb_ptr, nodes, nodes, nodes, nodes, 0,
+                                real(eltype(factor))(epsc), Val(false), w, workgroup)
     end
     return info
 end
