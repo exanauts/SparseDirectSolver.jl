@@ -493,19 +493,22 @@ assembly launches and, per chunk (`ldlt_c_chunk_end`) and batch member, one
 `panel_ldlt_kernel!` and up to two GEMMs per front per block of `nb` pivot
 columns, the finish kernel and one contribution-block pack per front; plus the
 `max |aᵢⱼ|` and statistics reductions. `lu = true` budgets `factorize_lu!`
-instead: every launch group is one fused launch, plus the Schur assembly.
-`@localmem`: the largest regime-A kernel (48 KiB) per subtree or fused launch
-plus the two reductions (T15).
+instead: every launch group is one fused launch, plus the two Schur assembly
+launches. `@localmem` (heap-allocated only under `--code-coverage` on KA 0.9):
+the largest regime-A kernel (48 KiB) per subtree launch and per launch group,
+blocked groups included as before, plus the two reductions (T15).
 """
 function ldlt_alloc_budget(S, N; nb::Integer = SparseDirectSolver.LDLT_C_NB, lu::Bool = false)
     plan, sc = N.plan, S.schedule
     members = N.nbatch
     fused = length(plan.sub_first)
-    blocked = lu ? 1 : 0
+    blocked = lu ? 2 : 0
+    nblocked = 0
     for k in eachindex(plan.group_first)
         a, b = plan.group_first[k], plan.group_last[k]
         if !lu && (plan.group_width[k] == 0 || SparseDirectSolver.ldlt_blocked_path(sc, sc.group_nodes[a]))
             blocked += 3
+            nblocked += 1
             q = a
             while q <= b
                 e = SparseDirectSolver.ldlt_c_chunk_end(sc, S.layout.cb_len, q, b, S.layout.work_len)
@@ -518,7 +521,7 @@ function ldlt_alloc_budget(S, N; nb::Integer = SparseDirectSolver.LDLT_C_NB, lu:
         end
     end
     launches = fused + blocked + 2
-    localmem = (fused + 2) * maximum(SparseDirectSolver.SUBTREE_LOCAL_SIZES) +
+    localmem = (fused + nblocked + 2) * maximum(SparseDirectSolver.SUBTREE_LOCAL_SIZES) +
                SparseDirectSolver.STATS_WORKGROUP * SparseDirectSolver.FRONT_STATS_FIELDS * sizeof(Int64)
     return ka_cpu_alloc_budget(launches, localmem)
 end
