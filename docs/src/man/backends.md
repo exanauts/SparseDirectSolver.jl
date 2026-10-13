@@ -28,3 +28,11 @@ numeric and solve phases. The symbolic analysis runs on the host.
 Element types are `Float32`, `Float64`, `ComplexF32` and `ComplexF64`; index
 types are `Int32` and `Int64`. Metal currently supports `Float32` factors;
 Apple GPUs do not expose Float64 arithmetic.
+
+On Metal, the default SPD schedule uses narrower regime-C thresholds than the
+CUDA/ROCm schedule (`32` columns and `128` rows). On an M4 Max this reduced a
+14,400-row 2-D Laplacian's warmed refactorization from 24.8 ms to 17.1 ms; one
+refactorization plus one solve fell from 26.4 ms to 19.8 ms. Explicit schedule
+options are never replaced by this backend tuning. LDLT and LU currently use
+the regime-C path because their fused kernels exceed Metal's 31-buffer argument
+limit.
