@@ -8,7 +8,7 @@
 const NUMERIC_A_OPTS = Options(subtree_parallelism = 0)
 # small budgets and regime-C thresholds: all three regimes on a 2-D Laplacian
 const NUMERIC_ABC_OPTS = Options(subtree_budgets = [8192, 16384], regime_c_width = 16, regime_c_rows = 128,
-                                 subtree_parallelism = 0)
+                                  subtree_parallelism = 0, subtree_max_fronts = 32)
 
 numeric_a_matrices(::Type{T}) where {T} =
     (("laplacian2d(40,40) A+B+C", laplacian2d(T, 40, 40), NUMERIC_ABC_OPTS),

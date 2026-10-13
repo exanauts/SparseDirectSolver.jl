@@ -97,7 +97,8 @@ function NumericPlan(S, nb::Integer = 1)
             maxchild[t] = max(maxchild[t], nchild[sc.group_nodes[q]])
         end
     end
-    return NumericPlan(first, last, maxchild, gfirst, glast, gmaxchild, gwidth, sfirst, slast, slocal, zeros(Int32, nb),
+    return NumericPlan(first, last, maxchild, gfirst, glast, gmaxchild, gwidth, sfirst, slast, slocal,
+                       zeros(Int32, (ns + 1) * nb),
                        Int32.(1:nb), Ref(Int(nb)), [1, nb + 1], Any[nothing for _ in 1:ns], schur_first,
                        sc.schur > 0 ? nchild[sc.schur] : 0)
 end

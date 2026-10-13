@@ -551,9 +551,10 @@ function _symbolic!(solver::DirectSolver{T, INT}) where {T, INT}
         sp = schur_supernode_partition(factor_pattern(P, ord), ord.perm, length(solver.schur.indices), opts)
         schur = nsupernodes(sp)
     end
-    sc = build_schedule(sp, opts, T; reserve = subtree_local_reserve(solver.structure),
-                        elsize = schedule_elsize(solver.structure, T), schur,
-                        max_local = max_local_bytes(solver.backend))
+    schedule_opts = _backend_schedule_options(solver.backend, solver.structure, opts, solver.nbatch)
+    sc = build_schedule(sp, schedule_opts, T; reserve = subtree_local_reserve(solver.structure),
+                         elsize = schedule_elsize(solver.structure, T), schur,
+                         max_local = max_local_bytes(solver.backend))
     layout = build_layout(sp, sc; ldlt = _is_ldlt_structure(solver.structure))
     Sh = Symbolic(sp, sc, layout, solver.host_rowptr, solver.analysis_colval, A.nrows, solver.structure;
                   view = _stored_view(solver), index = A.index, device = _device_backend(solver))
