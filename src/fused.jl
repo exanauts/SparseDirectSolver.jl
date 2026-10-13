@@ -2026,6 +2026,7 @@ function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, B
             # captured at plan build: a later setparam!("pivot_epsilon") changes the stock
             # path but not an already-built fused plan (rebuild the plan to change it)
             chol_eps = ldl ? 0.0 : Float64(SDS.resolved_pivot_epsilon(s.options, real(T))),
+            chol_eps_scaled = !ldl && s.options.pivot_epsilon_alg == SDS.PIVOT_EPSILON_SCALED,
             ldl_potrf = ldl && wides_potrf,
             sptr_h = Array(S.super_ptr),
             ldlw = KA.zeros(backend, T,
@@ -2039,6 +2040,10 @@ function refact_fused!(s, nzval, fp)
     plan = N.plan
     backend = KA.get_backend(N.factor)
     p = SDS._front_impls(N, S, :auto)
+    # the Cholesky pivot epsilon of this refactorization (algo1: scaled by the current
+    # values' max magnitude -- one device reduction, matching the stock path)
+    epsc_r = real(eltype(N.factor))(fp.chol_eps)
+    fp.chol_eps_scaled && epsc_r > 0 && (epsc_r *= real(eltype(N.factor))(mapreduce(abs, max, nzval)))
     # per-front statuses start clean every refactorization: the narrow-panel kernels
     # overwrite info[v] unconditionally, but the host-wide LDL kernels only SET it on
     # failure -- without this reset one failed refactorization stays failed forever.
@@ -2055,7 +2060,7 @@ function refact_fused!(s, nzval, fp)
     fill!(fp.wpd, Int32(0))
     copyto!(fp.wcb, fp.wcb_b)
     for k in eachindex(plan.sub_first)
-        launch_subtrees_sorted!(N, S, nzval, fp.ssub[k], plan.sub_local[k], backend, fp.ldl, fp.chol_eps)
+        launch_subtrees_sorted!(N, S, nzval, fp.ssub[k], plan.sub_local[k], backend, fp.ldl, epsc_r)
     end
     nodes = S.schedule.group_nodes
     fill!(fp.pcb, zero(eltype(fp.pcb)))
@@ -2075,7 +2080,7 @@ function refact_fused!(s, nzval, fp)
                                              S.snparent, S.front_ptr, S.front_nrows, S.front_ncols,
                                              S.cb_ptr, S.child_ptr, S.child_list, S.relind_ptr, S.relind,
                                              Int32(base), fp.wbase, fp.wupd, fp.wpd, fp.wtl, fp.wcb,
-                                             fp.scap, fp.eac, real(eltype(N.factor))(fp.chol_eps), N.d,
+                                             fp.scap, fp.eac, epsc_r, N.d,
                                              S.super_ptr, Val(fp.ldl), Val(fp.wgf);
                                              ndrange = fp.wgf * count)
         for v in gwides                              # host-wide fronts at the segment boundary
@@ -2085,7 +2090,7 @@ function refact_fused!(s, nzval, fp)
                 _factor_panel_c_ldl!(N, S, fp, v, p, backend)
             else
                 SDS._factor_panel_c!(N.factor, fp.pcb, N.work, N.info, v, S.layout.panel_ptr[v],
-                                     S.schedule.rows[v], S.schedule.width[v], fp.cb2_h[v], p, fp.chol_eps)
+                                     S.schedule.rows[v], S.schedule.width[v], fp.cb2_h[v], p, epsc_r)
             end
             signal_kernel!(backend, 32)(fp.cbd, fp.arrived, S.snparent, v; ndrange = 32)
         end

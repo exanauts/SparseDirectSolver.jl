@@ -289,4 +289,23 @@ end
             @test inn != 0
         end
     end
+    # pivot_epsilon_alg = "algo1": epsilon scales by max |a_ij|, so a pivot that is tiny
+    # RELATIVE to the matrix (1e6-scale entries, pivot ~1e6 eps/4) is inside the scaled
+    # threshold while far above the absolute one -- on the potrf route the floor then
+    # DETECTS under algo1 what the absolute default silently accepts
+    big = T(10)^6
+    Ar = sparse(T[big big; big big * (1 + dt)])
+    mkr(alg1) = begin
+        solver = DirectSolver(api_matrix(backend, tril(Ar), Int32), spd_structure(T), 'L')
+        setparam!(solver, "factorization_alg", "algo2")
+        solver.options.subtree_budgets = Int[]
+        alg1 && setparam!(solver, "pivot_epsilon_alg", "algo1")
+        x = to_device(backend, zeros(T, 2))
+        bd = to_device(backend, copy(b))
+        execute!("analysis", solver, x, bd; asynchronous = false)
+        execute!("factorization", solver, x, bd; asynchronous = false)
+        getparam(solver, "info")
+    end
+    @test mkr(false) == 0                        # absolute default: relatively tiny pivot accepted
+    @test mkr(true) != 0                         # scaled: the sqrt(epsilon) floor detects it
 end

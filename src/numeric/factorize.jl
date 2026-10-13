@@ -293,6 +293,12 @@ function factorize_cholesky!(N::Numeric{T}, S::Symbolic, nzval::AbstractVector; 
     # (0, epsc] are statically perturbed to epsc so a near-singular SPD system
     # factors with bounded growth; nonpositive/NaN pivots still fail the front
     epsc = resolved_pivot_epsilon(opts, real(T))
+    # pivot_epsilon_alg = "algo1": epsilon scales with max |a_ij| of the CURRENT values
+    # (one reduction per factorization), as the LU/LDL devices do; on a batch the max is
+    # taken over every member's values
+    if epsc > 0 && opts.pivot_epsilon_alg == PIVOT_EPSILON_SCALED
+        epsc *= Float64(mapreduce(abs, max, nzval))
+    end
     for k in eachindex(plan.sub_first)
         _poll_interrupt(flag)
         a, b = plan.sub_first[k], plan.sub_last[k]

@@ -26,6 +26,10 @@ Base.@kwdef mutable struct SDSSolverOptions <: MadNLP.AbstractOptions
     sds_tuning::Union{Nothing, SDSTuning} = nothing
     # a user permutation bypasses the reordering entirely (1-based, length n)
     sds_user_perm::Union{Nothing, Vector{Int}} = nothing
+    # pivot-epsilon passthroughs (#127 diagnostics): nothing keeps the library defaults
+    # (1e-13 Float64 / 1e-5 Float32, absolute); "algo1" scales epsilon by max |a_ij|
+    sds_pivot_epsilon::Union{Nothing, Float64} = nothing
+    sds_pivot_epsilon_alg::Union{Nothing, String} = nothing
 end
 
 # shared solver construction knobs: the custom reordering (nd knobs or a user
@@ -84,6 +88,8 @@ function SDSSolver(
     # detecting them on saddle systems (augmented 78k KKT, n = 2.09M: analysis 316 s
     # with the default pair detection, 64 s without -- measured on a GV100)
     ldl && SDS.setparam!(s, "pivot_pairs", "none")
+    opt.sds_pivot_epsilon === nothing || SDS.setparam!(s, "pivot_epsilon", opt.sds_pivot_epsilon)
+    opt.sds_pivot_epsilon_alg === nothing || SDS.setparam!(s, "pivot_epsilon_alg", opt.sds_pivot_epsilon_alg)
     s.options.regime_c_width = t.regime_c_width
     s.options.regime_c_rows = t.regime_c_rows  # the fused kernels own BOTH phases: no coupling conflict
     s.options.subtree_parallelism = t.subtree_parallelism
