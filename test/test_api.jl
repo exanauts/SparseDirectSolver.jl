@@ -18,7 +18,7 @@ function api_solve(backend, solver, b; phase = "solve")
     return to_host(xd)
 end
 
-@testset "constructors ($(backend_name(backend)), $T, $INT)" for backend in BACKENDS, T in ELTYPES, INT in INTTYPES
+@testset "constructors ($(backend_name(backend)), $T, $INT)" for backend in BACKENDS, T in ELTYPES, INT in int_types(T)
     A = random_spd(T, 60, 0.05)
     L = tril(A)
     s = spd_structure(T)
@@ -65,7 +65,7 @@ end
 end
 
 @testset "SparseMatrixCSC constructor and update! (CPU, $T, $INT)" for backend in filter(b -> b isa CPU, BACKENDS),
-                                                                       T in ELTYPES, INT in INTTYPES
+                                                                       T in ELTYPES, INT in int_types(T)
     # a SparseMatrixCSC is converted to host CSR arrays (index type kept) once, for the CPU backend
     Random.seed!(666)
     n = 60
@@ -100,7 +100,7 @@ end
     @test thrown(() -> DirectSolver(SparseMatrixCSC{T, INT}(sprand(T, n, n + 1, 0.05)), s, 'F')) isa InvalidValueError
 end
 
-@testset "phases ($(backend_name(backend)), $T, $INT)" for backend in BACKENDS, T in ELTYPES, INT in INTTYPES
+@testset "phases ($(backend_name(backend)), $T, $INT)" for backend in BACKENDS, T in ELTYPES, INT in int_types(T)
     A = laplacian2d(T, 15, 12) + spdiagm(0 => rand(real(T), 180))
     n = size(A, 1)
     for view in ('L', 'U', 'F')
@@ -225,7 +225,7 @@ end
     end
 end
 
-@testset "data parameters ($(backend_name(backend)), $T, $INT)" for backend in BACKENDS, T in ELTYPES, INT in INTTYPES
+@testset "data parameters ($(backend_name(backend)), $T, $INT)" for backend in BACKENDS, T in ELTYPES, INT in int_types(T)
     A = random_spd(T, 80, 0.04)
     n = size(A, 1)
     solver = api_solver(backend, A, INT)
@@ -324,7 +324,7 @@ end
 end
 
 @testset "update!, refactorization and info ($(backend_name(backend)), $T, $INT)" for backend in BACKENDS, T in ELTYPES,
-                                                                                      INT in INTTYPES
+                                                                                      INT in int_types(T)
     B = random_spd(T, 100, 0.03) - 101 * I        # B Bᴴ - I: not positive definite (no diagonal cancels)
     n = size(B, 1)
     solver = DirectSolver(api_matrix(backend, triu(B), INT), spd_structure(T), 'U')
@@ -427,7 +427,7 @@ end
 end
 
 @testset "LinearAlgebra layer ($(backend_name(backend)), $T, $INT)" for backend in BACKENDS, T in ELTYPES,
-                                                                       INT in INTTYPES
+                                                                       INT in int_types(T)
     A = random_spd(T, 120, 0.03)
     n = size(A, 1)
     b = rand(T, n, 2)

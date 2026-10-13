@@ -40,6 +40,6 @@ function ported_refactorization_cholesky(backend, ::Type{T}, ::Type{INT}) where 
     return nothing
 end
 
-@testset "refactorization ($(backend_name(backend)), $T, $INT)" for backend in BACKENDS, T in ELTYPES, INT in INTTYPES
+@testset "refactorization ($(backend_name(backend)), $T, $INT)" for backend in BACKENDS, T in ELTYPES, INT in PORTED_INTTYPES
     ported_refactorization_cholesky(backend, T, INT)
 end

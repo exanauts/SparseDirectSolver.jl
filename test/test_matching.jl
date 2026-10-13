@@ -14,6 +14,8 @@ host_matching(A::SparseMatrixCSC, structure, alg; view = 'F') =
 
 RUN_SHARED && @testset "MC64 jobs against brute force" begin
     Random.seed!(666)
+    # 12 draws kept: this brute-force fuzz is the only one of the six MC64 jobs, the testset is
+    # host-only and compile-dominated (the draws cost milliseconds), so cutting them saved nothing
     for trial in 1:12
         n = 6
         A = sprand(n, n, 0.4) + sparse(randperm(n), 1:n, rand(n) .+ 0.5)   # structurally nonsingular

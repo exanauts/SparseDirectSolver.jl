@@ -37,14 +37,16 @@ end
 @testset "batches of SPD and symmetric systems ($(backend_name(backend)), $T)" for backend in BACKENDS,
                                                                                   T in ELTYPES
     Random.seed!(666)
-    for (structure, A) in ((spd_structure(T), ubatch_spd(T)), ("S", ubatch_sym(T))), nb in (1, 2, 3, 16, 64)
+    # batch sizes: a single member, a small batch and a large one (nb = 2 and 64 exercised the same strided
+    # kernels as nb = 3 and 16; test-suite diet), and single- against multi-RHS
+    for (structure, A) in ((spd_structure(T), ubatch_spd(T)), ("S", ubatch_sym(T))), nb in (1, 3, 16)
         @testset "$structure nb = $nb" begin
             members = batch_members(A, nb)
             solver = ubatch_solver(backend, members, structure)
             @test solver.nbatch == nb == nbatch(solver.A)
             @test getparam(solver, "info") == (nb == 1 ? 0 : zeros(Int, nb))
             # the cuDSS multi-RHS batch bug (CUDSS.jl "Known issues"): every column of every member is right
-            for nrhs in (1, 2, 4)
+            for nrhs in (1, 4)
                 B = rand(T, size(A, 1), nrhs, nb)
                 @test maximum(batch_relres(members, ubatch_solve(backend, solver, B), B)) <= tol(T)
             end

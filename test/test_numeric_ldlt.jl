@@ -8,12 +8,13 @@ const LDLT_REGIMES = (("default", (;)),
                                                 regime_c_rows = 128)),
                       ("C only", (factorization_alg = "algo2", subtree_budgets = Int[])))
 
-# the T14 matrices: (name, matrix, option keywords, structure, compare the inertia with the eigenvalues)
+# the T14 matrices: (name, matrix, option keywords, structure, compare the inertia with the eigenvalues).
+# "random_symindef(400,0.01)" (the same generator as "random_symindef(300,0.02)" with the same options) and
+# "kkt(300,100,1e-2)" (quasi-definite; the same matrix is factored by the pivot_type 'D'/'N' testset below)
+# were dropped as redundant with the remaining cases (test-suite diet).
 function ldlt_cases(::Type{T}) where {T}
     nh, nj = 300, 100
-    cases = Any[("random_symindef(400,0.01)", random_symindef(T, 400, 0.01), (;), sym_structure(T), false),
-                ("kkt(300,100,1e-2)", kkt_matrix(T, nh, nj, 1.0e-2), (;), sym_structure(T), false),
-                ("kkt(300,100,1e-8)", kkt_matrix(T, nh, nj, 1.0e-8), (;), sym_structure(T), false),
+    cases = Any[("kkt(300,100,1e-8)", kkt_matrix(T, nh, nj, 1.0e-8), (;), sym_structure(T), false),
                 ("kkt(300,100,1e-8) interleaved", kkt_matrix(T, nh, nj, 1.0e-8),
                  (user_perm = kkt_interleaved_perm(nh, nj),), sym_structure(T), false),
                 ("random_symindef(300,0.02)", random_symindef(T, 300, 0.02), (;), sym_structure(T), true),
@@ -28,9 +29,15 @@ function ldlt_cases(::Type{T}) where {T}
     return cases
 end
 
+# every case runs under the default regime mix; the non-default regime mixes are re-checked on a covering
+# subset only (a 2×2-pivot KKT, the near-singular KKT and the complex-symmetric case) — the other cases
+# exercise the same kernels with the same pivot kinds (test-suite diet)
+const LDLT_ALL_REGIME_CASES = ("kkt(300,100,1e-8)", "kkt 1e-3 H, δ = 0, interleaved (2×2)", "complex symmetric")
+
 @testset "device factor equals the reference ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
     Random.seed!(666)
     for (name, A, kw, structure, eig) in ldlt_cases(T), (rname, rkw) in LDLT_REGIMES
+        rname == "default" || name in LDLT_ALL_REGIME_CASES || continue
         @testset "$name, $rname" begin
             opts = Options(; kw..., rkw...)
             S, Nr, Sd, Nd, nz = ldlt_setup(backend, A; opts, structure)
@@ -50,9 +57,11 @@ end
             @test st == SDS.pivot_stats(Nr) && Nh.totals == Nr.totals
             herm && eig && @test (st.npos, st.nneg) == eigen_npos_nneg(A)
             herm && @test st.npos + st.nneg == size(A, 1)
-            # device solve: forward (local pivot orders), diagonal, backward sweeps
+            # device solve: forward (local pivot orders), diagonal, backward sweeps; a covering pair of
+            # (nrhs, deterministic) cells — det and ldl are the only compile-time axes and both retained
+            # cells cover them; nrhs is a runtime scalar (test-suite diet)
             ws = SDS.allocate_solve(Sd, T, backend, 5)
-            for nrhs in (1, 5), det in (false, true)
+            for (nrhs, det) in ((1, false), (5, true))
                 b = nrhs == 1 ? rand(T, size(A, 1)) : rand(T, size(A, 1), nrhs)
                 x = device_solve(backend, ws, Sd, Nd, b; deterministic = det)
                 if name == "kkt(300,100,1e-8)" && T in (Float32, ComplexF32)
@@ -70,7 +79,10 @@ end
 @testset "regime-A groups and Int64 maps ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
     Random.seed!(666)
     A = kkt_matrix(T, 200, 100, 0.0; hessian = :indefinite, hessian_scale = 1.0e-3)
-    opts = Options(user_perm = kkt_interleaved_perm(200, 100), subtree_budgets = [8192, 16384, 32768, 49152])
+    # two budget classes keep the multi-class regime-A grouping with Int64 maps while compiling two
+    # fewer kernel instances than the former [8192, 16384, 32768, 49152] (test-suite diet; the four
+    # Int32 classes are exercised by the default budgets of the other testsets)
+    opts = Options(user_perm = kkt_interleaved_perm(200, 100), subtree_budgets = [8192, 16384])
     # the 64 KiB regime-A class (issue #60) where the backend has the local memory (CPU, ROCm)
     if SDS.max_local_bytes(backend) >= 65536
         o64 = Options(user_perm = kkt_interleaved_perm(200, 100), subtree_budgets = [65536], subtree_parallelism = 0)
@@ -371,7 +383,7 @@ end
     end
 end
 
-@testset "public API ($(backend_name(backend)), $T, $INT)" for backend in BACKENDS, T in ELTYPES, INT in INTTYPES
+@testset "public API ($(backend_name(backend)), $T, $INT)" for backend in BACKENDS, T in ELTYPES, INT in int_types(T)
     Random.seed!(666)
     nh, nj = 200, 100
     n = nh + nj

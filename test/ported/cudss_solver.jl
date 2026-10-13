@@ -181,7 +181,7 @@ function ported_solver(backend, ::Type{T}, ::Type{INT}, A_gpu, structure, view, 
 end
 
 @testset "solver parameters ($(backend_name(backend)), $T, $INT)" for backend in BACKENDS, T in ELTYPES,
-                                                                      INT in INTTYPES
+                                                                      INT in PORTED_INTTYPES
     n = 20
     A_cpu = random_spd(T, n, 1.0)
     @testset "structure = $structure" for structure in (T <: Real ? ("G", "S", "H", "SPD", "HPD") :

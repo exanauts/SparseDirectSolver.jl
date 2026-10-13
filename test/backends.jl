@@ -14,7 +14,7 @@ const TEST_CPU = get(ENV, "SDS_TEST_CPU", "1") != "0"
 const TEST_GPU = get(ENV, "SDS_TEST_GPU", "1") != "0"
 
 # Element types under test (issue #91): SDS_TEST_ELTYPES is a comma-separated subset of these, default all four.
-# Pull-request CI selects two (Float64,ComplexF32), the weekly run and local runs all four.
+# Every CI run and local default selects all four (owner call, 2026-10-13).
 const ALL_ELTYPES = (Float32, Float64, ComplexF32, ComplexF64)
 
 """

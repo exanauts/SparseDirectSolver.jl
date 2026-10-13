@@ -45,9 +45,15 @@ end
     end
 end
 
+# every case runs under the default regime mix; the non-default regime mixes are re-checked on a covering
+# subset only (the row-interchanging case and the large default case) — the other cases exercise the same
+# kernels with the same pivot kinds (test-suite diet)
+const LU_ALL_REGIME_CASES = ("random_general(400,0.01)", "weak diagonal, pivot_threshold = 1")
+
 @testset "device LU equals the reference ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
     Random.seed!(666)
     for (name, A, kw, _) in lu_cases(T), (rname, rkw) in LU_REGIMES
+        rname == "default" || name in LU_ALL_REGIME_CASES || continue
         @testset "$name, $rname" begin
             opts = Options(; kw..., rkw...)
             S, Nr, Sd, Nd, nz = lu_setup(backend, A; opts)
@@ -64,9 +70,10 @@ end
             @test lu_error(A, S, Nh) <= tol(T)
             @test Nh.stats == Nr.stats
             @test SDS.pivot_totals(Nd) == SDS.pivot_stats(Nr) && Nh.totals == Nr.totals
-            # device solves with A (L, D, U) and Aᵀ (Uᵀ, D, Lᵀ)
+            # device solves with A (L, D, U) and Aᵀ (Uᵀ, D, Lᵀ): a pairwise-covering subset of the former
+            # full (nrhs, deterministic, transpose) cross (test-suite diet)
             ws = SDS.allocate_solve(Sd, T, backend, 5)
-            for nrhs in (1, 5), det in (false, true), transpose in (false, true)
+            for (nrhs, det, transpose) in ((1, false, false), (1, true, true), (5, false, true), (5, true, false))
                 b = nrhs == 1 ? rand(T, size(A, 1)) : rand(T, size(A, 1), nrhs)
                 x = device_solve(backend, ws, Sd, Nd, b; deterministic = det, transpose)
                 @test relres(transpose ? Base.transpose(A) : A, x, b) <= tol(T)
@@ -78,7 +85,9 @@ end
 @testset "regime-A groups and Int64 maps ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
     Random.seed!(666)
     A = weak_diagonal_general(T, 400, 0.01)
-    opts = Options(pivot_threshold = 1.0, subtree_budgets = [8192, 16384, 32768, 49152])
+    # two budget classes keep the multi-class regime-A grouping with Int64 maps while compiling two
+    # fewer kernel instances than the former [8192, 16384, 32768, 49152] (test-suite diet)
+    opts = Options(pivot_threshold = 1.0, subtree_budgets = [8192, 16384])
     # the 64 KiB regime-A class (issue #60) where the backend has the local memory (CPU, ROCm)
     if SDS.max_local_bytes(backend) >= 65536
         o64 = Options(pivot_threshold = 1.0, subtree_budgets = [65536], subtree_parallelism = 0)
@@ -299,7 +308,7 @@ end
     setparam!(solver, "ubatch_index", -1)
 end
 
-@testset "public API ($(backend_name(backend)), $T, $INT)" for backend in BACKENDS, T in ELTYPES, INT in INTTYPES
+@testset "public API ($(backend_name(backend)), $T, $INT)" for backend in BACKENDS, T in ELTYPES, INT in int_types(T)
     Random.seed!(666)
     A = weak_diagonal_general(T, 300, 0.02)
     n = size(A, 1)

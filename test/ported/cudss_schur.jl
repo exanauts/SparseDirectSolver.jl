@@ -146,7 +146,7 @@ function ported_schur_sym(backend, ::Type{T}, ::Type{INT}, index, dense_schur, u
 end
 
 @testset "Schur complement -- LU ($(backend_name(backend)), $T, $INT)" for backend in BACKENDS, T in ELTYPES,
-                                                                          INT in INTTYPES
+                                                                          INT in PORTED_INTTYPES
     k = 0
     @testset "indexing = $index" for index in ('Z', 'O')
         @testset "Dense Schur complement = $dense_schur" for dense_schur in (false, true)
@@ -157,7 +157,7 @@ end
 
 for (name, cholesky_case) in (("LDLᵀ and LDLᴴ", false), ("LLᵀ and LLᴴ", true))
     @testset "Schur complement -- $name ($(backend_name(backend)), $T, $INT)" for backend in BACKENDS, T in ELTYPES,
-                                                                                  INT in INTTYPES
+                                                                                  INT in PORTED_INTTYPES
         k = 0
         @testset "indexing = $index" for index in ('Z', 'O')
             @testset "Dense Schur complement = $dense_schur" for dense_schur in (false, true)
