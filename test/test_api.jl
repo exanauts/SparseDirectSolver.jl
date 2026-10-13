@@ -472,8 +472,11 @@ end
     cholesky!(solver, api_matrix(backend, tril(A), INT))
     @test !solver.fresh_factorization
     @test relres(A, to_host(solver \ bd), b) <= tol(T)
-    # check = true throws on a failed factorization; the default does not (CUDSS.jl)
-    B = random_spd(T, n, 0.03) - n * I
+    # check = true throws on a failed factorization; the default does not (CUDSS.jl).
+    # -3n I makes the FIRST diagonal pivot decisively negative (~-2n): a negative pivot
+    # is never perturbed, so the failure holds under the default pivot_epsilon too (#127)
+    # -- the old -n I shift left tiny-positive pivots that ComplexF32's 1e-5 epsilon lifted
+    B = random_spd(T, n, 0.03) - 3 * n * I
     @test thrown(() -> cholesky(api_matrix(backend, tril(B), INT); view = 'L', check = true)) isa FactorizationError
     Fb = cholesky(api_matrix(backend, tril(B), INT); view = 'L')
     @test getparam(Fb, "info") > 0
