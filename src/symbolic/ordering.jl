@@ -62,7 +62,13 @@ struct Ordering
                        candidates::Vector{OrderingCandidate}, auto::Bool, level_flops::Float64,
                        pair_rounds::Int}
     pairs::Vector{Tuple{Int, Int}}
+    # the chosen candidate's (etree parent, postorder, column counts) on the
+    # factor pattern, as `evaluate_ordering` computed them — `supernode_partition`
+    # reuses them instead of recomputing (same pattern, same permutation)
+    etree_hint::Union{Nothing, Tuple{Vector{Int}, Vector{Int}, Vector{Int}}}
 end
+
+Ordering(perm, iperm, alg_used, stats, pairs) = Ordering(perm, iperm, alg_used, stats, pairs, nothing)
 
 Base.show(io::IO, o::Ordering) =
     print(io, "Ordering($(o.alg_used), n = $(length(o.perm)), nnz_L = $(o.stats.nnz_L), ",
@@ -147,14 +153,18 @@ _amalgamation(opts::Options) = opts.use_superpanels != 0 ? opts.amalgamation : n
 
 """
     evaluate_ordering(P::SymmetricPattern, perm; T = Float64, level_flops = ORDERING_LEVEL_FLOPS,
-                      amalgamation = DEFAULT_AMALGAMATION) -> (; nnz_L, flops, nlevels, sdepth, nsupernodes, cost)
+                      amalgamation = DEFAULT_AMALGAMATION)
+        -> (; nnz_L, flops, nlevels, sdepth, nsupernodes, cost, parent, post, counts)
 
 Elimination tree, column counts, column-etree height (`nlevels`) and
 supernodal schedule depth and supernode count (`sdepth`, `nsupernodes`,
 [`schedule_depth`](@ref) with `amalgamation`) of `A[perm, perm]`, condensed
 into the cost of [`ordering_cost`](@ref). `flops` counts real operations (`4×`
 for complex `T`); `cost` uses the real-arithmetic count whatever `T`, so the
-element type does not change the choice.
+element type does not change the choice. The returned `parent`, `post` and
+`counts` are the elimination tree, its postorder and the column counts the
+evaluation computed, so the caller can reuse them ([`compute_ordering`](@ref)
+carries the chosen candidate's triple for [`supernode_partition`](@ref)).
 """
 function evaluate_ordering(P::SymmetricPattern, perm::AbstractVector{<:Integer}; T::Type = Float64,
                            level_flops::Real = ORDERING_LEVEL_FLOPS, amalgamation = DEFAULT_AMALGAMATION)
@@ -165,7 +175,8 @@ function evaluate_ordering(P::SymmetricPattern, perm::AbstractVector{<:Integer};
     sdepth, nsn = schedule_depth(parent, post, counts, amalgamation)
     rflops = cholesky_flops(counts)
     return (nnz_L = nnz_L(counts), flops = rflops * _flop_factor(T), nlevels = nlevels, sdepth = sdepth,
-            nsupernodes = nsn, cost = ordering_cost(rflops, sdepth, level_flops))
+            nsupernodes = nsn, cost = ordering_cost(rflops, sdepth, level_flops),
+            parent = parent, post = post, counts = counts)
 end
 
 function _validate_user_perm(v::AbstractVector{<:Integer}, n::Integer)
@@ -289,6 +300,7 @@ function compute_ordering(P::SymmetricPattern, opts::Options; T::Type = Float64,
         perms = [order_on(requested)]
     end
     evaluated = OrderingCandidate[]
+    hints = Tuple{Vector{Int}, Vector{Int}, Vector{Int}}[]
     best = 0
     best_zeros = 0                                 # structurally zero pivots the pair search left in `best`
     Q = search ? nothing : pair_pattern(P, perms[1][3])   # the fixed pairs are shared by all algorithms
@@ -296,6 +308,7 @@ function compute_ordering(P::SymmetricPattern, opts::Options; T::Type = Float64,
         e = evaluate_ordering(search ? pair_pattern(P, prs) : Q, perm; T, level_flops, amalgamation = _amalgamation(opts))
         push!(evaluated, (alg = a, nnz_L = e.nnz_L, flops = e.flops, nlevels = e.nlevels, sdepth = e.sdepth,
                           nsupernodes = e.nsupernodes, cost = e.cost))
+        push!(hints, (e.parent, e.post, e.counts))
         zeros_left = search && length(perms) > 1 ? length(structural_zero_pivots(candidates, P, perm, prs)) : 0
         if best == 0 || zeros_left < best_zeros || (zeros_left == best_zeros && e.cost < evaluated[best].cost)
             best, best_zeros = k, zeros_left
@@ -306,7 +319,10 @@ function compute_ordering(P::SymmetricPattern, opts::Options; T::Type = Float64,
     stats = (nnz_L = c.nnz_L, flops = c.flops, nlevels = c.nlevels, sdepth = c.sdepth, nsupernodes = c.nsupernodes,
              cost = c.cost, candidates = evaluated, auto = requested === :auto, level_flops = Float64(level_flops),
              pair_rounds = rounds)
-    return Ordering(perm, invperm(perm), alg_used, stats, used_pairs)
+    # the winner's evaluation ran etree/postorder/colcounts on pair_pattern(P,
+    # used_pairs), which is the factor pattern the symbolic phase partitions:
+    # carry the triple so supernode_partition does not recompute it
+    return Ordering(perm, invperm(perm), alg_used, stats, used_pairs, hints[best])
 end
 
 # ---------------------------------------------------------------------------

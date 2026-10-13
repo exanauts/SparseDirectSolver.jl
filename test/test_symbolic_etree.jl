@@ -317,3 +317,26 @@ end
     batch = [C.nzval; 2 .* C.nzval]
     @test SDS.full_values(F, view(batch, (nnz(C) + 1):(2 * nnz(C)))) == 2 .* SDS.full_values(F, C.nzval)
 end
+
+@testset "etree hint reuse" begin
+    A = laplacian2d(40, 40)
+    P = SDS.SymmetricPattern(SDS.CSR(A), "SPD"; view = 'F')
+    opts = Options()
+    for alg in (:amd, :natural)
+        ord = SDS.compute_ordering(P, opts; alg)
+        @test ord.etree_hint !== nothing
+        parent = SDS.etree(P, ord.perm)
+        post = SDS.postorder(parent)
+        counts = SDS.colcounts(P, ord.perm, parent, post)
+        @test ord.etree_hint == (parent, post, counts)
+        sp0 = SDS.supernode_partition(P, ord.perm, opts)
+        sp1 = SDS.supernode_partition(P, ord.perm, opts; etree_hint = ord.etree_hint)
+        @testset "partition identical ($alg)" begin
+            for f in fieldnames(typeof(sp0))
+                @test getfield(sp0, f) == getfield(sp1, f)
+            end
+        end
+        @test_throws SDS.InvalidValueError SDS.supernode_partition(P, ord.perm, opts;
+                                                                   etree_hint = (parent[1:(end - 1)], post, counts))
+    end
+end
