@@ -21,4 +21,4 @@ jobs:
         # two upstream reasons as in test/test_aqua.jl: KA 0.10's CPU backend keeps
         # worker tasks alive at exit, and Aqua's fresh temporary project fails to
         # precompile pocl_standalone_jll ("Cannot load SLEEF_jll").
-        run: julia --color=yes -e 'using Pkg; Pkg.add(["Aqua", "MadNLP", "KernelAbstractions"]); Pkg.develop(path="."); using Aqua, MadNLP, KernelAbstractions, SparseDirectSolver; Aqua.test_all(SparseDirectSolver, ambiguities=false, persistent_tasks=(pkgversion(KernelAbstractions) >= v"0.10" ? false : true))'
+        run: julia --color=yes -e 'using Pkg; Pkg.add(["Aqua", "MadNLP", "KernelAbstractions"]); Pkg.develop(path="."); using Aqua, MadNLP, KernelAbstractions, SparseDirectSolver; Aqua.test_all(SparseDirectSolver, ambiguities=false, persistent_tasks=(pkgversion(KernelAbstractions) < v"0.10"))'
