@@ -29,8 +29,8 @@ regime-A kernel classes.
 """
 SparseDirectSolver.max_local_bytes(::MetalBackend) = 32768
 SparseDirectSolver._allow_batched_dense(::MetalBackend) = false
-SparseDirectSolver._serial_cholesky_stats(::MetalBackend) = true
-SparseDirectSolver._host_reduce_cholesky_info(::MetalBackend) = true
+SparseDirectSolver._serial_cholesky_stats(::MetalBackend, nbatch::Integer) = nbatch > 1
+SparseDirectSolver._host_reduce_cholesky_info(::MetalBackend, nbatch::Integer) = nbatch > 1
 
 # Metal.jl's MPS Cholesky and triangular solves work on full MtlMatrix objects,
 # but panel views dispatch to host LAPACK/BLAS. Mixing MPS commands with KA
@@ -55,6 +55,16 @@ end
 # existing regime-C kernels. Cholesky's smaller fused kernels remain enabled.
 function SparseDirectSolver._backend_schedule_options(::MetalBackend, structure::SparseDirectSolver.Structure,
                                                       opts::SparseDirectSolver.Options)
+    if structure in (SparseDirectSolver.STRUCTURE_SPD, SparseDirectSolver.STRUCTURE_HPD)
+        opts.regime_c_width == 64 && opts.regime_c_rows == 512 &&
+            opts.subtree_budgets == SparseDirectSolver.DEFAULT_SUBTREE_BUDGETS &&
+            opts.subtree_parallelism == SparseDirectSolver.SUBTREE_PARALLELISM &&
+            opts.subtree_max_fronts == 0 && opts.memory_budget == -1 || return opts
+        out = copy(opts)
+        out.regime_c_width = 32
+        out.regime_c_rows = 128
+        return out
+    end
     structure in (SparseDirectSolver.STRUCTURE_SYMMETRIC, SparseDirectSolver.STRUCTURE_HERMITIAN,
                   SparseDirectSolver.STRUCTURE_GENERAL) || return opts
     out = copy(opts)

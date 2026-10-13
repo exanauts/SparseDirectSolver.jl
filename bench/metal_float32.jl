@@ -48,10 +48,12 @@ function run_case(label, backend, A; samples = 10)
     println(join((label, size(A, 1), nnz(A), ta, tf, ts, residual), ','))
 end
 
-Random.seed!(666)
-println("backend,n,nnz,analysis_s,refactorization_s,solve_s,relative_residual")
-for grid in (40, 80, 120)
-    A = laplacian2d(grid)
-    run_case("CPU-$grid", KernelAbstractions.CPU(), A)
-    run_case("Metal-$grid", MetalBackend(), A)
+if abspath(PROGRAM_FILE) == @__FILE__
+    Random.seed!(666)
+    println("backend,n,nnz,analysis_s,refactorization_s,solve_s,relative_residual")
+    for grid in (40, 80, 120)
+        A = laplacian2d(grid)
+        run_case("CPU-$grid", KernelAbstractions.CPU(), A)
+        run_case("Metal-$grid", MetalBackend(), A)
+    end
 end

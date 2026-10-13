@@ -82,7 +82,7 @@ member. One workgroup per member, no atomics. Asynchronous.
 function cholesky_stats!(N::Numeric, S::Symbolic)
     bm = batch_map(N)
     backend = KernelAbstractions.get_backend(N.factor)
-    if _serial_cholesky_stats(backend)
+    if _serial_cholesky_stats(backend, N.nbatch)
         _cholesky_stats_serial_kernel!(backend, 1)(N.stats, N.info, S.super_ptr, S.front_ncols,
                                                      nsupernodes(S), S.schedule.schur, bm,
                                                      Val(FRONT_STATS_FIELDS); ndrange = bm.nact)
@@ -355,7 +355,7 @@ function _numeric_info!(N::Numeric, S::Symbolic, read::Bool)
     if read
         ns = nsupernodes(S)
         if !_is_ldlt_structure(S.structure) && S.structure != STRUCTURE_GENERAL &&
-           _host_reduce_cholesky_info(KernelAbstractions.get_backend(N.factor))
+           _host_reduce_cholesky_info(KernelAbstractions.get_backend(N.factor), nb)
             copyto!(plan.info_host, N.info)
             for k in 1:nb
                 best = typemax(Int32)

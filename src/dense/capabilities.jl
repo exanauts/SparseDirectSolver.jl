@@ -114,8 +114,8 @@ _backend_schedule_options(backend, structure::Structure, opts::Options) = opts
 _backend_schedule_options(backend, structure::Structure, opts::Options, nbatch::Integer) =
     _backend_schedule_options(backend, structure, opts)
 _allow_batched_dense(backend) = true
-_serial_cholesky_stats(backend) = false
-_host_reduce_cholesky_info(backend) = false
+_serial_cholesky_stats(backend, nbatch::Integer) = false
+_host_reduce_cholesky_info(backend, nbatch::Integer) = false
 
 # ---------------------------------------------------------------------------
 # probes
