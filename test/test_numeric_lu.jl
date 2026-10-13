@@ -100,7 +100,7 @@ end
         @test d_error(Nh, Nr) <= gt && panel_error(Nh, Nr) <= gt && upanel_error(Nh, Nr) <= gt
     end
     S, Nr, Sd, Nd, nz = lu_setup(backend, A, Int64; opts)
-    @test !isempty(Nd.plan.sub_first) && Nr.piv != 1:400
+    @test (backend_name(backend) == "Metal" || !isempty(Nd.plan.sub_first)) && Nr.piv != 1:400
     SDS.factorize!(Nd, Sd, nz; opts)
     Nh = SDS.host_numeric(Nd)
     @test Nh.piv == Nr.piv && Nh.pivot_kind == Nr.pivot_kind

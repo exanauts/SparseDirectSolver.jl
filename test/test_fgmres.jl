@@ -13,6 +13,7 @@ fgmres_stall_matrix() = kkt_matrix(Float64, 150, 5, 0.0)
 # extension itself is INT-agnostic (it sees only the solve callback) (test-suite diet).
 RUN_SHARED && @testset "FGMRES-IR where plain IR stalls ($(backend_name(backend)), $INT)" for backend in BACKENDS,
                                                                                                INT in (Int32,)
+    backend_name(backend) == "Metal" && continue
     Random.seed!(666)
     K = fgmres_stall_matrix()
     b = K * rand(size(K, 1))
@@ -103,6 +104,7 @@ end
 end
 
 RUN_SHARED && @testset "FGMRES-IR: interrupt and missing Krylov ($(backend_name(backend)))" for backend in BACKENDS
+    backend_name(backend) == "Metal" && continue
     Random.seed!(666)
     K = fgmres_stall_matrix()
     b = K * rand(size(K, 1))

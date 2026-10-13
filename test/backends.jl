@@ -62,6 +62,13 @@ if AMDGPU_LOADED
 end
 const AMDGPU_FUNCTIONAL = AMDGPU_LOADED && AMDGPU.functional()
 
+const METAL_LOADED = TEST_GPU && is_package_installed("Metal")
+if METAL_LOADED
+    using Metal
+    Metal.allowscalar(false)
+end
+const METAL_FUNCTIONAL = METAL_LOADED && Metal.functional()
+
 """
     BACKENDS
 
@@ -72,9 +79,10 @@ const BACKENDS = Any[]
 TEST_CPU && push!(BACKENDS, CPU())
 CUDA_FUNCTIONAL && push!(BACKENDS, CUDABackend())
 AMDGPU_FUNCTIONAL && push!(BACKENDS, ROCBackend())
+METAL_FUNCTIONAL && push!(BACKENDS, MetalBackend())
 isempty(BACKENDS) &&
     error("no backend to test: SDS_TEST_CPU=0 and no functional GPU backend (SDS_TEST_GPU=$(get(ENV, "SDS_TEST_GPU", "1")), ",
-          "CUDA loaded: $CUDA_LOADED, AMDGPU loaded: $AMDGPU_LOADED)")
+          "CUDA loaded: $CUDA_LOADED, AMDGPU loaded: $AMDGPU_LOADED, Metal loaded: $METAL_LOADED)")
 
 """
     backend_name(backend) -> String
@@ -212,6 +220,18 @@ if AMDGPU_LOADED
                                                (n, n))
 end
 
+if METAL_LOADED
+    backend_name(::MetalBackend) = "Metal"
+    to_device(::MetalBackend, x::Array) = MtlArray(x)
+    to_device(backend::MetalBackend, A::SparseMatrixCSC{T, INT}) where {T, INT} = to_device(backend, A, INT)
+    to_device(::MetalBackend, A::SparseMatrixCSC{T}, ::Type{INT}) where {T, INT} =
+        SparseDirectSolver.to_backend(SparseMatrixCSC{T, INT}(A), MetalBackend())
+    to_host(A::CSR{T, INT, <:MtlVector{INT}, <:MtlArray{T}}) where {T, INT} = SparseMatrixCSC(A)
+    index_eltype(::CSR{<:Any, INT, <:MtlVector{INT}}) where {INT} = INT
+    api_csr(::MetalBackend, rowptr::Vector{INT}, colval::Vector{INT}, nzval, n) where {INT} =
+        CSR(MtlVector{INT}(rowptr), MtlVector{INT}(colval), MtlArray(vec(nzval)), n, n)
+end
+
 """
     vendor_sparse_types(backend) -> Union{Nothing, Tuple}
 
@@ -234,8 +254,10 @@ function print_backends()
     gpus = String[]
     CUDA_FUNCTIONAL && push!(gpus, "CUDA ($(CUDA.name(CUDA.device())))")
     AMDGPU_FUNCTIONAL && push!(gpus, "ROCm ($(AMDGPU.device()))")
+    METAL_FUNCTIONAL && push!(gpus, "Metal ($(Metal.device().name))")
     CUDA_LOADED && !CUDA_FUNCTIONAL && push!(gpus, "CUDA installed but not functional: skipped")
     AMDGPU_LOADED && !AMDGPU_FUNCTIONAL && push!(gpus, "AMDGPU installed but not functional: skipped")
+    METAL_LOADED && !METAL_FUNCTIONAL && push!(gpus, "Metal installed but not functional: skipped")
     TEST_GPU || push!(gpus, "GPU backends disabled by SDS_TEST_GPU=0")
     TEST_CPU || push!(gpus, "CPU backend disabled by SDS_TEST_CPU=0")
     println("Backends under test: ", join(backend_name.(BACKENDS), ", "),

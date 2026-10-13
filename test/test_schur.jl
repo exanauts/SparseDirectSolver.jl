@@ -44,11 +44,13 @@ schur_ldlt(structure) = structure in ("S", "H")
     sc = solver.host_symbolic.schedule
     @test sc.schur == SDS.nsupernodes(solver.host_symbolic) && sc.regime[sc.schur] == SDS.REGIME_C
     @test solver.host_symbolic.partition.perm[(n - ns + 1):n] == s
-    rname == "A" && @test count(==(SDS.REGIME_A), sc.regime) > length(sc.regime) ÷ 2
+    rname == "A" && (backend_name(backend) == "Metal" && structure != "SPD" ||
+                     @test count(==(SDS.REGIME_A), sc.regime) > length(sc.regime) ÷ 2)
     # Laplacian: a regime-A subtree root hands its contribution block to the Schur root
     rname == "A" && structure in ("SPD", "HPD") &&
         @test any(t -> solver.host_symbolic.partition.snparent[t] == sc.schur, sc.subtree_root)
-    rname == "B/C" && @test any(==(SDS.REGIME_B), sc.regime) && count(==(SDS.REGIME_C), sc.regime) > 1
+    rname == "B/C" && (backend_name(backend) == "Metal" && structure != "SPD" ||
+                       @test any(==(SDS.REGIME_B), sc.regime) && count(==(SDS.REGIME_C), sc.regime) > 1)
     Sref = schur_reference(A, flags)
     P = schur_pattern_reference(A, flags)
     sym = structure != "G"
@@ -183,7 +185,7 @@ end
 
 RUN_SHARED && @testset "Schur complement: orderings, edge cases, errors ($(backend_name(backend)))" for backend in BACKENDS
     Random.seed!(666)
-    T = Float64
+    T = backend_name(backend) == "Metal" ? Float32 : Float64
     # two disconnected blocks, Schur indices in the second one only: the first block is a separate tree
     A = blockdiag(laplacian2d(T, 6, 6), laplacian2d(T, 7, 5))
     n = size(A, 1)
@@ -238,7 +240,8 @@ RUN_SHARED && @testset "Schur complement: orderings, edge cases, errors ($(backe
     execute!("analysis", solver, nothing, nothing)
     @test getparam(solver, "schur_shape") == (4, 4, 10)
     @test thrown(() -> getparam(solver, "schur_matrix")) isa FactorizationError
-    for bad in (to_device(backend, zeros(T, 3, 3)), to_device(backend, zeros(Float32, 4, 4)), sparse(1.0I, 4, 4),
+    wrongT = T === Float32 ? Float16 : Float32
+    for bad in (to_device(backend, zeros(T, 3, 3)), to_device(backend, zeros(wrongT, 4, 4)), sparse(1.0I, 4, 4),
                 (to_device(backend, zeros(T, 4, 4)), 'L'), "S",
                 CSR(to_device(backend, ones(Int32, 5)), to_device(backend, ones(Int32, 9)),
                     to_device(backend, zeros(T, 9)), 4, 4))

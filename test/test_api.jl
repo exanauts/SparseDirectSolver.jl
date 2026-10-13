@@ -186,7 +186,8 @@ end
     @test thrown(() -> execute!("solve", solver, x, to_device(backend, rand(T, 40, 2)))) isa DimensionMismatch
     # an n × nrhs × nbatch array is a uniform-batch layout (T17): 4 columns for X's 1
     @test thrown(() -> execute!("solve", solver, x, to_device(backend, rand(T, 40, 2, 2)))) isa DimensionMismatch
-    other = T <: Complex ? ComplexF64 === T ? ComplexF32 : ComplexF64 : Float64 === T ? Float32 : Float64
+    other = T === Float32 && backend_name(backend) == "Metal" ? Float16 :
+            T <: Complex ? ComplexF64 === T ? ComplexF32 : ComplexF64 : Float64 === T ? Float32 : Float64
     bo = to_device(backend, rand(other, 40))
     @test thrown(() -> execute!("solve", solver, bo, bo)) isa InvalidValueError
     backend isa CPU ||
@@ -482,7 +483,7 @@ end
     @test getparam(Fb, "info") > 0
     @test thrown(() -> cholesky!(Fb, api_matrix(backend, tril(B), INT); check = true)) isa FactorizationError
     # the Symmetric/Hermitian wrappers of the vendor matrix types (GPU extensions)
-    if !(backend isa CPU)
+    if vendor_sparse_types(backend) !== nothing
         M = api_matrix(backend, tril(A), INT)
         Fh = cholesky(Hermitian(M, :L))
         @test relres(A, to_host(Fh \ bd), b) <= tol(T)

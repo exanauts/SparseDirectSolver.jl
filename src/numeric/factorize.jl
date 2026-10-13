@@ -47,6 +47,28 @@ const STATS_WORKGROUP = 256
     end
 end
 
+@kernel function _cholesky_stats_serial_kernel!(stats_all, info_all, super_ptr, front_ncols, ns, schur, bm,
+                                                 ::Val{NF}) where {NF}
+    j = @index(Global)
+    @inbounds if j <= bm.nact
+        k = _bm_member(bm, j)
+        stats = _mview(stats_all, k, bm.nbatch)
+        info = _iview(info_all, k, bm.nbatch)
+        best = typemax(Int64)
+        for s in 1:ns
+            fi = Int64(info[s])
+            base = (s - 1) * NF
+            stats[base + 1] = s == schur ? Int64(0) : fi == 0 ? Int64(front_ncols[s]) : fi - 1
+            for q in 2:(NF - 1)
+                stats[base + q] = 0
+            end
+            stats[base + NF] = fi
+            fi > 0 && (best = min(best, Int64(super_ptr[s]) + fi - 1))
+        end
+        info[ns + 1] = best == typemax(Int64) ? Int32(0) : Int32(best)
+    end
+end
+
 """
     cholesky_stats!(numeric, symbolic) -> numeric
 
@@ -58,9 +80,16 @@ factor column into `numeric.info[ns + 1]` (0 = none), for every active batch
 member. One workgroup per member, no atomics. Asynchronous.
 """
 function cholesky_stats!(N::Numeric, S::Symbolic)
-    WG = STATS_WORKGROUP
     bm = batch_map(N)
-    kernel! = _cholesky_stats_kernel!(KernelAbstractions.get_backend(N.factor), WG)
+    backend = KernelAbstractions.get_backend(N.factor)
+    if _serial_cholesky_stats(backend)
+        _cholesky_stats_serial_kernel!(backend, 1)(N.stats, N.info, S.super_ptr, S.front_ncols,
+                                                     nsupernodes(S), S.schedule.schur, bm,
+                                                     Val(FRONT_STATS_FIELDS); ndrange = bm.nact)
+        return N
+    end
+    WG = STATS_WORKGROUP
+    kernel! = _cholesky_stats_kernel!(backend, WG)
     kernel!(N.stats, N.info, S.super_ptr, S.front_ncols, nsupernodes(S), S.schedule.schur, bm, Val(WG),
             Val(FRONT_STATS_FIELDS),
             Val(_ilog2(WG)); ndrange = WG * bm.nact)
@@ -100,7 +129,7 @@ end
 # batched path: `impl = :generic`, then every member takes the single-matrix path)
 function _front_impls(N::Numeric{T}, S::Symbolic, impl::Symbol) where {T}
     impl === :auto && !S.schedule.vendor_c && (impl = :ka)
-    batched = N.nbatch > 1 && impl !== :generic
+    batched = N.nbatch > 1 && impl !== :generic && _allow_batched_dense(KernelAbstractions.get_backend(N.factor))
     bimpl(op) = batched ? (impl === :ka ? :ka : select_impl(op, N.factor, :auto)) : :none
     return (potrf = select_impl(:potrf, N.factor, impl), trsm = select_impl(:trsm, N.factor, impl),
             herk = select_impl(T <: Real ? :syrk : :herk, N.factor, impl), bpotrf = bimpl(:potrf_batched),
@@ -324,7 +353,22 @@ function _numeric_info!(N::Numeric, S::Symbolic, read::Bool)
     plan = N.plan
     nb = N.nbatch
     if read
-        copyto!(plan.info_host, 1, N.info, nsupernodes(S) * nb + 1, nb)
+        ns = nsupernodes(S)
+        if !_is_ldlt_structure(S.structure) && S.structure != STRUCTURE_GENERAL &&
+           _host_reduce_cholesky_info(KernelAbstractions.get_backend(N.factor))
+            copyto!(plan.info_host, N.info)
+            for k in 1:nb
+                best = typemax(Int32)
+                for s in 1:ns
+                    fi = plan.info_host[(s - 1) * nb + k]
+                    fi > 0 && (best = min(best, Int32(S.partition.super_ptr[s]) + fi - 1))
+                end
+                plan.info_host[ns * nb + k] = best == typemax(Int32) ? Int32(0) : best
+            end
+            copyto!(plan.info_host, 1, plan.info_host, ns * nb + 1, nb)
+        else
+            copyto!(plan.info_host, 1, N.info, ns * nb + 1, nb)
+        end
     else
         for j in 1:plan.nact[]
             plan.info_host[plan.members_host[j]] = 0

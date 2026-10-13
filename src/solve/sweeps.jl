@@ -645,7 +645,7 @@ end
 # batched `b*` for a uniform batch, `:none` with `impl = :generic`)
 function _solve_impls(N::Numeric, S::Symbolic, impl::Symbol)
     impl === :auto && !S.schedule.vendor_c && (impl = :ka)
-    batched = N.nbatch > 1 && impl !== :generic
+    batched = N.nbatch > 1 && impl !== :generic && _allow_batched_dense(KernelAbstractions.get_backend(N.factor))
     bimpl(op) = batched ? (impl === :ka ? :ka : select_impl(op, N.factor, :auto)) : :none
     return (trsm = select_impl(:trsm, N.factor, impl), gemm = select_impl(:gemm, N.factor, impl),
             btrsm = bimpl(:trsm_strided_batched), bgemm = bimpl(:gemm_strided_batched))
