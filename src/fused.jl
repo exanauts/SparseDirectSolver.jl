@@ -109,10 +109,18 @@ end
 
 # ---------------------------------------------------------------------------
 # forward: z = inv(L11) y per front, then the atomic L21 update (stock scatter)
+# global position of the front's local pivot k (columns at c0): the stored factor is in
+# within-front pivot order, so a pivoted solve reads its inputs through `piv` on the way
+# into L11 (forward) and scatters its outputs through `piv` on the way out (backward),
+# exactly `_sv_piv_apply!` of the sweep solve. `PIV = false` is the identity (no-pivot
+# LDL and Cholesky): the instantiation never reads `piv`.
+@inline _ppos(piv, c0, k, ::Val{true}) = @inbounds Int(piv[c0 + k])
+@inline _ppos(piv, c0, k, ::Val{false}) = c0 + k
+
 @kernel function fwd1_kernel!(Y, @Const(factor), @Const(inv11), @Const(inv_ptr), @Const(list), first, count,
                               @Const(subtree_ptr), @Const(subtree_nodes), @Const(super_ptr), @Const(rowptr),
                               @Const(rowval), @Const(front_ptr), @Const(front_nrows), @Const(front_ncols),
-                              ::Val{SUB}, ::Val{WGV}) where {SUB, WGV}
+                              @Const(piv), pvv::Val, ::Val{SUB}, ::Val{WGV}) where {SUB, WGV}
     @uniform TT = eltype(Y)
     li = @index(Local, Linear)
     g = @index(Group, Linear)
@@ -131,11 +139,11 @@ end
             c0 = Int(super_ptr[v]) - 1
             ip = Int(inv_ptr[v]) - 1
             w > MW && continue
-            # t = inv(L11) * Y[c0+1 : c0+w]
+            # t = inv(L11) * (P' y)[c0+1 : c0+w] (PIV: read through the local pivot order)
             for kk in li:WGV:w
                 acc = zero(TT)
                 for j in 1:w
-                    acc += inv11[ip + (j - 1) * w + kk] * Y[c0 + j]
+                    acc += inv11[ip + (j - 1) * w + kk] * Y[_ppos(piv, c0, j, pvv)]
                 end
                 t[kk] = acc
             end
@@ -166,7 +174,7 @@ end
 @kernel function bwd1_kernel!(Y, @Const(factor), @Const(inv11), @Const(inv_ptr), @Const(list), first, count,
                               @Const(subtree_ptr), @Const(subtree_nodes), @Const(super_ptr), @Const(rowptr),
                               @Const(rowval), @Const(front_ptr), @Const(front_nrows), @Const(front_ncols),
-                              ::Val{SUB}, ::Val{WGV}) where {SUB, WGV}
+                              @Const(piv), pvv::Val, ::Val{SUB}, ::Val{WGV}) where {SUB, WGV}
     @uniform TT = eltype(Y)
     li = @index(Local, Linear)
     g = @index(Group, Linear)
@@ -194,14 +202,15 @@ end
                 t[kk] = Y[c0 + kk] - acc
             end
             @synchronize
-            # x = inv(L11)ᵀ t  (inv col-major: invᵀ[k, j] = inv11[(k-1)w + j], contiguous in j)
+            # x = inv(L11)ᵀ t  (inv col-major: invᵀ[k, j] = inv11[(k-1)w + j], contiguous in j);
+            # PIV: scatter back through the local pivot order (restore the original order)
             for kk in li:WGV:w
                 acc = zero(TT)
                 cb = ip + (kk - 1) * w
                 for j in 1:w
                     acc += inv11[cb + j] * t[j]
                 end
-                Y[c0 + kk] = acc
+                Y[_ppos(piv, c0, kk, pvv)] = acc
             end
             @synchronize
         end
@@ -248,7 +257,7 @@ end
                               @Const(flist), @Const(slist), nsub, @Const(subtree_ptr), @Const(subtree_nodes),
                               @Const(snparent), arrived, @Const(nchild), @Const(super_ptr),
                               @Const(rowptr), @Const(rowval), @Const(front_ptr), @Const(front_nrows),
-                              @Const(front_ncols), ::Val{WGV}) where {WGV}
+                              @Const(front_ncols), @Const(piv), pvv::Val, ::Val{WGV}) where {WGV}
     @uniform TT = eltype(Y)
     li = @index(Local, Linear)
     g = @index(Group, Linear)
@@ -271,7 +280,7 @@ end
             for kk in li:WGV:w
                 acc = zero(TT)
                 for j in 1:w
-                    acc += inv11[ip + (j - 1) * w + kk] * Y[c0 + j]
+                    acc += inv11[ip + (j - 1) * w + kk] * Y[_ppos(piv, c0, j, pvv)]
                 end
                 t[kk] = acc
             end
@@ -320,8 +329,8 @@ end
         end
         @synchronize
         Threads.atomic_fence()
-        for kk in li:WGV:w                          # coherent read of the front's columns
-            yb[kk] = Atomix.@atomic Y[c0 + kk] += zero(TT)
+        for kk in li:WGV:w                          # coherent read of the front's columns (PIV: in pivot order)
+            yb[kk] = Atomix.@atomic Y[_ppos(piv, c0, kk, pvv)] += zero(TT)
         end
         @synchronize
         for kk in li:WGV:w                          # t = inv(L11) * y
@@ -355,7 +364,7 @@ end
                               @Const(flist), @Const(slist), nsub, @Const(subtree_ptr), @Const(subtree_nodes),
                               @Const(snparent), done, @Const(super_ptr), @Const(rowptr),
                               @Const(rowval), @Const(front_ptr), @Const(front_nrows), @Const(front_ncols),
-                              ::Val{WGV}) where {WGV}
+                              @Const(piv), pvv::Val, ::Val{WGV}) where {WGV}
     @uniform TT = eltype(Y)
     li = @index(Local, Linear)
     g = @index(Group, Linear)
@@ -406,7 +415,7 @@ end
                 for j in 1:w
                     acc += inv11[cb + j] * t2[j]
                 end
-                Y[c0 + kk] = acc
+                Y[_ppos(piv, c0, kk, pvv)] = acc      # PIV: restore the original order
             end
             @synchronize
         end
@@ -467,7 +476,7 @@ end
             for j in 1:w
                 acc += inv11[cb + j] * t2[j]
             end
-            Y[c0 + kk] = acc
+            Y[_ppos(piv, c0, kk, pvv)] = acc          # PIV: restore the original order
         end
         @synchronize
         if li == 1
@@ -484,7 +493,8 @@ end
 # single block owns every row it touches; plain loads/stores + block barriers.
 @kernel function chain_fwd_kernel!(Y, @Const(factor), @Const(inv11), @Const(inv_ptr), @Const(clist),
                                    @Const(super_ptr), @Const(rowptr), @Const(rowval), @Const(front_ptr),
-                                   @Const(front_nrows), @Const(front_ncols), ::Val{WGV}) where {WGV}
+                                   @Const(front_nrows), @Const(front_ncols), @Const(piv), pvv::Val,
+                                   ::Val{WGV}) where {WGV}
     @uniform TT = eltype(Y)
     li = @index(Local, Linear)
     yb = @localmem TT (MW,)
@@ -498,7 +508,7 @@ end
         c0 = Int(super_ptr[v]) - 1
         ip = Int(inv_ptr[v]) - 1
         for kk in li:WGV:w
-            yb[kk] = Y[c0 + kk]
+            yb[kk] = Y[_ppos(piv, c0, kk, pvv)]       # PIV: read in pivot order
         end
         @synchronize
         for kk in li:WGV:w
@@ -525,7 +535,8 @@ end
 
 @kernel function chain_bwd_kernel!(Y, @Const(factor), @Const(inv11), @Const(inv_ptr), @Const(clist),
                                    @Const(super_ptr), @Const(rowptr), @Const(rowval), @Const(front_ptr),
-                                   @Const(front_nrows), @Const(front_ncols), ::Val{WGV}) where {WGV}
+                                   @Const(front_nrows), @Const(front_ncols), @Const(piv), pvv::Val,
+                                   ::Val{WGV}) where {WGV}
     @uniform TT = eltype(Y)
     li = @index(Local, Linear)
     t = @localmem TT (MW,)
@@ -578,7 +589,7 @@ end
         end
         @synchronize
         for k2 in li:WGV:w
-            Y[c0 + k2] = t[k2]
+            Y[_ppos(piv, c0, k2, pvv)] = t[k2]        # PIV: restore the original order
         end
         @synchronize
     end
@@ -652,12 +663,12 @@ end
 
 # one fused segment, forward sweep: `wg > 512` runs the single-workgroup chain kernel,
 # `wg == 64` the dependency-counter sweep (the workgroup size the sweep is tuned for)
-function run_fused!(fz, wg, Yv, s, inv11, inv_ptr, backend)
+function run_fused!(fz, wg, Yv, s, inv11, inv_ptr, backend, pvv::Val = Val(false))
     S, N = s.symbolic, s.numeric
     if wg > 512
         chain_fwd_kernel!(backend, CHWG)(Yv, N.factor, inv11, inv_ptr, fz.flist, S.super_ptr, S.rowptr,
-                                         S.rowval, S.front_ptr, S.front_nrows, S.front_ncols, Val(CHWG);
-                                         ndrange = CHWG)
+                                         S.rowval, S.front_ptr, S.front_nrows, S.front_ncols, N.piv, pvv,
+                                         Val(CHWG); ndrange = CHWG)
         return nothing
     end
     wg == 64 || throw(SDS.InvalidValueError("fused solve: workgroup size $wg; expected 64 or > 512 (chain)"))
@@ -665,17 +676,17 @@ function run_fused!(fz, wg, Yv, s, inv11, inv_ptr, backend)
     fwd2_kernel!(backend, 64)(Yv, N.factor, inv11, inv_ptr, fz.flist, fz.slist, fz.nsub, S.subtree_ptr,
                               S.subtree_nodes, S.snparent, fz.arrived, fz.nchild,
                               S.super_ptr, S.rowptr, S.rowval, S.front_ptr, S.front_nrows, S.front_ncols,
-                              Val(64); ndrange = 64 * (fz.nfused + fz.nsub))
+                              N.piv, pvv, Val(64); ndrange = 64 * (fz.nfused + fz.nsub))
     return nothing
 end
 
 # the backward counterpart of `run_fused!`
-function run_fused_bwd!(fz, wg, Yv, s, inv11, inv_ptr, backend)
+function run_fused_bwd!(fz, wg, Yv, s, inv11, inv_ptr, backend, pvv::Val = Val(false))
     S, N = s.symbolic, s.numeric
     if wg > 512
         chain_bwd_kernel!(backend, CHWG)(Yv, N.factor, inv11, inv_ptr, fz.flist, S.super_ptr, S.rowptr,
-                                         S.rowval, S.front_ptr, S.front_nrows, S.front_ncols, Val(CHWG);
-                                         ndrange = CHWG)
+                                         S.rowval, S.front_ptr, S.front_nrows, S.front_ncols, N.piv, pvv,
+                                         Val(CHWG); ndrange = CHWG)
         return nothing
     end
     wg == 64 || throw(SDS.InvalidValueError("fused solve: workgroup size $wg; expected 64 or > 512 (chain)"))
@@ -683,7 +694,7 @@ function run_fused_bwd!(fz, wg, Yv, s, inv11, inv_ptr, backend)
     bwd2_kernel!(backend, 64)(Yv, N.factor, inv11, inv_ptr, fz.flist, fz.slist, fz.nsub, S.subtree_ptr,
                               S.subtree_nodes, S.snparent, fz.done,
                               S.super_ptr, S.rowptr, S.rowval, S.front_ptr, S.front_nrows, S.front_ncols,
-                              Val(64); ndrange = 64 * (fz.nfused + fz.nsub))
+                              N.piv, pvv, Val(64); ndrange = 64 * (fz.nfused + fz.nsub))
     return nothing
 end
 
@@ -692,6 +703,15 @@ end
 # run through the level-batched kernels (`fwd1_kernel!`/`bwd1_kernel!`, vendor
 # dense calls for fronts wider than MW)
 function algo2_solve!(x, s, b, inv11, inv_ptr, fz)
+    # within-front pivot order (in-front BK/diagonal pivoting): a compile-time switch for
+    # the sweep kernels, one dynamic dispatch per solve (the explicit-branch convention)
+    pivoted = SDS._is_ldlt_structure(s.symbolic.structure) &&
+              SDS._ldlt_pivot_type(s.options.pivot_type) != SDS.PIVOT_NONE
+    return pivoted ? _algo2_solve!(x, s, b, inv11, inv_ptr, fz, Val(true)) :
+                     _algo2_solve!(x, s, b, inv11, inv_ptr, fz, Val(false))
+end
+
+function _algo2_solve!(x, s, b, inv11, inv_ptr, fz, pvv::Val{PIV}) where {PIV}
     S, N, ws = s.symbolic, s.numeric, s.workspace
     bm = SDS.batch_map(N; nrhs = 1)
     SDS.permute_rhs!(ws.Y, b, S.perm; transposed = false, bm)
@@ -699,11 +719,15 @@ function algo2_solve!(x, s, b, inv11, inv_ptr, fz)
     nodes = S.schedule.group_nodes
     widths = S.schedule.width
     p = SDS._solve_impls(N, S, :auto)
+    # the dense wide fronts go through the sweep machinery, which applies the within-front
+    # pivot order itself when the kind says so; the no-pivot LDL keeps the Cholesky kind
+    # (unit TRSV, no reorder) and this function's own D pass
+    dkind = PIV ? SDS._solve_kind(S, eltype(ws.Y)) : SDS._SV_CHOLESKY
     backend = KA.get_backend(ws.Y)
     Yv = vec(ws.Y)
     args(first, count) = (Yv, N.factor, inv11, inv_ptr, S.group_nodes, first, count, S.subtree_ptr,
                           S.subtree_nodes, S.super_ptr, S.rowptr, S.rowval, S.front_ptr, S.front_nrows,
-                          S.front_ncols)
+                          S.front_ncols, N.piv, pvv)
     fwd_entry(k) = begin
         a, b_ = plan.first[k], plan.last[k]
         if plan.kind[k] == SDS.SOLVE_SUBTREES
@@ -711,7 +735,7 @@ function algo2_solve!(x, s, b, inv11, inv_ptr, fz)
             any(widths[nodes[q]] <= MW for q in a:b_) &&
                 fwd1_kernel!(backend, WG)(args(a, b_ - a + 1)..., Val(false), Val(WG); ndrange = WG * (b_ - a + 1))
             for q in a:b_
-                widths[nodes[q]] > MW && SDS._fwd_dense!(ws, S, N, nodes[q], 1, false, p, SDS._SV_CHOLESKY)
+                widths[nodes[q]] > MW && SDS._fwd_dense!(ws, S, N, nodes[q], 1, false, p, dkind)
             end
         else
             fwd1_kernel!(backend, WG)(args(a, b_ - a + 1)..., Val(plan.kind[k] == SDS.SOLVE_SUBTREES), Val(WG);
@@ -723,7 +747,7 @@ function algo2_solve!(x, s, b, inv11, inv_ptr, fz)
         if plan.kind[k] == SDS.SOLVE_SUBTREES
         elseif plan.kind[k] == SDS.SOLVE_DENSE
             for q in b_:-1:a
-                widths[nodes[q]] > MW && SDS._bwd_dense!(ws, S, N, nodes[q], 1, p, SDS._SV_CHOLESKY)
+                widths[nodes[q]] > MW && SDS._bwd_dense!(ws, S, N, nodes[q], 1, p, dkind)
             end
             any(widths[nodes[q]] <= MW for q in a:b_) &&
                 bwd1_kernel!(backend, WG)(args(a, b_ - a + 1)..., Val(false), Val(WG); ndrange = WG * (b_ - a + 1))
@@ -738,21 +762,25 @@ function algo2_solve!(x, s, b, inv11, inv_ptr, fz)
         while k < fzk.i1
             fwd_entry(k); k += 1
         end
-        run_fused!(fzk, wg, Yv, s, inv11, inv_ptr, backend)
+        run_fused!(fzk, wg, Yv, s, inv11, inv_ptr, backend, pvv)
         k = fzk.i2 + 1
     end
     while k <= length(plan.kind)
         fwd_entry(k); k += 1
     end
     if SDS._is_ldlt_structure(S.structure)      # LDL: apply D between the unit-triangular sweeps
-        Yv ./= view(N.d, 1:length(Yv))
+        if PIV
+            SDS.diagonal_sweep!(ws, S, N; nrhs = 1)     # 1x1 and 2x2 pivot blocks
+        else
+            Yv ./= view(N.d, 1:length(Yv))
+        end
     end
     k = length(plan.kind)
     for (fzk, wg) in Iterators.reverse(segs)
         while k > fzk.i2
             bwd_entry(k); k -= 1
         end
-        run_fused_bwd!(fzk, wg, Yv, s, inv11, inv_ptr, backend)
+        run_fused_bwd!(fzk, wg, Yv, s, inv11, inv_ptr, backend, pvv)
         k = fzk.i1 - 1
     end
     while k >= 1
