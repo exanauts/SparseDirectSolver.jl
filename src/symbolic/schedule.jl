@@ -46,7 +46,7 @@ Bytes of the regime-A LDLᵀ/LDLᴴ kernel's local memory kept for its control w
 reduction slots of the cooperative pivot search (structures `"S"`/`"H"`; at most 944 bytes for
 `ComplexF64` with `Int64` maps).
 """
-const SUBTREE_LOCAL_RESERVE_LDLT = 1024
+const SUBTREE_LOCAL_RESERVE_LDLT = 4608   # ctl + pv + full-workgroup red/redi (the pivot search scans with every thread since the lane widening)
 
 """
     subtree_local_reserve(structure) -> Int
