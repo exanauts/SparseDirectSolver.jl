@@ -1013,6 +1013,9 @@ const ROLE_WSIG = Int8(9)
     return nothing
 end
 
+# HERM of the resolved pivoting parameters, as a compile-time value
+@inline _prm_herm(::SDS._LDLTDevice{R, H}) where {R, H} = Val(H)
+
 @kernel function fused_fact_kernel!(factor, stack, pcb, info, @Const(nzval), @Const(amap), @Const(amap_ptr),
                                     @Const(amap_src), @Const(cb2), @Const(wt), @Const(role), @Const(ra), @Const(rb), @Const(rc),
                                     @Const(nchild), arrived, ea_left, panel_done, trsm_left, tiles_left,
@@ -1021,14 +1024,21 @@ end
                                     @Const(front_ncols), @Const(cb_ptr), @Const(child_ptr),
                                     @Const(child_list), @Const(relind_ptr), @Const(relind), base,
                                     @Const(wbase), wupd, wpdone2, wtrsml, wcbl, scap, eac, epsc, d, @Const(super_ptr),
-                                    ::Val{LDL}, ::Val{WG}) where {LDL, WG}
+                                    stats, pivord, pivot_kind, psign, @Const(perm), aux, prm,
+                                    ::Val{LDL}, ::Val{BK}, ::Val{WG}) where {LDL, BK, WG}
     @uniform TT = eltype(factor)
     @uniform RT = real(eltype(factor))
+    @uniform ITc = eltype(front_ptr)
     li = @index(Local, Linear)
     G = Int(base) + @index(Group, Linear)
     sh = @localmem TT (NL64,)
     st = @localmem Int32 (1,)
     piv = @localmem RT (1,)
+    # Bunch-Kaufman state (BK instantiations only; 1-element placeholders otherwise)
+    lctl = @localmem ITc (BK ? Int(SDS._LT_CTL) : 1,)
+    pv2 = @localmem TT (BK ? Int(SDS._LT_NPV) : 1,)
+    red = @localmem RT (BK ? 3 * WG : 1,)
+    redi = @localmem ITc (BK ? 2 * WG : 1,)
     fscr = @localmem Int32 (1,)   # spin-backoff scratch (integer: no Float64 in kernels)
     @inbounds begin
         r = role[G]
@@ -1123,6 +1133,97 @@ end
                     @synchronize
                 end
             end
+            if BK
+                # in-front Bunch-Kaufman: the stock regime-B flow verbatim on the split front
+                # (F11 staged in sh, rows below in the factor panel), one workgroup per front.
+                # No TRSM/TILE roles exist for BK fronts: every pivot step updates the whole
+                # remaining column (rows below w included), and the contribution block goes
+                # through the stock _lt_cb_* update, which handles the 2x2 pivot blocks the
+                # scalar-d tile math cannot.
+                hv = _prm_herm(prm)
+                if li == 1
+                    lctl[SDS._ST_NODE] = v % ITc
+                    lctl[SDS._ST_F] = front_nrows[v] % ITc
+                    lctl[SDS._ST_W] = front_ncols[v] % ITc
+                    lctl[SDS._ST_LF] = front_ptr[v] % ITc
+                    SDS._lt_reset!(lctl, super_ptr[v])
+                    lctl[SDS._LT_NTILE] = SDS._lt_cb_ntiles(Int(front_nrows[v]), Int(front_ncols[v]),
+                                                            Int(cb2[v]) - 1) % ITc
+                end
+                @synchronize
+                SDS._lt_init_piv!(pivord, lctl, li, Val(WG))
+                SDS._lt_stage!(sh, factor, lctl, li, Val(64), Val(WG), true)
+                @synchronize
+                SDS._lt_pass1!(SDS._lt_fa(sh, factor, Val(64)), lctl, red, redi, li, Val(WG), prm, Val(64))
+                @synchronize
+                for it in 1:lctl[SDS._ST_W]
+                    if WG > SDS._LT_S1
+                        SDS._lt_stage1!(red, redi, lctl, li, Val(WG), Val(1))
+                        @synchronize
+                    end
+                    if li == 1
+                        SDS._lt_decide1!(SDS._lt_fa(sh, factor, Val(64)), lctl, pv2, red, redi, d, pivot_kind,
+                                         pivord, psign, perm, aux, prm, Val(WG), Val(64), hv)
+                    end
+                    @synchronize
+                    if lctl[SDS._LT_PHASE] == 2
+                        SDS._lt_pass2!(SDS._lt_fa(sh, factor, Val(64)), lctl, red, redi, li, Val(WG), prm, Val(64))
+                        @synchronize
+                        if WG > SDS._LT_S1
+                            SDS._lt_stage1!(red, redi, lctl, li, Val(WG), Val(2))
+                            @synchronize
+                        end
+                        if li == 1
+                            SDS._lt_decide2!(SDS._lt_fa(sh, factor, Val(64)), lctl, pv2, red, redi, d, pivot_kind,
+                                             pivord, psign, perm, aux, prm, Val(WG), Val(64), hv)
+                        end
+                        @synchronize
+                    end
+                    if lctl[SDS._LT_PHASE] == 3
+                        SDS._lt_pass3!(SDS._lt_fa(sh, factor, Val(64)), lctl, red, redi, li, Val(WG), aux, prm,
+                                       Val(64))
+                        @synchronize
+                        if WG > SDS._LT_S1
+                            SDS._lt_stage1!(red, redi, lctl, li, Val(WG), Val(3))
+                            @synchronize
+                        end
+                        if li == 1
+                            SDS._lt_decide3!(SDS._lt_fa(sh, factor, Val(64)), lctl, pv2, red, redi, d, pivot_kind,
+                                             pivord, psign, perm, aux, prm, Val(WG), Val(64), hv)
+                        end
+                        @synchronize
+                    end
+                    SDS._lt_swap!(SDS._lt_fa(sh, factor, Val(64)), lctl, pv2, pivord, li, Val(WG), Val(64), hv)
+                    @synchronize
+                    SDS._lt_update!(SDS._lt_fa(sh, factor, Val(64)), lctl, pv2, red, redi, li, Val(WG), Val(true),
+                                    prm, Val(64), hv)
+                    @synchronize
+                end
+                SDS._lt_finalize!(SDS._lt_fa(sh, factor, Val(64)), lctl, d, pivot_kind, li, Val(WG), Val(64), hv)
+                @synchronize
+                SDS._lt_stage!(sh, factor, lctl, li, Val(64), Val(WG), false)
+                @synchronize
+                for tt in 1:lctl[SDS._LT_NTILE]
+                    for kc in 1:SDS._lt_cb_nchunks(lctl)
+                        SDS._lt_cb_load!(sh, factor, lctl, d, pivot_kind, tt, kc, li, Val(WG), hv)
+                        @synchronize
+                        SDS._lt_cb_acc!(sh, lctl, kc, li, Val(WG), hv)
+                        @synchronize
+                    end
+                    SDS._lt_cb_store!(sh, lctl, pcb, Int(cb2[v]) - 1, tt, li, Val(WG), hv)
+                end
+                coffbk = lctl[SDS._LT_NTILE] == 0 ? Int(cb2[v]) - 1 : -1
+                SDS._lt_cb_update!(factor, lctl, pcb, coffbk, d, pivot_kind, li, Val(WG), Val(false), hv)
+                SDS._lt_front_finish!(factor, stats, info, lctl, li, Val(WG))
+                @synchronize
+                Threads.atomic_fence()      # ALL threads: each wave drains its own stores (gfx9)
+                @synchronize
+                if li == 1
+                    Atomix.@atomic cb_done[v] += Int32(1)
+                    pvb = Int(snparent[v])
+                    pvb > 0 && (Atomix.@atomic arrived[pvb] += Int32(1))
+                end
+            else begin
             SDS._front_load!(sh, st, factor, v, li, front_ptr, front_nrows, front_ncols, Val(64), Val(WG))
             @synchronize
             w = Int(front_ncols[v])
@@ -1188,6 +1289,7 @@ end
                     Atomix.@atomic panel_done[v] += Int32(1)
                 end
             end
+            end end                         # else begin (the no-pivot/Cholesky panel flow)
         elseif r == ROLE_TRSM
             v = Int(ra[G])
             if li == 1
@@ -1795,10 +1897,28 @@ end
 end
 
 # subtree launcher with a custom (sorted) list, local memory sized by eltype
-function launch_subtrees_sorted!(N, S, nzval, list, lb, backend, ldl::Bool = false, epsc::Real = 0.0)
+function launch_subtrees_sorted!(N, S, nzval, list, lb, backend, ldl::Bool = false, epsc::Real = 0.0,
+                                 prm = nothing)
     SDS._with_local_bytes(Int(lb)) do LBv
-        _sorted_subtree_launch(N, S, nzval, list, Val(ldl), LBv, Val(SDS.SUBTREE_WORKGROUP), backend, epsc)
+        if prm === nothing
+            _sorted_subtree_launch(N, S, nzval, list, Val(ldl), LBv, Val(SDS.SUBTREE_WORKGROUP), backend, epsc)
+        else
+            # in-front Bunch-Kaufman: the stock pivoted subtree kernel on the sorted list
+            _sorted_subtree_launch_bk(N, S, nzval, list, prm, LBv, Val(SDS.SUBTREE_WORKGROUP), backend)
+        end
     end
+end
+function _sorted_subtree_launch_bk(N::SDS.Numeric{T}, S, nzval, list, prm, ::Val{LB}, ::Val{WG},
+                                   backend) where {T, LB, WG}
+    bm = SDS.batch_map(N; first = 1)
+    k! = SDS.subtree_ldlt_kernel!(backend, WG)
+    k!(N.factor, N.stack, N.info, N.stats, N.d, N.piv, N.pivot_kind, N.psign, S.perm, N.aux, nzval,
+       S.amap, S.amap_ptr, S.amap_src, list, bm, S.subtree_ptr, S.subtree_nodes, S.super_ptr,
+       S.front_ptr, S.front_nrows, S.front_ncols, S.cb_ptr, S.local_front, S.local_cb, S.child_ptr,
+       S.child_list, S.relind_ptr, S.relind, prm,
+       Val((LB - SDS.SUBTREE_LOCAL_RESERVE_LDLT) ÷ sizeof(T)), Val(WG);
+       ndrange = WG * length(list) * bm.nact)
+    return nothing
 end
 function _sorted_subtree_launch(N::SDS.Numeric{T}, S, nzval, list, ::Val{LDL}, ::Val{LB}, ::Val{WG},
                                 backend, epsc::Real = 0.0) where {T, LDL, LB, WG}
@@ -1823,10 +1943,22 @@ end
 
 # ---------------------------------------------------------------------------
 # host: the topologically ordered role list + counter bases + stream-2 program
-function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, Bool} = nothing,
+function build_fused_plan(s; ldl::Bool = false, bk::Bool = false,
+                          inkernel_wides::Union{Nothing, Bool} = nothing,
                           wides_potrf::Bool = false, merge_segments::Bool = false,
                           wgf::Int = WGF, scap::Integer = 128, ea_chunk::Integer = 16384)
     S = s.symbolic
+    if bk
+        # in-front Bunch-Kaufman mode: the stock pivot machinery inside the fused kernels.
+        # The scalar-d trailing updates (TRSM/TILE/W-roles, potrf wides) cannot represent a
+        # 2x2 pivot block, so BK fronts are factored whole by their PANEL workgroup.
+        ldl || throw(SDS.InvalidValueError("fused plan: bk = true needs ldl = true"))
+        wides_potrf && throw(SDS.NotSupportedError("fused plan: bk with wides_potrf (potrf assumes no pivoting)"))
+        inkernel_wides == true &&
+            throw(SDS.NotSupportedError("fused plan: bk with in-kernel wides is not implemented"))
+        inkernel_wides = false
+        s.nbatch == 1 || throw(SDS.NotSupportedError("fused plan: bk with a uniform batch"))
+    end
     plan = s.numeric.plan
     backend = KA.get_backend(s.numeric.factor)
     T = eltype(s.numeric.factor)
@@ -1878,6 +2010,7 @@ function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, B
     wt_h = zeros(Int32, ns)
     nwt = 0; ewt = 0
     for v in 1:ns
+        bk && break                              # write-through rides the TILE roles: none in BK mode
         (covered[v] || cbp[v] == 0) && continue
         width_h[v] <= 64 || continue             # wide children have no tiles to settle the debt
         m = rows_h[v] - width_h[v]
@@ -1904,6 +2037,7 @@ function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, B
         end
     end
     emit_split(v) = begin
+        bk && return nothing                     # BK: the PANEL workgroup factors the whole front
         m = rows_h[v] - width_h[v]
         m > SYRK_IN || return nothing
         for ch in 1:cld(m, wgf)
@@ -2003,6 +2137,9 @@ function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, B
         end
     end
     push!(segments, (seg_base, length(role) - seg_base, Int[]))
+    bk && !isempty(wides) &&
+        throw(SDS.NotSupportedError("fused plan: bk with fronts wider than 64 " *
+                                    "($(length(wides)) here) is not implemented yet"))
 
     cb2_h = zeros(Int64, ns)
     off = 1
@@ -2050,7 +2187,7 @@ function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, B
             wbase = _dvec(backend, wbase_h), wupd_b = _dvec(backend, wupd_b), wtl_b = _dvec(backend, wtl_b),
             wcb_b = _dvec(backend, wcb_b), wupd = KA.zeros(backend, Int32, max(nwslots, 1)),
             wtl = KA.zeros(backend, Int32, max(nwslots, 1)), wpd = KA.zeros(backend, Int32, max(nwslots, 1)),
-            wcb = KA.zeros(backend, Int32, ns), wgf, scap = Int32(scap), eac = Int32(ea_chunk), ldl,
+            wcb = KA.zeros(backend, Int32, ns), wgf, scap = Int32(scap), eac = Int32(ea_chunk), ldl, bk,
             # captured at plan build: a later setparam!("pivot_epsilon") changes the stock
             # path but not an already-built fused plan (rebuild the plan to change it)
             chol_eps = ldl ? 0.0 : Float64(SDS.resolved_pivot_epsilon(s.options, real(T))),
@@ -2082,8 +2219,13 @@ function refact_fused!(s, nzval, fp)
     length(fp.wtl_b) > 0 && copyto!(fp.wtl, fp.wtl_b)
     fill!(fp.wpd, Int32(0))
     copyto!(fp.wcb, fp.wcb_b)
+    # in-front Bunch-Kaufman: resolved pivot parameters per refactorization (a later
+    # setparam!("pivot_threshold"/"pivot_epsilon") takes effect, unlike chol_eps), and
+    # the |a|max reduction the perturbation/fallback scan reads
+    prm = fp.bk ? SDS._ldlt_device_params(S, eltype(N.factor), s.options) : nothing
+    fp.bk && SDS.abs_max!(N.aux, nzval)
     for k in eachindex(plan.sub_first)
-        launch_subtrees_sorted!(N, S, nzval, fp.ssub[k], plan.sub_local[k], backend, fp.ldl, fp.chol_eps)
+        launch_subtrees_sorted!(N, S, nzval, fp.ssub[k], plan.sub_local[k], backend, fp.ldl, fp.chol_eps, prm)
     end
     nodes = S.schedule.group_nodes
     fill!(fp.pcb, zero(eltype(fp.pcb)))
@@ -2104,7 +2246,11 @@ function refact_fused!(s, nzval, fp)
                                              S.cb_ptr, S.child_ptr, S.child_list, S.relind_ptr, S.relind,
                                              Int32(base), fp.wbase, fp.wupd, fp.wpd, fp.wtl, fp.wcb,
                                              fp.scap, fp.eac, real(eltype(N.factor))(fp.chol_eps), N.d,
-                                             S.super_ptr, Val(fp.ldl), Val(fp.wgf);
+                                             S.super_ptr, N.stats,
+                                             fp.bk ? N.piv : N.info, fp.bk ? N.pivot_kind : N.info,
+                                             fp.bk ? N.psign : N.info, fp.bk ? S.perm : N.info,
+                                             fp.bk ? N.aux : N.factor, prm,
+                                             Val(fp.ldl), Val(fp.bk), Val(fp.wgf);
                                              ndrange = fp.wgf * count)
         for v in gwides                              # host-wide fronts at the segment boundary
             if fp.ldl && fp.ldl_potrf
