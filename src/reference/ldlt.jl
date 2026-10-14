@@ -423,6 +423,42 @@ function _ldlt_front!(F::Matrix{T}, w::Int, prm::_LDLTParams, signof) where {T}
             up = prm.herm ? conj(b) : b
             F[k, k], F[k + 1, k + 1], F[k, k + 1] = a, c2, up
             det = a * c2 - up * b
+            # Lazy perturbation of a 2x2 whose INVERSE is unusable (Sungho; the CPU
+            # precedent is pivot_mode = :match_adapt, trigger max(|a|,|b|,|d|)/|det| >
+            # 1/eps). Every entry below is divided by `det`, so `|det| < eps * M` puts an
+            # inverse entry above 1/eps and the multipliers it forms are unbounded.
+            # Reachable despite Bunch-Kaufman's own safeguards: a block with a tiny `a`
+            # and a partner `c2` far above lambda has a healthy |det|/lambda^2 and still a
+            # huge |c2/det| (worked fixture in test_reference_ldlt.jl).
+            # NOT for two reasons that look plausible and are false here: a pair CHOSEN by
+            # Bunch-Kaufman satisfies akk*sigma < alpha*lambda^2 and |c2| < alpha*sigma, so
+            # |a*c2| <= alpha^2 lambda^2 < lambda^2 = b^2 and therefore det < 0 strictly
+            # with |det| >= (1 - alpha^2) lambda^2 -- so the determinant can neither vanish
+            # nor round to the wrong SIGN (verified over 2.3e5 sampled choices, min
+            # |det|/lambda^2 = 0.72 against the 0.59 bound), and the (1 pos, 1 neg) inertia
+            # credit below is never wrong for such a pair.
+            # Restore |det| to eps * M by moving whichever diagonal is SMALLER (dividing by
+            # the larger), keeping det negative, which is the sign a saddle 2x2 must have.
+            # Mirrors the device edit in `_lt_select!` entry for entry: the kernels and this
+            # reference are compared on the exact pivot sequence and factor.
+            if prm.herm
+                εb = prm.eps
+                M = max(max(abs(a), abs(c2)), abs(b))
+                if εb > zero(εb) && (iszero(det) || !(abs(det) >= εb * M))
+                    bb = real(up * b)
+                    if abs(a) < εb && abs(c2) < εb
+                        a = T(εb)                       # whole block below eps: two signed
+                        c2 = T(-εb)                     # bumps, so the pair stays indefinite
+                    elseif abs(a) >= abs(c2)
+                        c2 = T((bb - εb * M) / a)       # => det = -eps * M
+                    else
+                        a = T((bb - εb * M) / c2)
+                    end
+                    det = a * c2 - up * b
+                    F[k, k], F[k + 1, k + 1] = a, c2
+                    st[STAT_NPERTURBED] += 1
+                end
+            end
             e11, e12, e21, e22 = c2 / det, -up / det, -b / det, a / det
             kind[k], kind[k + 1] = PIVOT_KIND_2X2_FIRST, PIVOT_KIND_2X2_SECOND
             dd[k], dd[k + 1], ee[k] = a, c2, b

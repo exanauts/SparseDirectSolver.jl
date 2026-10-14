@@ -598,6 +598,33 @@ end
 
 # symmetric interchange of the columns/rows p < q of the front (lower triangle), as `_swap_front!`, then
 # the new diagonal entries of the pivot block from `pv` (and the zero below a 2×2 block's diagonal)
+# the step's interchange is a no-op (the chosen pivot already sits at k, or at k + 1 for a
+# 2×2): the only entries `_lt_swap!` would write are then the pivot block's diagonal, which
+# `_lt_update!` never reads (it reads `pv` and the columns/rows strictly past the block), so
+# work item 1 writes them and the workgroup skips the swap and its barrier. Uniform.
+@inline function _lt_noswap(ctl)
+    @inbounds begin
+        k = Int(ctl[_LT_K])
+        k <= Int(ctl[_LT_KEND]) || return true
+        r = Int(ctl[_LT_R])
+        return r == 0 ? Int(ctl[_LT_C]) == k : r == k + 1
+    end
+end
+
+@inline function _lt_setdiag!(fa, ctl, pv, pk::Val)
+    @inbounds begin
+        k = Int(ctl[_LT_K])
+        k <= Int(ctl[_LT_KEND]) || return nothing
+        F = _lt_raw_front(fa, ctl, pk)
+        _fset!(F, k, k, pv[5])
+        if Int(ctl[_LT_R]) != 0
+            _fset!(F, k + 1, k, zero(eltype(pv)))      # the 2×2 block lives in D, L's is I
+            _fset!(F, k + 1, k + 1, pv[6])
+        end
+    end
+    return nothing
+end
+
 @inline function _lt_swap!(fa, ctl, pv, piv, li, ::Val{WG}, pk::Val, h::Val) where {WG}
     @inbounds begin
         k = Int(ctl[_LT_K])
@@ -1072,7 +1099,11 @@ statistics, updates its packed contribution block on the update stack
             end
             @synchronize
         end
-        _lt_swap!(_lt_fa(L11, factor, Val(W)), ctl, pv, _mview(piv, _bm_gmember(bm, G), bm.nbatch), li, Val(WG), _lt_pk(Val(W)), Val(HERM))
+        if _lt_noswap(ctl)
+            li == 1 && _lt_setdiag!(_lt_fa(L11, factor, Val(W)), ctl, pv, _lt_pk(Val(W)))
+        else
+            _lt_swap!(_lt_fa(L11, factor, Val(W)), ctl, pv, _mview(piv, _bm_gmember(bm, G), bm.nbatch), li, Val(WG), _lt_pk(Val(W)), Val(HERM))
+        end
         @synchronize
         _lt_update!(_lt_fa(L11, factor, Val(W)), ctl, pv, red, redi, li, Val(WG), Val(true), prm, _lt_pk(Val(W)),
                     Val(HERM))
@@ -1171,8 +1202,8 @@ stack.
     buf = @localmem TT (NE,)
     ctl = @localmem IT (_LT_CTL,)
     pv = @localmem TT (_LT_NPV,)
-    red = @localmem R (3 * _LT_S1,)
-    redi = @localmem IT (2 * _LT_S1,)
+    red = @localmem R (3 * WG,)
+    redi = @localmem IT (2 * WG,)
     if li == 1
         @inbounds t = trees[bm.first + _bm_node(bm, G) - 1]
         @inbounds ctl[_ST_FIRST] = subtree_ptr[t]
@@ -1196,47 +1227,64 @@ stack.
                                  relind, li, Val(WG))
             @synchronize
         end
-        _lt_pass1!(buf, ctl, red, redi, li, Val(_LT_S1), prm, Val(true))
+        _lt_pass1!(buf, ctl, red, redi, li, Val(WG), prm, Val(true))
         @synchronize
         for it in 1:ctl[_ST_W]
+            if WG > _LT_S1
+                _lt_stage1!(red, redi, ctl, li, Val(WG), Val(1))
+                @synchronize
+            end
             if li == 1
                 mb = _bm_gmember(bm, G)
                 nb = bm.nbatch
                 _lt_decide1!(buf, ctl, pv, red, redi, _mview(d, mb, nb), _mview(pivot_kind, mb, nb),
-                             _mview(piv, mb, nb), psign, perm, _mview(aux, mb, nb), prm, Val(_LT_S1), Val(true),
+                             _mview(piv, mb, nb), psign, perm, _mview(aux, mb, nb), prm, Val(WG), Val(true),
                              Val(HERM))
             end
             @synchronize
             if ctl[_LT_PHASE] == 2
-                _lt_pass2!(buf, ctl, red, redi, li, Val(_LT_S1), prm, Val(true))
+                _lt_pass2!(buf, ctl, red, redi, li, Val(WG), prm, Val(true))
                 @synchronize
+                if WG > _LT_S1
+                    _lt_stage1!(red, redi, ctl, li, Val(WG), Val(2))
+                    @synchronize
+                end
                 if li == 1
                     mb = _bm_gmember(bm, G)
                     nb = bm.nbatch
                     _lt_decide2!(buf, ctl, pv, red, redi, _mview(d, mb, nb), _mview(pivot_kind, mb, nb),
-                                 _mview(piv, mb, nb), psign, perm, _mview(aux, mb, nb), prm, Val(_LT_S1), Val(true),
+                                 _mview(piv, mb, nb), psign, perm, _mview(aux, mb, nb), prm, Val(WG), Val(true),
                                  Val(HERM))
                 end
                 @synchronize
             end
             if ctl[_LT_PHASE] == 3
-                _lt_pass3!(buf, ctl, red, redi, li, Val(_LT_S1), _mview(aux, _bm_gmember(bm, G), bm.nbatch), prm,
+                _lt_pass3!(buf, ctl, red, redi, li, Val(WG), _mview(aux, _bm_gmember(bm, G), bm.nbatch), prm,
                            Val(true))
                 @synchronize
+                if WG > _LT_S1
+                    _lt_stage1!(red, redi, ctl, li, Val(WG), Val(3))
+                    @synchronize
+                end
                 if li == 1
                     mb = _bm_gmember(bm, G)
                     nb = bm.nbatch
                     _lt_decide3!(buf, ctl, pv, red, redi, _mview(d, mb, nb), _mview(pivot_kind, mb, nb),
-                                 _mview(piv, mb, nb), psign, perm, _mview(aux, mb, nb), prm, Val(_LT_S1), Val(true),
+                                 _mview(piv, mb, nb), psign, perm, _mview(aux, mb, nb), prm, Val(WG), Val(true),
                                  Val(HERM))
                 end
                 @synchronize
             end
-            _lt_swap!(buf, ctl, pv, _mview(piv, _bm_gmember(bm, G), bm.nbatch), li, Val(WG), Val(true), Val(HERM))
+            if _lt_noswap(ctl)
+                li == 1 && _lt_setdiag!(buf, ctl, pv, Val(true))
+            else
+                _lt_swap!(buf, ctl, pv, _mview(piv, _bm_gmember(bm, G), bm.nbatch), li, Val(WG), Val(true),
+                          Val(HERM))
+            end
             @synchronize
-            _lt_update!(buf, ctl, pv, red, redi, li, Val(WG), Val(false), prm, Val(true), Val(HERM))
-            @synchronize
-            _lt_pass1!(buf, ctl, red, redi, li, Val(_LT_S1), prm, Val(true))
+            # TRACK: the next column's maxima come out of the update itself, as in
+            # `front_ldlt_kernel!` -- one barrier and one column scan less per step
+            _lt_update!(buf, ctl, pv, red, redi, li, Val(WG), Val(true), prm, Val(true), Val(HERM))
             @synchronize
         end
         mb = _bm_gmember(bm, G)
