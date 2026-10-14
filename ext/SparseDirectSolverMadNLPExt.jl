@@ -20,7 +20,14 @@ Base.@kwdef mutable struct SDSSolverOptions <: MadNLP.AbstractOptions
     # :cholesky (SPD; the condensed-KKT default) or :ldl (no-pivot LDL^T: factors
     # indefinite matrices and reports TRUE inertia from the signs of D)
     sds_factorization::Symbol = :cholesky
-    # :ldl only. :none factors in identity pivot order; :bk runs in-front Bunch-Kaufman
+    # :ldl only. :diag is simpler partial in-front pivoting: per column take the largest
+    # remaining diagonal of the fully-summed block and permute it in symmetrically, never a
+    # 2x2. Only 1x1 pivots, so the factor keeps the no-pivot shape plus a permutation and
+    # every no-pivot role applies: 1.04x of no-pivot on the 78k condensed KKT (GV100),
+    # against :bk's 1.84x. It cannot rescue a front whose remaining diagonals are ALL zero
+    # (an unregularized saddle block) where :bk's 2x2 can, so it sits between :none and :bk
+    # in robustness.
+    # :none factors in identity pivot order; :bk runs in-front Bunch-Kaufman
     # through the fused pipeline (stock pivot machinery in the subtree and PANEL kernels,
     # vendor-sytrf wide fronts) with the pivot-aware fused solve; :bk_hybrid pivots the
     # subtrees and narrow fronts only, wide fronts take the potrf-derived path (a sign
@@ -95,20 +102,24 @@ function SDSSolver(
     backend = KA.get_backend(csc.nzVal)
     t = Fused.resolve_tuning(something(opt.sds_tuning, Fused.default_tuning(backend)), backend)
     ldl = opt.sds_factorization === :ldl
-    opt.sds_pivoting in (:none, :bk, :bk_hybrid) ||
-        throw(ArgumentError("sds_pivoting must be :none, :bk or :bk_hybrid, got $(repr(opt.sds_pivoting))"))
-    bk = opt.sds_pivoting !== :none
-    bk && !ldl && throw(ArgumentError("sds_pivoting = $(repr(opt.sds_pivoting)) needs sds_factorization = :ldl"))
+    opt.sds_pivoting in (:none, :diag, :bk, :bk_hybrid) ||
+        throw(ArgumentError("sds_pivoting must be :none, :diag, :bk or :bk_hybrid, got " *
+                            "$(repr(opt.sds_pivoting))"))
+    diagp = opt.sds_pivoting === :diag
+    bk = opt.sds_pivoting in (:bk, :bk_hybrid)
+    (bk || diagp) && !ldl &&
+        throw(ArgumentError("sds_pivoting = $(repr(opt.sds_pivoting)) needs sds_factorization = :ldl"))
     s = SDS.DirectSolver(csc.colPtr, csc.rowVal, csc.nzVal, ldl ? "S" : "SPD", 'U')
     # BK modes keep pivot_type AUTO (the in-front machinery reads it); a user threshold
     # reaches the acceptance test of the narrow fronts and subtrees
-    ldl && !bk && SDS.setparam!(s, "pivot_type", 'N')
+    ldl && !bk && !diagp && SDS.setparam!(s, "pivot_type", 'N')
+    diagp && SDS.setparam!(s, "pivot_type", 'D')
     bk && opt.sds_pivot_threshold !== nothing &&
         SDS.setparam!(s, "pivot_threshold", opt.sds_pivot_threshold)
     # pairs: the no-pivot LDL never consumes them ("none" skips the costly "S" detection);
     # the BK modes keep them by default (see sds_pivot_pairs above)
     if ldl
-        pairs = something(opt.sds_pivot_pairs, bk ? "default" : "none")
+        pairs = something(opt.sds_pivot_pairs, bk ? "default" : "none")   # :diag takes no pairs
         SDS.setparam!(s, "pivot_pairs", pairs)
     end
     s.options.regime_c_width = t.regime_c_width
@@ -123,7 +134,9 @@ function SDSSolver(
     SDS.execute!("solve", s, x, b; asynchronous = false)   # allocates the solve workspace
     nzval = SDS._factor_values(s)
     fp_slow = nothing
-    if bk
+    if diagp
+        fp = Fused.build_fused_plan(s; ldl, diag = true, wgf = t.workgroup, scap = t.spin_cap)
+    elseif bk
         # NOTE an optimistic fast-path-with-certified-retry was measured and rejected:
         # in-front BK cannot honor |l| <= 1/u on wide fronts either (the fallback accepts
         # sub-threshold pivots when nothing in the fully-summed block passes; the stock
