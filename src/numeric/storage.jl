@@ -240,10 +240,11 @@ function allocate_numeric(S::Symbolic{INT}, ::Type{T}, backend::KernelAbstractio
     ustack = KernelAbstractions.zeros(backend, T, lu ? nb * L.stack_len : 0)
     plan = NumericPlan(S, nb)
     if nb == 1 && !_is_ldlt_structure(S.structure) && S.structure != STRUCTURE_GENERAL
+        vstatus = _offset_potrf_status(backend)    # vendor potrf status output, shared by the fronts (never read)
         for s in 1:nsupernodes(S)
             takes_c_path(S.schedule, s) || continue
             plan.vendor_ptrs[s] = _offset_potrf_plan(backend, factor, L.panel_ptr[s], S.schedule.rows[s],
-                                                     S.schedule.width[s], aux)
+                                                     S.schedule.width[s], vstatus)
         end
     end
     nb > 1 && _vendor_batch_pointers!(plan.vendor_ptrs, factor, S, nb)

@@ -3299,7 +3299,7 @@ minutes of work (`src/symbolic/ndtree.jl` with the tree export/import and a
 canonical supernode postorder, `test/test_ndtree.jl`), unreviewed and without
 CI. Start from it or from scratch; it was not checked against this text.
 
-### T31 — oneAPI and Metal extensions, allocation-free KA dense fallbacks (issues #112, #53)   `[ ]`
+### T31 — oneAPI and Metal extensions, allocation-free KA dense fallbacks (issues #112, #53)   `[~]`
 
 The remainder of T23, split off by owner decision when PR #113 delivered the
 AMDGPU extension and the per-backend local-memory cap alone (#112). Three
@@ -3328,6 +3328,58 @@ machine: a temporary environment that adds oneAPI and Metal and precompiles
 both extensions (no hardware needed to load them on Linux; Metal by review
 only). Mark both as untested in the Report; the `:ka` allocation budget and
 the `select_impl` order are tested on the KA CPU backend. Closes #112 and #53.
+
+### Report
+- Status: [~] — part (2), the Metal extension, only (PR #136). Parts (1) oneAPI and (3) the allocation-free
+  `:ka` fallbacks with `:auto` preferring `:ka` (#53, #112) are not done; the owner decides whether to split
+  the task (e.g. `T31a: Metal extension`) before #118 is closed.
+- What was built: `ext/SparseDirectSolverMetalExt.jl` (weak dependency `Metal`, compat `1.11`: the
+  offset-aware `MPSMatrix(buffer, desc, offset)` constructor and the `MPSMatrixDecompositionCholesky`
+  wrapper used by the extension): Float32 CSR upload (`to_backend`), `max_local_bytes(::MetalBackend) = 32768`,
+  backend hooks in `src/dense/capabilities.jl` (`_backend_schedule_options`, `_allow_batched_dense`,
+  `_allow_generic_dense`, `_serial_cholesky_stats`, `_host_reduce_cholesky_info`, `_dense_solve_front`,
+  `_solve_workgroup`, `_offset_potrf_status`/`_offset_potrf_plan`/`_offset_potrf_info!`), MPS Cholesky for
+  single-matrix regime-C fronts at least 64 wide (plans and the status buffer preallocated in
+  `allocate_numeric`, pivots checked after MPS by `ka_chol_check_info!`, #127 semantics), every Metal front in
+  the fused level solve, 128-item solve workgroups; Metal in `test/backends.jl`, docs, `bench/metal_*.jl`.
+  `_tri_decode` (`src/symbolic/schedule.jl`) uses an integer binary search (`_kernel_isqrt`) instead of
+  `Base.isqrt`, whose Julia 1.13 implementation goes through Float64 and does not compile for Metal, on
+  every backend.
+- Tests: Metal (M4 Max, Float32, implementer's run): full suite 23,399 pass / 0 fail / 1 broken (existing).
+  Owner's machine after the review fixes, `SDS_TEST_ONLY="test_helpers,test_numeric_cholesky_a,
+  test_numeric_cholesky_b,test_numeric_cholesky_c,test_solve,test_api"` (+ `test_aqua` on CPU), all four
+  element types: CPU 5,817 pass / 0 fail; CUDA (`SDS_TEST_CPU=0`, RTX 4080) 5,584 pass / 0 fail.
+  Full suite and AMDGPU: CI on the PR. oneAPI: not built.
+- Measurements (M4 Max, Metal.jl 1.11.1, Float32, warmed median, `lap2d_300`, n = 90,000): refactorization
+  142 → 62 ms (2.29×), solve 5.19 → 5.18 ms; 113 regime-C fronts, 18 at least 64 wide; MPS potrf 5–14×
+  faster than KA potrf at widths 128–256, crossover near 64; MPS trsm was correct but slower end to end
+  (not used). RTX 4080 Float64 context: SDS 32.9 / 3.48 ms, cuDSS 3.96 / 0.675 ms (not precision parity).
+- Deviations from PLAN.md / this task:
+  * `:auto` on Metal resolves `gemm`/`syrk` to `:generic` (MPS through `mul!` on views, allocating MPS
+    descriptors per call), not `:ka` as the task asks. The extension states it is faster; the comparison
+    with `:ka` is not recorded and has to be measured. POTRF/TRSM stay `:ka` (POTRF: MPS for wide fronts,
+    above).
+  * The MPS potrf route creates an `MPSCommandBuffer` wrapper per wide front per refactorization, about
+    2.1 MB of host allocation per refactorization on `lap2d_300` — an exception to "no allocation in the
+    numeric phase"; needs a reusable command-buffer encoding (follow-up).
+  * Float32 only: `ComplexF32` is not supported on Metal yet (`to_backend` raises `NotSupportedError`).
+  * LDLᵀ/LDLᴴ and LU on Metal run in regime C only (vendor factorization, no subtree budgets): their fused
+    kernels bind 32 buffers, Apple GPUs allow 31. Cholesky with default options uses
+    `regime_c_width = 32`, `regime_c_rows = 128` on Metal.
+  * Uniform batches on Metal: KA dense kernels only, and the Cholesky statistics/`info` reduction runs in
+    a serial kernel plus a host reduction (`_serial_cholesky_stats`, `_host_reduce_cholesky_info`).
+  * `test/test_numeric_cholesky_a.jl`: `NUMERIC_ABC_OPTS` gains `subtree_max_fronts = 32` on every backend.
+- Open issues / follow-ups: reusable MPS command-buffer encoding (allocation above); why the 256-item
+  `_cholesky_stats_kernel!` reduction needs the serial variant for Metal batches (kernel bug hidden by
+  CUDA/AMD warps, or a Metal compiler limit) — not yet diagnosed; confirm on CUDA that the `_tri_decode`
+  change does not slow regime A/B (`bench/`); `ComplexF32` on Metal; oneAPI and part (3) of this task.
+  Review fixes (PR #136): the MPS status output had been written into `N.aux` (clobbering the `max |aᵢⱼ|`
+  statistic); it now has its own `MPSMatrixDecompositionStatus` buffer. The test-helper round trip keeps
+  `ComplexF64` on CUDA/AMDGPU. The budget-class test in `test_numeric_cholesky_a.jl` expects the
+  rejection of an explicit budget above `max_local_bytes` (failed on AMDGPU once the test helpers passed
+  the backend's `max_local` to the analysis).
+- Suggested plan changes: split T31 into Metal (this PR), oneAPI, and the `:ka` allocation work; record
+  Metal's 31-buffer argument limit next to the 32 KiB local-memory cap in PLAN §2.7.
 
 ### External — MadNLPGPU integration (in the MadNLP repository)   `[ ]`
 
