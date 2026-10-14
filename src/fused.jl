@@ -1147,8 +1147,7 @@ end
                     lctl[SDS._ST_W] = front_ncols[v] % ITc
                     lctl[SDS._ST_LF] = front_ptr[v] % ITc
                     SDS._lt_reset!(lctl, super_ptr[v])
-                    lctl[SDS._LT_NTILE] = SDS._lt_cb_ntiles(Int(front_nrows[v]), Int(front_ncols[v]),
-                                                            Int(cb2[v]) - 1) % ITc
+                    lctl[SDS._LT_NTILE] = zero(ITc)   # CB: TILE roles (m > SYRK_IN) or _lt_cb_update!
                 end
                 @synchronize
                 SDS._lt_init_piv!(pivord, lctl, li, Val(WG))
@@ -1203,25 +1202,28 @@ end
                 @synchronize
                 SDS._lt_stage!(sh, factor, lctl, li, Val(64), Val(WG), false)
                 @synchronize
-                for tt in 1:lctl[SDS._LT_NTILE]
-                    for kc in 1:SDS._lt_cb_nchunks(lctl)
-                        SDS._lt_cb_load!(sh, factor, lctl, d, pivot_kind, tt, kc, li, Val(WG), hv)
-                        @synchronize
-                        SDS._lt_cb_acc!(sh, lctl, kc, li, Val(WG), hv)
-                        @synchronize
+                if tiles_base[v] > Int32(0)
+                    # the 2x2-aware TILE roles do the contribution block in parallel;
+                    # this workgroup finishes the panel and releases them
+                    SDS._lt_front_finish!(factor, stats, info, lctl, li, Val(WG))
+                    @synchronize
+                    Threads.atomic_fence()      # ALL threads: each wave drains its own stores (gfx9)
+                    @synchronize
+                    if li == 1
+                        Atomix.@atomic panel_done[v] += Int32(1)
                     end
-                    SDS._lt_cb_store!(sh, lctl, pcb, Int(cb2[v]) - 1, tt, li, Val(WG), hv)
-                end
-                coffbk = lctl[SDS._LT_NTILE] == 0 ? Int(cb2[v]) - 1 : -1
-                SDS._lt_cb_update!(factor, lctl, pcb, coffbk, d, pivot_kind, li, Val(WG), Val(false), hv)
-                SDS._lt_front_finish!(factor, stats, info, lctl, li, Val(WG))
-                @synchronize
-                Threads.atomic_fence()      # ALL threads: each wave drains its own stores (gfx9)
-                @synchronize
-                if li == 1
-                    Atomix.@atomic cb_done[v] += Int32(1)
-                    pvb = Int(snparent[v])
-                    pvb > 0 && (Atomix.@atomic arrived[pvb] += Int32(1))
+                else
+                    SDS._lt_cb_update!(factor, lctl, pcb, Int(cb2[v]) - 1, d, pivot_kind, li, Val(WG),
+                                       Val(false), hv)
+                    SDS._lt_front_finish!(factor, stats, info, lctl, li, Val(WG))
+                    @synchronize
+                    Threads.atomic_fence()      # ALL threads: each wave drains its own stores (gfx9)
+                    @synchronize
+                    if li == 1
+                        Atomix.@atomic cb_done[v] += Int32(1)
+                        pvb = Int(snparent[v])
+                        pvb > 0 && (Atomix.@atomic arrived[pvb] += Int32(1))
+                    end
                 end
             else begin
             SDS._front_load!(sh, st, factor, v, li, front_ptr, front_nrows, front_ncols, Val(64), Val(WG))
@@ -1349,7 +1351,11 @@ end
         elseif r == ROLE_TILE
             v = Int(ra[G])
             if li == 1
-                _spin_until_eq!(trsm_left, v, Int32(0), fscr, scap)
+                if BK                             # BK: the panel finishes the whole f x w panel
+                    _spin_until_eq!(panel_done, v, Int32(1), fscr, scap)
+                else
+                    _spin_until_eq!(trsm_left, v, Int32(0), fscr, scap)
+                end
             end
             @synchronize
             Threads.atomic_fence()
@@ -1366,7 +1372,7 @@ end
             kk0 = 0
             while kk0 < w                           # k in two halves: Ai/Aj share sh (2 x 1024)
                 kb = min(32, w - kk0)
-                if LDL                              # stage the block's pivots; fold into Ai only
+                if LDL && !BK                       # stage the block's pivots; fold into Ai only
                     if ok
                         g0 = Int(super_ptr[v]) - 1
                         for c in li:WG:kb
@@ -1380,9 +1386,29 @@ end
                         rr = q % TILE + 1
                         cc = q ÷ TILE + 1
                         row = i0 + rr
-                        sh[rr + (cc - 1) * TILE] = row <= m ?
-                            (LDL ? factor[p0 + (kk0 + cc - 1) * f + row] * sh[2048 + cc] :
-                                   factor[p0 + (kk0 + cc - 1) * f + row]) : zero(TT)
+                        if BK
+                            # W = L D with 1x1 and 2x2 pivot blocks: the 2x2 partner column
+                            # is read straight from the panel (it may be in the next k-block)
+                            g0b = Int(super_ptr[v]) - 1
+                            g = g0b + kk0 + cc
+                            lval = row <= m ? factor[p0 + (kk0 + cc - 1) * f + row] : zero(TT)
+                            kindb = pivot_kind[g]
+                            nn = length(pivot_kind)
+                            wv = if kindb == SDS.PIVOT_KIND_2X2_FIRST
+                                lval * TT(d[g]) +
+                                (row <= m ? factor[p0 + (kk0 + cc) * f + row] : zero(TT)) * TT(d[nn + g])
+                            elseif kindb == SDS.PIVOT_KIND_2X2_SECOND
+                                (row <= m ? factor[p0 + (kk0 + cc - 2) * f + row] : zero(TT)) * TT(d[nn + g - 1]) +
+                                lval * TT(d[g])
+                            else
+                                lval * TT(d[g])
+                            end
+                            sh[rr + (cc - 1) * TILE] = row <= m ? wv : zero(TT)
+                        else
+                            sh[rr + (cc - 1) * TILE] = row <= m ?
+                                (LDL ? factor[p0 + (kk0 + cc - 1) * f + row] * sh[2048 + cc] :
+                                       factor[p0 + (kk0 + cc - 1) * f + row]) : zero(TT)
+                        end
                         row2 = j0 + rr
                         sh[1024 + rr + (cc - 1) * TILE] =
                             row2 <= m ? factor[p0 + (kk0 + cc - 1) * f + row2] : zero(TT)
@@ -1826,6 +1852,75 @@ function _factor_panel_c_ldl_potrf!(N, S, fp, v, p, backend)
     return nothing
 end
 
+# host-wide fronts for in-front Bunch-Kaufman: the stock blocked path (ldlt_c.jl) over a
+# COMPACTED list of a segment's wide fronts, chunked by workspace at plan time -- one
+# panel_ldlt_kernel! launch per 32-column block covers every front of the chunk (one
+# workgroup each, the stock lazy Lb/Wb pivot steps), then the trailing + CB GEMMs per
+# front; the finish kernel scales L, and each m x m workspace CB is packed-added into the
+# fused private CB. The fronts are already assembled (czero prelaunch, scatter_A!, EA
+# roles of the mega launch); their pivot sequence is the stock one by construction.
+function _factor_wides_c_bk!(N, S, fp, wseg, prm, backend)
+    T = eltype(N.factor)
+    sc, L = S.schedule, S.layout
+    gi = SDS.select_impl(:gemm, N.factor, :auto)
+    tB = SDS._ldlt_herm(S, T) ? 'C' : 'T'
+    hv = _prm_herm(prm)
+    NB = SDS.LDLT_C_NB
+    panel! = SDS.panel_ldlt_kernel!(backend, SDS.LDLT_C_WORKGROUP)
+    finish! = SDS.finish_ldlt_kernel!(backend, SDS.LDLT_C_WORKGROUP)
+    _wt = get(ENV, "SDS_BK_TIMING", "") == "1"
+    _tp = _tg = _tf = 0.0
+    for ch in wseg.chunks
+        count = length(ch.nodes)
+        lw = view(N.work, 1:ch.len)
+        for b in 1:ch.nblocks
+            _t0 = _wt ? (KA.synchronize(backend); time()) : 0.0
+            panel!(N.factor, lw, N.d, N.piv, N.pivot_kind, N.psign, S.perm, N.aux, N.stats,
+                   wseg.wl, ch.qa, b, NB, S.super_ptr, S.front_ptr, 1, 1, S.front_nrows,
+                   S.front_ncols, S.cb_ptr, prm, Val(SDS.LDLT_C_WORKGROUP);
+                   ndrange = SDS.LDLT_C_WORKGROUP * count)
+            _wt && (KA.synchronize(backend); _tp += time() - _t0; _t0 = time())
+            base = 0
+            for v in ch.nodes
+                f, w = Int(sc.rows[v]), Int(sc.width[v])
+                m = f - w
+                cb = m > 0 && fp.cb2_h[v] > 0
+                if b <= cld(w, NB)
+                    p0 = Int(L.panel_ptr[v])
+                    P = reshape(view(N.factor, p0:(p0 + f * w - 1)), f, w)
+                    lo, wo, _ = SDS._ltc_offsets(f, m, NB, cb)
+                    Lb = reshape(view(lw, (base + lo + 1):(base + lo + f * (NB + 1))), f, NB + 1)
+                    Wb = reshape(view(lw, (base + wo + 1):(base + wo + f * (NB + 1))), f, NB + 1)
+                    k1 = b * NB + 1
+                    k1 <= w && SDS._gemm_impl!(gi, 'N', tB, -one(T), view(Lb, k1:f, :), view(Wb, k1:w, :),
+                                               one(T), view(P, k1:f, k1:w))
+                    cb && SDS._gemm_impl!(gi, 'N', tB, -one(T), view(Lb, (w + 1):f, :), view(Wb, (w + 1):f, :),
+                                          b == 1 ? zero(T) : one(T),
+                                          reshape(view(lw, (base + 1):(base + m * m)), m, m))
+                end
+                base += SDS.ldlt_c_work_len(f, w, cb)
+            end
+            _wt && (KA.synchronize(backend); _tg += time() - _t0)
+        end
+        _t1 = _wt ? time() : 0.0
+        finish!(N.factor, N.d, N.pivot_kind, N.info, wseg.wl, ch.qa, S.super_ptr, S.front_ptr,
+                1, 1, S.front_nrows, S.front_ncols, hv, Val(SDS.LDLT_C_WORKGROUP);
+                ndrange = SDS.LDLT_C_WORKGROUP * count)
+        base = 0
+        for v in ch.nodes
+            f, w = Int(sc.rows[v]), Int(sc.width[v])
+            m = f - w
+            cb = m > 0 && fp.cb2_h[v] > 0
+            cb && SDS.pack_add!(fp.pcb, fp.cb2_h[v], view(N.work, (base + 1):(base + m * m)), m)
+            base += SDS.ldlt_c_work_len(f, w, cb)
+        end
+        _wt && (KA.synchronize(backend); _tf += time() - _t1)
+    end
+    _wt && println("  wides: panel ", round(_tp; digits = 4), "s  gemm ", round(_tg; digits = 4),
+                   "s  finish+pack ", round(_tf; digits = 4), "s")
+    return nothing
+end
+
 # the host-wide front for LDL: blocked right-looking over 64-column panels, then one
 # D-scaled GEMM for the contribution block (the Cholesky path's trsm/herk shape)
 function _factor_panel_c_ldl!(N, S, fp, v, p, backend)
@@ -2037,12 +2132,13 @@ function build_fused_plan(s; ldl::Bool = false, bk::Bool = false,
         end
     end
     emit_split(v) = begin
-        bk && return nothing                     # BK: the PANEL workgroup factors the whole front
         m = rows_h[v] - width_h[v]
         m > SYRK_IN || return nothing
-        for ch in 1:cld(m, wgf)
-            push!(role, ROLE_TRSM); push!(ra, Int32(v)); push!(rb, Int32(ch)); push!(rc, Int32(0))
-            trsm_left[v] += 1
+        if !bk                                   # BK: no TRSM roles (the panel's pivot steps
+            for ch in 1:cld(m, wgf)              # already updated every row below w)
+                push!(role, ROLE_TRSM); push!(ra, Int32(v)); push!(rb, Int32(ch)); push!(rc, Int32(0))
+                trsm_left[v] += 1
+            end
         end
         if cbp[v] > 0
             # ntl, not T: this closure assigns in function scope, and T is the element type
@@ -2095,6 +2191,7 @@ function build_fused_plan(s; ldl::Bool = false, bk::Bool = false,
         return nothing
     end
 
+    wq_h = zeros(Int32, ns)                      # wide front -> its group_nodes index
     segments = NTuple{3, Any}[]                  # (base, count, wides-at-boundary)
     seg_base = 0
     for k in eachindex(plan.group_first)
@@ -2118,6 +2215,7 @@ function build_fused_plan(s; ldl::Bool = false, bk::Bool = false,
                     push!(role, ROLE_PANEL_C); push!(ra, Int32(v)); push!(rb, Int32(0)); push!(rc, Int32(0))
                 else
                     push!(gwides, v)
+                    wq_h[v] = Int32(q)           # group-node index: the BK blocked path addresses by it
                 end
             end
             for q in a:b
@@ -2137,9 +2235,40 @@ function build_fused_plan(s; ldl::Bool = false, bk::Bool = false,
         end
     end
     push!(segments, (seg_base, length(role) - seg_base, Int[]))
-    bk && !isempty(wides) &&
-        throw(SDS.NotSupportedError("fused plan: bk with fronts wider than 64 " *
-                                    "($(length(wides)) here) is not implemented yet"))
+
+    # bk: the wide fronts of each segment, compacted and chunked by workspace capacity
+    # (the panel kernel walks the COMPACTED list, so host offsets and kernel slices agree)
+    wsegs = Any[]
+    if bk
+        for (_, _, gw) in segments
+            if isempty(gw)
+                push!(wsegs, nothing)
+                continue
+            end
+            wl = _dvec(backend, Int32.(gw))
+            chunks = NamedTuple[]
+            i = 1
+            cap = length(s.numeric.work)
+            while i <= length(gw)
+                len = 0
+                j = i
+                while j <= length(gw)
+                    v = gw[j]
+                    l = SDS.ldlt_c_work_len(rows_h[v], width_h[v], cbp[v] > 0)
+                    j > i && len + l > cap && break
+                    len + l > cap &&
+                        throw(SDS.NotSupportedError("fused plan: bk wide front $v needs $l workspace entries, " *
+                                                    "the numeric storage has $cap"))
+                    len += l
+                    j += 1
+                end
+                nbl = maximum(cld(width_h[v], SDS.LDLT_C_NB) for v in gw[i:(j - 1)])
+                push!(chunks, (; qa = i, nodes = gw[i:(j - 1)], len, nblocks = nbl))
+                i = j
+            end
+            push!(wsegs, (; wl, chunks))
+        end
+    end
 
     cb2_h = zeros(Int64, ns)
     off = 1
@@ -2191,7 +2320,7 @@ function build_fused_plan(s; ldl::Bool = false, bk::Bool = false,
             # captured at plan build: a later setparam!("pivot_epsilon") changes the stock
             # path but not an already-built fused plan (rebuild the plan to change it)
             chol_eps = ldl ? 0.0 : Float64(SDS.resolved_pivot_epsilon(s.options, real(T))),
-            ldl_potrf = ldl && wides_potrf,
+            ldl_potrf = ldl && wides_potrf, wq_h, wsegs = bk ? wsegs : nothing,
             sptr_h = Array(S.super_ptr),
             ldlw = KA.zeros(backend, T,
                             ldl ? maximum(vcat([1], [max(rows_h[v] * 64,
@@ -2224,9 +2353,12 @@ function refact_fused!(s, nzval, fp)
     # the |a|max reduction the perturbation/fallback scan reads
     prm = fp.bk ? SDS._ldlt_device_params(S, eltype(N.factor), s.options) : nothing
     fp.bk && SDS.abs_max!(N.aux, nzval)
+    _bk_t = get(ENV, "SDS_BK_TIMING", "") == "1"
+    _tt0 = _bk_t ? (KA.synchronize(backend); time()) : 0.0
     for k in eachindex(plan.sub_first)
         launch_subtrees_sorted!(N, S, nzval, fp.ssub[k], plan.sub_local[k], backend, fp.ldl, fp.chol_eps, prm)
     end
+    _tt1 = _bk_t ? (KA.synchronize(backend); time()) : 0.0
     nodes = S.schedule.group_nodes
     fill!(fp.pcb, zero(eltype(fp.pcb)))
     isempty(fp.czero) ||
@@ -2237,7 +2369,11 @@ function refact_fused!(s, nzval, fp)
         a, b = plan.group_first[k], plan.group_last[k]
         SDS.scatter_A!(N, S, nzval, a, b - a + 1)
     end
-    for (base, count, gwides) in fp.segments
+    _tt2 = _bk_t ? (KA.synchronize(backend); time()) : 0.0
+    _tw = 0.0
+    _tm = 0.0
+    for (segi, (base, count, gwides)) in enumerate(fp.segments)
+        _tm0 = _bk_t ? time() : 0.0
         count > 0 &&
             fused_fact_kernel!(backend, fp.wgf)(N.factor, N.stack, fp.pcb, N.info, nzval, S.amap, S.amap_ptr,
                                              S.amap_src, fp.cb2, fp.wt, fp.role, fp.ra, fp.rb, fp.rc, fp.nchild,
@@ -2252,7 +2388,15 @@ function refact_fused!(s, nzval, fp)
                                              fp.bk ? N.aux : N.factor, prm,
                                              Val(fp.ldl), Val(fp.bk), Val(fp.wgf);
                                              ndrange = fp.wgf * count)
-        for v in gwides                              # host-wide fronts at the segment boundary
+        _bk_t && (KA.synchronize(backend); _tm += time() - _tm0)
+        _tws = _bk_t && !isempty(gwides) ? time() : 0.0
+        if fp.bk && !isempty(gwides)
+            _factor_wides_c_bk!(N, S, fp, fp.wsegs[segi], prm, backend)
+            for v in gwides
+                signal_kernel!(backend, 32)(fp.cbd, fp.arrived, S.snparent, v; ndrange = 32)
+            end
+        end
+        for v in (fp.bk ? Int[] : gwides)            # host-wide fronts at the segment boundary
             if fp.ldl && fp.ldl_potrf
                 _factor_panel_c_ldl_potrf!(N, S, fp, v, p, backend)
             elseif fp.ldl
@@ -2263,6 +2407,16 @@ function refact_fused!(s, nzval, fp)
             end
             signal_kernel!(backend, 32)(fp.cbd, fp.arrived, S.snparent, v; ndrange = 32)
         end
+        if _bk_t && !isempty(gwides)
+            KA.synchronize(backend); _tw += time() - _tws
+        end
+    end
+    if _bk_t
+        KA.synchronize(backend)
+        _tt3 = time()
+        println("BK timing: subtrees ", round(_tt1 - _tt0; digits = 4), "s  assembly ",
+                round(_tt2 - _tt1; digits = 4), "s  mega ", round(_tm; digits = 4),
+                "s  wides ", round(_tw; digits = 4), "s  total ", round(_tt3 - _tt0; digits = 4), "s")
     end
     SDS.assemble_schur!(N, S, nzval)
     # the stats kernel ALSO reduces the per-front info into info[ns + 1], which
