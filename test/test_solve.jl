@@ -206,3 +206,50 @@ end
         @test relres(A, x, b) <= tol(T)
     end
 end
+
+# The fused solve (`Fused.algo2_solve!`) on a PIVOTED LDLᵀ factor: every sweep kernel
+# (level-batched fwd1/bwd1, the chain walker, the dense wide path) reads its front inputs
+# and scatters its outputs through the within-front pivot order `piv`, and the D pass goes
+# through `diagonal_sweep!` (1x1 and 2x2 pivot blocks). The stock sweep solve on the same
+# stock Bunch-Kaufman factor is the oracle; without the `piv` handling an identity-order
+# solve is silently wrong, so the kkt fixture asserts real 2x2 pivots occurred. The
+# counter-sweep segment (fwd2/bwd2) spins on dependency counters (resident grid): GPU only.
+@testset "fused solve on a pivoted factor ($(backend_name(backend)), $T)" for backend in BACKENDS,
+                                                                              T in eltypes_among((Float64, Float32))
+    # the fused solve is GPU-targeted: its kernels keep workgroup-uniform front state in
+    # locals across @synchronize (no ctl @localmem), which the KA CPU barrier transform
+    # does not carry over, and the counter sweep needs a resident grid
+    backend isa CPU && continue
+    Random.seed!(666)
+    # kkt: the tiny Hessian scale makes 1x1 pivots unacceptable next to J (2x2 pivots);
+    # symindef(400, 0.5): one front wider than Fused.MW exercises the dense solve path
+    for (name, A, need2x2) in (("kkt_matrix(300,150,0;1e-4)", kkt_matrix(T, 300, 150, 0; hessian_scale = 1e-4), true),
+                               ("random_symindef(400,0.5)", random_symindef(T, 400, 0.5), false))
+        solver = DirectSolver(api_matrix(backend, tril(A), Int32), "S", 'L')
+        n = size(A, 1)
+        x = to_device(backend, zeros(T, n))
+        b0 = to_device(backend, zeros(T, n))
+        execute!("analysis", solver, x, b0; asynchronous = false)
+        execute!("factorization", solver, x, b0; asynchronous = false)
+        @test getparam(solver, "info") == 0
+        st = getparam(solver, "pivot_stats")
+        need2x2 && @test st.n2x2 > 0               # otherwise this testset is vacuous
+        @test st.nzero == 0 && st.nperturbed == 0  # a perturbed factor would poison the oracle
+        xref = rand(T, n) .- T(0.5)
+        b = to_device(backend, Matrix(Symmetric(A, :L)) * xref)
+        xo = to_device(backend, zeros(T, n))
+        execute!("solve", solver, xo, b; asynchronous = false)
+        @test norm(Array(xo) - xref) <= 100 * tol(T) * norm(xref)
+        inv11, inv_ptr, invert!, _ = SDS.Fused.build_inverse(solver)
+        invert!()
+        fz1 = SDS.Fused.build_fused(solver; kstart = 1, wcap = SDS.Fused.MW)
+        configs = Any[("level-batched", (Tuple{Any, Int}[], true))]
+        fz1 === nothing || push!(configs, ("chain", ([(fz1, 1024)], true)))
+        fz1 === nothing || backend isa CPU || push!(configs, ("counter sweep", ([(fz1, 64)], true)))
+        for (cname, fz) in configs
+            xf = to_device(backend, zeros(T, n))
+            SDS.Fused.algo2_solve!(xf, solver, b, inv11, inv_ptr, fz)
+            @test norm(Array(xf) - Array(xo)) <= 100 * tol(T) * norm(Array(xo))
+        end
+    end
+end
