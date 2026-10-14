@@ -129,11 +129,16 @@ function SDSSolver(
         # sub-threshold pivots when nothing in the fully-summed block passes; the stock
         # factor's wide multipliers reach 4.6e4 on the 78k, LARGER than the unpivoted
         # 3.9e4), so no sound certification criterion separates the two.
+        # the BK panel roles want a wider workgroup than the no-pivot path the tuning
+        # bundle was measured for: a pivoted front is factored by ONE workgroup over all
+        # its rows, where no-pivot spreads the rows below the block across TRSM/TILE roles
+        # (78k condensed, GV100: 0.0874s at 256 vs 0.0906 at 128 and 0.0902 at 512)
+        wgf_bk = max(t.workgroup, 256)
         if opt.sds_pivoting === :bk            # full BK: vendor-sytrf (or blocked) wides
-            fp = Fused.build_fused_plan(s; ldl, bk = true, wgf = t.workgroup, scap = t.spin_cap)
+            fp = Fused.build_fused_plan(s; ldl, bk = true, wgf = wgf_bk, scap = t.spin_cap)
         else                                   # :bk_hybrid: BK narrow, in-kernel no-pivot wides
             fp = Fused.build_fused_plan(s; ldl, bk = true, inkernel_wides = true,
-                                        merge_segments = true, wgf = t.workgroup, scap = t.spin_cap)
+                                        merge_segments = true, wgf = wgf_bk, scap = t.spin_cap)
         end
     else
         merged = t.wides === :merged
