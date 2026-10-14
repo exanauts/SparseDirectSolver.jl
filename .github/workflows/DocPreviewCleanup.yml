@@ -3,8 +3,8 @@ name: Doc Preview Cleanup
 on:
   pull_request:
     types: [closed]
-  # claude-pipeline.yml merges with github.token, whose PR close triggers nothing:
-  # it dispatches this workflow with the PR number instead
+  # by hand, for a PR whose close did not trigger the cleanup (e.g. one merged
+  # with github.token)
   workflow_dispatch:
     inputs:
       pr:

@@ -1,8 +1,8 @@
 name: Claude review
 
 # Reviews every task PR with Claude Fable 5.1 at effort "high". The review ends with a
-# `VERDICT:` line. On CHANGES_REQUESTED, Claude Opus 5.5 (effort "medium") addresses the
-# review on the same branch, at most 3 rounds, then the PR is labelled `needs-owner`.
+# `VERDICT:` line. On CHANGES_REQUESTED nothing is fixed automatically: the owner decides
+# how the findings are addressed (a push to the PR starts a new review).
 # See AGENTS.md, section "GitHub workflow".
 
 on:
@@ -27,7 +27,6 @@ env:
   PR: ${{ github.event.pull_request.number }}
   HEAD_SHA: ${{ github.event.pull_request.head.sha }}
   HEAD_REF: ${{ github.event.pull_request.head.ref }}
-  MAX_ROUNDS: 3
 
 jobs:
   review:
@@ -39,8 +38,6 @@ jobs:
        contains(github.event.pull_request.labels.*.name, 'claude:pr'))
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    outputs:
-      verdict: ${{ steps.verdict.outputs.verdict }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -66,7 +63,7 @@ jobs:
             The PR implements one task of TASKS.md (its id `TNN` is the title prefix). Read AGENTS.md,
             the task's section in TASKS.md on `main` (`git show origin/main:TASKS.md`), the PLAN.md
             sections it names, and the diff (`git diff origin/main...HEAD`, `gh pr diff ${{ env.PR }}`).
-            The implementer could only run the KA CPU backend; CUDA/AMDGPU run in CI on this PR.
+            CUDA/AMDGPU run in CI on this PR.
 
             Review for, in this order:
             1. Scope: exactly the task's deliverables, nothing from later tasks; PLAN.md untouched;
@@ -90,7 +87,7 @@ jobs:
             5. The Report block: every claim matches the diff; test counts are plausible; deviations
                and follow-ups are listed and follow-ups have issues.
             6. CI (`gh pr checks ${{ env.PR }}`): pending or failing checks are handled by the
-               pipeline and are not by themselves a reason to request changes, but a Report that
+               owner and are not by themselves a reason to request changes, but a Report that
                claims green tests which CI contradicts is.
 
             Output:
@@ -116,84 +113,3 @@ jobs:
           verdict=$(bash .github/scripts/pr-verdict.sh "$PR" "$HEAD_SHA")
           echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
           echo "Verdict for $HEAD_SHA: ${verdict:-none}"
-
-  fix:
-    needs: review
-    if: needs.review.outputs.verdict == 'CHANGES_REQUESTED'
-    runs-on: ubuntu-latest
-    # Shared with the pipeline's ci-fix job: never two agents pushing to one branch.
-    concurrency:
-      group: claude-fix-${{ github.event.pull_request.head.ref }}
-      cancel-in-progress: false
-    timeout-minutes: 240
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ env.HEAD_REF }}
-          fetch-depth: 0
-
-      - name: Count review rounds
-        id: rounds
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          n=$(bash .github/scripts/pr-verdict.sh "$PR" --count-changes-requested)
-          echo "Review rounds with CHANGES_REQUESTED so far: $n (max $MAX_ROUNDS)"
-          if [ "$n" -gt "$MAX_ROUNDS" ]; then
-            gh pr edit "$PR" --add-label needs-owner
-            gh pr comment "$PR" --body "The Claude reviewer requested changes $n times; the automatic fix loop stops here (max $MAX_ROUNDS). Labelled \`needs-owner\`."
-            echo "go=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "go=true" >> "$GITHUB_OUTPUT"
-            echo "round=$n" >> "$GITHUB_OUTPUT"
-          fi
-
-      - uses: julia-actions/setup-julia@latest
-        if: steps.rounds.outputs.go == 'true'
-        with:
-          version: '1'
-      - uses: julia-actions/cache@v2
-        if: steps.rounds.outputs.go == 'true'
-
-      - name: Instantiate the project and clone the reference repositories
-        if: steps.rounds.outputs.go == 'true'
-        run: |
-          set -euo pipefail
-          julia --project=. -e 'using Pkg; Pkg.instantiate(); Pkg.precompile()'
-          git clone --quiet --depth 1 https://github.com/exanauts/CUDSS.jl ../CUDSS.jl
-          git clone --quiet --depth 1 https://github.com/JuliaSmoothOptimizers/KrylovPreconditioners.jl ../KrylovPreconditioners.jl
-          git config user.name "claude[bot]"
-          git config user.email "claude[bot]@users.noreply.github.com"
-
-      - name: Address the review with Claude
-        if: steps.rounds.outputs.go == 'true'
-        uses: anthropics/claude-code-action@v1
-        env:
-          CLAUDE_CODE_EFFORT_LEVEL: medium
-        with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          allowed_bots: "claude[bot],github-actions[bot]"
-          claude_args: |
-            --model claude-opus-5-5
-            --effort medium
-            --allowedTools "Bash,Edit,MultiEdit,Write,Read,Glob,Grep,LS,WebFetch"
-          prompt: |
-            You are the implementing agent of exanauts/SparseDirectSolver.jl, running unattended in
-            GitHub Actions. Pull request #${{ env.PR }} (branch `${{ env.HEAD_REF }}`, checked out) received
-            `VERDICT: CHANGES_REQUESTED` from the Claude reviewer; this is fix round ${{ steps.rounds.outputs.round }} of ${{ env.MAX_ROUNDS }}.
-
-            Read AGENTS.md, then the review: `gh pr view ${{ env.PR }} --comments`,
-            `gh api repos/${{ github.repository }}/pulls/${{ env.PR }}/reviews`,
-            `gh api repos/${{ github.repository }}/pulls/${{ env.PR }}/comments` (inline threads).
-            Address every blocking finding for the current head (${{ env.HEAD_SHA }}) in code, tests or
-            the Report block of TASKS.md. Where a finding is wrong, leave the code and reply on that
-            thread (`gh api -X POST repos/${{ github.repository }}/pulls/${{ env.PR }}/comments/<id>/replies -f body=...`)
-            explaining why. Never weaken, skip or delete tests. Only the KA CPU backend exists here:
-            run `SDS_TEST_GPU=0 julia --project=. -e 'using Pkg; Pkg.test()'` until green.
-            Update the Report block if the changes affect it. Commit with the message
-            `<TNN>: address review round ${{ steps.rounds.outputs.round }}` (never commit Manifest.toml)
-            and `git push origin ${{ env.HEAD_REF }}`. No rebase, no force-push, no new PR.
-            Finish with one PR comment (`gh pr comment ${{ env.PR }} --body ...`) listing what changed
-            and which findings you rejected and why.

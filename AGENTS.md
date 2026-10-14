@@ -49,76 +49,54 @@ Three documents define the work. Read them in this order before touching code:
 * The repository is `github.com/exanauts/SparseDirectSolver.jl` (remote
   `origin`, branch `main`). Commit at the end of the task with a message
   starting with the task id, e.g. `T05: symbolic pattern, ordering, etree,
-  column counts`. Do not commit `Manifest.toml`. In a GitHub Actions session
-  push and open the PR as described under "GitHub workflow"; in a local
-  session do not push unless asked.
+  column counts`. Do not commit `Manifest.toml`. Do not push or open the PR
+  (as described under "GitHub workflow") unless asked.
 
 ## GitHub workflow
 
 Every task is tracked on GitHub and lands through a pull request that CI and a
-reviewing agent must pass. The moving parts:
+reviewing agent check; the owner merges by hand. The moving parts:
 
 * **Milestones** are `PLAN.md` §5 (`M0 — …` to `M13 — …`). **Issues**: one per
   task, title `TNN — <task title>` (`External — …` for the MadNLP task), label
   `task`, milestone set. The issue only points at `TASKS.md`; the task text
   there stays the single source of truth. Tasks are strictly sequential: the
   previous task's issue must be closed before the next one starts.
-* **Implementer** (`.github/workflows/claude-implement.yml`, Claude Opus 5.5,
-  effort medium) starts when a task issue gets the label `claude:implement`
-  (the owner, or the pipeline after the previous merge). It works on
-  `ubuntu-latest` with Julia and the KA CPU backend only; CUDA is verified
-  by CI on the PR. Branch `task/TNN-<slug>` from `main`; commits
-  `TNN: …`; PR titled `TNN: …`, labelled `claude:pr`, milestone set, body from
-  `.github/pull_request_template.md` with the exact line `Closes #<issue>`. The
-  Report block is filled in before the PR is opened ("CUDA: pending CI on
-  the PR" under Tests). If the task cannot be finished, the PR is opened as
-  a draft and the issue labelled `needs-owner`; never a silent stop.
+* **Task PRs**: branch `task/TNN-<slug>` from `main`; commits `TNN: …`; PR
+  titled `TNN: …`, labelled `claude:pr`, milestone set, body from
+  `.github/pull_request_template.md` with the exact line `Closes #<issue>`.
+  The Report block is filled in before the PR is opened. If the task cannot
+  be finished, the PR is opened as a draft with the state described in the
+  body and the Report; never a silent stop.
 * **Reviewer** (`.github/workflows/claude-review.yml`, Claude Fable 5.1, effort
   high) reviews every push on a `task/**` or `claude:pr` PR against the task
   text, this file and `PLAN.md`, posts inline comments and a verdict (a
   neutral review comment, so it never blocks a merge by itself) whose first
   line is `VERDICT: APPROVE (head <sha>)` or
-  `VERDICT: CHANGES_REQUESTED (head <sha>)`. On changes requested the
-  implementer (same workflow, job `fix`) addresses every finding on the same
-  branch, replies on threads it rejects, and pushes; at most 3 rounds, then the
-  PR is labelled `needs-owner`.
-* **Pipeline** (`.github/workflows/claude-pipeline.yml`) reacts to completed CI
-  and review runs. A red `Run tests`/`Aqua` run on a task PR triggers a CI-fix
-  round by the implementer (at most 3, comments `CI-FIX round k`). Green CI on
-  the current head plus `VERDICT: APPROVE` for that head squash-merges the PR
-  (which closes the issue) and starts the next task issue unless it is labelled
-  `on-hold` or `external`. The repository variable `CLAUDE_AUTOPILOT=false`
-  pauses merging and chaining. Only the status checks are required by the
-  branch rules; approval is the verdict line, since a bot cannot approve its
-  own PR.
+  `VERDICT: CHANGES_REQUESTED (head <sha>)`. On changes requested nothing is
+  fixed automatically: the owner decides how the findings are addressed, and
+  a push to the branch starts a new review.
+* **Merging** is done by the owner. No workflow implements a task, fixes
+  failing CI or review findings, merges a PR or starts the next task: the
+  owner squash-merges (which closes the issue) and starts the next task.
 * **Issues opened by agents**: anything found outside the task's scope (a bug
   in earlier code, a limit hit, a plan problem) becomes an issue with label
   `found-by-agent` using `.github/ISSUE_TEMPLATE/agent-finding.md`, cited in
   the Report. Do not fix it in the task's PR and do not edit `PLAN.md`; the
-  owner decides what becomes a task. **Such issues hold the chain**: after a
-  task PR merges, the pipeline starts the next task only when every open
-  `found-by-agent` issue carries the label `triaged` or is closed; otherwise it
-  comments on the next task issue and waits. Labelling the last untriaged issue
-  `triaged` (or closing it) resumes the chain (`claude-triage.yml`).
-* The owner re-evaluates `PLAN.md` and `TASKS.md` between tasks by pausing the
-  chain (`CLAUDE_AUTOPILOT=false` or `on-hold` on the next issue), editing on
-  `main`, and relabelling.
+  owner decides what becomes a task.
+* The owner re-evaluates `PLAN.md` and `TASKS.md` between tasks, editing on
+  `main`, before starting the next task.
 
 ## Environment
 
-### GitHub Actions (where the agents run)
+### GitHub Actions (where the reviewer runs)
 
-* `ubuntu-latest`, Julia `1` from `julia-actions/setup-julia`, the project
-  instantiated, `gh` authenticated as the Claude GitHub App. **CPU backend
-  only**: no GPU, CUDA.jl is not installed; GPU results come from the
-  self-hosted `cuda` runner through `ci.yml` on the PR, and from the `amdgpu`
-  leg of `ci.yml` on the self-hosted AMD runner (the AMDGPU extension, T23;
-  no longer continue-on-error, a required check once the owner adds it to
-  the branch ruleset).
-* Reference code is cloned next to the checkout, read-only: `../CUDSS.jl` and
-  `../KrylovPreconditioners.jl` (same relative paths as below). MadNLPGPU's
-  cuDSS integration is not checked out; when a task needs it, read it from the
-  `MadNLP/MadNLP.jl` repository on GitHub (`lib/MadNLPGPU`).
+* `ubuntu-latest`, `gh` authenticated as the Claude GitHub App, no Julia and
+  no GPU. GPU results come from the self-hosted `cuda` runner through
+  `ci.yml` on the PR, and from the `amdgpu` leg of `ci.yml` on the
+  self-hosted AMD runner (the AMDGPU extension, T23; no longer
+  continue-on-error, a required check once the owner adds it to the branch
+  ruleset).
 
 ### The owner's machine
 
@@ -261,7 +239,7 @@ name their types).
 ```text
 PLAN.md  TASKS.md  RESEARCH.md  AGENTS.md
 Project.toml  src/  ext/  test/  bench/  docs/
-.github/workflows/   ci.yml Aqua.yml (checks)  Documentation.yml DocPreviewCleanup.yml (docs)  claude-implement.yml claude-review.yml claude-pipeline.yml (agents)
+.github/workflows/   ci.yml Aqua.yml (checks)  Documentation.yml DocPreviewCleanup.yml (docs)  claude-review.yml (agent)
 .github/scripts/     pr-verdict.sh (reads the reviewer's verdict)
 .github/ISSUE_TEMPLATE/agent-finding.md  .github/pull_request_template.md
 ```
