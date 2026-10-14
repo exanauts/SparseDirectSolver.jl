@@ -823,7 +823,9 @@ const _SP_SEL = SDS._ST_CTL + 2     # DIAG: the chosen diagonal of the current c
 const _SP_CTL = _SP_SEL
 
 @inline function _subtree_ldl_update!(buf, ctl, pv, j, li, d, piv, pivot_kind, ::Val{WG},
-                                      ::Val{DIAG} = Val(false)) where {WG, DIAG}
+                                      ::Val{DIAG} = Val(false), psign = nothing, perm = nothing,
+                                      epsl = 0.0, nstab = nothing,
+                                      ::Val{STAB} = Val(false)) where {WG, DIAG, STAB}
     @inbounds begin
         T = eltype(buf)
         IT = eltype(ctl)
@@ -831,6 +833,15 @@ const _SP_CTL = _SP_SEL
         lf = ctl[SDS._ST_LF] - 1
         if ctl[SDS._ST_STATUS] == 0
             dk = real(buf[lf + SDS._packed(j, j, f)])
+            if STAB && isfinite(dk) && abs(dk) < epsl
+                g = Int(ctl[_SP_C0]) + j - 1
+                sgn = SDS._perturbation_sign(dk, Int(psign[perm[piv[g]]]), true)
+                dk = sgn * epsl
+                if li == 1
+                    buf[lf + SDS._packed(j, j, f)] = dk
+                    Atomix.@atomic nstab[1] += Int32(1)
+                end
+            end
             if isfinite(dk) && !iszero(dk)   # NaN/Inf must fail like potrf, not "factor"
                 if li == 1
                     g = Int(ctl[_SP_C0]) + j - 1
@@ -937,7 +948,8 @@ end
                                      @Const(front_nrows), @Const(front_ncols), @Const(cb_ptr),
                                      @Const(local_front), @Const(local_cb), @Const(child_ptr),
                                      @Const(child_list), @Const(relind_ptr), @Const(relind),
-                                     ::Val{NE}, ::Val{DIAG}, ::Val{WG}) where {NE, DIAG, WG}
+                                     psign, @Const(perm), epsl, nstab,
+                                     ::Val{NE}, ::Val{DIAG}, ::Val{STAB}, ::Val{WG}) where {NE, DIAG, STAB, WG}
     @uniform TT = eltype(factor)
     @uniform IT = eltype(subtree_nodes)
     li = @index(Local, Linear)
@@ -979,7 +991,7 @@ end
             _subtree_ldl_update!(buf, ctl, pv, j, li, SDS._mview(d, SDS._bm_gmember(bm, G), bm.nbatch),
                                  SDS._mview(piv, SDS._bm_gmember(bm, G), bm.nbatch),
                                  SDS._mview(pivot_kind, SDS._bm_gmember(bm, G), bm.nbatch), Val(WG),
-                                 Val(DIAG))
+                                 Val(DIAG), psign, perm, epsl, nstab, Val(STAB))
             @synchronize
             _subtree_ldl_scale!(buf, ctl, pv, j, li, Val(WG))
             @synchronize
@@ -995,11 +1007,26 @@ end
     end
 end
 
-@inline function _front_ldl_update!(sh, st, pv, j, v, li, front_ncols, d, g0, ::Val{WG}) where {WG}
+@inline function _front_ldl_update!(sh, st, pv, j, v, li, front_ncols, d, g0, ::Val{WG},
+                                   pivord = nothing, psign = nothing, perm = nothing, epsl = 0.0,
+                                   nstab = nothing, ::Val{STAB} = Val(false)) where {WG, STAB}
     @inbounds begin
         w = Int(front_ncols[v])
         if j <= w && st[1] == Int32(0)
             dk = real(sh[SDS._packed(j, j, 64)])
+            if STAB && isfinite(dk) && abs(dk) < epsl
+                # lazy stabilization: a pivot below pivot_epsilon is bumped to +/-epsilon
+                # with the declared sign instead of failing the front. Every work item
+                # derives the SAME value, so the diagonal write below needs no barrier (a
+                # later reader either sees the old value and re-derives it, or the new one,
+                # which is already at the epsilon and so not perturbed twice).
+                sgn = SDS._perturbation_sign(dk, Int(psign[perm[pivord[g0 + j]]]), true)
+                dk = sgn * epsl
+                if li == 1
+                    sh[SDS._packed(j, j, 64)] = dk
+                    Atomix.@atomic nstab[1] += Int32(1)
+                end
+            end
             if isfinite(dk) && !iszero(dk)   # NaN/Inf must fail like potrf, not "factor"
                 if li == 1
                     d[g0 + j] = dk
@@ -1176,8 +1203,9 @@ end
                                     @Const(front_ncols), @Const(cb_ptr), @Const(child_ptr),
                                     @Const(child_list), @Const(relind_ptr), @Const(relind), base,
                                     @Const(wbase), wupd, wpdone2, wtrsml, wcbl, scap, eac, epsc, d, @Const(super_ptr),
-                                    stats, pivord, pivot_kind, psign, @Const(perm), aux, prm,
-                                    ::Val{LDL}, ::Val{BK}, ::Val{DIAG}, ::Val{WG}) where {LDL, BK, DIAG, WG}
+                                    stats, pivord, pivot_kind, psign, @Const(perm), aux, prm, epsl, nstab,
+                                    ::Val{LDL}, ::Val{BK}, ::Val{DIAG}, ::Val{STAB},
+                                    ::Val{WG}) where {LDL, BK, DIAG, STAB, WG}
     @uniform TT = eltype(factor)
     @uniform RT = real(eltype(factor))
     @uniform ITc = eltype(front_ptr)
@@ -1396,7 +1424,8 @@ end
                     @synchronize
                 end
                 if LDL
-                    _front_ldl_update!(sh, st, piv, j, v, li, front_ncols, d, g0, Val(WG))
+                    _front_ldl_update!(sh, st, piv, j, v, li, front_ncols, d, g0, Val(WG),
+                                       pivord, psign, perm, epsl, nstab, Val(STAB))
                 else
                     SDS._front_chol_update!(sh, st, piv, j, v, li, front_ncols, epsc, Val(64), Val(WG))
                 end
@@ -2358,13 +2387,22 @@ end
 
 # subtree launcher with a custom (sorted) list, local memory sized by eltype
 function launch_subtrees_sorted!(N, S, nzval, list, lb, backend, ldl::Bool = false, epsc::Real = 0.0,
-                                 prm = nothing, diag::Bool = false)
+                                 prm = nothing, diag::Bool = false, epsl::Real = 0.0, nstab = nothing)
     SDS._with_local_bytes(Int(lb)) do LBv
         if prm === nothing
-            diag ? _sorted_subtree_launch(N, S, nzval, list, Val(ldl), LBv, Val(SDS.SUBTREE_WORKGROUP),
-                                          backend, epsc, Val(true)) :
-                   _sorted_subtree_launch(N, S, nzval, list, Val(ldl), LBv, Val(SDS.SUBTREE_WORKGROUP),
-                                          backend, epsc, Val(false))
+            # explicit branches: Val from a runtime flag would be a dynamic dispatch
+            stab = epsl > 0
+            diag && stab ?
+                _sorted_subtree_launch(N, S, nzval, list, Val(ldl), LBv, Val(SDS.SUBTREE_WORKGROUP),
+                                       backend, epsc, Val(true), epsl, nstab, Val(true)) :
+            diag ?
+                _sorted_subtree_launch(N, S, nzval, list, Val(ldl), LBv, Val(SDS.SUBTREE_WORKGROUP),
+                                       backend, epsc, Val(true), epsl, nstab, Val(false)) :
+            stab ?
+                _sorted_subtree_launch(N, S, nzval, list, Val(ldl), LBv, Val(SDS.SUBTREE_WORKGROUP),
+                                       backend, epsc, Val(false), epsl, nstab, Val(true)) :
+                _sorted_subtree_launch(N, S, nzval, list, Val(ldl), LBv, Val(SDS.SUBTREE_WORKGROUP),
+                                       backend, epsc, Val(false), epsl, nstab, Val(false))
         else
             # in-front Bunch-Kaufman: the stock pivoted subtree kernel on the sorted list
             _sorted_subtree_launch_bk(N, S, nzval, list, prm, LBv, Val(SDS.SUBTREE_WORKGROUP), backend)
@@ -2384,7 +2422,8 @@ function _sorted_subtree_launch_bk(N::SDS.Numeric{T}, S, nzval, list, prm, ::Val
     return nothing
 end
 function _sorted_subtree_launch(N::SDS.Numeric{T}, S, nzval, list, ::Val{LDL}, ::Val{LB}, ::Val{WG},
-                                backend, epsc::Real = 0.0, ::Val{DIAG} = Val(false)) where {T, LDL, LB, WG, DIAG}
+                                backend, epsc::Real = 0.0, ::Val{DIAG} = Val(false), epsl::Real = 0.0,
+                                nstab = nothing, ::Val{STAB} = Val(false)) where {T, LDL, LB, WG, DIAG, STAB}
     bm = SDS.batch_map(N; first = 1)
     if LDL
         # the schedule sized the "S" budget classes with the LDLT reserve: match it
@@ -2392,7 +2431,8 @@ function _sorted_subtree_launch(N::SDS.Numeric{T}, S, nzval, list, ::Val{LDL}, :
         k!(N.factor, N.stack, N.info, N.d, N.piv, N.pivot_kind, nzval, S.amap, S.amap_ptr, S.amap_src,
            list, bm, S.subtree_ptr, S.subtree_nodes, S.super_ptr, S.front_ptr, S.front_nrows, S.front_ncols,
            S.cb_ptr, S.local_front, S.local_cb, S.child_ptr, S.child_list, S.relind_ptr, S.relind,
-           Val((LB - SDS.SUBTREE_LOCAL_RESERVE_LDLT) ÷ sizeof(T)), Val(DIAG), Val(WG);
+           N.psign, S.perm, real(T)(epsl), nstab === nothing ? N.info : nstab,
+           Val((LB - SDS.SUBTREE_LOCAL_RESERVE_LDLT) ÷ sizeof(T)), Val(DIAG), Val(STAB), Val(WG);
            ndrange = WG * length(list) * bm.nact)
     else
         k! = SDS.subtree_cholesky_kernel!(backend, WG)
@@ -2407,6 +2447,7 @@ end
 # ---------------------------------------------------------------------------
 # host: the topologically ordered role list + counter bases + stream-2 program
 function build_fused_plan(s; ldl::Bool = false, bk::Bool = false, diag::Bool = false,
+                          stabilize::Bool = false,
                           wides_sytrf::Union{Nothing, Bool} = nothing,
                           inkernel_wides::Union{Nothing, Bool} = nothing,
                           wides_potrf::Bool = false, merge_segments::Bool = false,
@@ -2699,6 +2740,14 @@ function build_fused_plan(s; ldl::Bool = false, bk::Bool = false, diag::Bool = f
             wtl = KA.zeros(backend, Int32, max(nwslots, 1)), wpd = KA.zeros(backend, Int32, max(nwslots, 1)),
             wcb = KA.zeros(backend, Int32, ns), wgf, scap = Int32(scap), eac = Int32(ea_chunk), ldl, bk,
             diag,
+            # lazy stabilization of the 1x1 paths (:none and :diag): a pivot below
+            # pivot_epsilon takes +/-epsilon with the pivot_sign policy instead of failing
+            # the front, which is what the BK path's _lt_select! has always done. nstab
+            # counts the perturbations so a run cannot be reported as "stabilized" when
+            # nothing fired.
+            stab_eps = (stabilize && ldl && !bk) ?
+                       Float64(SDS.resolved_pivot_epsilon(s.options, real(T))) : 0.0,
+            nstab = KA.zeros(backend, Int32, 1),
             # captured at plan build: a later setparam!("pivot_epsilon") changes the stock
             # path but not an already-built fused plan (rebuild the plan to change it)
             chol_eps = ldl ? 0.0 : Float64(SDS.resolved_pivot_epsilon(s.options, real(T))),
@@ -2716,6 +2765,14 @@ function build_fused_plan(s; ldl::Bool = false, bk::Bool = false, diag::Bool = f
                                                          (rows_h[v] - width_h[v]) * width_h[v])
                                                 for v in wides])) : 1))
 end
+
+"""
+    nperturbed(fp) -> Int
+
+Pivots the last `refact_fused!` perturbed under lazy stabilization (`stabilize = true`).
+Zero means the policy never fired, so a run is not distinguishable from an unstabilized one.
+"""
+nperturbed(fp) = fp.stab_eps > 0 ? Int(Array(fp.nstab)[1]) : 0
 
 function refact_fused!(s, nzval, fp)
     N, S = s.numeric, s.symbolic
@@ -2746,11 +2803,12 @@ function refact_fused!(s, nzval, fp)
     # their columns, and unpivoted wide fronts keep consistent state for the solve
     (fp.bk || fp.diag) &&
         _bk_identity_piv_kernel!(backend, 256)(N.piv, N.pivot_kind, 0, S.n; ndrange = 256)
+    fp.stab_eps > 0 && fill!(fp.nstab, Int32(0))
     _bk_t = get(ENV, "SDS_BK_TIMING", "") == "1"
     _tt0 = _bk_t ? (KA.synchronize(backend); time()) : 0.0
     for k in eachindex(plan.sub_first)
         launch_subtrees_sorted!(N, S, nzval, fp.ssub[k], plan.sub_local[k], backend, fp.ldl,
-                                fp.chol_eps, prm, fp.diag)
+                                fp.chol_eps, prm, fp.diag, fp.stab_eps, fp.nstab)
     end
     _tt1 = _bk_t ? (KA.synchronize(backend); time()) : 0.0
     nodes = S.schedule.group_nodes
@@ -2777,11 +2835,14 @@ function refact_fused!(s, nzval, fp)
                                              Int32(base), fp.wbase, fp.wupd, fp.wpd, fp.wtl, fp.wcb,
                                              fp.scap, fp.eac, real(eltype(N.factor))(fp.chol_eps), N.d,
                                              S.super_ptr, N.stats,
-                                             (fp.bk || fp.diag) ? N.piv : N.info,
+                                             (fp.bk || fp.diag || fp.stab_eps > 0) ? N.piv : N.info,
                                              fp.bk ? N.pivot_kind : N.info,
-                                             fp.bk ? N.psign : N.info, fp.bk ? S.perm : N.info,
+                                             (fp.bk || fp.stab_eps > 0) ? N.psign : N.info,
+                                             (fp.bk || fp.stab_eps > 0) ? S.perm : N.info,
                                              fp.bk ? N.aux : N.factor, prm,
-                                             Val(fp.ldl), Val(fp.bk), Val(fp.diag), Val(fp.wgf);
+                                             real(eltype(N.factor))(fp.stab_eps), fp.nstab,
+                                             Val(fp.ldl), Val(fp.bk), Val(fp.diag),
+                                             Val(fp.stab_eps > 0), Val(fp.wgf);
                                              ndrange = fp.wgf * count)
         _bk_t && (KA.synchronize(backend); _tm += time() - _tm0)
         _tws = _bk_t && !isempty(gwides) ? time() : 0.0
