@@ -75,6 +75,7 @@ mutable struct SDSSolver{T} <: MadNLP.AbstractLinearSolver{T}
     b::Any
     nzval::Any
     fp::Any                                    # fused factorization plan
+    fp_slow::Any                               # :bk fallback plan (real pivoting on the wides)
     fz::Any                                    # fused solve segments
     inv11::Any
     inv_ptr::Any
@@ -121,12 +122,19 @@ function SDSSolver(
     SDS.execute!("factorization", s, x, b; asynchronous = false)
     SDS.execute!("solve", s, x, b; asynchronous = false)   # allocates the solve workspace
     nzval = SDS._factor_values(s)
+    fp_slow = nothing
     if bk
-        # fused BK: no in-kernel/merged wides; :bk runs vendor-sytrf (or blocked) wide
-        # fronts, :bk_hybrid the potrf-derived path
-        fp = Fused.build_fused_plan(s; ldl, bk = true,
-                                    wides_potrf = opt.sds_pivoting === :bk_hybrid,
-                                    wgf = t.workgroup, scap = t.spin_cap)
+        # NOTE an optimistic fast-path-with-certified-retry was measured and rejected:
+        # in-front BK cannot honor |l| <= 1/u on wide fronts either (the fallback accepts
+        # sub-threshold pivots when nothing in the fully-summed block passes; the stock
+        # factor's wide multipliers reach 4.6e4 on the 78k, LARGER than the unpivoted
+        # 3.9e4), so no sound certification criterion separates the two.
+        if opt.sds_pivoting === :bk            # full BK: vendor-sytrf (or blocked) wides
+            fp = Fused.build_fused_plan(s; ldl, bk = true, wgf = t.workgroup, scap = t.spin_cap)
+        else                                   # :bk_hybrid: BK narrow, in-kernel no-pivot wides
+            fp = Fused.build_fused_plan(s; ldl, bk = true, inkernel_wides = true,
+                                        merge_segments = true, wgf = t.workgroup, scap = t.spin_cap)
+        end
     else
         merged = t.wides === :merged
         # LDL wide fronts run the verbatim Cholesky vendor path (wides_potrf): valid while a
@@ -139,7 +147,7 @@ function SDSSolver(
     fz1 = Fused.build_fused(s; kstart = 1, wcap = 256)
     fz1 === nothing && throw(SDS.NotSupportedError("fused solve: no plan entry with fronts of width <= 256"))
     fz = ([(fz1, 64)], true)
-    M = SDSSolver{T}(s, csc, x, b, nzval, fp, fz, inv11, inv_ptr, invertf, 0, opt, logger)
+    M = SDSSolver{T}(s, csc, x, b, nzval, fp, fp_slow, fz, inv11, inv_ptr, invertf, 0, opt, logger)
     MadNLP.factorize!(M)                       # prime the factorization path once
     return M
 end
