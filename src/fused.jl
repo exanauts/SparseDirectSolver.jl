@@ -819,9 +819,11 @@ const NL64 = 2080                 # packed 64x64 lower triangle
 # no separate finalize/CB pass exists, and d/piv/pivot_kind are filled as the stock LDL
 # path (identity pivot order; a zero pivot sets the front status, as Cholesky).
 const _SP_C0 = SDS._ST_CTL + 1
-const _SP_CTL = _SP_C0
+const _SP_SEL = SDS._ST_CTL + 2     # DIAG: the chosen diagonal of the current column
+const _SP_CTL = _SP_SEL
 
-@inline function _subtree_ldl_update!(buf, ctl, pv, j, li, d, piv, pivot_kind, ::Val{WG}) where {WG}
+@inline function _subtree_ldl_update!(buf, ctl, pv, j, li, d, piv, pivot_kind, ::Val{WG},
+                                      ::Val{DIAG} = Val(false)) where {WG, DIAG}
     @inbounds begin
         T = eltype(buf)
         IT = eltype(ctl)
@@ -833,7 +835,9 @@ const _SP_CTL = _SP_C0
                 if li == 1
                     g = Int(ctl[_SP_C0]) + j - 1
                     d[g] = dk
-                    piv[g] = Int32(g)
+                    # DIAG maintains the pivot order itself (identity init + the
+                    # interchanges); writing the identity here would erase it
+                    DIAG || (piv[g] = Int32(g))
                     pivot_kind[g] = SDS.PIVOT_KIND_1X1
                     pv[1] = dk
                 end
@@ -869,13 +873,71 @@ end
     return nothing
 end
 
+# DIAG for the packed regime-A front: the same largest-remaining-diagonal rule as the panel
+# roles. The packed front holds the contribution block too, so the interchange is the full
+# symmetric one over 1:f (real element types only, as the fused LDL mode).
+@inline function _subtree_diag_pick!(buf, ctl, j, li)
+    @inbounds if li == 1 && ctl[SDS._ST_STATUS] == 0
+        f = ctl[SDS._ST_F]
+        lf = ctl[SDS._ST_LF] - 1
+        w = Int(ctl[SDS._ST_W])
+        best = j
+        bv = abs(real(buf[lf + SDS._packed(j, j, f)]))
+        for c in (j + 1):w
+            a = abs(real(buf[lf + SDS._packed(c, c, f)]))
+            if a > bv
+                bv = a
+                best = c
+            end
+        end
+        ctl[_SP_SEL] = best % eltype(ctl)
+    end
+    return nothing
+end
+
+@inline function _subtree_diag_swap!(buf, ctl, pivord, j, li, ::Val{WG}) where {WG}
+    @inbounds begin
+        q = Int(ctl[_SP_SEL])
+        if q != j && ctl[SDS._ST_STATUS] == 0
+            f = ctl[SDS._ST_F]
+            lf = ctl[SDS._ST_LF] - 1
+            for i in li:WG:Int(f)
+                if i < j
+                    x = buf[lf + SDS._packed(j, i, f)]
+                    buf[lf + SDS._packed(j, i, f)] = buf[lf + SDS._packed(q, i, f)]
+                    buf[lf + SDS._packed(q, i, f)] = x
+                elseif i == j
+                    x = buf[lf + SDS._packed(j, j, f)]
+                    buf[lf + SDS._packed(j, j, f)] = buf[lf + SDS._packed(q, q, f)]
+                    buf[lf + SDS._packed(q, q, f)] = x
+                elseif i < q
+                    x = buf[lf + SDS._packed(i, j, f)]
+                    buf[lf + SDS._packed(i, j, f)] = buf[lf + SDS._packed(q, i, f)]
+                    buf[lf + SDS._packed(q, i, f)] = x
+                elseif i > q
+                    x = buf[lf + SDS._packed(i, j, f)]
+                    buf[lf + SDS._packed(i, j, f)] = buf[lf + SDS._packed(i, q, f)]
+                    buf[lf + SDS._packed(i, q, f)] = x
+                end
+            end
+            if li == 1
+                g0 = Int(ctl[_SP_C0]) - 1
+                x = pivord[g0 + j]
+                pivord[g0 + j] = pivord[g0 + q]
+                pivord[g0 + q] = x
+            end
+        end
+    end
+    return nothing
+end
+
 @kernel function subtree_ldl_kernel!(factor, stack, info, d, piv, pivot_kind, @Const(nzval), @Const(amap),
                                      @Const(amap_ptr), @Const(amap_src), @Const(trees), bm, @Const(subtree_ptr),
                                      @Const(subtree_nodes), @Const(super_ptr), @Const(front_ptr),
                                      @Const(front_nrows), @Const(front_ncols), @Const(cb_ptr),
                                      @Const(local_front), @Const(local_cb), @Const(child_ptr),
                                      @Const(child_list), @Const(relind_ptr), @Const(relind),
-                                     ::Val{NE}, ::Val{WG}) where {NE, WG}
+                                     ::Val{NE}, ::Val{DIAG}, ::Val{WG}) where {NE, DIAG, WG}
     @uniform TT = eltype(factor)
     @uniform IT = eltype(subtree_nodes)
     li = @index(Local, Linear)
@@ -907,9 +969,17 @@ end
             @synchronize
         end
         for j in 1:ctl[SDS._ST_W]
+            if DIAG
+                _subtree_diag_pick!(buf, ctl, j, li)
+                @synchronize
+                _subtree_diag_swap!(buf, ctl, SDS._mview(piv, SDS._bm_gmember(bm, G), bm.nbatch), j, li,
+                                    Val(WG))
+                @synchronize
+            end
             _subtree_ldl_update!(buf, ctl, pv, j, li, SDS._mview(d, SDS._bm_gmember(bm, G), bm.nbatch),
                                  SDS._mview(piv, SDS._bm_gmember(bm, G), bm.nbatch),
-                                 SDS._mview(pivot_kind, SDS._bm_gmember(bm, G), bm.nbatch), Val(WG))
+                                 SDS._mview(pivot_kind, SDS._bm_gmember(bm, G), bm.nbatch), Val(WG),
+                                 Val(DIAG))
             @synchronize
             _subtree_ldl_scale!(buf, ctl, pv, j, li, Val(WG))
             @synchronize
@@ -989,6 +1059,88 @@ end
     return nothing
 end
 
+# ---------------------------------------------------------------------------
+# simpler partial in-front pivoting (DIAG): at each column take the largest remaining
+# diagonal of the fully-summed block and permute it in symmetrically. Only 1x1 pivots, so
+# the factor has the SAME SHAPE as the no-pivot one plus a within-front permutation: the
+# whole no-pivot trailing machinery (TRSM and TILE roles, in-kernel wides) applies
+# verbatim, and -- unlike Bunch-Kaufman -- the selection needs nothing from the rows below
+# the block, so those rows are never read during the column loop. Per front that is O(f w)
+# of interchange traffic against BK's O(f w^2) of per-step updates.
+#
+# The acceptance rule is "largest |diagonal|", NOT BK's threshold test against the column
+# (which would need the below-block maxima and so the per-step update): it fixes the
+# failure KKT systems actually hit -- a zero or tiny diagonal where a later column has a
+# good one -- and it keeps no-pivot's failure contract, a front whose remaining diagonals
+# are all zero sets info and MadNLP regularizes.
+@inline function _front_diag_pick!(sh, dsel, st, j, v, li, front_ncols)
+    @inbounds if li == 1
+        w = Int(front_ncols[v])
+        if j <= w && st[1] == Int32(0)
+            best = j
+            bv = abs(real(sh[SDS._packed(j, j, 64)]))
+            for c in (j + 1):w
+                a = abs(real(sh[SDS._packed(c, c, 64)]))
+                if a > bv
+                    bv = a
+                    best = c
+                end
+            end
+            dsel[1] = Int32(best)
+        else
+            dsel[1] = Int32(j)
+        end
+    end
+    return nothing
+end
+
+# symmetric interchange of j and dsel inside the packed F11, plus the column swap in the
+# panel rows below the block (those rows are not permuted, only their two columns), and
+# the pivot order itself. Real element types only, as the fused LDL mode.
+@inline function _front_diag_swap!(sh, factor, pivord, dsel, j, v, li, front_ptr, front_nrows,
+                                   front_ncols, g0, ::Val{WG}) where {WG}
+    @inbounds begin
+        q = Int(dsel[1])
+        if q != j
+            w = Int(front_ncols[v])
+            f = Int(front_nrows[v])
+            p0 = Int(front_ptr[v])
+            for i in li:WG:w
+                if i < j
+                    x = sh[SDS._packed(j, i, 64)]
+                    sh[SDS._packed(j, i, 64)] = sh[SDS._packed(q, i, 64)]
+                    sh[SDS._packed(q, i, 64)] = x
+                elseif i == j
+                    x = sh[SDS._packed(j, j, 64)]
+                    sh[SDS._packed(j, j, 64)] = sh[SDS._packed(q, q, 64)]
+                    sh[SDS._packed(q, q, 64)] = x
+                elseif i < q
+                    x = sh[SDS._packed(i, j, 64)]
+                    sh[SDS._packed(i, j, 64)] = sh[SDS._packed(q, i, 64)]
+                    sh[SDS._packed(q, i, 64)] = x
+                elseif i > q
+                    x = sh[SDS._packed(i, j, 64)]
+                    sh[SDS._packed(i, j, 64)] = sh[SDS._packed(i, q, 64)]
+                    sh[SDS._packed(i, q, 64)] = x
+                end
+            end
+            for i in (w + li):WG:f
+                a = p0 + (j - 1) * f + i - 1
+                b = p0 + (q - 1) * f + i - 1
+                x = factor[a]
+                factor[a] = factor[b]
+                factor[b] = x
+            end
+            if li == 1
+                x = pivord[g0 + j]
+                pivord[g0 + j] = pivord[g0 + q]
+                pivord[g0 + q] = x
+            end
+        end
+    end
+    return nothing
+end
+
 const ROLE_PANEL_B = Int8(1)
 const ROLE_PANEL_C = Int8(2)
 const ROLE_TRSM = Int8(3)
@@ -1025,7 +1177,7 @@ end
                                     @Const(child_list), @Const(relind_ptr), @Const(relind), base,
                                     @Const(wbase), wupd, wpdone2, wtrsml, wcbl, scap, eac, epsc, d, @Const(super_ptr),
                                     stats, pivord, pivot_kind, psign, @Const(perm), aux, prm,
-                                    ::Val{LDL}, ::Val{BK}, ::Val{WG}) where {LDL, BK, WG}
+                                    ::Val{LDL}, ::Val{BK}, ::Val{DIAG}, ::Val{WG}) where {LDL, BK, DIAG, WG}
     @uniform TT = eltype(factor)
     @uniform RT = real(eltype(factor))
     @uniform ITc = eltype(front_ptr)
@@ -1039,6 +1191,7 @@ end
     pv2 = @localmem TT (BK ? Int(SDS._LT_NPV) : 1,)
     red = @localmem RT (BK ? 3 * WG : 1,)
     redi = @localmem ITc (BK ? 2 * WG : 1,)
+    dsel = @localmem Int32 (DIAG ? 1 : 1,)        # DIAG: the chosen diagonal of this column
     fscr = @localmem Int32 (1,)   # spin-backoff scratch (integer: no Float64 in kernels)
     @inbounds begin
         r = role[G]
@@ -1198,8 +1351,8 @@ end
                         SDS._lt_swap!(SDS._lt_fa(sh, factor, Val(64)), lctl, pv2, pivord, li, Val(WG), Val(64), hv)
                     end
                     @synchronize
-                    SDS._lt_update!(SDS._lt_fa(sh, factor, Val(64)), lctl, pv2, red, redi, li, Val(WG), Val(true),
-                                    prm, Val(64), hv)
+                    SDS._lt_update!(SDS._lt_fa(sh, factor, Val(64)), lctl, pv2, red, redi, li, Val(WG),
+                                    Val(true), prm, Val(64), hv)
                     @synchronize
                 end
                 SDS._lt_finalize!(SDS._lt_fa(sh, factor, Val(64)), lctl, d, pivot_kind, li, Val(WG), Val(64), hv)
@@ -1235,6 +1388,13 @@ end
             w = Int(front_ncols[v])
             g0 = Int(super_ptr[v]) - 1
             for j in 1:w
+                if DIAG                      # take the largest remaining diagonal first
+                    _front_diag_pick!(sh, dsel, st, j, v, li, front_ncols)
+                    @synchronize
+                    _front_diag_swap!(sh, factor, pivord, dsel, j, v, li, front_ptr, front_nrows,
+                                      front_ncols, g0, Val(WG))
+                    @synchronize
+                end
                 if LDL
                     _front_ldl_update!(sh, st, piv, j, v, li, front_ncols, d, g0, Val(WG))
                 else
@@ -2198,10 +2358,13 @@ end
 
 # subtree launcher with a custom (sorted) list, local memory sized by eltype
 function launch_subtrees_sorted!(N, S, nzval, list, lb, backend, ldl::Bool = false, epsc::Real = 0.0,
-                                 prm = nothing)
+                                 prm = nothing, diag::Bool = false)
     SDS._with_local_bytes(Int(lb)) do LBv
         if prm === nothing
-            _sorted_subtree_launch(N, S, nzval, list, Val(ldl), LBv, Val(SDS.SUBTREE_WORKGROUP), backend, epsc)
+            diag ? _sorted_subtree_launch(N, S, nzval, list, Val(ldl), LBv, Val(SDS.SUBTREE_WORKGROUP),
+                                          backend, epsc, Val(true)) :
+                   _sorted_subtree_launch(N, S, nzval, list, Val(ldl), LBv, Val(SDS.SUBTREE_WORKGROUP),
+                                          backend, epsc, Val(false))
         else
             # in-front Bunch-Kaufman: the stock pivoted subtree kernel on the sorted list
             _sorted_subtree_launch_bk(N, S, nzval, list, prm, LBv, Val(SDS.SUBTREE_WORKGROUP), backend)
@@ -2221,7 +2384,7 @@ function _sorted_subtree_launch_bk(N::SDS.Numeric{T}, S, nzval, list, prm, ::Val
     return nothing
 end
 function _sorted_subtree_launch(N::SDS.Numeric{T}, S, nzval, list, ::Val{LDL}, ::Val{LB}, ::Val{WG},
-                                backend, epsc::Real = 0.0) where {T, LDL, LB, WG}
+                                backend, epsc::Real = 0.0, ::Val{DIAG} = Val(false)) where {T, LDL, LB, WG, DIAG}
     bm = SDS.batch_map(N; first = 1)
     if LDL
         # the schedule sized the "S" budget classes with the LDLT reserve: match it
@@ -2229,7 +2392,7 @@ function _sorted_subtree_launch(N::SDS.Numeric{T}, S, nzval, list, ::Val{LDL}, :
         k!(N.factor, N.stack, N.info, N.d, N.piv, N.pivot_kind, nzval, S.amap, S.amap_ptr, S.amap_src,
            list, bm, S.subtree_ptr, S.subtree_nodes, S.super_ptr, S.front_ptr, S.front_nrows, S.front_ncols,
            S.cb_ptr, S.local_front, S.local_cb, S.child_ptr, S.child_list, S.relind_ptr, S.relind,
-           Val((LB - SDS.SUBTREE_LOCAL_RESERVE_LDLT) ÷ sizeof(T)), Val(WG);
+           Val((LB - SDS.SUBTREE_LOCAL_RESERVE_LDLT) ÷ sizeof(T)), Val(DIAG), Val(WG);
            ndrange = WG * length(list) * bm.nact)
     else
         k! = SDS.subtree_cholesky_kernel!(backend, WG)
@@ -2243,12 +2406,18 @@ end
 
 # ---------------------------------------------------------------------------
 # host: the topologically ordered role list + counter bases + stream-2 program
-function build_fused_plan(s; ldl::Bool = false, bk::Bool = false,
+function build_fused_plan(s; ldl::Bool = false, bk::Bool = false, diag::Bool = false,
                           wides_sytrf::Union{Nothing, Bool} = nothing,
                           inkernel_wides::Union{Nothing, Bool} = nothing,
                           wides_potrf::Bool = false, merge_segments::Bool = false,
                           wgf::Int = WGF, scap::Integer = 128, ea_chunk::Integer = 16384)
     S = s.symbolic
+    if diag
+        # DIAG keeps every no-pivot role (TRSM/TILE/W): only the panel column loop changes
+        ldl || throw(SDS.InvalidValueError("fused plan: diag = true needs ldl = true"))
+        bk && throw(SDS.InvalidValueError("fused plan: diag and bk are exclusive"))
+        s.nbatch == 1 || throw(SDS.NotSupportedError("fused plan: diag with a uniform batch"))
+    end
     if bk
         # in-front Bunch-Kaufman mode: the stock pivot machinery inside the fused kernels.
         # The scalar-d trailing updates (TRSM/TILE/W-roles, potrf wides) cannot represent a
@@ -2529,6 +2698,7 @@ function build_fused_plan(s; ldl::Bool = false, bk::Bool = false,
             wcb_b = _dvec(backend, wcb_b), wupd = KA.zeros(backend, Int32, max(nwslots, 1)),
             wtl = KA.zeros(backend, Int32, max(nwslots, 1)), wpd = KA.zeros(backend, Int32, max(nwslots, 1)),
             wcb = KA.zeros(backend, Int32, ns), wgf, scap = Int32(scap), eac = Int32(ea_chunk), ldl, bk,
+            diag,
             # captured at plan build: a later setparam!("pivot_epsilon") changes the stock
             # path but not an already-built fused plan (rebuild the plan to change it)
             chol_eps = ldl ? 0.0 : Float64(SDS.resolved_pivot_epsilon(s.options, real(T))),
@@ -2574,11 +2744,13 @@ function refact_fused!(s, nzval, fp)
     fp.bk && SDS.abs_max!(N.aux, nzval)
     # identity pivot order and 1x1 kinds everywhere up front: the BK kernels overwrite
     # their columns, and unpivoted wide fronts keep consistent state for the solve
-    fp.bk && _bk_identity_piv_kernel!(backend, 256)(N.piv, N.pivot_kind, 0, S.n; ndrange = 256)
+    (fp.bk || fp.diag) &&
+        _bk_identity_piv_kernel!(backend, 256)(N.piv, N.pivot_kind, 0, S.n; ndrange = 256)
     _bk_t = get(ENV, "SDS_BK_TIMING", "") == "1"
     _tt0 = _bk_t ? (KA.synchronize(backend); time()) : 0.0
     for k in eachindex(plan.sub_first)
-        launch_subtrees_sorted!(N, S, nzval, fp.ssub[k], plan.sub_local[k], backend, fp.ldl, fp.chol_eps, prm)
+        launch_subtrees_sorted!(N, S, nzval, fp.ssub[k], plan.sub_local[k], backend, fp.ldl,
+                                fp.chol_eps, prm, fp.diag)
     end
     _tt1 = _bk_t ? (KA.synchronize(backend); time()) : 0.0
     nodes = S.schedule.group_nodes
@@ -2605,10 +2777,11 @@ function refact_fused!(s, nzval, fp)
                                              Int32(base), fp.wbase, fp.wupd, fp.wpd, fp.wtl, fp.wcb,
                                              fp.scap, fp.eac, real(eltype(N.factor))(fp.chol_eps), N.d,
                                              S.super_ptr, N.stats,
-                                             fp.bk ? N.piv : N.info, fp.bk ? N.pivot_kind : N.info,
+                                             (fp.bk || fp.diag) ? N.piv : N.info,
+                                             fp.bk ? N.pivot_kind : N.info,
                                              fp.bk ? N.psign : N.info, fp.bk ? S.perm : N.info,
                                              fp.bk ? N.aux : N.factor, prm,
-                                             Val(fp.ldl), Val(fp.bk), Val(fp.wgf);
+                                             Val(fp.ldl), Val(fp.bk), Val(fp.diag), Val(fp.wgf);
                                              ndrange = fp.wgf * count)
         _bk_t && (KA.synchronize(backend); _tm += time() - _tm0)
         _tws = _bk_t && !isempty(gwides) ? time() : 0.0
