@@ -4,6 +4,8 @@ using SparseDirectSolver
 using SparseDirectSolver: CSR, INDEX_ONE
 using SparseArrays
 using Metal
+using Metal.MPS
+using Metal.MTL
 
 """
     to_backend(A::SparseMatrixCSC, ::MetalBackend; index = 'O') -> CSR
@@ -33,6 +35,32 @@ SparseDirectSolver._serial_cholesky_stats(::MetalBackend, nbatch::Integer) = nba
 SparseDirectSolver._host_reduce_cholesky_info(::MetalBackend, nbatch::Integer) = nbatch > 1
 SparseDirectSolver._dense_solve_front(::MetalBackend, schedule::SparseDirectSolver.Schedule, s::Integer) = false
 SparseDirectSolver._solve_workgroup(::MetalBackend) = 128
+
+const MPS_POTRF_MIN_WIDTH = 64
+SparseDirectSolver._offset_potrf_enabled(::MetalBackend) = true
+
+struct MetalPotrfPlan{M, K, B}
+    panel::M
+    kernel::K
+    status::B
+end
+
+function SparseDirectSolver._offset_potrf_plan(::MetalBackend, factor::MtlVector{Float32}, p0, f, w,
+                                               status::MtlVector{Float32})
+    w >= MPS_POTRF_MIN_WIDTH || return nothing
+    desc = MPSMatrixDescriptor(w, w, sizeof(Float32) * f, Float32)
+    panel = MPSMatrix(factor, desc, (p0 - 1) * sizeof(Float32))
+    kernel = MPSMatrixDecompositionCholesky(Metal.device(), false, w)
+    return MetalPotrfPlan(panel, kernel, Base.unsafe_convert(MTLBuffer, status))
+end
+
+function SparseDirectSolver._offset_potrf_info!(::MetalBackend, plan::MetalPotrfPlan, info, idx)
+    fill!(view(info, idx:idx), Int32(0))
+    cmdbuf = MPSCommandBuffer(global_queue(Metal.device()))
+    encode!(cmdbuf, plan.kernel, plan.panel, plan.panel, plan.status)
+    commit!(cmdbuf)
+    return true
+end
 
 # Metal.jl's MPS Cholesky and triangular solves work on full MtlMatrix objects,
 # but panel views dispatch to host LAPACK/BLAS. Panel GEMM/SYRK are supported

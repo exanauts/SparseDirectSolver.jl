@@ -31,8 +31,10 @@ Apple GPUs do not expose Float64 arithmetic.
 
 On Metal, the default SPD schedule uses narrower regime-C thresholds than the
 CUDA/ROCm schedule (`32` columns and `128` rows), Metal.jl's panel GEMM/SYRK,
-and fused level solves for every front. On an M4 Max this reduced a 14,400-row
-2-D Laplacian's warmed refactorization from 24.8 ms to 16.8 ms while preserving
-the original 1.6 ms solve time. Explicit schedule options are never replaced by
-this backend tuning. LDLT and LU currently use the regime-C factorization path
-because their fused kernels exceed Metal's 31-buffer argument limit.
+and fused level solves for every front. Regime-C Cholesky fronts at least 64
+columns wide use offset-aware MPS decomposition objects cached at analysis. On
+an M4 Max, the 90,000-row `lap2d_300` warmed refactorization fell from 142 ms to
+62 ms while its 5.2 ms solve time was preserved. Explicit schedule options are
+never replaced by this backend tuning. LDLT and LU currently use the regime-C
+factorization path because their fused kernels exceed Metal's 31-buffer argument
+limit.

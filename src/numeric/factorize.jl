@@ -141,8 +141,13 @@ end
 function _factor_front_c!(N::Numeric{T}, S::Symbolic, s::Int, p::NamedTuple, epsc::Real = 0.0) where {T}
     L, sc = S.layout, S.schedule
     if N.nbatch == 1
-        _factor_panel_c!(N.factor, N.stack, N.work, N.info, s, L.panel_ptr[s], sc.rows[s], sc.width[s], L.cb_ptr[s],
-                         p, epsc)
+        if _offset_potrf_enabled(KernelAbstractions.get_backend(N.factor))
+            _factor_panel_c!(N.factor, N.stack, N.work, N.info, s, L.panel_ptr[s], sc.rows[s], sc.width[s],
+                             L.cb_ptr[s], p, epsc, N.aux, N.plan.vendor_ptrs[s])
+        else
+            _factor_panel_c!(N.factor, N.stack, N.work, N.info, s, L.panel_ptr[s], sc.rows[s], sc.width[s],
+                             L.cb_ptr[s], p, epsc)
+        end
         return nothing
     end
     plan = N.plan
@@ -230,7 +235,7 @@ end
 
 function _factor_panel_c!(factor::AbstractVector{T}, stack::AbstractVector{T}, work::AbstractVector{T},
                           info::AbstractVector{Int32}, s::Int, p0::Int, f::Int, w::Int, c0::Int,
-                          p::NamedTuple, epsc::Real = 0.0) where {T}
+                          p::NamedTuple, epsc::Real = 0.0, vendor_status = nothing, vendor_plan = nothing) where {T}
     m = f - w
     P = reshape(view(factor, p0:(p0 + f * w - 1)), f, w)
     F11 = view(P, 1:w, 1:w)
@@ -244,7 +249,14 @@ function _factor_panel_c!(factor::AbstractVector{T}, stack::AbstractVector{T}, w
     # elimination is caught after the fact by the sqrt(epsilon) factor-diagonal floor
     # inside _potrf_info_impl!, reported through info (the potrf route DETECTS where the
     # kernel routes perturb -- either way MadNLP gets its regularization signal, #127)
-    _potrf_info_impl!(p.potrf, 'L', F11, info, s, sqrt(real(T)(epsc)))
+    dmin = sqrt(real(T)(epsc))
+    mps = vendor_plan !== nothing && vendor_status !== nothing && p.potrf === :ka &&
+          _offset_potrf_info!(KernelAbstractions.get_backend(factor), vendor_plan, info, s)
+    if mps
+        ka_chol_check_info!(info, s, F11, dmin)
+    else
+        _potrf_info_impl!(p.potrf, 'L', F11, info, s, dmin)
+    end
     m > 0 || return nothing
     F21 = view(P, (w + 1):f, 1:w)
     _trsm_impl!(p.trsm, 'R', 'L', 'C', 'N', one(T), F11, F21)
