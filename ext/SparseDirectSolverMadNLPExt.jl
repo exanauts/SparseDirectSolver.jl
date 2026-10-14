@@ -20,6 +20,14 @@ Base.@kwdef mutable struct SDSSolverOptions <: MadNLP.AbstractOptions
     # :cholesky (SPD; the condensed-KKT default) or :ldl (no-pivot LDL^T: factors
     # indefinite matrices and reports TRUE inertia from the signs of D)
     sds_factorization::Symbol = :cholesky
+    # :ldl only. :none factors in identity pivot order through the fused pipeline;
+    # :bk routes factorization and solve through the stock in-front Bunch-Kaufman
+    # path (src/numeric/ldlt.jl and the pivot-aware sweep solve): more robust on
+    # ill-conditioned KKT systems, at stock (launch-per-level) speed
+    sds_pivoting::Symbol = :none
+    # in-front pivot acceptance threshold of :bk (nothing keeps the SDS default
+    # 0.01; cuDSS's default is 1.0)
+    sds_pivot_threshold::Union{Nothing, Float64} = nothing
     sds_reordering::String = "algo4"          # native ND
     # ALL performance knobs live in the tuning bundle; nothing (the default)
     # selects the measured per-architecture profile from Fused.default_tuning
@@ -78,12 +86,20 @@ function SDSSolver(
     backend = KA.get_backend(csc.nzVal)
     t = Fused.resolve_tuning(something(opt.sds_tuning, Fused.default_tuning(backend)), backend)
     ldl = opt.sds_factorization === :ldl
+    opt.sds_pivoting in (:none, :bk) ||
+        throw(ArgumentError("sds_pivoting must be :none or :bk, got $(repr(opt.sds_pivoting))"))
+    bk = opt.sds_pivoting === :bk
+    bk && !ldl && throw(ArgumentError("sds_pivoting = :bk needs sds_factorization = :ldl"))
     s = SDS.DirectSolver(csc.colPtr, csc.rowVal, csc.nzVal, ldl ? "S" : "SPD", 'U')
-    ldl && SDS.setparam!(s, "pivot_type", 'N')
+    # :bk keeps pivot_type AUTO (Bunch-Kaufman for "S") and the default 2x2 pivot
+    # pairs; a user threshold reaches the in-front acceptance test
+    ldl && !bk && SDS.setparam!(s, "pivot_type", 'N')
+    bk && opt.sds_pivot_threshold !== nothing &&
+        SDS.setparam!(s, "pivot_threshold", opt.sds_pivot_threshold)
     # no-pivot LDL never consumes 2x2 pivot pairs, and "S" analysis pays dearly for
     # detecting them on saddle systems (augmented 78k KKT, n = 2.09M: analysis 316 s
     # with the default pair detection, 64 s without -- measured on a GV100)
-    ldl && SDS.setparam!(s, "pivot_pairs", "none")
+    ldl && !bk && SDS.setparam!(s, "pivot_pairs", "none")
     s.options.regime_c_width = t.regime_c_width
     s.options.regime_c_rows = t.regime_c_rows  # the fused kernels own BOTH phases: no coupling conflict
     s.options.subtree_parallelism = t.subtree_parallelism
@@ -95,30 +111,45 @@ function SDSSolver(
     SDS.execute!("factorization", s, x, b; asynchronous = false)
     SDS.execute!("solve", s, x, b; asynchronous = false)   # allocates the solve workspace
     nzval = SDS._factor_values(s)
-    merged = t.wides === :merged
-    # LDL wide fronts run the verbatim Cholesky vendor path (wides_potrf): valid while a
-    # front's pivots share a sign; a sign flip fails potrf -> info != 0 -> MadNLP regularizes
-    fp = Fused.build_fused_plan(s; ldl, inkernel_wides = merged, merge_segments = merged,
-                                wides_potrf = !merged, wgf = t.workgroup, scap = t.spin_cap)
-    inv11, inv_ptr, invertf, _ = Fused.build_inverse(s)
-    # the solve plan: one merged dependency-counter sweep over the whole tree
-    fz1 = Fused.build_fused(s; kstart = 1, wcap = 256)
-    fz1 === nothing && throw(SDS.NotSupportedError("fused solve: no plan entry with fronts of width <= 256"))
-    fz = ([(fz1, 64)], true)
+    if bk
+        # the stock path is the whole pipeline: no fused plan, no partitioned inverse
+        fp = fz = inv11 = inv_ptr = nothing
+        invertf = Returns(nothing)
+    else
+        merged = t.wides === :merged
+        # LDL wide fronts run the verbatim Cholesky vendor path (wides_potrf): valid while a
+        # front's pivots share a sign; a sign flip fails potrf -> info != 0 -> MadNLP regularizes
+        fp = Fused.build_fused_plan(s; ldl, inkernel_wides = merged, merge_segments = merged,
+                                    wides_potrf = !merged, wgf = t.workgroup, scap = t.spin_cap)
+        inv11, inv_ptr, invertf, _ = Fused.build_inverse(s)
+        # the solve plan: one merged dependency-counter sweep over the whole tree
+        fz1 = Fused.build_fused(s; kstart = 1, wcap = 256)
+        fz1 === nothing && throw(SDS.NotSupportedError("fused solve: no plan entry with fronts of width <= 256"))
+        fz = ([(fz1, 64)], true)
+    end
     M = SDSSolver{T}(s, csc, x, b, nzval, fp, fz, inv11, inv_ptr, invertf, 0, opt, logger)
-    MadNLP.factorize!(M)                       # prime the fused path once
+    MadNLP.factorize!(M)                       # prime the factorization path once
     return M
 end
 
 function MadNLP.factorize!(M::SDSSolver)
-    M.last_info = Int(Fused.refact_fused!(M.inner, M.nzval, M.fp))
-    M.invert!()
+    if M.opt.sds_pivoting === :bk
+        SDS.execute!("refactorization", M.inner, M.x, M.b; asynchronous = false)
+        M.last_info = Int(SDS.getparam(M.inner, "info"))
+    else
+        M.last_info = Int(Fused.refact_fused!(M.inner, M.nzval, M.fp))
+        M.invert!()
+    end
     return M
 end
 
 function _solve!(M::SDSSolver, xb)
     copyto!(M.b, xb)
-    Fused.algo2_solve!(M.x, M.inner, M.b, M.inv11, M.inv_ptr, M.fz)
+    if M.opt.sds_pivoting === :bk
+        SDS.execute!("solve", M.inner, M.x, M.b; asynchronous = false)
+    else
+        Fused.algo2_solve!(M.x, M.inner, M.b, M.inv11, M.inv_ptr, M.fz)
+    end
     copyto!(xb, M.x)
     KA.synchronize(KA.get_backend(xb))
     return xb
@@ -138,6 +169,10 @@ function MadNLP.inertia(M::SDSSolver)
     if M.opt.sds_factorization === :ldl
         # failure tuple must sum to n (the inertia contract), same as the Cholesky branch
         M.last_info == 0 || return (n - 2, 1, 1)
+        if M.opt.sds_pivoting === :bk
+            npos, nneg = SDS.getparam(M.inner, "inertia")   # of D, 2x2 blocks included
+            return (Int(npos), n - Int(npos) - Int(nneg), Int(nneg))
+        end
         l = count(x -> x < zero(x), view(M.inner.numeric.d, 1:n))   # true inertia from D
         return (n - l, 0, l)
     end
