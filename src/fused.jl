@@ -1852,6 +1852,152 @@ function _factor_panel_c_ldl_potrf!(N, S, fp, v, p, backend)
     return nothing
 end
 
+# vendor-sytrf wide front for in-front Bunch-Kaufman: LAPACK/cuSOLVER Bunch-Kaufman on
+# the dense w x w fully-summed block at vendor speed (the BK analog of wides_potrf), then
+# a conversion to the stock conventions: the one-workgroup kernel below simulates ipiv
+# into the final within-front pivot order, extracts D (1x1 and 2x2 blocks) into d and
+# pivot_kind, and scrubs the factor to a unit-lower L; the L21 columns are gathered into
+# the pivot order, TRSM'd against unit L11 (W = L21 D), divided by the D blocks (from the
+# W copy, so the 2x2 pair reads race-free), and the CB is one GEMM. The pivot SEQUENCE is
+# LAPACK's (alpha = (1+sqrt(17))/8), not the stock kernels' threshold rule: wide fronts
+# trade stock-equality for vendor speed, exactly as wides_potrf does for Cholesky.
+@kernel function sytrf2ldl_kernel!(factor, d, pivord, pivot_kind, @Const(ipiv), p0, f, w, g0, n,
+                                   ::Val{WG}) where {WG}
+    @uniform TT = eltype(factor)
+    li = @index(Local, Linear)
+    @inbounds for k in li:WG:w
+        pivord[g0 + k] = eltype(pivord)(g0 + k)
+    end
+    @synchronize
+    # cuSOLVER stores the PRODUCT form prod_k (P_k L_k): unlike LAPACK it does NOT swap the
+    # rows of previously computed L columns at an interchange (measured: the LAPACK-style
+    # reconstruction fails at 0.97 rel err while the product form reconstructs to 3e-16).
+    # Walk ipiv in order, applying each interchange to columns 1:k-1 cooperatively; after
+    # the walk the factor is LAPACK-convention and the stock solve conventions apply.
+    k = 1
+    while k <= w
+        @inbounds begin
+            ip = Int(ipiv[k])
+            r1 = ip > 0 ? k : k + 1
+            p = ip > 0 ? ip : -ip
+            if p != r1
+                for j in li:WG:(k - 1)
+                    x = factor[p0 + (j - 1) * f + r1 - 1]
+                    factor[p0 + (j - 1) * f + r1 - 1] = factor[p0 + (j - 1) * f + p - 1]
+                    factor[p0 + (j - 1) * f + p - 1] = x
+                end
+                if li == 1
+                    t = pivord[g0 + r1]; pivord[g0 + r1] = pivord[g0 + p]; pivord[g0 + p] = t
+                end
+            end
+            if li == 1
+                if ip > 0
+                    d[g0 + k] = real(factor[p0 + (k - 1) * f + k - 1])
+                    d[n + g0 + k] = zero(real(TT))
+                    pivot_kind[g0 + k] = SDS.PIVOT_KIND_1X1
+                else
+                    d[g0 + k] = real(factor[p0 + (k - 1) * f + k - 1])
+                    d[g0 + k + 1] = real(factor[p0 + k * f + k])
+                    d[n + g0 + k] = real(factor[p0 + (k - 1) * f + k])      # A(k+1, k)
+                    d[n + g0 + k + 1] = zero(real(TT))
+                    pivot_kind[g0 + k] = SDS.PIVOT_KIND_2X2_FIRST
+                    pivot_kind[g0 + k + 1] = SDS.PIVOT_KIND_2X2_SECOND
+                end
+            end
+            k += ip > 0 ? 1 : 2
+        end
+        @synchronize
+    end
+    @inbounds for k in li:WG:w                   # unit diagonal; clear the stored D entries
+        factor[p0 + (k - 1) * f + k - 1] = one(TT)
+        if pivot_kind[g0 + k] == SDS.PIVOT_KIND_2X2_FIRST
+            factor[p0 + (k - 1) * f + k] = zero(TT)
+        end
+    end
+end
+
+# gather the L21 columns into the within-front pivot order (dst dense m x w)
+@kernel function _bk_permcols_kernel!(dst, @Const(factor), @Const(pivord), p0, f, w, m, g0)
+    q = @index(Global, Linear)
+    @inbounds if q <= m * w
+        j = (q - 1) ÷ m + 1
+        i = q - (j - 1) * m
+        pl = Int(pivord[g0 + j]) - g0
+        dst[q] = factor[p0 + (pl - 1) * f + w + i - 1]
+    end
+end
+
+# L21 = W D^{-1} with 1x1 and 2x2 blocks; W read from the dense copy (race-free pairs)
+@kernel function _bk_wdiv_kernel!(factor, @Const(wcopy), @Const(d), @Const(pivot_kind), p0, f, w, m, g0, n)
+    q = @index(Global, Linear)
+    @inbounds if q <= m * w
+        j = (q - 1) ÷ m + 1
+        i = q - (j - 1) * m
+        g = g0 + j
+        kind = pivot_kind[g]
+        pos = p0 + (j - 1) * f + w + i - 1
+        if kind == SDS.PIVOT_KIND_2X2_FIRST
+            a, b, c = d[g], d[n + g], d[g + 1]
+            det = a * c - b * b
+            factor[pos] = (wcopy[q] * c - wcopy[q + m] * b) / det
+        elseif kind == SDS.PIVOT_KIND_2X2_SECOND
+            a, b, c = d[g - 1], d[n + g - 1], d[g]
+            det = a * c - b * b
+            factor[pos] = (wcopy[q] * a - wcopy[q - m] * b) / det
+        else
+            factor[pos] = wcopy[q] / d[g]
+        end
+    end
+end
+
+# potrf-derived wides inside BK mode: identity pivot order and 1x1 kinds, so the
+# pivot-aware solve and the 2x2-capable D pass read consistent state for those columns
+@kernel function _bk_identity_piv_kernel!(pivord, pivot_kind, g0, w)
+    li = @index(Global, Linear)
+    @inbounds for k in li:256:w
+        pivord[g0 + k] = eltype(pivord)(g0 + k)
+        pivot_kind[g0 + k] = SDS.PIVOT_KIND_1X1
+    end
+end
+
+const _BK_SYTRF_T = Float64[0.0, 0.0, 0.0]   # sytrf, convert, rest (SDS_BK_TIMING=1)
+function _factor_panel_c_bk_sytrf!(N, S, fp, v, p, backend)
+    T = eltype(N.factor)
+    sc, L = S.schedule, S.layout
+    f, w = Int(sc.rows[v]), Int(sc.width[v])
+    m = f - w
+    p0 = Int(L.panel_ptr[v])
+    g0 = fp.sptr_h[v] - 1
+    P = reshape(view(N.factor, p0:(p0 + f * w - 1)), f, w)
+    F11 = view(P, 1:w, 1:w)
+    _st = get(ENV, "SDS_BK_TIMING", "") == "1"
+    _t0 = _st ? (KA.synchronize(backend); time()) : 0.0
+    info = SDS.vendor_sytrf!('L', F11, fp.ipiv)
+    _st && (KA.synchronize(backend); _BK_SYTRF_T[1] += time() - _t0; _t0 = time())
+    info != 0 && fill!(view(N.info, v:v), Int32(min(info, w)))
+    sytrf2ldl_kernel!(backend, 256)(N.factor, N.d, N.piv, N.pivot_kind, fp.ipiv, p0, f, w, g0, S.n,
+                                    Val(256); ndrange = 256)
+    _st && (KA.synchronize(backend); _BK_SYTRF_T[2] += time() - _t0; _t0 = time())
+    m > 0 || return nothing
+    _st || (_t0 = 0.0)
+    Wm = reshape(view(fp.ldlw, 1:(m * w)), m, w)
+    _bk_permcols_kernel!(backend, 256)(vec(Wm), N.factor, N.piv, p0, f, w, m, g0; ndrange = m * w)
+    F21 = view(P, (w + 1):f, 1:w)
+    F21 .= Wm
+    SDS._trsm_impl!(p.trsm, 'R', 'L', 'C', 'U', one(T), F11, F21)        # F21 <- W = L21 D
+    copyto!(vec(Wm), vec(F21))
+    _bk_wdiv_kernel!(backend, 256)(N.factor, vec(Wm), N.d, N.pivot_kind, p0, f, w, m, g0, S.n;
+                                   ndrange = m * w)
+    c0 = fp.cb2_h[v]
+    c0 > 0 || return nothing
+    gi = SDS.select_impl(:gemm, N.factor, :auto)
+    C = reshape(view(N.work, 1:(m * m)), m, m)
+    SDS._gemm_impl!(gi, 'N', 'T', -one(T), Wm, F21, zero(T), C)
+    SDS.pack_add!(fp.pcb, c0, N.work, m)
+    _st && (KA.synchronize(backend); _BK_SYTRF_T[3] += time() - _t0)
+    return nothing
+end
+
 # host-wide fronts for in-front Bunch-Kaufman: the stock blocked path (ldlt_c.jl) over a
 # COMPACTED list of a segment's wide fronts, chunked by workspace at plan time -- one
 # panel_ldlt_kernel! launch per 32-column block covers every front of the chunk (one
@@ -2039,6 +2185,7 @@ end
 # ---------------------------------------------------------------------------
 # host: the topologically ordered role list + counter bases + stream-2 program
 function build_fused_plan(s; ldl::Bool = false, bk::Bool = false,
+                          wides_sytrf::Union{Nothing, Bool} = nothing,
                           inkernel_wides::Union{Nothing, Bool} = nothing,
                           wides_potrf::Bool = false, merge_segments::Bool = false,
                           wgf::Int = WGF, scap::Integer = 128, ea_chunk::Integer = 16384)
@@ -2048,7 +2195,10 @@ function build_fused_plan(s; ldl::Bool = false, bk::Bool = false,
         # The scalar-d trailing updates (TRSM/TILE/W-roles, potrf wides) cannot represent a
         # 2x2 pivot block, so BK fronts are factored whole by their PANEL workgroup.
         ldl || throw(SDS.InvalidValueError("fused plan: bk = true needs ldl = true"))
-        wides_potrf && throw(SDS.NotSupportedError("fused plan: bk with wides_potrf (potrf assumes no pivoting)"))
+        # bk + wides_potrf = the HYBRID: Bunch-Kaufman on subtrees and narrow fronts, the
+        # verbatim potrf-derived path on wide fronts (valid while a wide front's pivots
+        # share a sign; a flip fails potrf -> info != 0 -> MadNLP regularizes, exactly the
+        # no-pivot LDL behavior there). Near no-pivot speed; full BK covers the rest.
         inkernel_wides == true &&
             throw(SDS.NotSupportedError("fused plan: bk with in-kernel wides is not implemented"))
         inkernel_wides = false
@@ -2321,6 +2471,11 @@ function build_fused_plan(s; ldl::Bool = false, bk::Bool = false,
             # path but not an already-built fused plan (rebuild the plan to change it)
             chol_eps = ldl ? 0.0 : Float64(SDS.resolved_pivot_epsilon(s.options, real(T))),
             ldl_potrf = ldl && wides_potrf, wq_h, wsegs = bk ? wsegs : nothing,
+            bk_sytrf = bk && !isempty(wides) &&
+                       (wides_sytrf === nothing ? SDS.capabilities(backend, T).vendor_sytrf :
+                        wides_sytrf),
+            ipiv = KA.zeros(backend, Int32,
+                            bk && !isempty(wides) ? maximum(width_h[v] for v in wides) : 1),
             sptr_h = Array(S.super_ptr),
             ldlw = KA.zeros(backend, T,
                             ldl ? maximum(vcat([1], [max(rows_h[v] * 64,
@@ -2391,7 +2546,19 @@ function refact_fused!(s, nzval, fp)
         _bk_t && (KA.synchronize(backend); _tm += time() - _tm0)
         _tws = _bk_t && !isempty(gwides) ? time() : 0.0
         if fp.bk && !isempty(gwides)
-            _factor_wides_c_bk!(N, S, fp, fp.wsegs[segi], prm, backend)
+            if fp.ldl_potrf
+                for v in gwides
+                    _factor_panel_c_ldl_potrf!(N, S, fp, v, p, backend)
+                    _bk_identity_piv_kernel!(backend, 256)(N.piv, N.pivot_kind, Int(fp.sptr_h[v]) - 1,
+                                                           Int(S.schedule.width[v]); ndrange = 256)
+                end
+            elseif fp.bk_sytrf
+                for v in gwides
+                    _factor_panel_c_bk_sytrf!(N, S, fp, v, p, backend)
+                end
+            else
+                _factor_wides_c_bk!(N, S, fp, fp.wsegs[segi], prm, backend)
+            end
             for v in gwides
                 signal_kernel!(backend, 32)(fp.cbd, fp.arrived, S.snparent, v; ndrange = 32)
             end
@@ -2417,6 +2584,10 @@ function refact_fused!(s, nzval, fp)
         println("BK timing: subtrees ", round(_tt1 - _tt0; digits = 4), "s  assembly ",
                 round(_tt2 - _tt1; digits = 4), "s  mega ", round(_tm; digits = 4),
                 "s  wides ", round(_tw; digits = 4), "s  total ", round(_tt3 - _tt0; digits = 4), "s")
+        fp.bk && fp.bk_sytrf &&
+            println("  sytrf ", round(_BK_SYTRF_T[1]; digits = 4), "s  convert ",
+                    round(_BK_SYTRF_T[2]; digits = 4), "s  rest ", round(_BK_SYTRF_T[3]; digits = 4), "s")
+        fill!(_BK_SYTRF_T, 0.0)
     end
     SDS.assemble_schur!(N, S, nzval)
     # the stats kernel ALSO reduces the per-front info into info[ns + 1], which
