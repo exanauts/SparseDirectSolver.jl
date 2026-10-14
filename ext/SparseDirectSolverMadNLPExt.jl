@@ -43,6 +43,22 @@ Base.@kwdef mutable struct SDSSolverOptions <: MadNLP.AbstractOptions
     # solve degrades to 5e-2, stock and fused alike). On mostly-positive condensed KKT
     # the detection finds nothing and costs ~42 s of analysis on the 78k: set "none" there.
     sds_pivot_pairs::Union{Nothing, String} = nothing
+    # saddle-point partition, filled in by MadNLP's block_structure API before the
+    # analysis: rows 1:n_primal are primal, the rest dual. 0 means undeclared.
+    n_primal::Int = 0
+    n_dual::Int = 0
+    # use the declared partition as the static pivot sign (+1 primal, -1 dual), so a
+    # perturbed pivot takes the sign the saddle structure demands and the inertia MadNLP
+    # regularizes against comes out right. Opt-in (upstreamed from the benchmark's
+    # experimental branch); it only bites where a pivot is actually perturbed, i.e. under
+    # :bk or with sds_stabilize = true.
+    sds_pivot_signs::Bool = false
+    # lazy stabilization for the 1x1 paths (:none and :diag): a pivot below pivot_epsilon
+    # takes +/-epsilon with the sign policy instead of failing the front, which is what the
+    # :bk path has always done in _lt_select!. Off by default, so the failure contract the
+    # existing modes were measured under is unchanged. With it, the three pivoting modes
+    # share one stabilization policy and differ only in pivoting.
+    sds_stabilize::Bool = false
     sds_reordering::String = "algo4"          # native ND
     # ALL performance knobs live in the tuning bundle; nothing (the default)
     # selects the measured per-architecture profile from Fused.default_tuning
@@ -122,6 +138,15 @@ function SDSSolver(
         pairs = something(opt.sds_pivot_pairs, bk ? "default" : "none")   # :diag takes no pairs
         SDS.setparam!(s, "pivot_pairs", pairs)
     end
+    if opt.sds_pivot_signs && opt.n_primal > 0
+        npr = opt.n_primal
+        0 < npr <= n || throw(ArgumentError("n_primal = $npr outside 1:$n"))
+        psign = Vector{Int8}(undef, n)
+        @inbounds for i in 1:n
+            psign[i] = i <= npr ? Int8(1) : Int8(-1)
+        end
+        SDS.setparam!(s, "pivot_sign", psign)
+    end
     s.options.regime_c_width = t.regime_c_width
     s.options.regime_c_rows = t.regime_c_rows  # the fused kernels own BOTH phases: no coupling conflict
     s.options.subtree_parallelism = t.subtree_parallelism
@@ -135,7 +160,8 @@ function SDSSolver(
     nzval = SDS._factor_values(s)
     fp_slow = nothing
     if diagp
-        fp = Fused.build_fused_plan(s; ldl, diag = true, wgf = t.workgroup, scap = t.spin_cap)
+        fp = Fused.build_fused_plan(s; ldl, diag = true, stabilize = opt.sds_stabilize,
+                                    wgf = t.workgroup, scap = t.spin_cap)
     elseif bk
         # NOTE an optimistic fast-path-with-certified-retry was measured and rejected:
         # in-front BK cannot honor |l| <= 1/u on wide fronts either (the fallback accepts
@@ -158,7 +184,8 @@ function SDSSolver(
         # LDL wide fronts run the verbatim Cholesky vendor path (wides_potrf): valid while a
         # front's pivots share a sign; a sign flip fails potrf -> info != 0 -> MadNLP regularizes
         fp = Fused.build_fused_plan(s; ldl, inkernel_wides = merged, merge_segments = merged,
-                                    wides_potrf = !merged, wgf = t.workgroup, scap = t.spin_cap)
+                                    wides_potrf = !merged, stabilize = opt.sds_stabilize,
+                                    wgf = t.workgroup, scap = t.spin_cap)
     end
     inv11, inv_ptr, invertf, _ = Fused.build_inverse(s)
     # the solve plan: one merged dependency-counter sweep over the whole tree
