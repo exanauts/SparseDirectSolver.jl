@@ -1192,7 +1192,11 @@ end
                         end
                         @synchronize
                     end
-                    SDS._lt_swap!(SDS._lt_fa(sh, factor, Val(64)), lctl, pv2, pivord, li, Val(WG), Val(64), hv)
+                    if SDS._lt_noswap(lctl)
+                        li == 1 && SDS._lt_setdiag!(SDS._lt_fa(sh, factor, Val(64)), lctl, pv2, Val(64))
+                    else
+                        SDS._lt_swap!(SDS._lt_fa(sh, factor, Val(64)), lctl, pv2, pivord, li, Val(WG), Val(64), hv)
+                    end
                     @synchronize
                     SDS._lt_update!(SDS._lt_fa(sh, factor, Val(64)), lctl, pv2, red, redi, li, Val(WG), Val(true),
                                     prm, Val(64), hv)
