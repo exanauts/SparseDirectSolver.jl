@@ -25,12 +25,13 @@
         dx = to_device(backend, x)
         @test KernelAbstractions.get_backend(dx) == backend
         @test to_host(dx) == x
-        A = sprand(Float32, 9, 9, 0.3) + I
+        TC = backend_name(backend) == "Metal" ? Float32 : ComplexF64   # Metal's to_backend takes Float32 only
+        A = sprand(TC, 9, 9, 0.3) + I
         @test to_host(to_device(backend, A)) == A
         for INT in INTTYPES
             dA = to_device(backend, A, INT)
             @test to_host(dA) == A
-            @test eltype(dA) == Float32
+            @test eltype(dA) == TC
             @test index_eltype(dA) == INT   # issue #30: vendor constructors silently use Int32
         end
     end

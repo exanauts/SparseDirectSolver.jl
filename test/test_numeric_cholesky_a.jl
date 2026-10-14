@@ -112,9 +112,10 @@ end
                  Options(subtree_budgets = [8192, 20000, 49152], regime_c_width = 32, subtree_parallelism = 0),
                  Options(subtree_budgets = [8192, 20000, 1 << 20], regime_c_width = 32, subtree_parallelism = 0),
                  Options(subtree_budgets = [32768], factorization_alg = "algo2", subtree_parallelism = 0))
-        # the 64 KiB class (issue #60) runs where the backend has the local memory (CPU, ROCm); elsewhere (CUDA)
-        # the allocation of an analysis that uses it is rejected
-        if SDS.subtree_local_bytes(maximum(opts.subtree_budgets)) > SDS.max_local_bytes(backend)
+        # the 64 KiB class (issue #60) runs where the backend has the local memory (CPU, ROCm); elsewhere (CUDA,
+        # Metal) the analysis rejects it, and an explicit budget above `max_local_bytes` (the 1 MiB entry) is
+        # rejected on every GPU backend (`resolve_subtree_budgets`)
+        if maximum(opts.subtree_budgets) > SDS.max_local_bytes(backend)
             @test thrown(() -> numeric_setup(backend, A; opts)) isa InvalidValueError
             continue
         end
