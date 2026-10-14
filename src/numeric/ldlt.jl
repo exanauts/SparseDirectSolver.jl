@@ -1171,8 +1171,8 @@ stack.
     buf = @localmem TT (NE,)
     ctl = @localmem IT (_LT_CTL,)
     pv = @localmem TT (_LT_NPV,)
-    red = @localmem R (3 * _LT_S1,)
-    redi = @localmem IT (2 * _LT_S1,)
+    red = @localmem R (3 * WG,)
+    redi = @localmem IT (2 * WG,)
     if li == 1
         @inbounds t = trees[bm.first + _bm_node(bm, G) - 1]
         @inbounds ctl[_ST_FIRST] = subtree_ptr[t]
@@ -1196,38 +1196,50 @@ stack.
                                  relind, li, Val(WG))
             @synchronize
         end
-        _lt_pass1!(buf, ctl, red, redi, li, Val(_LT_S1), prm, Val(true))
+        _lt_pass1!(buf, ctl, red, redi, li, Val(WG), prm, Val(true))
         @synchronize
         for it in 1:ctl[_ST_W]
+            if WG > _LT_S1
+                _lt_stage1!(red, redi, ctl, li, Val(WG), Val(1))
+                @synchronize
+            end
             if li == 1
                 mb = _bm_gmember(bm, G)
                 nb = bm.nbatch
                 _lt_decide1!(buf, ctl, pv, red, redi, _mview(d, mb, nb), _mview(pivot_kind, mb, nb),
-                             _mview(piv, mb, nb), psign, perm, _mview(aux, mb, nb), prm, Val(_LT_S1), Val(true),
+                             _mview(piv, mb, nb), psign, perm, _mview(aux, mb, nb), prm, Val(WG), Val(true),
                              Val(HERM))
             end
             @synchronize
             if ctl[_LT_PHASE] == 2
-                _lt_pass2!(buf, ctl, red, redi, li, Val(_LT_S1), prm, Val(true))
+                _lt_pass2!(buf, ctl, red, redi, li, Val(WG), prm, Val(true))
                 @synchronize
+                if WG > _LT_S1
+                    _lt_stage1!(red, redi, ctl, li, Val(WG), Val(2))
+                    @synchronize
+                end
                 if li == 1
                     mb = _bm_gmember(bm, G)
                     nb = bm.nbatch
                     _lt_decide2!(buf, ctl, pv, red, redi, _mview(d, mb, nb), _mview(pivot_kind, mb, nb),
-                                 _mview(piv, mb, nb), psign, perm, _mview(aux, mb, nb), prm, Val(_LT_S1), Val(true),
+                                 _mview(piv, mb, nb), psign, perm, _mview(aux, mb, nb), prm, Val(WG), Val(true),
                                  Val(HERM))
                 end
                 @synchronize
             end
             if ctl[_LT_PHASE] == 3
-                _lt_pass3!(buf, ctl, red, redi, li, Val(_LT_S1), _mview(aux, _bm_gmember(bm, G), bm.nbatch), prm,
+                _lt_pass3!(buf, ctl, red, redi, li, Val(WG), _mview(aux, _bm_gmember(bm, G), bm.nbatch), prm,
                            Val(true))
                 @synchronize
+                if WG > _LT_S1
+                    _lt_stage1!(red, redi, ctl, li, Val(WG), Val(3))
+                    @synchronize
+                end
                 if li == 1
                     mb = _bm_gmember(bm, G)
                     nb = bm.nbatch
                     _lt_decide3!(buf, ctl, pv, red, redi, _mview(d, mb, nb), _mview(pivot_kind, mb, nb),
-                                 _mview(piv, mb, nb), psign, perm, _mview(aux, mb, nb), prm, Val(_LT_S1), Val(true),
+                                 _mview(piv, mb, nb), psign, perm, _mview(aux, mb, nb), prm, Val(WG), Val(true),
                                  Val(HERM))
                 end
                 @synchronize
@@ -1236,7 +1248,7 @@ stack.
             @synchronize
             _lt_update!(buf, ctl, pv, red, redi, li, Val(WG), Val(false), prm, Val(true), Val(HERM))
             @synchronize
-            _lt_pass1!(buf, ctl, red, redi, li, Val(_LT_S1), prm, Val(true))
+            _lt_pass1!(buf, ctl, red, redi, li, Val(WG), prm, Val(true))
             @synchronize
         end
         mb = _bm_gmember(bm, G)

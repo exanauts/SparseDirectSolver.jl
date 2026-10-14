@@ -2195,13 +2195,15 @@ function build_fused_plan(s; ldl::Bool = false, bk::Bool = false,
         # The scalar-d trailing updates (TRSM/TILE/W-roles, potrf wides) cannot represent a
         # 2x2 pivot block, so BK fronts are factored whole by their PANEL workgroup.
         ldl || throw(SDS.InvalidValueError("fused plan: bk = true needs ldl = true"))
-        # bk + wides_potrf = the HYBRID: Bunch-Kaufman on subtrees and narrow fronts, the
-        # verbatim potrf-derived path on wide fronts (valid while a wide front's pivots
-        # share a sign; a flip fails potrf -> info != 0 -> MadNLP regularizes, exactly the
-        # no-pivot LDL behavior there). Near no-pivot speed; full BK covers the rest.
-        inkernel_wides == true &&
-            throw(SDS.NotSupportedError("fused plan: bk with in-kernel wides is not implemented"))
-        inkernel_wides = false
+        # bk + wides_potrf or bk + inkernel_wides = the HYBRID: Bunch-Kaufman on subtrees
+        # and narrow fronts, NO pivoting on wide fronts -- either the verbatim potrf-derived
+        # host path (a sign flip fails potrf -> info != 0 -> MadNLP regularizes) or the
+        # in-kernel no-pivot LDL W-roles (factors through sign flips, true inertia from d;
+        # merged single launch, near no-pivot speed). Full BK (neither flag) covers wides
+        # with real pivoting (vendor-sytrf or the blocked stock path).
+        (inkernel_wides == true && wides_potrf) &&
+            throw(SDS.InvalidValueError("fused plan: wides_potrf with in-kernel wides"))
+        inkernel_wides = inkernel_wides === nothing ? false : inkernel_wides
         s.nbatch == 1 || throw(SDS.NotSupportedError("fused plan: bk with a uniform batch"))
     end
     plan = s.numeric.plan
@@ -2508,6 +2510,9 @@ function refact_fused!(s, nzval, fp)
     # the |a|max reduction the perturbation/fallback scan reads
     prm = fp.bk ? SDS._ldlt_device_params(S, eltype(N.factor), s.options) : nothing
     fp.bk && SDS.abs_max!(N.aux, nzval)
+    # identity pivot order and 1x1 kinds everywhere up front: the BK kernels overwrite
+    # their columns, and unpivoted wide fronts keep consistent state for the solve
+    fp.bk && _bk_identity_piv_kernel!(backend, 256)(N.piv, N.pivot_kind, 0, S.n; ndrange = 256)
     _bk_t = get(ENV, "SDS_BK_TIMING", "") == "1"
     _tt0 = _bk_t ? (KA.synchronize(backend); time()) : 0.0
     for k in eachindex(plan.sub_first)
@@ -2547,10 +2552,8 @@ function refact_fused!(s, nzval, fp)
         _tws = _bk_t && !isempty(gwides) ? time() : 0.0
         if fp.bk && !isempty(gwides)
             if fp.ldl_potrf
-                for v in gwides
+                for v in gwides                      # piv/kinds: the upfront identity init covers these
                     _factor_panel_c_ldl_potrf!(N, S, fp, v, p, backend)
-                    _bk_identity_piv_kernel!(backend, 256)(N.piv, N.pivot_kind, Int(fp.sptr_h[v]) - 1,
-                                                           Int(S.schedule.width[v]); ndrange = 256)
                 end
             elseif fp.bk_sytrf
                 for v in gwides
