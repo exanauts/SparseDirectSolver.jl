@@ -1998,6 +1998,61 @@ function _factor_panel_c_bk_sytrf!(N, S, fp, v, p, backend)
     return nothing
 end
 
+# optimistic wides: a no-pivot LDL sequence on a wide front IS a valid threshold-BK
+# sequence iff every multiplier satisfies |l| <= 1/u (the acceptance test |d_k| >= u*colmax
+# written in terms of the stored factor). One workgroup per wide front reduces max|L| over
+# the strict lower panel; the host compares against 1/u and decides whether this
+# refactorization must be redone with real pivoting on the wides.
+@kernel function _wide_lmax_kernel!(out, @Const(factor), @Const(wlist), @Const(panel_ptr),
+                                    @Const(front_nrows), @Const(front_ncols), ::Val{WG}) where {WG}
+    @uniform RT = real(eltype(factor))
+    li = @index(Local, Linear)
+    G = @index(Group, Linear)
+    sh = @localmem RT (WG,)
+    @inbounds begin
+        v = Int(wlist[G])
+        f = Int(front_nrows[v])
+        w = Int(front_ncols[v])
+        p0 = Int(panel_ptr[v]) - 1
+        m = zero(RT)
+        for q in (li - 1):WG:(f * w - 1)
+            j = q ÷ f + 1
+            i = q - (j - 1) * f + 1
+            i > j && (m = max(m, abs(factor[p0 + q + 1])))
+        end
+        sh[li] = m
+    end
+    @synchronize
+    @inbounds begin
+        s2 = WG >> 1
+        while s2 >= 1
+            li <= s2 && (sh[li] = max(sh[li], sh[li + s2]))
+            @synchronize
+            s2 >>= 1
+        end
+        li == 1 && (out[G] = sh[1])
+    end
+end
+
+"""
+    wide_multipliers_ok(s, fp) -> Bool
+
+After a refactorization whose wide fronts ran WITHOUT pivoting (bk + inkernel_wides or
+bk + wides_potrf), check that every wide front's multipliers satisfy |l| <= 1/u, i.e.
+that the unpivoted sequence was a valid threshold-Bunch-Kaufman sequence. `true` means
+the factor is BK-grade as is; `false` means redo this refactorization with real pivoting
+on the wides (a plan with neither inkernel_wides nor wides_potrf).
+"""
+function wide_multipliers_ok(s, fp)
+    fp.nwall == 0 && return true
+    N, S = s.numeric, s.symbolic
+    backend = KA.get_backend(N.factor)
+    _wide_lmax_kernel!(backend, 256)(fp.lmax, N.factor, fp.wall, S.front_ptr, S.front_nrows,
+                                     S.front_ncols, Val(256); ndrange = 256 * fp.nwall)
+    lim = real(eltype(N.factor))(1 / max(s.options.pivot_threshold, eps(Float64)))
+    return maximum(view(fp.lmax, 1:fp.nwall)) <= lim
+end
+
 # host-wide fronts for in-front Bunch-Kaufman: the stock blocked path (ldlt_c.jl) over a
 # COMPACTED list of a segment's wide fronts, chunked by workspace at plan time -- one
 # panel_ldlt_kernel! launch per 32-column block covers every front of the chunk (one
@@ -2344,6 +2399,7 @@ function build_fused_plan(s; ldl::Bool = false, bk::Bool = false,
     end
 
     wq_h = zeros(Int32, ns)                      # wide front -> its group_nodes index
+    wall = Int32[v for v in 1:ns if !covered[v] && width_h[v] > 64]   # every wide front
     segments = NTuple{3, Any}[]                  # (base, count, wides-at-boundary)
     seg_base = 0
     for k in eachindex(plan.group_first)
@@ -2473,6 +2529,8 @@ function build_fused_plan(s; ldl::Bool = false, bk::Bool = false,
             # path but not an already-built fused plan (rebuild the plan to change it)
             chol_eps = ldl ? 0.0 : Float64(SDS.resolved_pivot_epsilon(s.options, real(T))),
             ldl_potrf = ldl && wides_potrf, wq_h, wsegs = bk ? wsegs : nothing,
+            wall = _dvec(backend, wall), wall_h = wall, nwall = length(wall),
+            lmax = KA.zeros(backend, real(T), max(length(wall), 1)),
             bk_sytrf = bk && !isempty(wides) &&
                        (wides_sytrf === nothing ? SDS.capabilities(backend, T).vendor_sytrf :
                         wides_sytrf),
