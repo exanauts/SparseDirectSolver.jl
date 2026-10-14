@@ -259,3 +259,52 @@ end
     @test relres(Aw, SDS.ref_solve!(similar(b), S, N, b), b) <= tol(T)
     @test eigen_npos_nneg(Aw) == (nh, nj)
 end
+
+# Lazy perturbation of a 2x2 whose inverse is unusable. The fixture is DERIVED, not
+# guessed: it has to reach `_choose_pivot`'s fallback, which needs Bunch-Kaufman to choose
+# the pair (akk*sigma < alpha*lambda^2, |c2| < alpha*sigma), `_accept_2x2` to reject it,
+# and NO acceptable 1x1 anywhere in the block (that branch short-circuits first, so
+# |c2| < u*sigma). The asserts below check the path is really taken -- without that the
+# test would pass vacuously on a block the chooser never routes through the fallback.
+RUN_SHARED && @testset "reference LDL: near-unusable 2x2 is perturbed lazily" begin
+    prm_eps = 1.0e-13
+    prm = SDS._LDLTParams{Float64}(SDS.PIVOT_BUNCH_KAUFMAN, 0.01, prm_eps, true)
+    # lambda = 1, sigma = 1e17, c2 = 1e14 (< u*sigma = 1e15, and > 1/eps), big entries in
+    # columns 3 and 4 so their diagonals fail the threshold test too
+    A = [1e-18 1.0 0.0 0.0; 1.0 1e14 1e17 0.0; 0.0 1e17 1e-20 1e18; 0.0 0.0 1e18 1e-20]
+    # the path: Bunch-Kaufman picks the pair, acceptance rejects it, no 1x1 qualifies, and
+    # only the weak nonsingular guard stands between it and the factorization
+    @test SDS._choose_pivot(copy(A), 1, 4, prm) == (1, 2)
+    @test !SDS._accept_2x2(copy(A), 1, 2, prm)
+    @test SDS._best_1x1(copy(A), 1, 4, prm) == 0
+    @test SDS._nonsingular_2x2(copy(A), 1, 2, prm)
+    det0 = A[1, 1] * A[2, 2] - A[1, 2] * A[2, 1]
+    M0 = max(abs(A[1, 1]), abs(A[2, 1]), abs(A[2, 2]))
+    @test abs(det0) < prm_eps * M0                      # the trigger really fires
+    @test M0 / abs(det0) > 1 / prm_eps                  # i.e. an inverse entry above 1/eps
+    @test det0 < 0                                      # a BK-chosen pair is always indefinite
+
+    F = copy(A)
+    lp, kind, dd, ee, st = SDS._ldlt_front!(F, 4, prm, _ -> 0)
+    @test st[SDS.STAT_NPERTURBED] >= 1                  # the policy fired
+    @test kind[1] == SDS.PIVOT_KIND_2X2_FIRST && kind[2] == SDS.PIVOT_KIND_2X2_SECOND
+    # after the bump the 2x2 is usable: its inverse entries are bounded by 1/eps, and it is
+    # still indefinite, so the (1 pos, 1 neg) inertia the solver reports stays right
+    detp = dd[1] * dd[2] - ee[1]^2
+    Mp = max(abs(dd[1]), abs(dd[2]), abs(ee[1]))
+    @test detp < 0
+    @test Mp / abs(detp) <= 1 / prm_eps * (1 + 1e-6)
+    @test st[SDS.STAT_NPOS] >= 1 && st[SDS.STAT_NNEG] >= 1
+    # and the perturbation is small against the block it replaced: only the SMALLER
+    # diagonal moved, by at most eps * M
+    @test abs(dd[2] - A[2, 2]) <= 8 * prm_eps * M0 || abs(dd[1] - A[1, 1]) <= 8 * prm_eps * M0
+
+    # with the policy off (eps = 0) the same block goes through untouched: the test above
+    # is about the policy, not about the fixture happening to be benign
+    prm0 = SDS._LDLTParams{Float64}(SDS.PIVOT_BUNCH_KAUFMAN, 0.01, 0.0, true)
+    F0 = copy(A)
+    _, _, dd0, ee0, st0 = SDS._ldlt_front!(F0, 4, prm0, _ -> 0)
+    @test st0[SDS.STAT_NPERTURBED] == 0
+    det0p = dd0[1] * dd0[2] - ee0[1]^2
+    @test max(abs(dd0[1]), abs(dd0[2]), abs(ee0[1])) / abs(det0p) > 1 / prm_eps
+end
