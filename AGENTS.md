@@ -96,7 +96,9 @@ reviewing agent check; the owner merges by hand. The moving parts:
   `ci.yml` on the PR, and from the `amdgpu` leg of `ci.yml` on the
   self-hosted AMD runner (the AMDGPU extension, T23; no longer
   continue-on-error, a required check once the owner adds it to the branch
-  ruleset).
+  ruleset), and from the `oneapi` leg on the self-hosted Intel GPU runner
+  `headroom` (the oneAPI extension, T31; oneAPI.jl from its `main` branch until a
+  release supports KernelAbstractions 0.10).
 
 ### The owner's machine
 
@@ -108,8 +110,8 @@ reviewing agent check; the owner merges by hand. The moving parts:
   KernelAbstractions CPU backend and on CUDA only. GitHub CI
   (`.github/workflows/ci.yml`, modelled on `../ExaPF.jl`) runs the CPU suite and
   the GPU suite on the exanauts self-hosted runners (CPU suite: the `kkt`
-  machine; GPU suite: the runners labelled `cuda` and `amdgpu`). oneAPI and Metal extension files are written by analogy
-  (task T23) and only precompile-checked.
+  machine; GPU suite: the runners labelled `cuda`, `amdgpu` and `oneapi`; Metal:
+  GitHub's hosted `macos-latest` runner, `Float32` only, job `test-metal`).
 * CUDA.jl 6.x is split into packages: `CUDACore` (`CuArray`, `CUDABackend`),
   `cuSPARSE` (`CuSparseMatrixCSR`, `CuSparseMatrixCSC`), `cuBLAS`, `cuSOLVER`.
   Use these as weak dependencies; tests load the umbrella `CUDA`.
