@@ -218,6 +218,7 @@ end
         CUDA_LOADED && backend isa CUDABackend && @test SDS.max_local_bytes(backend) == 49152
         AMDGPU_LOADED && backend isa ROCBackend && @test SDS.max_local_bytes(backend) >= 65536
         METAL_LOADED && backend isa MetalBackend && @test SDS.max_local_bytes(backend) == 32768
+        ONEAPI_LOADED && backend isa oneAPIBackend && @test SDS.max_local_bytes(backend) >= 65536
     end
     # the defaults are clamped to the cap, explicit budgets above it are rejected
     @test SDS.resolve_subtree_budgets(SDS.DEFAULT_SUBTREE_BUDGETS, typemax(Int)) == [16384, 32768, 49152]

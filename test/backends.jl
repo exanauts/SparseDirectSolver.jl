@@ -69,6 +69,14 @@ if METAL_LOADED
 end
 const METAL_FUNCTIONAL = METAL_LOADED && Metal.functional()
 
+const ONEAPI_LOADED = TEST_GPU && is_package_installed("oneAPI")
+if ONEAPI_LOADED
+    using oneAPI
+    using oneAPI.oneMKL: oneSparseMatrixCSR, oneSparseMatrixCSC
+    oneAPI.GPUArrays.allowscalar(false)
+end
+const ONEAPI_FUNCTIONAL = ONEAPI_LOADED && oneAPI.functional()
+
 """
     BACKENDS
 
@@ -80,14 +88,16 @@ TEST_CPU && push!(BACKENDS, CPU())
 CUDA_FUNCTIONAL && push!(BACKENDS, CUDABackend())
 AMDGPU_FUNCTIONAL && push!(BACKENDS, ROCBackend())
 METAL_FUNCTIONAL && push!(BACKENDS, MetalBackend())
+ONEAPI_FUNCTIONAL && push!(BACKENDS, oneAPIBackend())
 isempty(BACKENDS) &&
     error("no backend to test: SDS_TEST_CPU=0 and no functional GPU backend (SDS_TEST_GPU=$(get(ENV, "SDS_TEST_GPU", "1")), ",
-          "CUDA loaded: $CUDA_LOADED, AMDGPU loaded: $AMDGPU_LOADED, Metal loaded: $METAL_LOADED)")
+          "CUDA loaded: $CUDA_LOADED, AMDGPU loaded: $AMDGPU_LOADED, Metal loaded: $METAL_LOADED, ",
+          "oneAPI loaded: $ONEAPI_LOADED)")
 
 """
     backend_name(backend) -> String
 
-Short name for testset titles: `"CPU"`, `"CUDA"`, `"ROCm"`.
+Short name for testset titles: `"CPU"`, `"CUDA"`, `"ROCm"`, `"Metal"`, `"oneAPI"`.
 """
 backend_name(::CPU) = "CPU"
 
@@ -232,6 +242,21 @@ if METAL_LOADED
         CSR(MtlVector{INT}(rowptr), MtlVector{INT}(colval), MtlArray(vec(nzval)), n, n)
 end
 
+if ONEAPI_LOADED
+    backend_name(::oneAPIBackend) = "oneAPI"
+    to_device(::oneAPIBackend, x::Array) = oneArray(x)
+    to_device(backend::oneAPIBackend, A::SparseMatrixCSC{T, INT}) where {T, INT} = to_device(backend, A, INT)
+    function to_device(::oneAPIBackend, A::SparseMatrixCSC{T}, ::Type{INT}) where {T, INT}
+        rowptr, colval, nzval = host_csr_arrays(A, INT)
+        return oneSparseMatrixCSR{T, INT}(oneVector{INT}(rowptr), oneVector{INT}(colval), oneVector{T}(nzval), size(A))
+    end
+    to_host(A::oneSparseMatrixCSR) = host_csc(A.rowPtr, A.colVal, A.nzVal, size(A)...)
+    index_eltype(A::oneSparseMatrixCSR) = eltype(A.rowPtr)
+    api_csr(::oneAPIBackend, rowptr::Vector{INT}, colval::Vector{INT}, nzval, n) where {INT} =
+        oneSparseMatrixCSR{eltype(nzval), INT}(oneVector{INT}(rowptr), oneVector{INT}(colval), oneVector(vec(nzval)),
+                                               (n, n))
+end
+
 """
     vendor_sparse_types(backend) -> Union{Nothing, Tuple}
 
@@ -243,6 +268,7 @@ backend extensions loop over these.
 vendor_sparse_types(backend) = nothing
 CUDA_LOADED && (vendor_sparse_types(::CUDABackend) = (CuSparseMatrixCSR, CuSparseMatrixCSC, CuVector))
 AMDGPU_LOADED && (vendor_sparse_types(::ROCBackend) = (ROCSparseMatrixCSR, ROCSparseMatrixCSC, ROCVector))
+ONEAPI_LOADED && (vendor_sparse_types(::oneAPIBackend) = (oneSparseMatrixCSR, oneSparseMatrixCSC, oneVector))
 
 """
     print_backends()
@@ -255,9 +281,11 @@ function print_backends()
     CUDA_FUNCTIONAL && push!(gpus, "CUDA ($(CUDA.name(CUDA.device())))")
     AMDGPU_FUNCTIONAL && push!(gpus, "ROCm ($(AMDGPU.device()))")
     METAL_FUNCTIONAL && push!(gpus, "Metal ($(Metal.device().name))")
+    ONEAPI_FUNCTIONAL && push!(gpus, "oneAPI ($(oneAPI.oneL0.properties(oneAPI.device()).name))")
     CUDA_LOADED && !CUDA_FUNCTIONAL && push!(gpus, "CUDA installed but not functional: skipped")
     AMDGPU_LOADED && !AMDGPU_FUNCTIONAL && push!(gpus, "AMDGPU installed but not functional: skipped")
     METAL_LOADED && !METAL_FUNCTIONAL && push!(gpus, "Metal installed but not functional: skipped")
+    ONEAPI_LOADED && !ONEAPI_FUNCTIONAL && push!(gpus, "oneAPI installed but not functional: skipped")
     TEST_GPU || push!(gpus, "GPU backends disabled by SDS_TEST_GPU=0")
     TEST_CPU || push!(gpus, "CPU backend disabled by SDS_TEST_CPU=0")
     println("Backends under test: ", join(backend_name.(BACKENDS), ", "),
