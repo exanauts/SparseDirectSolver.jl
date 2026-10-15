@@ -97,7 +97,8 @@ function NumericPlan(S, nb::Integer = 1)
             maxchild[t] = max(maxchild[t], nchild[sc.group_nodes[q]])
         end
     end
-    return NumericPlan(first, last, maxchild, gfirst, glast, gmaxchild, gwidth, sfirst, slast, slocal, zeros(Int32, nb),
+    return NumericPlan(first, last, maxchild, gfirst, glast, gmaxchild, gwidth, sfirst, slast, slocal,
+                       zeros(Int32, (ns + 1) * nb),
                        Int32.(1:nb), Ref(Int(nb)), [1, nb + 1], Any[nothing for _ in 1:ns], schur_first,
                        sc.schur > 0 ? nchild[sc.schur] : 0)
 end
@@ -238,6 +239,14 @@ function allocate_numeric(S::Symbolic{INT}, ::Type{T}, backend::KernelAbstractio
     ufactor = KernelAbstractions.zeros(backend, T, lu ? nb * L.factor_len : 0)
     ustack = KernelAbstractions.zeros(backend, T, lu ? nb * L.stack_len : 0)
     plan = NumericPlan(S, nb)
+    if nb == 1 && !_is_ldlt_structure(S.structure) && S.structure != STRUCTURE_GENERAL
+        vstatus = _offset_potrf_status(backend)    # vendor potrf status output, shared by the fronts (never read)
+        for s in 1:nsupernodes(S)
+            takes_c_path(S.schedule, s) || continue
+            plan.vendor_ptrs[s] = _offset_potrf_plan(backend, factor, L.panel_ptr[s], S.schedule.rows[s],
+                                                     S.schedule.width[s], vstatus)
+        end
+    end
     nb > 1 && _vendor_batch_pointers!(plan.vendor_ptrs, factor, S, nb)
     return Numeric{T, typeof(factor), typeof(stats), typeof(info), typeof(pivot_kind)}(factor, d, stack, work, stats,
                                                                                          info, piv, pivot_kind, totals,

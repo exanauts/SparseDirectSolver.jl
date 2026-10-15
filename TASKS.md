@@ -3299,7 +3299,7 @@ minutes of work (`src/symbolic/ndtree.jl` with the tree export/import and a
 canonical supernode postorder, `test/test_ndtree.jl`), unreviewed and without
 CI. Start from it or from scratch; it was not checked against this text.
 
-### T31 — oneAPI and Metal extensions, allocation-free KA dense fallbacks (issues #112, #53)   `[ ]`
+### T31 — oneAPI and Metal extensions, allocation-free KA dense fallbacks (issues #112, #53)   `[~]`
 
 The remainder of T23, split off by owner decision when PR #113 delivered the
 AMDGPU extension and the per-backend local-memory cap alone (#112). Three
@@ -3328,6 +3328,90 @@ machine: a temporary environment that adds oneAPI and Metal and precompiles
 both extensions (no hardware needed to load them on Linux; Metal by review
 only). Mark both as untested in the Report; the `:ka` allocation budget and
 the `select_impl` order are tested on the KA CPU backend. Closes #112 and #53.
+
+### Report
+- Status: [~] — parts (1) oneAPI and (2) Metal are done (PR #136); part (3), the allocation-free `:ka`
+  fallbacks (#53), is not. `:auto` prefers `:ka` on oneAPI for LAPACK (below), not for every op (#112).
+- What was built (oneAPI, part 1): `ext/SparseDirectSolverOneAPIExt.jl` (weak dependency `oneAPI`, compat
+  `2.9.2`, i.e. oneAPI.jl `main`, the only version with KernelAbstractions 0.10 support; the released 2.9.2 is
+  KA 0.9 and does not co-resolve): `CSR(::oneSparseMatrixCSR)`/`CSR(::oneSparseMatrixCSC)` sharing the
+  arrays, `oneSparseMatrixCSR(::CSR)`, `to_backend` (Float64/ComplexF64 rejected on devices without FP64),
+  the T13 forwarders (`DirectSolver`, `update!`, `cholesky`/`ldlt`/`lu` and the wrappers),
+  `max_local_bytes(::oneAPIBackend)` from `maxSharedLocalMemory` (128 KiB on the Max 1550), oneMKL bindings
+  for `gemm`, `syrk`, `herk`, `trsm`, `potrf`/`potrf_info!`/`getrf` (through the C shims, which keep the
+  LAPACK info that oneAPI.jl's wrappers drop), strided-batched `gemm` and `trsm`. Core: the
+  `_auto_vendor_dense(op, backend, T)` hook (`src/dense/interface.jl`): every oneMKL call waits for its queue
+  and LAPACK allocates a scratchpad, so on oneAPI `:auto` keeps `potrf`/`getrf` on the KA kernels and the
+  generic LinearAlgebra path is off; `impl = :vendor` still reaches oneMKL. `dense_impls` lists only the
+  `:auto`-eligible vendor bindings, so `:auto` stays its first entry and `:ka` its last. Tests: oneAPI in
+  `test/backends.jl`, the oneMKL column and the `:auto` policy in `test_dense.jl`, the extension check, the
+  local-memory cap. CI: a `oneapi` leg of `test-gpu` on the runner `headroom` (labels `gpu`, `oneapi`;
+  oneAPI.jl `main`) and a `test-metal` job on GitHub's hosted `macos-latest`, Float32 only. Docs:
+  `lib/oneapi.md`, backend table, README. Base commit (also in this PR): `backend isa
+  KernelAbstractions.GPU` was true for the CPU backend under KA 0.10 (`GPU` is an alias of `Backend` there),
+  so the CPU took the device symbolic-map route; now `!(backend isa CPU)`. KA compat stays `"0.9, 0.10"`.
+- Tests (oneAPI): Aurora compute node, Intel Data Center GPU Max 1550 (one tile, `ZE_FLAT_DEVICE_HIERARCHY=FLAT`),
+  oneAPI.jl `main` (94aa6f2) with its support library built by the oneAPI.jl CI build step, KA 0.10.0, all
+  four element types, `SDS_TEST_CPU=0 SDS_TEST_SKIP=test_aqua`, 16 workers: 64,637 pass / 0 fail / 4 broken
+  (the `@test_skip` of `test_api.jl`: no device allocation counter on oneAPI), 6.5 min. The CPU backend was
+  not run on Aurora by owner decision (CI's CPU job covers it); a 48-worker CPU run there aborted in POCL's
+  thread-pool start-up (`pthread_scheduler_init`, every worker starts a pool of all 208 hardware threads).
+- What was built (Metal, part 2): `ext/SparseDirectSolverMetalExt.jl` (weak dependency `Metal`, compat `1.11`: the
+  offset-aware `MPSMatrix(buffer, desc, offset)` constructor and the `MPSMatrixDecompositionCholesky`
+  wrapper used by the extension): Float32 CSR upload (`to_backend`), `max_local_bytes(::MetalBackend) = 32768`,
+  backend hooks in `src/dense/capabilities.jl` (`_backend_schedule_options`, `_allow_batched_dense`,
+  `_allow_generic_dense`, `_serial_cholesky_stats`, `_host_reduce_cholesky_info`, `_dense_solve_front`,
+  `_solve_workgroup`, `_offset_potrf_status`/`_offset_potrf_plan`/`_offset_potrf_info!`), MPS Cholesky for
+  single-matrix regime-C fronts at least 64 wide (plans and the status buffer preallocated in
+  `allocate_numeric`, pivots checked after MPS by `ka_chol_check_info!`, #127 semantics), every Metal front in
+  the fused level solve, 128-item solve workgroups; Metal in `test/backends.jl`, docs, `bench/metal_*.jl`.
+  `_tri_decode` (`src/symbolic/schedule.jl`) uses an integer binary search (`_kernel_isqrt`) instead of
+  `Base.isqrt`, whose Julia 1.13 implementation goes through Float64 and does not compile for Metal, on
+  every backend.
+- Tests (Metal, M4 Max, Float32, implementer's run): full suite 23,399 pass / 0 fail / 1 broken (existing).
+  Owner's machine after the review fixes, `SDS_TEST_ONLY="test_helpers,test_numeric_cholesky_a,
+  test_numeric_cholesky_b,test_numeric_cholesky_c,test_solve,test_api"` (+ `test_aqua` on CPU), all four
+  element types: CPU 5,817 pass / 0 fail; CUDA (`SDS_TEST_CPU=0`, RTX 4080) 5,584 pass / 0 fail.
+  Full suite and AMDGPU: CI on the PR. oneAPI: above.
+- Measurements (M4 Max, Metal.jl 1.11.1, Float32, warmed median, `lap2d_300`, n = 90,000): refactorization
+  142 → 62 ms (2.29×), solve 5.19 → 5.18 ms; 113 regime-C fronts, 18 at least 64 wide; MPS potrf 5–14×
+  faster than KA potrf at widths 128–256, crossover near 64; MPS trsm was correct but slower end to end
+  (not used). RTX 4080 Float64 context: SDS 32.9 / 3.48 ms, cuDSS 3.96 / 0.675 ms (not precision parity).
+- Deviations from PLAN.md / this task:
+  * `:auto` on Metal resolves `gemm`/`syrk` to `:generic` (MPS through `mul!` on views, allocating MPS
+    descriptors per call), not `:ka` as the task asks. The extension states it is faster; the comparison
+    with `:ka` is not recorded and has to be measured. POTRF/TRSM stay `:ka` (POTRF: MPS for wide fronts,
+    above).
+  * The MPS potrf route creates an `MPSCommandBuffer` wrapper per wide front per refactorization, about
+    2.1 MB of host allocation per refactorization on `lap2d_300` — an exception to "no allocation in the
+    numeric phase"; needs a reusable command-buffer encoding (follow-up).
+  * Float32 only: `ComplexF32` is not supported on Metal yet (`to_backend` raises `NotSupportedError`).
+  * LDLᵀ/LDLᴴ and LU on Metal run in regime C only (vendor factorization, no subtree budgets): their fused
+    kernels bind 32 buffers, Apple GPUs allow 31. Cholesky with default options uses
+    `regime_c_width = 32`, `regime_c_rows = 128` on Metal.
+  * Uniform batches on Metal: KA dense kernels only, and the Cholesky statistics/`info` reduction runs in
+    a serial kernel plus a host reduction (`_serial_cholesky_stats`, `_host_reduce_cholesky_info`).
+  * `test/test_numeric_cholesky_a.jl`: `NUMERIC_ABC_OPTS` gains `subtree_max_fronts = 32` on every backend.
+- Open issues / follow-ups (oneAPI): upstream oneAPI.jl: (a) the `*_scratchpad_size` C shims do not catch
+  oneMKL exceptions, so `sytrf` (unsupported on the Max 1550) aborts the process — no `vendor_sytrf!` binding
+  here; (b) the generated `onemklZtrsm_batch_strided` binding declares `Ptr{ComplexF32}` arguments (and the
+  strided-batch trsm bindings host `Ptr`s, not `ZePtr`s) — the extension passes typed raw pointers; (c) every
+  shim ends in `wait_and_throw`, so a vendor call is a host synchronization; (d) no cumulative device
+  allocation counter for `device_allocated`. Batched `potrf`/`getrf` report one status per batch, so uniform
+  batches use the KA kernels. Width-dependent `:auto` (oneMKL only for wide fronts) is not measured. The POCL
+  thread oversubscription of the KA 0.10 CPU backend with many test workers (`JULIA_KA_CPU_THREADS`).
+- Open issues / follow-ups (Metal): reusable MPS command-buffer encoding (allocation above); why the 256-item
+  `_cholesky_stats_kernel!` reduction needs the serial variant for Metal batches (kernel bug hidden by
+  CUDA/AMD warps, or a Metal compiler limit) — not yet diagnosed; confirm on CUDA that the `_tri_decode`
+  change does not slow regime A/B (`bench/`); `ComplexF32` on Metal; oneAPI and part (3) of this task.
+  Review fixes (PR #136): the MPS status output had been written into `N.aux` (clobbering the `max |aᵢⱼ|`
+  statistic); it now has its own `MPSMatrixDecompositionStatus` buffer. The test-helper round trip keeps
+  `ComplexF64` on CUDA/AMDGPU. The budget-class test in `test_numeric_cholesky_a.jl` expects the
+  rejection of an explicit budget above `max_local_bytes` (failed on AMDGPU once the test helpers passed
+  the backend's `max_local` to the analysis).
+- Suggested plan changes: part (3) (#53) as its own task; PLAN §2.6 oneAPI column: gemm/syrk/herk/trsm,
+  potrf/getrf and strided-batched gemm/trsm yes, sytrf and per-member batched potrf/getrf no; record
+  Metal's 31-buffer argument limit next to the 32 KiB local-memory cap in PLAN §2.7.
 
 ### External — MadNLPGPU integration (in the MadNLP repository)   `[ ]`
 

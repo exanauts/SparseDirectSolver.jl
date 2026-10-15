@@ -33,6 +33,25 @@ dense_part(C, uplo::Char) = uplo == 'L' ? tril(C) : triu(C)
             end
             @test caps.vendor_herk == (T <: Complex)
         end
+        if backend_name(backend) == "oneAPI"  # the oneMKL column of PLAN §2.6 (T31)
+            for f in (:vendor_gemm, :vendor_syrk, :vendor_trsm, :vendor_potrf, :vendor_getrf,
+                      :vendor_gemm_strided_batched, :vendor_trsm_batched, :reshape_view_mul)
+                @test getfield(caps, f)
+            end
+            @test caps.vendor_herk == (T <: Complex)
+            # one status per batch in oneMKL: no per-member info, the KA kernels serve uniform batches;
+            # no sytrf on the GPU (oneMKL aborts with unsupported_device)
+            @test !caps.vendor_potrf_batched && !caps.vendor_getrf_batched && !caps.vendor_sytrf
+            # LAPACK waits for the queue and allocates its scratchpad: `:auto` takes the KA kernels,
+            # `impl = :vendor` still reaches oneMKL; the generic LinearAlgebra path is not used
+            @test SDS.dense_impls(:potrf, backend, T) == [:ka]
+            @test SDS.dense_impls(:getrf, backend, T) == [:ka]
+            @test SDS.dense_impls(:gemm, backend, T) == [:vendor, :ka]
+            @test SDS.dense_impls(:trsm, backend, T) == [:vendor, :ka]
+            X = to_device(backend, zeros(T, 2, 2))
+            @test SDS.select_impl(:potrf, X, :vendor) === :vendor
+            @test_throws SDS.NotSupportedError SDS.select_impl(:potrf, X, :generic)
+        end
         for op in keys(SDS.DENSE_OPS)
             impls = SDS.dense_impls(op, backend, T)
             @test last(impls) === :ka

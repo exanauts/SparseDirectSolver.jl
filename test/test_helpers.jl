@@ -8,6 +8,10 @@
     @test ("CUDA" in names) == cuda_expected
     rocm_expected = TEST_GPU && AMDGPU_LOADED && AMDGPU.functional()
     @test ("ROCm" in names) == rocm_expected
+    metal_expected = TEST_GPU && METAL_LOADED && Metal.functional()
+    @test ("Metal" in names) == metal_expected
+    oneapi_expected = TEST_GPU && ONEAPI_LOADED && oneAPI.functional()
+    @test ("oneAPI" in names) == oneapi_expected
     @info "Active backends: $(join(names, ", "))"
     if CUDA_LOADED  # loading CUDA triggers the package extension
         @test Base.get_extension(SparseDirectSolver, :SparseDirectSolverCUDAExt) !== nothing
@@ -15,17 +19,24 @@
     if AMDGPU_LOADED  # likewise AMDGPU (T23)
         @test Base.get_extension(SparseDirectSolver, :SparseDirectSolverAMDGPUExt) !== nothing
     end
+    if METAL_LOADED
+        @test Base.get_extension(SparseDirectSolver, :SparseDirectSolverMetalExt) !== nothing
+    end
+    if ONEAPI_LOADED  # likewise oneAPI (T31)
+        @test Base.get_extension(SparseDirectSolver, :SparseDirectSolverOneAPIExt) !== nothing
+    end
     for backend in BACKENDS
         x = rand(Float32, 7)
         dx = to_device(backend, x)
         @test KernelAbstractions.get_backend(dx) == backend
         @test to_host(dx) == x
-        A = sprand(ComplexF64, 9, 9, 0.3) + I
+        TC = backend_name(backend) == "Metal" ? Float32 : ComplexF64   # Metal's to_backend takes Float32 only
+        A = sprand(TC, 9, 9, 0.3) + I
         @test to_host(to_device(backend, A)) == A
         for INT in INTTYPES
             dA = to_device(backend, A, INT)
             @test to_host(dA) == A
-            @test eltype(dA) == ComplexF64
+            @test eltype(dA) == TC
             @test index_eltype(dA) == INT   # issue #30: vendor constructors silently use Int32
         end
     end

@@ -109,6 +109,20 @@ per-architecture tuning (`Fused.default_tuning`) keys on it.
 """
 max_threads_per_multiprocessor(backend) = 0
 
+# Backend extensions may adjust scheduling options for hard kernel ABI limits.
+_backend_schedule_options(backend, structure::Structure, opts::Options) = opts
+_backend_schedule_options(backend, structure::Structure, opts::Options, nbatch::Integer) =
+    _backend_schedule_options(backend, structure, opts)
+_allow_batched_dense(backend) = true
+_serial_cholesky_stats(backend, nbatch::Integer) = false
+_host_reduce_cholesky_info(backend, nbatch::Integer) = false
+_dense_solve_front(backend, schedule, s::Integer) = takes_c_path(schedule, s)
+_solve_workgroup(backend) = 64
+_offset_potrf_status(backend) = nothing
+_offset_potrf_plan(backend, factor, p0, f, w, status) = nothing
+_offset_potrf_info!(backend, plan, info, idx) = false
+_offset_potrf_enabled(backend) = false
+
 # ---------------------------------------------------------------------------
 # probes
 
