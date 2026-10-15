@@ -10,7 +10,7 @@ copy and every numeric phase runs where they live.
 | CUDA (`using CUDA`) | `CuSparseMatrixCSR`, `CuSparseMatrixCSC`, [`CSR`](@ref) of `CuArray`s | cuBLAS, cuSOLVER | tested |
 | AMDGPU (`using AMDGPU`) | `ROCSparseMatrixCSR`, `ROCSparseMatrixCSC`, [`CSR`](@ref) of `ROCArray`s | rocBLAS, rocSOLVER | tested (MI300X) |
 | Metal (`using Metal`) | [`CSR`](@ref) of `MtlArray`s | Metal.jl / KernelAbstractions kernels | Float32, tested (M4 Max) |
-| oneAPI | [`CSR`](@ref) of device arrays | KernelAbstractions kernels | planned extension |
+| oneAPI (`using oneAPI`) | `oneSparseMatrixCSR`, `oneSparseMatrixCSC`, [`CSR`](@ref) of `oneArray`s | oneMKL BLAS, KernelAbstractions kernels for the panel factorizations | tested (Intel Data Center GPU Max 1550) |
 
 [`to_backend`](@ref) moves a `SparseMatrixCSC` to a backend:
 

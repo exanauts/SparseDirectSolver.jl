@@ -10,7 +10,8 @@ and other cuDSS users can switch to it mechanically, and targets CUDA, AMDGPU,
 oneAPI, Metal and the KernelAbstractions CPU backend.
 
 **Status: v0.1 under construction.** Working today on the CPU backend, CUDA,
-AMDGPU (ROCm), and Metal (`Float32`, tested on an M4 Max):
+AMDGPU (ROCm), Metal (`Float32`, tested on an M4 Max) and oneAPI (tested on an
+Intel Data Center GPU Max 1550):
 
 * host symbolic analysis: AMD or nested dissection (METIS) ordering,
   elimination tree, supernodes with GPU-tuned
@@ -107,7 +108,9 @@ Pkg.add(url = "https://github.com/exanauts/SparseDirectSolver.jl")
 Loading CUDA.jl enables the CUDA extension (`CuSparseMatrixCSR`/`CuSparseMatrixCSC`
 constructors, cuBLAS/cuSOLVER dense kernels); loading AMDGPU.jl enables the
 AMDGPU extension (`ROCSparseMatrixCSR`/`ROCSparseMatrixCSC` constructors,
-rocBLAS/rocSOLVER dense kernels; ROCm must be found by AMDGPU.jl).
+rocBLAS/rocSOLVER dense kernels; ROCm must be found by AMDGPU.jl); loading
+oneAPI.jl enables the oneAPI extension (`oneSparseMatrixCSR`/`oneSparseMatrixCSC`
+constructors, oneMKL BLAS kernels; needs oneAPI.jl with KernelAbstractions 0.10).
 
 ## Usage
 
