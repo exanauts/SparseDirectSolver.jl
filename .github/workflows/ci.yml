@@ -72,11 +72,12 @@ jobs:
         os: [ubuntu-latest]
         julia-version: ['1']
         julia-arch: [x64]
-        # Both legs must pass: the AMDGPU extension (T23) runs the suite on
-        # ROCBackend with rocBLAS/rocSOLVER (test/backends.jl adds it when
-        # AMDGPU is functional). Making the amdgpu check required is a branch
-        # ruleset setting of the owner.
-        backend: ['cuda', 'amdgpu']
+        # Every leg must pass: the AMDGPU extension (T23) runs the suite on
+        # ROCBackend with rocBLAS/rocSOLVER, the oneAPI extension (T31) on
+        # oneAPIBackend with oneMKL (the runner `headroom`); test/backends.jl adds
+        # each backend when its package is functional. Making a check required is
+        # a branch ruleset setting of the owner.
+        backend: ['cuda', 'amdgpu', 'oneapi']
     runs-on: [self-hosted, linux, X64, gpu, '${{ matrix.backend }}']
 
     steps:
@@ -95,9 +96,48 @@ jobs:
         if: matrix.backend == 'amdgpu'
         run: |
           julia --project=test -e 'using Pkg; Pkg.add("AMDGPU")'
+      # oneAPI.jl main: the released oneAPI.jl does not support KernelAbstractions 0.10 yet,
+      # which the oneAPI extension needs; switch to Pkg.add("oneAPI") once a release does
+      - name: Add oneAPI.jl to the test environment
+        if: matrix.backend == 'oneapi'
+        run: |
+          julia --project=test -e 'using Pkg; Pkg.add(url = "https://github.com/JuliaGPU/oneAPI.jl", rev = "main")'
+          julia --project=test -e 'using oneAPI; oneAPI.versioninfo()'
       - uses: julia-actions/julia-runtest@latest
       - uses: julia-actions/julia-processcoverage@v1
       - uses: codecov/codecov-action@v4
         with:
           file: lcov.info
           token: ${{ secrets.CODECOV_TOKEN }}
+
+  # Metal (T31) on GitHub's hosted Apple Silicon runner. Metal has no Float64 and the extension takes Float32
+  # only (`to_backend` raises NotSupportedError otherwise), so this leg tests Float32 whatever the
+  # workflow-level element types are.
+  test-metal:
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SDS_TEST_ELTYPES: 'Float32'
+      SDS_TEST_CPU: '0'
+      SDS_TEST_SKIP: 'test_aqua'
+      # the hosted macOS arm64 runner has 3 cores and 7 GB
+      PTR_NUM_JOBS: '3'
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        julia-version: ['1']
+        julia-arch: [aarch64]
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@latest
+        with:
+          version: ${{ matrix.julia-version }}
+          arch: ${{ matrix.julia-arch }}
+      - name: Machine
+        run: sysctl -n hw.ncpu machdep.cpu.brand_string && system_profiler SPDisplaysDataType | grep -E "Chipset|Metal" || true
+      - name: Add Metal.jl to the test environment
+        run: |
+          julia --project=test -e 'using Pkg; Pkg.add("Metal")'
+          julia --project=test -e 'using Metal; Metal.versioninfo(); Metal.functional() || error("Metal is not functional on this runner")'
+      - uses: julia-actions/julia-runtest@latest
