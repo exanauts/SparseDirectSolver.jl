@@ -3299,35 +3299,51 @@ minutes of work (`src/symbolic/ndtree.jl` with the tree export/import and a
 canonical supernode postorder, `test/test_ndtree.jl`), unreviewed and without
 CI. Start from it or from scratch; it was not checked against this text.
 
-### T31 — oneAPI and Metal extensions, allocation-free KA dense fallbacks (issues #112, #53)   `[ ]`
+### T31 — oneAPI and Metal extensions (issue #118)   `[ ]`
 
 The remainder of T23, split off by owner decision when PR #113 delivered the
-AMDGPU extension and the per-backend local-memory cap alone (#112). Three
+AMDGPU extension and the per-backend local-memory cap alone (#112). Two
 parts: (1) `ext/SparseDirectSolverOneAPIExt.jl`: `oneSparseMatrixCSR` adapters,
 the T13 API on them, oneMKL dense bindings for the `vendor_*` table,
 `max_local_bytes(::oneAPIBackend)` from the device; (2)
 `ext/SparseDirectSolverMetalExt.jl`: MPS bindings where they exist or the KA
 fallbacks only, `max_local_bytes(::MetalBackend) = 32768` (the cap already
-clamps the default `subtree_budgets`), Float32/ComplexF32 only; (3) the owner
-note of #53: the `impl = :ka` dense fallbacks (`ka_potrf!`, `ka_trsm!`,
-`ka_gemm!` and the batched variants) are the only dense path on these backends
-and must be allocation-free per call — the T23 survey found no allocation
-inside `src/dense/fallback/*.jl`; the per-call cost is the launch
-configuration (`Val`s built from runtime flags such as `Val(ul == 'L')` in
-`potrf.jl`, `Val(tA)`/`Val(tB)` and the `Union`-typed tile of `_default_tile`
-in `gemm.jl`, kernel objects built per call, keyword calls), so the fix is
-static launch configurations resolved at analysis and preallocated workspace
-in `Numeric`, asserted with `ka_cpu_alloc_budget` from `test/utils.jl`. Also
-from #112: `select_impl` resolves `:auto` to the allocating `:generic` path
-before `:ka` on a backend without `vendor_*` bindings whose `mul!`/`cholesky!`
-probes pass, so on oneAPI/Metal `:auto` must prefer `:ka`. `:generic` stays
-the allocating reference path (PLAN §3.9).
+clamps the default `subtree_budgets`), Float32/ComplexF32 only.
 
 Written by analogy with the CUDA and AMDGPU extensions. Test on the owner's
 machine: a temporary environment that adds oneAPI and Metal and precompiles
 both extensions (no hardware needed to load them on Linux; Metal by review
-only). Mark both as untested in the Report; the `:ka` allocation budget and
-the `select_impl` order are tested on the KA CPU backend. Closes #112 and #53.
+only). Mark both as untested in the Report.
+
+**Owner note (2026-10-27, PR #136)**: split. The allocation-free `:ka` dense
+fallbacks (#53) and the `:auto` order of #112 moved to T32; T31 is the two
+extensions and closes #118 only. Both extensions were tested on hardware after
+all (oneAPI on an Intel Data Center GPU Max 1550, Metal on an M4 Max; CI legs
+`oneapi` and `test-metal`), so the Report records those runs instead of
+"untested". T31 lands ahead of T24–T30 by owner decision; those tasks keep
+their numbers and order.
+
+### T32 — Allocation-free KA dense fallbacks, `:auto` prefers `:ka` (issues #146, #112, #53)   `[ ]`
+
+Part (3) of the original T31, split off by owner decision (PR #136). The
+owner note of #53: the `impl = :ka` dense fallbacks (`ka_potrf!`, `ka_trsm!`,
+`ka_gemm!` and the batched variants) are the only dense path on backends
+without vendor bindings and must be allocation-free per call — the T23 survey
+found no allocation inside `src/dense/fallback/*.jl`; the per-call cost is the
+launch configuration (`Val`s built from runtime flags such as
+`Val(ul == 'L')` in `potrf.jl`, `Val(tA)`/`Val(tB)` and the `Union`-typed tile
+of `_default_tile` in `gemm.jl`, kernel objects built per call, keyword
+calls), so the fix is static launch configurations resolved at analysis and
+preallocated workspace in `Numeric`, asserted with `ka_cpu_alloc_budget` from
+`test/utils.jl`. Also from #112: `select_impl` resolves `:auto` to the
+allocating `:generic` path before `:ka` on a backend without `vendor_*`
+bindings whose `mul!`/`cholesky!` probes pass, so on oneAPI/Metal `:auto` must
+prefer `:ka` (T31 kept `:generic` for Metal's GEMM/SYRK and LAPACK on `:ka`
+for oneAPI; measure both against allocation-free `:ka` and record the
+choice). `:generic` stays the allocating reference path (PLAN §3.9).
+
+Tests: the `:ka` allocation budget and the `select_impl` order on the KA CPU
+backend; on CUDA, AMDGPU, oneAPI and Metal through CI. Closes #112 and #53.
 
 ### External — MadNLPGPU integration (in the MadNLP repository)   `[ ]`
 
