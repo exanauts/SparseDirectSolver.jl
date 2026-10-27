@@ -15,4 +15,4 @@ SparseDirectSolver = {path = ".."}
 AMDGPU = "2.9"
 CUDA = "6.5"
 Documenter = "1"
-oneAPI = "2.9.2"
+oneAPI = "2.10"

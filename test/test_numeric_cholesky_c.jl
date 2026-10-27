@@ -154,3 +154,43 @@ end
     @test info_ref == 4
     @test SDS.factorize!(Nd, Sd, nz) == 4
 end
+
+# a failing pivot inside a regime-C front at least 64 wide: on Metal the offset-aware MPS Cholesky
+# (`_offset_potrf_plan`) takes such a front under `impl = :auto`, and its status is folded into `info`;
+# MPS names no column, so there `info` is only required to fall into the failing front
+@testset "info: failing pivot in a wide front ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
+    Random.seed!(666)
+    n, j = 96, 70
+    A = sparse(dense_hpd(T, n))
+    S, Nr, info_ref, Sd, Nd, nz = numeric_c_setup(backend, A)
+    @test info_ref == 0
+    @test SDS.factorize!(Nd, Sd, nz) == 0
+    @test panel_error(SDS.host_numeric(Nd), Nr) <= panel_tol(T)
+    for d in (-1, 0)
+        A[j, j] = d
+        S, Nr, info_ref, Sd, Nd, nz = numeric_c_setup(backend, A)
+        sc, P = S.schedule, S.partition
+        @test info_ref > 0
+        s = P.col2sn[P.iperm[info_ref]]
+        @test SDS.takes_c_path(sc, s) && sc.width[s] >= 64
+        info = SDS.factorize!(Nd, Sd, nz; opts = Options(pivot_epsilon = 0.0))
+        @test info > 0 && P.col2sn[P.iperm[info]] == s
+        backend_name(backend) == "Metal" || @test info == info_ref
+    end
+end
+
+# the vendor potrf of a backend (MPS on Metal) is an `impl = :auto` decision: `impl = :ka` and
+# `factorization_alg = "algo1"` (no vendor calls, PLAN §1.3) keep the KA kernels
+@testset "offset-aware vendor potrf only under :auto ($(backend_name(backend)), $T)" for backend in BACKENDS,
+                                                                                         T in ELTYPES
+    A = sparse(dense_hpd(T, 96))
+    _, _, _, Sd, Nd, _ = numeric_c_setup(backend, A)
+    @test SDS._front_impls(Nd, Sd, :auto).mps == SDS._offset_potrf_enabled(backend)
+    @test !SDS._front_impls(Nd, Sd, :ka).mps
+    _, _, _, Sd1, Nd1, nz1 = numeric_c_setup(backend, A; opts = Options(subtree_budgets = Int[],
+                                                                      factorization_alg = "algo1",
+                                                                      regime_c_width = 16))
+    @test !Sd1.schedule.vendor_c && !SDS._front_impls(Nd1, Sd1, :auto).mps
+    @test all(isnothing, Nd1.plan.vendor_ptrs)
+    @test SDS.factorize!(Nd1, Sd1, nz1) == 0
+end

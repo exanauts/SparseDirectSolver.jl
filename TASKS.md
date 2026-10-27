@@ -3376,18 +3376,26 @@ their numbers and order.
   `_tri_decode` (`src/symbolic/schedule.jl`): `Base.isqrt` goes through Float64, which Metal kernels cannot
   compile; it now seeds from a `Float32` square root and corrects with the two integer fixups (exact,
   checked for every index of every triangle up to 2,100 rows in Int32 and Int64 and for 10⁷ random
-  `p < 2^44`). The binary search of the earlier head (#142) cost TRI_BSEARCH on CUDA; see Measurements.
+  `p < 2^44`). The binary search of the earlier head cost 9–36% of a regime-A/B factorization on CUDA (#142); see
+  Measurements.
 - Tests (Metal, M4 Max, Float32, implementer's run before the round-4 review fixes): full suite 23,399 pass /
   0 fail / 1 broken (existing). The round-4 fixes (MPS status, `:auto` gating, `NotSupportedError`, the new
   wide-front `info` testsets in `test_numeric_cholesky_c.jl`) are covered on Metal by the `test-metal` CI
   leg only. This machine (2× NVIDIA H200, Julia 1.13.3, not the RTX 4080 of AGENTS.md) after the round-4
-  fixes, all four element types: TESTS_LOCAL.
+  fixes, all four element types, CUDA.jl added to the test environment as CI does,
+  `SDS_TEST_ONLY="test_numeric_cholesky_a,test_numeric_cholesky_b,test_numeric_cholesky_c,test_solve,test_dense,
+  test_symbolic_schedule,test_api,test_numeric_ldlt,test_numeric_lu,test_ubatch,test_schur,test_helpers,
+  test_aqua"`: CPU + CUDA 77,371 pass / 0 fail / 0 broken (5.0 min, 24 workers). Full suite, AMDGPU, oneAPI
+  and Metal: CI on the PR.
 - Measurements (M4 Max, Metal.jl 1.11.1, Float32, warmed median, `lap2d_300`, n = 90,000): refactorization
   142 → 62 ms (2.29×), solve 5.19 → 5.18 ms; 113 regime-C fronts, 18 at least 64 wide; MPS potrf 5–14×
   faster than KA potrf at widths 128–256, crossover near 64; MPS trsm was correct but slower end to end
   (not used). RTX 4080 Float64 context: SDS 32.9 / 3.48 ms, cuDSS 3.96 / 0.675 ms (not precision parity).
   `_tri_decode` on CUDA (H200, warmed median of 60 `factorize!`, default options unless noted;
-  `main`'s `isqrt` / binary search of the earlier head / `Float32` seed): TRI_TABLE
+  `main`'s `isqrt` / binary search of the earlier head / `Float32` seed): `laplacian3d(40,40,40)` 499.2 / 544.3 /
+  499.1 ms; `laplacian2d(300,300)` 52.5 / 71.4 / 49.7 ms; `laplacian3d(30,30,30)` with `subtree_parallelism = 0`
+  153.4 / 179.6 / 153.4 ms; `laplacian2d(300,300)` Float32 45.1 / 54.1 / 44.6 ms. The `Float32` seed with
+  `while` fixup loops instead of single steps measured 527.1 / 58.7 / 171.3 / 44.7 ms.
 - Deviations from PLAN.md / this task:
   * `:auto` on Metal resolves `gemm`/`syrk` to `:generic` (MPS through `mul!` on views, allocating MPS
     descriptors per call), not `:ka` as the original task text asked; the comparison with an allocation-free

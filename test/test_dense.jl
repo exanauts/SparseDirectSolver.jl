@@ -9,6 +9,10 @@ dense_tri(A, uplo::Char, diag::Char) =
     uplo == 'L' ? (diag == 'U' ? UnitLowerTriangular(A) : LowerTriangular(A)) :
     (diag == 'U' ? UnitUpperTriangular(A) : UpperTriangular(A))
 dense_part(C, uplo::Char) = uplo == 'L' ? tril(C) : triu(C)
+# the impls the potrf/getrf loops run: `dense_impls`, plus oneMKL on oneAPI, where `:auto` keeps LAPACK on the
+# KA kernels so `dense_impls` omits it, but an explicit `impl = :vendor` still reaches it
+tested_impls(op, backend, T) =
+    backend_name(backend) == "oneAPI" ? union(SDS.dense_impls(op, backend, T), [:vendor]) : SDS.dense_impls(op, backend, T)
 
 @testset "capability audit ($(backend_name(backend)))" for backend in BACKENDS
     if RUN_SHARED   # the table covers every element type
@@ -121,14 +125,14 @@ end
 
         @testset "potrf $m panel=$panel" begin
             S = dense_hpd(T, m)
-            for uplo in ('L', 'U'), impl in SDS.dense_impls(:potrf, backend, T)
+            for uplo in ('L', 'U'), impl in tested_impls(:potrf, backend, T)
                 X = dev(S)
                 @test SDS.potrf!(uplo, X; impl) == 0
                 F = uplo == 'L' ? LowerTriangular(to_host(X)) : UpperTriangular(to_host(X))'
                 @test norm(F * F' - S) <= tl * norm(F)^2
             end
             # not positive definite at column j: info == j
-            for j in unique((1, cld(m, 2), m)), uplo in ('L', 'U'), impl in SDS.dense_impls(:potrf, backend, T)
+            for j in unique((1, cld(m, 2), m)), uplo in ('L', 'U'), impl in tested_impls(:potrf, backend, T)
                 Sj = copy(S)
                 Sj[j, j] = -one(T)
                 @test SDS.potrf!(uplo, dev(Sj); impl) == j
@@ -139,7 +143,7 @@ end
             for (r, c) in unique(((m, n), (m, m)))
                 A = randn(T, r, c)
                 kmin = min(r, c)
-                for impl in SDS.dense_impls(:getrf, backend, T), IP in (Int32, Int64)
+                for impl in tested_impls(:getrf, backend, T), IP in (Int32, Int64)
                     X = dev(A)
                     ipiv = to_device(backend, zeros(IP, kmin))
                     @test SDS.getrf!(X, ipiv; impl) == 0
@@ -171,7 +175,7 @@ end
     @testset "getrf zero pivot" begin
         A = randn(T, 6, 6)
         A[:, 3] .= 0
-        for impl in SDS.dense_impls(:getrf, backend, T)
+        for impl in tested_impls(:getrf, backend, T)
             ipiv = to_device(backend, zeros(Int32, 6))
             @test SDS.getrf!(to_device(backend, A), ipiv; impl) == 3
         end
@@ -315,7 +319,7 @@ end
     for m in (1, 7, 32, 100)
         S = dense_hpd(T, m)
         f = m + 5
-        for uplo in ('L', 'U'), impl in SDS.dense_impls(:potrf, backend, T)
+        for uplo in ('L', 'U'), impl in tested_impls(:potrf, backend, T)
             P = to_panel(backend, vcat(S, randn(T, f - m, m)))
             F11 = view(P, 1:m, 1:m)
             info = to_device(backend, fill(Int32(7), 4))

@@ -116,28 +116,15 @@ packed_length(m::Integer) = Int(m) * (Int(m) + 1) ÷ 2
 # inverse of the packed lower-triangle enumeration: 0-based q in an r x r lower
 # triangle (col-major, n = r(r+1)/2 entries) -> 1-based (a, b), a >= b. Enumerating
 # only the triangle halves the work-item count of the guarded full-square loops.
-# Integer square root without Base.isqrt, whose Julia 1.13 implementation uses
-# Float64 internally and therefore cannot compile for Metal kernels.
-@inline function _kernel_isqrt(x::T) where {T <: Integer}
-    x <= one(T) && return x
-    lo, hi = zero(T), min(x, T(1) << ((8 * sizeof(T) + 1) >> 1))
-    while lo + one(T) < hi
-        mid = lo + ((hi - lo) >> 1)
-        if mid <= x ÷ mid
-            lo = mid
-        else
-            hi = mid
-        end
-    end
-    return lo
-end
-
-# The two boundary fixups are kept as a belt against integer overflow or a
-# compiler quirk in the inverse triangular-number calculation.
+# t = floor((sqrt(8p + 1) - 1) / 2), the largest t with t(t + 1)/2 <= p: seeded from a Float32
+# square root (Base.isqrt goes through Float64, which Metal kernels cannot compile) and made
+# exact by the two integer fixups; the seed is within one of t far beyond the fronts regimes A
+# and B enumerate (checked for p < 2^44). Fixup loops instead of single steps cost 6-12% of a
+# regime-A/B factorization on CUDA (T31 Report)
 @inline function _tri_decode(q, r)
     n = r * (r + 1) ÷ 2
     p = n - 1 - q
-    t = (_kernel_isqrt(8 * p + 1) - 1) ÷ 2
+    t = (unsafe_trunc(typeof(p), sqrt(Float32(8 * p + 1))) - 1) ÷ 2
     t * (t + 1) ÷ 2 > p && (t -= 1)
     (t + 1) * (t + 2) ÷ 2 <= p && (t += 1)
     b = r - t

@@ -61,7 +61,7 @@ Intel Data Center GPU Max 1550):
   through `SDS_LOG_LEVEL`.
 
 Not there yet: non-uniform batches, ND partition-tree export, mixed precision,
-hybrid host memory, delayed pivots, and the oneAPI extension. Unsupported structures, phases and parameters raise
+hybrid host memory, and delayed pivots. Unsupported structures, phases and parameters raise
 `NotSupportedError` rather than falling back silently. The remaining gap to
 cuDSS is performance, not features (see below and
 [`PERFORMANCE.md`](PERFORMANCE.md)); a MadNLP end-to-end run on CUDA and AMD

@@ -43,9 +43,11 @@ Three documents define the work. Read them in this order before touching code:
   mechanically.
 * New dependencies need a one-line justification in the Report. Never `dev`
   unregistered or local checkouts into the project (the package requires
-  KernelAbstractions 0.10 and GPUArrays 12, hence CUDA.jl >= 6.5 and
-  AMDGPU.jl >= 2.9; the test allocation budgets carry a per-launch allowance
-  for the 0.10 CPU backend -- see `ka_cpu_alloc_budget`).
+  KernelAbstractions 0.10 and GPUArrays 12, hence CUDA.jl >= 6.5, AMDGPU.jl
+  >= 2.10 and Metal.jl >= 1.11; oneAPI.jl comes from its `main` branch in the CI
+  test environment only, until a release supports 0.10; the test allocation
+  budgets carry a per-launch allowance for the 0.10 CPU backend -- see
+  `ka_cpu_alloc_budget` and #145).
 * The repository is `github.com/exanauts/SparseDirectSolver.jl` (remote
   `origin`, branch `main`). Commit at the end of the task with a message
   starting with the task id, e.g. `T05: symbolic pattern, ordering, etree,

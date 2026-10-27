@@ -239,8 +239,9 @@ function allocate_numeric(S::Symbolic{INT}, ::Type{T}, backend::KernelAbstractio
     ufactor = KernelAbstractions.zeros(backend, T, lu ? nb * L.factor_len : 0)
     ustack = KernelAbstractions.zeros(backend, T, lu ? nb * L.stack_len : 0)
     plan = NumericPlan(S, nb)
-    if nb == 1 && !_is_ldlt_structure(S.structure) && S.structure != STRUCTURE_GENERAL
-        vstatus = _offset_potrf_status(backend)    # vendor potrf status output, shared by the fronts (never read)
+    if nb == 1 && S.schedule.vendor_c && !_is_ldlt_structure(S.structure) && S.structure != STRUCTURE_GENERAL
+        # vendor potrf status output, shared by the fronts: each is folded into `info` right after its potrf
+        vstatus = _offset_potrf_status(backend)
         for s in 1:nsupernodes(S)
             takes_c_path(S.schedule, s) || continue
             plan.vendor_ptrs[s] = _offset_potrf_plan(backend, factor, L.panel_ptr[s], S.schedule.rows[s],

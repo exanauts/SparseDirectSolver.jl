@@ -120,7 +120,7 @@ _dense_solve_front(backend, schedule, s::Integer) = takes_c_path(schedule, s)
 _solve_workgroup(backend) = 64
 _offset_potrf_status(backend) = nothing
 _offset_potrf_plan(backend, factor, p0, f, w, status) = nothing
-_offset_potrf_info!(backend, plan, info, idx) = false
+_offset_potrf_info!(backend, plan, info, idx, A, dmin) = false
 _offset_potrf_enabled(backend) = false
 
 # ---------------------------------------------------------------------------

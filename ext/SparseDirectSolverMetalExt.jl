@@ -1,8 +1,9 @@
 module SparseDirectSolverMetalExt
 
 using SparseDirectSolver
-using SparseDirectSolver: CSR, INDEX_ONE
+using SparseDirectSolver: CSR, INDEX_ONE, NotSupportedError
 using SparseArrays
+using KernelAbstractions
 using Metal
 using Metal.MPS
 using Metal.MTL
@@ -42,17 +43,16 @@ SparseDirectSolver._offset_potrf_enabled(::MetalBackend) = true
 struct MetalPotrfPlan{M, K, S}
     panel::M
     kernel::K
-    status::S   # keeps the MTLBuffer of the MPS status output alive
+    status::S   # the MPS status output (`MPSMatrixDecompositionStatus`, an Int32 enum; 0 = success)
 end
 
-# MPS writes an `MPSMatrixDecompositionStatus` per encode; one buffer of that type is
-# shared by the wide fronts of a factorization. It is never read: the pivots are
-# checked afterwards by `ka_chol_check_info!`.
-SparseDirectSolver._offset_potrf_status(::MetalBackend) =
-    MtlArray{MPS.MPSMatrixDecompositionStatus, 0, Metal.SharedStorage}(undef)
+# MPS writes an `MPSMatrixDecompositionStatus` per encode into one Int32 buffer shared by the wide
+# fronts of a factorization; `_mps_status_info_kernel!` folds it into `info` right after each encode,
+# on the same queue, so a front reads the status of its own decomposition
+SparseDirectSolver._offset_potrf_status(::MetalBackend) = Metal.zeros(Int32, 1)
 
 function SparseDirectSolver._offset_potrf_plan(::MetalBackend, factor::MtlVector{Float32}, p0, f, w,
-                                               status::MtlArray{MPS.MPSMatrixDecompositionStatus, 0})
+                                               status::MtlVector{Int32})
     w >= MPS_POTRF_MIN_WIDTH || return nothing
     desc = MPSMatrixDescriptor(w, w, sizeof(Float32) * f, Float32)
     panel = MPSMatrix(factor, desc, (p0 - 1) * sizeof(Float32))
@@ -60,27 +60,56 @@ function SparseDirectSolver._offset_potrf_plan(::MetalBackend, factor::MtlVector
     return MetalPotrfPlan(panel, kernel, status)
 end
 
-function SparseDirectSolver._offset_potrf_info!(::MetalBackend, plan::MetalPotrfPlan, info, idx)
+# Apple leaves the panel undefined after a failed decomposition, so the diagonal check
+# alone cannot be trusted: a nonzero MPS status with no bad diagonal entry reports the
+# last column `w` of the front (a failure inside it, column unknown); the status is reset
+@kernel function _mps_status_info_kernel!(info, idx, status, w)
+    @inbounds if @index(Global) == 1
+        status[1] != Int32(0) && info[idx] == Int32(0) && (info[idx] = Int32(w))
+        status[1] = Int32(0)
+    end
+end
+
+function SparseDirectSolver._offset_potrf_info!(backend::MetalBackend, plan::MetalPotrfPlan, info, idx, A, dmin)
     fill!(view(info, idx:idx), Int32(0))
-    # the KA kernels before (assembly) and after (`ka_chol_check_info!`, trsm) run on the
-    # same `global_queue`, which orders them with this command buffer
+    # the KA kernels before (assembly) and after (the pivot and status checks, trsm) run on
+    # Metal.jl's `global_queue`, the queue of this command buffer, which orders them with the
+    # MPS decomposition; moving either to another queue would need explicit synchronization
     cmdbuf = MPSCommandBuffer(global_queue(Metal.device()))
     encode!(cmdbuf, plan.kernel, plan.panel, plan.panel, Base.unsafe_convert(MTLBuffer, plan.status))
     commit!(cmdbuf)
+    SparseDirectSolver.ka_chol_check_info!(info, idx, A, dmin)
+    _mps_status_info_kernel!(backend, 1)(info, Int(idx), plan.status, Int32(size(A, 1)); ndrange = 1)
     return true
 end
 
 # Metal.jl's MPS Cholesky and triangular solves work on full MtlMatrix objects,
-# but panel views dispatch to host LAPACK/BLAS. Panel GEMM/SYRK are supported
-# and faster (`:generic` allocates MPS descriptors per call on Metal); TRSM stays
-# on KA, POTRF too except for single-matrix fronts at least `MPS_POTRF_MIN_WIDTH`
-# wide (`_offset_potrf_plan`). Uniform batches use only KA dense kernels.
+# but panel views dispatch to host LAPACK/BLAS. Panel GEMM/SYRK run on MPS through
+# `:generic` (`mul!` on `MtlArray` views), which allocates MPS descriptors per call
+# but is faster than the KA kernels (a deviation from T31's `:auto` prefers `:ka`,
+# recorded in its Report); TRSM stays on KA. POTRF stays on KA through `select_impl`;
+# under `impl = :auto` with vendor calls allowed, single-matrix fronts at least
+# `MPS_POTRF_MIN_WIDTH` wide take the cached MPS Cholesky (`_offset_potrf_plan`).
+# Uniform batches use only KA dense kernels.
 function SparseDirectSolver._allow_generic_dense(op::Symbol, ::MetalBackend, ::Type{T}) where {T}
     return op === :gemm || op === :syrk
 end
 
+# The analysis entry point (`src/solver.jl`): LDLT/LU and uniform batches run regime C only
+# (`_regime_c_only`), so an explicit schedule that asks for anything else is rejected
+# instead of replaced. The 3-argument method below does the replacement (test helpers).
 function SparseDirectSolver._backend_schedule_options(backend::MetalBackend, structure::SparseDirectSolver.Structure,
                                                       opts::SparseDirectSolver.Options, nbatch::Integer)
+    if nbatch > 1 || _regime_c_only(structure)
+        what = nbatch > 1 ? "uniform batches" : "structure $(structure)"
+        opts.factorization_alg in (SparseDirectSolver.FACTORIZATION_DEFAULT, SparseDirectSolver.FACTORIZATION_VENDOR) ||
+            throw(NotSupportedError("factorization_alg = $(opts.factorization_alg) on Metal: $what run every " *
+                                    "front through the vendor regime-C path (\"algo2\"); the fused kernels " *
+                                    "bind 32 buffers and Apple GPUs expose 31"))
+        isempty(opts.subtree_budgets) || opts.subtree_budgets == SparseDirectSolver.DEFAULT_SUBTREE_BUDGETS ||
+            throw(NotSupportedError("explicit subtree_budgets on Metal: $what run no regime-A subtrees " *
+                                    "(the fused kernels bind 32 buffers, Apple GPUs expose 31)"))
+    end
     out = SparseDirectSolver._backend_schedule_options(backend, structure, opts)
     nbatch == 1 && return out
     out === opts && (out = copy(opts))
@@ -88,6 +117,9 @@ function SparseDirectSolver._backend_schedule_options(backend::MetalBackend, str
     empty!(out.subtree_budgets)
     return out
 end
+
+_regime_c_only(structure) = structure in (SparseDirectSolver.STRUCTURE_SYMMETRIC, SparseDirectSolver.STRUCTURE_HERMITIAN,
+                                          SparseDirectSolver.STRUCTURE_GENERAL)
 
 # The fused LDLT/LU kernels bind 32 device buffers; Apple GPUs expose 31
 # indirect argument-buffer resources. Route those structures through the
@@ -104,8 +136,7 @@ function SparseDirectSolver._backend_schedule_options(::MetalBackend, structure:
         out.regime_c_rows = 128
         return out
     end
-    structure in (SparseDirectSolver.STRUCTURE_SYMMETRIC, SparseDirectSolver.STRUCTURE_HERMITIAN,
-                  SparseDirectSolver.STRUCTURE_GENERAL) || return opts
+    _regime_c_only(structure) || return opts
     out = copy(opts)
     out.factorization_alg = SparseDirectSolver.FACTORIZATION_VENDOR
     empty!(out.subtree_budgets)

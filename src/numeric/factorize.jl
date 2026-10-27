@@ -127,13 +127,17 @@ end
 # `factorization_alg = "algo1"` (no vendor calls) turns `:auto` into the KA kernels
 # uniform batch: the strided-batched ops (`b*`), `:ka` or `:vendor` from the capabilities, or `:none` (no
 # batched path: `impl = :generic`, then every member takes the single-matrix path)
+# `mps`: the backend's offset-aware vendor potrf (`_offset_potrf_plan`, Metal) may take the wide fronts; only
+# for `impl = :auto` with vendor calls allowed, so `impl = :ka` and `"algo1"` stay on the KA kernels
 function _front_impls(N::Numeric{T}, S::Symbolic, impl::Symbol) where {T}
+    backend = KernelAbstractions.get_backend(N.factor)
+    mps = impl === :auto && S.schedule.vendor_c && _offset_potrf_enabled(backend)
     impl === :auto && !S.schedule.vendor_c && (impl = :ka)
-    batched = N.nbatch > 1 && impl !== :generic && _allow_batched_dense(KernelAbstractions.get_backend(N.factor))
+    batched = N.nbatch > 1 && impl !== :generic && _allow_batched_dense(backend)
     bimpl(op) = batched ? (impl === :ka ? :ka : select_impl(op, N.factor, :auto)) : :none
     return (potrf = select_impl(:potrf, N.factor, impl), trsm = select_impl(:trsm, N.factor, impl),
             herk = select_impl(T <: Real ? :syrk : :herk, N.factor, impl), bpotrf = bimpl(:potrf_batched),
-            btrsm = bimpl(:trsm_strided_batched), bgemm = bimpl(:gemm_strided_batched))
+            btrsm = bimpl(:trsm_strided_batched), bgemm = bimpl(:gemm_strided_batched), mps)
 end
 
 # regime-C dense kernels of front `s` (assembled panel + contribution block) of every active batch member,
@@ -250,13 +254,10 @@ function _factor_panel_c!(factor::AbstractVector{T}, stack::AbstractVector{T}, w
     # inside _potrf_info_impl!, reported through info (the potrf route DETECTS where the
     # kernel routes perturb -- either way MadNLP gets its regularization signal, #127)
     dmin = sqrt(real(T)(epsc))
-    mps = vendor_plan !== nothing && p.potrf === :ka &&
-          _offset_potrf_info!(KernelAbstractions.get_backend(factor), vendor_plan, info, s)
-    if mps
-        ka_chol_check_info!(info, s, F11, dmin)
-    else
-        _potrf_info_impl!(p.potrf, 'L', F11, info, s, dmin)
-    end
+    # the offset-aware vendor potrf validates the pivots and folds its own status into `info[s]`
+    mps = vendor_plan !== nothing && p.mps &&
+          _offset_potrf_info!(KernelAbstractions.get_backend(factor), vendor_plan, info, s, F11, dmin)
+    mps || _potrf_info_impl!(p.potrf, 'L', F11, info, s, dmin)
     m > 0 || return nothing
     F21 = view(P, (w + 1):f, 1:w)
     _trsm_impl!(p.trsm, 'R', 'L', 'C', 'N', one(T), F11, F21)

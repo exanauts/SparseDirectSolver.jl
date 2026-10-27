@@ -1,5 +1,9 @@
 # Metal Optimization Plan
 
+Implementer's plan and execution record of the Metal part of T31 (PR #136), kept next to
+`bench/metal_*.jl`; the measurements that matter are summarised in the T31 Report in `TASKS.md`.
+Its baseline and gates describe the state when it was written and are not maintained.
+
 ## Goal
 
 Improve Float32 performance on Apple GPUs without changing the portable sparse
