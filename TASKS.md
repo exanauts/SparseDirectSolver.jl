@@ -3409,6 +3409,11 @@ the `select_impl` order are tested on the KA CPU backend. Closes #112 and #53.
   `ComplexF64` on CUDA/AMDGPU. The budget-class test in `test_numeric_cholesky_a.jl` expects the
   rejection of an explicit budget above `max_local_bytes` (failed on AMDGPU once the test helpers passed
   the backend's `max_local` to the analysis).
+  CUDA.jl 6.5 (CUDACore) exports an `update!` of its own (CUDA graphs), so `using CUDA` next to
+  `using SparseDirectSolver` leaves `update!` undefined (ambiguous export): every CUDA test calling it and
+  the documentation build failed. `test/runtests.jl`, `docs/make.jl` and the CUDA extension now import
+  `SparseDirectSolver: update!` explicitly; user code that loads both packages has to do the same or write
+  `SparseDirectSolver.update!` (the public name is PLAN §3.1's, so this is for the owner to decide).
 - Suggested plan changes: part (3) (#53) as its own task; PLAN §2.6 oneAPI column: gemm/syrk/herk/trsm,
   potrf/getrf and strided-batched gemm/trsm yes, sytrf and per-member batched potrf/getrf no; record
   Metal's 31-buffer argument limit next to the 32 KiB local-memory cap in PLAN §2.7.
