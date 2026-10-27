@@ -1,6 +1,6 @@
 name = "SparseDirectSolver"
 uuid = "dc8e0fd9-41f1-440b-9624-22817132f700"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Michel Schanen <Michel.Schanen@gmail.com>"]
 
 [deps]
@@ -36,7 +36,7 @@ SparseDirectSolverOneAPIExt = "oneAPI"
 
 [compat]
 AMD = "0.5"
-AMDGPU = "2.9"
+AMDGPU = "2.10"
 Adapt = "4"
 Atomix = "1"
 CUDACore = "6.5"
@@ -54,4 +54,4 @@ cuBLAS = "6.5"
 cuSOLVER = "6.5"
 cuSPARSE = "6.5"
 julia = "1.13"
-oneAPI = "2.9.2"
+oneAPI = "2.10"
