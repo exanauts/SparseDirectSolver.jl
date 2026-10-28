@@ -211,12 +211,14 @@ end
     @test SDS.SUBTREE_LOCAL_SIZES[end] == 65536
     @test SDS.subtree_local_bytes(1 << 20) == 65536
     @test SDS.subtree_local_bytes(65535) == 49152
-    # the caps: no limit on the CPU backend, at least the CUDA-safe 48 KiB on every GPU backend
+    # the caps: no limit on CPU, 32 KiB on Metal, at least 48 KiB on the other GPU backends
     @test SDS.max_local_bytes(CPU()) >= 65536
     for backend in BACKENDS
-        @test SDS.max_local_bytes(backend) >= 49152
+        @test SDS.max_local_bytes(backend) >= (backend_name(backend) == "Metal" ? 32768 : 49152)
         CUDA_LOADED && backend isa CUDABackend && @test SDS.max_local_bytes(backend) == 49152
         AMDGPU_LOADED && backend isa ROCBackend && @test SDS.max_local_bytes(backend) >= 65536
+        METAL_LOADED && backend isa MetalBackend && @test SDS.max_local_bytes(backend) == 32768
+        ONEAPI_LOADED && backend isa oneAPIBackend && @test SDS.max_local_bytes(backend) >= 65536
     end
     # the defaults are clamped to the cap, explicit budgets above it are rejected
     @test SDS.resolve_subtree_budgets(SDS.DEFAULT_SUBTREE_BUDGETS, typemax(Int)) == [16384, 32768, 49152]
@@ -245,7 +247,8 @@ end
     @test SDS.allocate_numeric(S64, Float64, CPU()) isa SDS.Numeric
     for backend in BACKENDS
         SDS.max_local_bytes(backend) < 65536 || continue
-        @test thrown(() -> SDS.allocate_numeric(SDS.adapt(backend, S64, Int32), Float64, backend)) isa InvalidValueError
+        T = backend_name(backend) == "Metal" ? Float32 : Float64
+        @test thrown(() -> SDS.allocate_numeric(SDS.adapt(backend, S64, Int32), T, backend)) isa InvalidValueError
     end
 end
 

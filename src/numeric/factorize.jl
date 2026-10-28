@@ -47,6 +47,28 @@ const STATS_WORKGROUP = 256
     end
 end
 
+@kernel function _cholesky_stats_serial_kernel!(stats_all, info_all, super_ptr, front_ncols, ns, schur, bm,
+                                                 ::Val{NF}) where {NF}
+    j = @index(Global)
+    @inbounds if j <= bm.nact
+        k = _bm_member(bm, j)
+        stats = _mview(stats_all, k, bm.nbatch)
+        info = _iview(info_all, k, bm.nbatch)
+        best = typemax(Int64)
+        for s in 1:ns
+            fi = Int64(info[s])
+            base = (s - 1) * NF
+            stats[base + 1] = s == schur ? Int64(0) : fi == 0 ? Int64(front_ncols[s]) : fi - 1
+            for q in 2:(NF - 1)
+                stats[base + q] = 0
+            end
+            stats[base + NF] = fi
+            fi > 0 && (best = min(best, Int64(super_ptr[s]) + fi - 1))
+        end
+        info[ns + 1] = best == typemax(Int64) ? Int32(0) : Int32(best)
+    end
+end
+
 """
     cholesky_stats!(numeric, symbolic) -> numeric
 
@@ -58,9 +80,16 @@ factor column into `numeric.info[ns + 1]` (0 = none), for every active batch
 member. One workgroup per member, no atomics. Asynchronous.
 """
 function cholesky_stats!(N::Numeric, S::Symbolic)
-    WG = STATS_WORKGROUP
     bm = batch_map(N)
-    kernel! = _cholesky_stats_kernel!(KernelAbstractions.get_backend(N.factor), WG)
+    backend = KernelAbstractions.get_backend(N.factor)
+    if _serial_cholesky_stats(backend, N.nbatch)
+        _cholesky_stats_serial_kernel!(backend, 1)(N.stats, N.info, S.super_ptr, S.front_ncols,
+                                                     nsupernodes(S), S.schedule.schur, bm,
+                                                     Val(FRONT_STATS_FIELDS); ndrange = bm.nact)
+        return N
+    end
+    WG = STATS_WORKGROUP
+    kernel! = _cholesky_stats_kernel!(backend, WG)
     kernel!(N.stats, N.info, S.super_ptr, S.front_ncols, nsupernodes(S), S.schedule.schur, bm, Val(WG),
             Val(FRONT_STATS_FIELDS),
             Val(_ilog2(WG)); ndrange = WG * bm.nact)
@@ -98,13 +127,17 @@ end
 # `factorization_alg = "algo1"` (no vendor calls) turns `:auto` into the KA kernels
 # uniform batch: the strided-batched ops (`b*`), `:ka` or `:vendor` from the capabilities, or `:none` (no
 # batched path: `impl = :generic`, then every member takes the single-matrix path)
+# `mps`: the backend's offset-aware vendor potrf (`_offset_potrf_plan`, Metal) may take the wide fronts; only
+# for `impl = :auto` with vendor calls allowed, so `impl = :ka` and `"algo1"` stay on the KA kernels
 function _front_impls(N::Numeric{T}, S::Symbolic, impl::Symbol) where {T}
+    backend = KernelAbstractions.get_backend(N.factor)
+    mps = impl === :auto && S.schedule.vendor_c && _offset_potrf_enabled(backend)
     impl === :auto && !S.schedule.vendor_c && (impl = :ka)
-    batched = N.nbatch > 1 && impl !== :generic
+    batched = N.nbatch > 1 && impl !== :generic && _allow_batched_dense(backend)
     bimpl(op) = batched ? (impl === :ka ? :ka : select_impl(op, N.factor, :auto)) : :none
     return (potrf = select_impl(:potrf, N.factor, impl), trsm = select_impl(:trsm, N.factor, impl),
             herk = select_impl(T <: Real ? :syrk : :herk, N.factor, impl), bpotrf = bimpl(:potrf_batched),
-            btrsm = bimpl(:trsm_strided_batched), bgemm = bimpl(:gemm_strided_batched))
+            btrsm = bimpl(:trsm_strided_batched), bgemm = bimpl(:gemm_strided_batched), mps)
 end
 
 # regime-C dense kernels of front `s` (assembled panel + contribution block) of every active batch member,
@@ -112,8 +145,13 @@ end
 function _factor_front_c!(N::Numeric{T}, S::Symbolic, s::Int, p::NamedTuple, epsc::Real = 0.0) where {T}
     L, sc = S.layout, S.schedule
     if N.nbatch == 1
-        _factor_panel_c!(N.factor, N.stack, N.work, N.info, s, L.panel_ptr[s], sc.rows[s], sc.width[s], L.cb_ptr[s],
-                         p, epsc)
+        if _offset_potrf_enabled(KernelAbstractions.get_backend(N.factor))
+            _factor_panel_c!(N.factor, N.stack, N.work, N.info, s, L.panel_ptr[s], sc.rows[s], sc.width[s],
+                             L.cb_ptr[s], p, epsc, N.plan.vendor_ptrs[s])
+        else
+            _factor_panel_c!(N.factor, N.stack, N.work, N.info, s, L.panel_ptr[s], sc.rows[s], sc.width[s],
+                             L.cb_ptr[s], p, epsc)
+        end
         return nothing
     end
     plan = N.plan
@@ -201,7 +239,7 @@ end
 
 function _factor_panel_c!(factor::AbstractVector{T}, stack::AbstractVector{T}, work::AbstractVector{T},
                           info::AbstractVector{Int32}, s::Int, p0::Int, f::Int, w::Int, c0::Int,
-                          p::NamedTuple, epsc::Real = 0.0) where {T}
+                          p::NamedTuple, epsc::Real = 0.0, vendor_plan = nothing) where {T}
     m = f - w
     P = reshape(view(factor, p0:(p0 + f * w - 1)), f, w)
     F11 = view(P, 1:w, 1:w)
@@ -215,7 +253,11 @@ function _factor_panel_c!(factor::AbstractVector{T}, stack::AbstractVector{T}, w
     # elimination is caught after the fact by the sqrt(epsilon) factor-diagonal floor
     # inside _potrf_info_impl!, reported through info (the potrf route DETECTS where the
     # kernel routes perturb -- either way MadNLP gets its regularization signal, #127)
-    _potrf_info_impl!(p.potrf, 'L', F11, info, s, sqrt(real(T)(epsc)))
+    dmin = sqrt(real(T)(epsc))
+    # the offset-aware vendor potrf validates the pivots and folds its own status into `info[s]`
+    mps = vendor_plan !== nothing && p.mps &&
+          _offset_potrf_info!(KernelAbstractions.get_backend(factor), vendor_plan, info, s, F11, dmin)
+    mps || _potrf_info_impl!(p.potrf, 'L', F11, info, s, dmin)
     m > 0 || return nothing
     F21 = view(P, (w + 1):f, 1:w)
     _trsm_impl!(p.trsm, 'R', 'L', 'C', 'N', one(T), F11, F21)
@@ -324,7 +366,22 @@ function _numeric_info!(N::Numeric, S::Symbolic, read::Bool)
     plan = N.plan
     nb = N.nbatch
     if read
-        copyto!(plan.info_host, 1, N.info, nsupernodes(S) * nb + 1, nb)
+        ns = nsupernodes(S)
+        if !_is_ldlt_structure(S.structure) && S.structure != STRUCTURE_GENERAL &&
+           _host_reduce_cholesky_info(KernelAbstractions.get_backend(N.factor), nb)
+            copyto!(plan.info_host, N.info)
+            for k in 1:nb
+                best = typemax(Int32)
+                for s in 1:ns
+                    fi = plan.info_host[(s - 1) * nb + k]
+                    fi > 0 && (best = min(best, Int32(S.partition.super_ptr[s]) + fi - 1))
+                end
+                plan.info_host[ns * nb + k] = best == typemax(Int32) ? Int32(0) : best
+            end
+            copyto!(plan.info_host, 1, plan.info_host, ns * nb + 1, nb)
+        else
+            copyto!(plan.info_host, 1, N.info, ns * nb + 1, nb)
+        end
     else
         for j in 1:plan.nact[]
             plan.info_host[plan.members_host[j]] = 0

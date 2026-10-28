@@ -32,6 +32,16 @@ const DENSE_OPS = (
 const _DENSE_OP_FIELDS = Dict{Symbol, Tuple{Symbol, Symbol}}(
     op => (something(spec.generic, :none), something(spec.vendor, :none)) for (op, spec) in pairs(DENSE_OPS))
 
+# Backend extensions may reject a probed generic operation when the public
+# entry point does not satisfy the solver's stronger panel/status contract.
+_allow_generic_dense(op::Symbol, backend, ::Type{T}) where {T} = true
+
+# Backend extensions may keep `impl = :auto` off a probed vendor operation whose
+# per-call cost does not fit the numeric phase (oneAPI: every oneMKL call waits for
+# the queue, LAPACK allocates its scratchpad); an explicit `impl = :vendor` still
+# reaches it.
+_auto_vendor_dense(op::Symbol, backend, ::Type{T}) where {T} = true
+
 function _flag_char(x, allowed::String, what::String)
     c = x isa Symbol ? (length(String(x)) == 1 ? only(String(x)) : '?') : x isa AbstractChar ? Char(x) : '?'
     c = uppercase(c)
@@ -79,15 +89,16 @@ The implementations of dense op `op` (`:gemm`, `:syrk`, `:herk`, `:trsm`,
 `:potrf_batched`)
 available for element type `T` on `backend` according to
 [`capabilities`](@ref), in `:auto` preference order (`:vendor`, `:generic`,
-`:ka`). `:ka` is always present.
+`:ka`). `:ka` is always present. A vendor binding the backend keeps out of
+`:auto` (oneAPI's LAPACK) is not listed; `impl = :vendor` still selects it.
 """
 function dense_impls(op::Symbol, backend, ::Type{T}) where {T}
     haskey(DENSE_OPS, op) || throw(InvalidValueError("unknown dense op :$op; expected one of $(keys(DENSE_OPS))"))
     spec = DENSE_OPS[op]
     caps = capabilities(backend, T)
     impls = Symbol[]
-    spec.vendor === nothing || getfield(caps, spec.vendor) && push!(impls, :vendor)
-    spec.generic === nothing || getfield(caps, spec.generic) && push!(impls, :generic)
+    spec.vendor === nothing || getfield(caps, spec.vendor) && _auto_vendor_dense(op, backend, T) && push!(impls, :vendor)
+    spec.generic === nothing || getfield(caps, spec.generic) && _allow_generic_dense(op, backend, T) && push!(impls, :generic)
     push!(impls, :ka)
     return impls
 end
@@ -108,8 +119,11 @@ function select_impl(op::Symbol, X::AbstractArray, impl::Symbol)
     gfield, vfield = _DENSE_OP_FIELDS[op]
     caps = capabilities(KernelAbstractions.get_backend(X), eltype(X))
     vendor = vfield !== :none && getfield(caps, vfield)::Bool
-    generic = gfield !== :none && getfield(caps, gfield)::Bool
-    impl === :auto && return vendor ? :vendor : generic ? :generic : :ka
+    generic = gfield !== :none && getfield(caps, gfield)::Bool &&
+              _allow_generic_dense(op, KernelAbstractions.get_backend(X), eltype(X))
+    impl === :auto &&
+        return vendor && _auto_vendor_dense(op, KernelAbstractions.get_backend(X), eltype(X)) ? :vendor :
+               generic ? :generic : :ka
     (impl === :vendor ? vendor : generic) ||
         throw(NotSupportedError("impl = :$impl is not available for $op with $(eltype(X)) on $(KernelAbstractions.get_backend(X))"))
     return impl

@@ -9,6 +9,10 @@ dense_tri(A, uplo::Char, diag::Char) =
     uplo == 'L' ? (diag == 'U' ? UnitLowerTriangular(A) : LowerTriangular(A)) :
     (diag == 'U' ? UnitUpperTriangular(A) : UpperTriangular(A))
 dense_part(C, uplo::Char) = uplo == 'L' ? tril(C) : triu(C)
+# the impls the potrf/getrf loops run: `dense_impls`, plus oneMKL on oneAPI, where `:auto` keeps LAPACK on the
+# KA kernels so `dense_impls` omits it, but an explicit `impl = :vendor` still reaches it
+tested_impls(op, backend, T) =
+    backend_name(backend) == "oneAPI" ? union(SDS.dense_impls(op, backend, T), [:vendor]) : SDS.dense_impls(op, backend, T)
 
 @testset "capability audit ($(backend_name(backend)))" for backend in BACKENDS
     if RUN_SHARED   # the table covers every element type
@@ -32,6 +36,25 @@ dense_part(C, uplo::Char) = uplo == 'L' ? tril(C) : triu(C)
                 @test getfield(caps, f)
             end
             @test caps.vendor_herk == (T <: Complex)
+        end
+        if backend_name(backend) == "oneAPI"  # the oneMKL column of PLAN §2.6 (T31)
+            for f in (:vendor_gemm, :vendor_syrk, :vendor_trsm, :vendor_potrf, :vendor_getrf,
+                      :vendor_gemm_strided_batched, :vendor_trsm_batched, :reshape_view_mul)
+                @test getfield(caps, f)
+            end
+            @test caps.vendor_herk == (T <: Complex)
+            # one status per batch in oneMKL: no per-member info, the KA kernels serve uniform batches;
+            # no sytrf on the GPU (oneMKL aborts with unsupported_device)
+            @test !caps.vendor_potrf_batched && !caps.vendor_getrf_batched && !caps.vendor_sytrf
+            # LAPACK waits for the queue and allocates its scratchpad: `:auto` takes the KA kernels,
+            # `impl = :vendor` still reaches oneMKL; the generic LinearAlgebra path is not used
+            @test SDS.dense_impls(:potrf, backend, T) == [:ka]
+            @test SDS.dense_impls(:getrf, backend, T) == [:ka]
+            @test SDS.dense_impls(:gemm, backend, T) == [:vendor, :ka]
+            @test SDS.dense_impls(:trsm, backend, T) == [:vendor, :ka]
+            X = to_device(backend, zeros(T, 2, 2))
+            @test SDS.select_impl(:potrf, X, :vendor) === :vendor
+            @test_throws SDS.NotSupportedError SDS.select_impl(:potrf, X, :generic)
         end
         for op in keys(SDS.DENSE_OPS)
             impls = SDS.dense_impls(op, backend, T)
@@ -102,14 +125,15 @@ end
 
         @testset "potrf $m panel=$panel" begin
             S = dense_hpd(T, m)
-            for uplo in ('L', 'U'), impl in SDS.dense_impls(:potrf, backend, T)
+            for uplo in ('L', 'U'), impl in tested_impls(:potrf, backend, T)
                 X = dev(S)
                 @test SDS.potrf!(uplo, X; impl) == 0
                 F = uplo == 'L' ? LowerTriangular(to_host(X)) : UpperTriangular(to_host(X))'
                 @test norm(F * F' - S) <= tl * norm(F)^2
             end
-            # not positive definite at column j: info == j
-            for j in unique((1, cld(m, 2), m)), uplo in ('L', 'U'), impl in SDS.dense_impls(:potrf, backend, T)
+            # not positive definite at column j: info == j (33: the first column of oneMKL's
+            # second panel, which it reports as 1)
+            for j in filter(<=(m), unique((1, 33, cld(m, 2), m))), uplo in ('L', 'U'), impl in tested_impls(:potrf, backend, T)
                 Sj = copy(S)
                 Sj[j, j] = -one(T)
                 @test SDS.potrf!(uplo, dev(Sj); impl) == j
@@ -120,7 +144,7 @@ end
             for (r, c) in unique(((m, n), (m, m)))
                 A = randn(T, r, c)
                 kmin = min(r, c)
-                for impl in SDS.dense_impls(:getrf, backend, T), IP in (Int32, Int64)
+                for impl in tested_impls(:getrf, backend, T), IP in (Int32, Int64)
                     X = dev(A)
                     ipiv = to_device(backend, zeros(IP, kmin))
                     @test SDS.getrf!(X, ipiv; impl) == 0
@@ -152,7 +176,7 @@ end
     @testset "getrf zero pivot" begin
         A = randn(T, 6, 6)
         A[:, 3] .= 0
-        for impl in SDS.dense_impls(:getrf, backend, T)
+        for impl in tested_impls(:getrf, backend, T)
             ipiv = to_device(backend, zeros(Int32, 6))
             @test SDS.getrf!(to_device(backend, A), ipiv; impl) == 3
         end
@@ -296,7 +320,7 @@ end
     for m in (1, 7, 32, 100)
         S = dense_hpd(T, m)
         f = m + 5
-        for uplo in ('L', 'U'), impl in SDS.dense_impls(:potrf, backend, T)
+        for uplo in ('L', 'U'), impl in tested_impls(:potrf, backend, T)
             P = to_panel(backend, vcat(S, randn(T, f - m, m)))
             F11 = view(P, 1:m, 1:m)
             info = to_device(backend, fill(Int32(7), 4))
@@ -305,7 +329,7 @@ end
             Fh = to_host(F11)
             F = uplo == 'L' ? LowerTriangular(Fh) : UpperTriangular(Fh)'
             @test norm(F * F' - S) <= tl * norm(F)^2
-            for j in unique((1, cld(m, 2), m))
+            for j in filter(<=(m), unique((1, 33, cld(m, 2), m)))
                 Sj = copy(S)
                 Sj[j, j] = -one(T)
                 X = to_device(backend, Sj)

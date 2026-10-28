@@ -16,6 +16,7 @@ function Base.CoreLogging.handle_message(L::InterruptAtStepLogger, level, messag
 end
 
 RUN_SHARED && @testset "refinement on a badly scaled SPD matrix ($(backend_name(backend)))" for backend in BACKENDS
+    backend_name(backend) == "Metal" && continue
     Random.seed!(666)
     T = Float64
     A = badly_scaled_spd(T, 300, 0.02)       # rows scaled by up to 10^(±8)
@@ -43,6 +44,7 @@ end
 RUN_SHARED &&
 @testset "refinement with static pivot perturbation ($(backend_name(backend)), $INT)" for backend in BACKENDS,
                                                                                            INT in INTTYPES
+    backend_name(backend) == "Metal" && continue
     Random.seed!(666)
     # KKT matrix without 2×2 pairs: the zero (2,2) block is perturbed (pivot_epsilon), and refinement
     # removes the perturbation error (the case of the MadNLP K2 systems, issue #71)
@@ -271,8 +273,9 @@ end
 RUN_SHARED && @testset "logging" begin
     Random.seed!(666)
     backend = first(BACKENDS)
-    A = random_spd(Float64, 80, 0.05)
-    b = rand(80)
+    T = backend_name(backend) == "Metal" ? Float32 : Float64
+    A = random_spd(T, 80, 0.05)
+    b = rand(T, 80)
     old = SDS.set_log_level!("info")
     try
         solver = DirectSolver(api_matrix(backend, tril(A), Int32), "SPD", 'L')

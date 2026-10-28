@@ -153,7 +153,7 @@ end
     @test get_backend(d) == backend
     @test thrown(() -> update!(d, to_device(backend, rand(T, n * nb + 1)))) isa InvalidValueError
     @test thrown(() -> update!(d, to_device(backend, rand(T, n, nb + 1)))) isa InvalidValueError
-    @test thrown(() -> update!(d, to_device(backend, rand(T === Float32 ? Float64 : Float32, n * nb)))) isa
+    @test thrown(() -> update!(d, to_device(backend, rand(T === Float32 ? Float16 : Float32, n * nb)))) isa
           InvalidValueError
     @test d.data === x                      # failed updates leave the descriptor alone
 

@@ -116,12 +116,15 @@ packed_length(m::Integer) = Int(m) * (Int(m) + 1) ÷ 2
 # inverse of the packed lower-triangle enumeration: 0-based q in an r x r lower
 # triangle (col-major, n = r(r+1)/2 entries) -> 1-based (a, b), a >= b. Enumerating
 # only the triangle halves the work-item count of the guarded full-square loops.
-# Integer isqrt (exact, and no Float64 in kernels: Metal has no fp64); the two
-# boundary fixups are kept as a belt against any isqrt implementation quirk.
+# t = floor((sqrt(8p + 1) - 1) / 2), the largest t with t(t + 1)/2 <= p: seeded from a Float32
+# square root (Base.isqrt goes through Float64, which Metal kernels cannot compile) and made
+# exact by the two integer fixups; the seed is within one of t far beyond the fronts regimes A
+# and B enumerate (checked for p < 2^44). Fixup loops instead of single steps cost 6-12% of a
+# regime-A/B factorization on CUDA (T31 Report)
 @inline function _tri_decode(q, r)
     n = r * (r + 1) ÷ 2
     p = n - 1 - q
-    t = (isqrt(8 * p + 1) - 1) ÷ 2
+    t = (unsafe_trunc(typeof(p), sqrt(Float32(8 * p + 1))) - 1) ÷ 2
     t * (t + 1) ÷ 2 > p && (t -= 1)
     (t + 1) * (t + 2) ÷ 2 <= p && (t += 1)
     b = r - t

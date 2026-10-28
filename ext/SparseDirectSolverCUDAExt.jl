@@ -8,7 +8,7 @@ module SparseDirectSolverCUDAExt
 # (uniform batch, T17).
 
 using SparseDirectSolver
-using SparseDirectSolver: CSR, DirectSolver, INDEX_ONE, INDEX_ZERO, InvalidValueError
+using SparseDirectSolver: CSR, DirectSolver, INDEX_ONE, INDEX_ZERO, InvalidValueError, update!
 using SparseArrays
 using LinearAlgebra
 using CUDACore

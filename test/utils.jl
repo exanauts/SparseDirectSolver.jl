@@ -306,7 +306,10 @@ storage `Nd` and the values `nz` on `backend` (T09, T10).
 function numeric_setup(backend, A::SparseMatrixCSC{T}, ::Type{INT} = Int32; view = 'L', index = 'O',
                        opts = Options(subtree_budgets = Int[])) where {T, INT}
     C = SparseDirectSolver.CSR(triangle_view(A, view); index)
-    S = SparseDirectSolver.symbolic_analysis(C, spd_structure(T), view; opts)
+    structure = SparseDirectSolver._structure(spd_structure(T))
+    schedule_opts = SparseDirectSolver._backend_schedule_options(backend, structure, opts)
+    S = SparseDirectSolver.symbolic_analysis(C, structure, view; opts = schedule_opts,
+                                             max_local = SparseDirectSolver.max_local_bytes(backend))
     Nr = SparseDirectSolver.allocate_numeric(S, T)
     info_ref = SparseDirectSolver.ref_factorize!(Nr, S, C.nzval)
     Sd = SparseDirectSolver.adapt(backend, S, INT)
@@ -426,9 +429,10 @@ end
 # --- LDLᵀ/LDLᴴ reference helpers (T14; shared with the 2×2 pivot pair tests of #64) ---
 
 # analysis + numeric storage + LDLᵀ/LDLᴴ factorization of A given through `view`
-function reference_ldlt(A::SparseMatrixCSC{T}; view = 'L', opts = Options(), structure = sym_structure(T)) where {T}
+function reference_ldlt(A::SparseMatrixCSC{T}; view = 'L', opts = Options(), structure = sym_structure(T),
+                        max_local = typemax(Int)) where {T}
     C = SparseDirectSolver.CSR(triangle_view(A, view))
-    S = SparseDirectSolver.symbolic_analysis(C, structure, view; opts)
+    S = SparseDirectSolver.symbolic_analysis(C, structure, view; opts, max_local)
     N = SparseDirectSolver.allocate_numeric(S, T, CPU())
     info = SparseDirectSolver.ref_ldlt!(N, S, C.nzval; opts)
     return S, N, info, C
@@ -494,7 +498,10 @@ values `nz` on `backend` (T15).
 """
 function ldlt_setup(backend, A::SparseMatrixCSC{T}, ::Type{INT} = Int32; view = 'L', opts = Options(),
                     structure = sym_structure(T)) where {T, INT}
-    S, Nr, info, C = reference_ldlt(A; view, opts, structure)
+    st = SparseDirectSolver._structure(structure)
+    schedule_opts = SparseDirectSolver._backend_schedule_options(backend, st, opts)
+    S, Nr, info, C = reference_ldlt(A; view, opts = schedule_opts, structure = st,
+                                    max_local = SparseDirectSolver.max_local_bytes(backend))
     info == 0 || error("ldlt_setup: the reference factorization failed")
     Sd = SparseDirectSolver.adapt(backend, S, INT)
     Nd = SparseDirectSolver.allocate_numeric(Sd, T, backend)
@@ -665,7 +672,9 @@ with `INT` maps, device storage `Nd` and the values `nz` on `backend` (T19).
 """
 function lu_setup(backend, A::SparseMatrixCSC{T}, ::Type{INT} = Int32; opts = Options()) where {T, INT}
     C = SparseDirectSolver.CSR(A)
-    S = SparseDirectSolver.symbolic_analysis(C, "G", 'F'; opts)
+    schedule_opts = SparseDirectSolver._backend_schedule_options(backend, SparseDirectSolver.STRUCTURE_GENERAL, opts)
+    S = SparseDirectSolver.symbolic_analysis(C, "G", 'F'; opts = schedule_opts,
+                                             max_local = SparseDirectSolver.max_local_bytes(backend))
     Nr = SparseDirectSolver.allocate_numeric(S, T)
     SparseDirectSolver.ref_lu!(Nr, S, C.nzval; opts) == 0 || error("lu_setup: the reference factorization failed")
     Sd = SparseDirectSolver.adapt(backend, S, INT)

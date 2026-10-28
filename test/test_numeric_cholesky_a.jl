@@ -9,9 +9,13 @@ const NUMERIC_A_OPTS = Options(subtree_parallelism = 0)
 # small budgets and regime-C thresholds: all three regimes on a 2-D Laplacian
 const NUMERIC_ABC_OPTS = Options(subtree_budgets = [8192, 16384], regime_c_width = 16, regime_c_rows = 128,
                                  subtree_parallelism = 0)
+# Metal only: subtrees of at most 32 fronts, as in the Metal bring-up (T31, which recorded no measured
+# reason); the other backends keep the fixture of T11
+numeric_abc_opts(backend) =
+    backend_name(backend) == "Metal" ? (o = copy(NUMERIC_ABC_OPTS); o.subtree_max_fronts = 32; o) : NUMERIC_ABC_OPTS
 
-numeric_a_matrices(::Type{T}) where {T} =
-    (("laplacian2d(40,40) A+B+C", laplacian2d(T, 40, 40), NUMERIC_ABC_OPTS),
+numeric_a_matrices(::Type{T}, backend = CPU()) where {T} =
+    (("laplacian2d(40,40) A+B+C", laplacian2d(T, 40, 40), numeric_abc_opts(backend)),
      ("laplacian2d(40,40) A only", laplacian2d(T, 40, 40), NUMERIC_A_OPTS),
      ("random_spd(500,0.01)", random_spd(T, 500, 0.01), NUMERIC_A_OPTS),
      ("laplacian3d(10,10,10)", laplacian3d(T, 10, 10, 10), NUMERIC_A_OPTS))
@@ -77,11 +81,11 @@ end
 
 @testset "panels, solves, determinism ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
     Random.seed!(666)
-    for (name, A, opts) in numeric_a_matrices(T), INT in (name == "laplacian2d(40,40) A+B+C" ? INTTYPES : (Int32,))
+    for (name, A, opts) in numeric_a_matrices(T, backend), INT in (name == "laplacian2d(40,40) A+B+C" ? INTTYPES : (Int32,))
         @testset "$name $INT" begin
             S, Nr, info_ref, Sd, Nd, nz = numeric_setup(backend, A, INT; opts)
             @test nregime_a(S, SDS.REGIME_A) > 0
-            if opts === NUMERIC_ABC_OPTS
+            if name == "laplacian2d(40,40) A+B+C"
                 @test nregime_a(S, SDS.REGIME_B) > 0 && nregime_a(S, SDS.REGIME_C) > 0
             end
             @test info_ref == 0
@@ -112,9 +116,10 @@ end
                  Options(subtree_budgets = [8192, 20000, 49152], regime_c_width = 32, subtree_parallelism = 0),
                  Options(subtree_budgets = [8192, 20000, 1 << 20], regime_c_width = 32, subtree_parallelism = 0),
                  Options(subtree_budgets = [32768], factorization_alg = "algo2", subtree_parallelism = 0))
-        # the 64 KiB class (issue #60) runs where the backend has the local memory (CPU, ROCm); elsewhere (CUDA)
-        # the allocation of an analysis that uses it is rejected
-        if SDS.subtree_local_bytes(maximum(opts.subtree_budgets)) > SDS.max_local_bytes(backend)
+        # the 64 KiB class (issue #60) runs where the backend has the local memory (CPU, ROCm); elsewhere (CUDA,
+        # Metal) the analysis rejects it, and an explicit budget above `max_local_bytes` (the 1 MiB entry) is
+        # rejected on every GPU backend (`resolve_subtree_budgets`)
+        if maximum(opts.subtree_budgets) > SDS.max_local_bytes(backend)
             @test thrown(() -> numeric_setup(backend, A; opts)) isa InvalidValueError
             continue
         end
@@ -157,7 +162,7 @@ end
 @testset "views, index bases, refactorization ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
     Random.seed!(666)
     A = random_spd(T, 300, 0.02)
-    for opts in (NUMERIC_A_OPTS, NUMERIC_ABC_OPTS)
+    for opts in (NUMERIC_A_OPTS, numeric_abc_opts(backend))
         S, Nr, _, Sd, Nd, nz = numeric_setup(backend, A; opts)
         @test nregime_a(S, SDS.REGIME_A) > 0
         @test SDS.factorize!(Nd, Sd, nz) == 0
@@ -194,7 +199,7 @@ end
     Random.seed!(666)
     n, j = 60, 23
     for opts in (NUMERIC_A_OPTS, Options(reordering_alg = "algo5", subtree_parallelism = 0),
-                 Options(use_superpanels = 0, subtree_parallelism = 0), NUMERIC_ABC_OPTS)
+                 Options(use_superpanels = 0, subtree_parallelism = 0), numeric_abc_opts(backend))
         A = singular_block_matrix(T, n, j; stored_zero = true)
         A[j, j] = 3
         _, Nr, info_ref, Sd, Nd, nz = numeric_setup(backend, A; opts)

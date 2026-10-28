@@ -18,9 +18,10 @@ cuDSS it is open source and not tied to one vendor: it runs on CUDA, AMDGPU,
 oneAPI, Metal and the KernelAbstractions CPU backend.
 
 !!! warning "Status"
-    Version 0.1 is under construction. The CPU backend, CUDA and AMDGPU are
-    tested; the oneAPI and Metal extensions, non-uniform batches and mixed
-    precision are not there yet. Unsupported structures, phases and parameters raise
+    Version 0.1 is under construction. The CPU backend, CUDA, AMDGPU, oneAPI
+    (tested on an Intel Data Center GPU Max 1550) and Metal (`Float32`, tested
+    on an M4 Max) are tested; non-uniform batches and mixed precision are not
+    there yet. Unsupported structures, phases and parameters raise
     [`NotSupportedError`](@ref) rather than falling back silently.
 
 ## Features

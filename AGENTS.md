@@ -43,9 +43,10 @@ Three documents define the work. Read them in this order before touching code:
   mechanically.
 * New dependencies need a one-line justification in the Report. Never `dev`
   unregistered or local checkouts into the project (the package requires
-  KernelAbstractions 0.10 and GPUArrays 12, hence CUDA.jl >= 6.5 and
-  AMDGPU.jl >= 2.9; the test allocation budgets carry a per-launch allowance
-  for the 0.10 CPU backend -- see `ka_cpu_alloc_budget`).
+  KernelAbstractions 0.10 and GPUArrays 12, hence CUDA.jl >= 6.5, AMDGPU.jl
+  >= 2.10, Metal.jl >= 1.11 and oneAPI.jl >= 2.10; the test allocation budgets
+  carry a per-launch allowance for the 0.10 CPU backend -- see
+  `ka_cpu_alloc_budget` and #145).
 * The repository is `github.com/exanauts/SparseDirectSolver.jl` (remote
   `origin`, branch `main`). Commit at the end of the task with a message
   starting with the task id, e.g. `T05: symbolic pattern, ordering, etree,
@@ -96,7 +97,8 @@ reviewing agent check; the owner merges by hand. The moving parts:
   `ci.yml` on the PR, and from the `amdgpu` leg of `ci.yml` on the
   self-hosted AMD runner (the AMDGPU extension, T23; no longer
   continue-on-error, a required check once the owner adds it to the branch
-  ruleset).
+  ruleset), and from the `oneapi` leg on the self-hosted Intel GPU runner
+  `headroom` (the oneAPI extension, T31; oneAPI.jl release, compat `2.10`).
 
 ### The owner's machine
 
@@ -108,8 +110,8 @@ reviewing agent check; the owner merges by hand. The moving parts:
   KernelAbstractions CPU backend and on CUDA only. GitHub CI
   (`.github/workflows/ci.yml`, modelled on `../ExaPF.jl`) runs the CPU suite and
   the GPU suite on the exanauts self-hosted runners (CPU suite: the `kkt`
-  machine; GPU suite: the runners labelled `cuda` and `amdgpu`). oneAPI and Metal extension files are written by analogy
-  (task T23) and only precompile-checked.
+  machine; GPU suite: the runners labelled `cuda`, `amdgpu` and `oneapi`; Metal has no CI
+  leg: the hosted `macos-latest` runner could not run the Metal suite).
 * CUDA.jl 6.x is split into packages: `CUDACore` (`CuArray`, `CUDABackend`),
   `cuSPARSE` (`CuSparseMatrixCSR`, `CuSparseMatrixCSC`), `cuBLAS`, `cuSOLVER`.
   Use these as weak dependencies; tests load the umbrella `CUDA`.
