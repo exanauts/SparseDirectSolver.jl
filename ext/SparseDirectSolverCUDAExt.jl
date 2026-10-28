@@ -109,7 +109,7 @@ SparseDirectSolver.DirectSolver(A::CuSparseMatrixCSC, structure, view; index = I
     update!(solver::DirectSolver, A::CuSparseMatrixCSC)
 
 Point `solver` at the arrays of `A` (≅ `cudss_update(solver, A)`), see
-[`update!`](@ref).
+[`update!`](@ref SparseDirectSolver.update!).
 """
 SparseDirectSolver.update!(solver::DirectSolver, A::Union{CuSparseMatrixCSR, CuSparseMatrixCSC}) =
     SparseDirectSolver.update!(solver, CSR(A))

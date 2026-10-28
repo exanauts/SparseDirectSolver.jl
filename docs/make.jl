@@ -11,6 +11,7 @@ using SparseArrays
 using SparseDirectSolver
 using CUDA
 using AMDGPU
+using SparseDirectSolver: update!  # CUDA.jl >= 6.5 exports an update! too (CuGraph); the explicit import wins
 
 CUDA.functional() || error("the documentation examples need a functional CUDA.jl")
 CUDA.versioninfo()

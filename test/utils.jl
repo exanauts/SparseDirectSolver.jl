@@ -271,20 +271,19 @@ kernel launches whose `@localmem` buffers total `localmem_bytes`, on top of
 the 1024 B allowed to an allocation-free phase (PLAN §3.9). Measured (T09
 review round 1): 0 without coverage (the local runs, Julia ≥ 1.13 is required);
 with `--code-coverage` (CI's `julia-runtest`) the `@localmem` `MArray`s are
-heap-allocated, hence `localmem_bytes` plus 64 B of header per launch. Under
-KernelAbstractions ≥ 0.10 the CPU backend heap-allocates on every launch
-(~230 B measured), hence 320 B per launch on that version only. (Julia
-≤ 1.11 also boxed the arguments of every launch behind KA's `__run` inference
+heap-allocated, hence `localmem_bytes` plus 64 B of header per launch. The
+KernelAbstractions 0.10 CPU backend heap-allocates on every launch (~230 B
+measured; 0.9 was allocation-free), hence 320 B per launch. (Julia ≤ 1.11
+also boxed the arguments of every launch behind KA's `__run` inference
 barrier; that allowance went with the Julia 1.10 support.)
 """
 function ka_cpu_alloc_budget(launches::Integer, localmem_bytes::Integer)
     b = 1024
     # KernelAbstractions 0.10's CPU backend heap-allocates per launch (~230 B measured
-    # with a trivial precompiled kernel; the new backend's task machinery), where 0.9
-    # was allocation-free. 320 B of per-launch headroom keeps the budgets meaningful --
-    # they still scale with the phase's launch count -- until the upstream allocation
-    # is fixed; the 0.9 contract stays exact.
-    pkgversion(KernelAbstractions) >= v"0.10" && (b += 320 * launches)
+    # with a trivial precompiled kernel; the new backend's task machinery). 320 B of
+    # per-launch headroom keeps the budgets meaningful -- they still scale with the
+    # phase's launch count -- until the upstream allocation is fixed.
+    b += 320 * launches
     Base.JLOptions().code_coverage != 0 && (b += localmem_bytes + 64 * launches)
     return b
 end

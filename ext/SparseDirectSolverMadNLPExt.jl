@@ -156,9 +156,7 @@ function _solve!(M::SDSSolver, xb)
 end
 
 MadNLP.solve!(M::SDSSolver, xb::AbstractVector) = _solve!(M, xb)
-# the dev MadNLP routes through solve_linear_system!; the registered 0.8 does not have it
-isdefined(MadNLP, :solve_linear_system!) &&
-    @eval MadNLP.solve_linear_system!(M::SDSSolver, xb) = _solve!(M, xb)
+MadNLP.solve_linear_system!(M::SDSSolver, xb) = _solve!(M, xb)   # MadNLP >= 0.9 routes through it
 MadNLP.input_type(::Type{SDSSolver}) = :csc
 MadNLP.default_options(::Type{SDSSolver}) = SDSSolverOptions()
 MadNLP.is_inertia(::SDSSolver) = true

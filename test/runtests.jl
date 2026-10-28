@@ -32,6 +32,7 @@ const init_code = quote
     using Aqua
     using KernelAbstractions
     using SparseDirectSolver
+    using SparseDirectSolver: update!  # CUDA.jl >= 6.5 exports an update! too (CuGraph); the explicit import wins
     using Krylov  # activates SparseDirectSolverKrylovExt (ir_mode = "fgmres", T18)
     const SDS = SparseDirectSolver
 end

@@ -24,7 +24,7 @@ sizes that fit the packed 64-bit sort keys.
 """
 function device_maps_supported(backend, structure, view, n::Integer, nnz::Integer,
                                factor_len::Integer)
-    backend isa KernelAbstractions.GPU || return false
+    backend isa KernelAbstractions.CPU && return false
     s = _structure(structure)
     (s == STRUCTURE_SPD || s == STRUCTURE_HPD || s == STRUCTURE_SYMMETRIC ||
      s == STRUCTURE_HERMITIAN) || return false

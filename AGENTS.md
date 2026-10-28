@@ -42,10 +42,10 @@ Three documents define the work. Read them in this order before touching code:
   §1.2–§1.4 and §3.1. They mirror `../CUDSS.jl` so MadNLP can migrate
   mechanically.
 * New dependencies need a one-line justification in the Report. Never `dev`
-  unregistered or local checkouts into the project (the package admits the
-  registered KernelAbstractions 0.9.x and 0.10.x; the GPU stacks still resolve
-  0.9 until CUDA.jl/AMDGPU.jl ship 0.10 support, and the test allocation
-  budgets carry a per-launch allowance on 0.10 -- see `ka_cpu_alloc_budget`).
+  unregistered or local checkouts into the project (the package requires
+  KernelAbstractions 0.10 and GPUArrays 12, hence CUDA.jl >= 6.5 and
+  AMDGPU.jl >= 2.9; the test allocation budgets carry a per-launch allowance
+  for the 0.10 CPU backend -- see `ka_cpu_alloc_budget`).
 * The repository is `github.com/exanauts/SparseDirectSolver.jl` (remote
   `origin`, branch `main`). Commit at the end of the task with a message
   starting with the task id, e.g. `T05: symbolic pattern, ordering, etree,
