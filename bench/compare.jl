@@ -16,7 +16,13 @@
 #                       times of a single run instead of a BenchmarkTools trial
 #   --no-suitesparse    skip the MatrixDepot matrices
 #   --no-dumps          skip the KKT dumps under bench/data/
-#   --force             run SDS features whose task is not done in TASKS.md (rows record the error)
+#
+# Every feature of `features.jl` is implemented; a feature whose task is not
+# marked done in TASKS.md is a configuration error and stops the SDS run. The
+# `cholesky_fused` feature runs the fused factorization and partitioned-inverse
+# solve of `SparseDirectSolver.Fused` exactly as the MadNLP extension's
+# `SDSSolver` does (ND ordering, per-architecture tuning, plans built with the
+# first factorization); it needs a GPU backend.
 #
 # Each phase is timed on a fresh solver: the `setup` of the benchmark creates the
 # solver and runs the phases it depends on, the timed expression runs the phase
@@ -40,11 +46,10 @@ using .BenchFeatures
 
 function parse_args(args)
     o = Dict{String, String}("solver" => "", "backend" => "cuda", "features" => "", "only" => "",
-                             "samples" => "5", "seconds" => "60", "single-run-above" => "5", "suitesparse" => "true", "dumps" => "true",
-                             "force" => "false")
+                             "samples" => "5", "seconds" => "60", "single-run-above" => "5", "suitesparse" => "true", "dumps" => "true")
     for a in args
-        if a in ("--no-suitesparse", "--no-dumps", "--force")
-            o[a == "--force" ? "force" : a[6:end]] = a == "--force" ? "true" : "false"
+        if a in ("--no-suitesparse", "--no-dumps")
+            o[a[6:end]] = "false"
         elseif (m = match(r"^--(solver|backend|features|only|samples|seconds|single-run-above)=(.*)$", a)) !== nothing
             o[m[1]] = m[2]
         else
@@ -64,6 +69,7 @@ if SOLVER == "cudss"
     using CUDA, CUDA.cuSPARSE, CUDSS
 else
     using SparseDirectSolver, Metis   # Metis: nested dissection in the default ordering
+    using SparseDirectSolver.KernelAbstractions: get_backend
     ON_GPU && using CUDA, CUDA.cuSPARSE
 end
 
@@ -104,12 +110,75 @@ const API = if SOLVER == "cudss"
      version = string(CUDSS.version()))
 else
     (solver = SparseDirectSolver.DirectSolver,
-     batched = (a...) -> getproperty(SparseDirectSolver, :BatchedDirectSolver)(a...),  # T22
      set = SparseDirectSolver.setparam!, get = SparseDirectSolver.getparam,
      exec = (p, s, x, b) -> SparseDirectSolver.execute!(p, s, x, b; asynchronous = false),
      flops = s -> SparseDirectSolver.getparam(s, "flops"),
-     ubatch_rhs = (X, nb) -> X,  # assumed (n, nbatch) arrays; revisit when T17 lands
+     ubatch_rhs = (X, nb) -> X,  # (n, nbatch) arrays
      version = string(pkgversion(SparseDirectSolver)))
+end
+
+# --- the fused pipeline (`SparseDirectSolver.Fused`), as the MadNLP extension's SDSSolver runs it ---
+
+# The `DirectSolver` does the analysis and owns the numeric storage and the solve
+# workspace; the fused plans are built with the first factorization, as the
+# `SDSSolver` constructor does (`ext/SparseDirectSolverMadNLPExt.jl`).
+mutable struct FusedSolver
+    s::Any          # the DirectSolver
+    tuning::Any     # Fused.SDSTuning, the per-architecture defaults of the backend
+    nzval::Any      # the values the numeric phase factors
+    fp::Any         # fused factorization plan
+    fz::Any         # fused solve segments
+    inv11::Any
+    inv_ptr::Any
+    invert!::Any
+    info::Int
+end
+
+inner(s) = s isa FusedSolver ? s.s : s
+solver_info(s) = s isa FusedSolver ? s.info : API.get(s, "info")
+
+if SOLVER == "sds"
+    function fused_solver(Ad, view)
+        F = SparseDirectSolver.Fused
+        backend = get_backend(Ad isa SparseMatrixCSC ? Ad.nzval : Ad.nzVal)
+        t = F.resolve_tuning(F.default_tuning(backend), backend)
+        s = API.solver(Ad, "SPD", view)
+        s.options.amalgamation = t.amalgamation
+        s.options.regime_c_width = t.regime_c_width
+        s.options.regime_c_rows = t.regime_c_rows
+        s.options.subtree_parallelism = t.subtree_parallelism
+        s.options.subtree_budgets = copy(t.subtree_budgets)
+        API.set(s, "reordering_alg", "algo4")        # native nested dissection
+        API.set(s, "nd_nseps", t.nd_nseps)
+        API.set(s, "nd_seed", t.nd_seed)
+        return FusedSolver(s, t, nothing, nothing, nothing, nothing, nothing, nothing, 0)
+    end
+
+    function fused_phase(w::FusedSolver, p, x, b)
+        F, s, t = SparseDirectSolver.Fused, w.s, w.tuning
+        if p == "analysis"
+            API.exec("analysis", s, x, b)
+        elseif p == "factorization"
+            API.exec("factorization", s, x, b)
+            API.exec("solve", s, x, b)              # allocates the solve workspace the fused solve uses
+            w.nzval = SparseDirectSolver._factor_values(s)
+            merged = t.wides === :merged
+            w.fp = F.build_fused_plan(s; ldl = false, inkernel_wides = merged, merge_segments = merged,
+                                      wides_potrf = !merged, wgf = t.workgroup, scap = t.spin_cap)
+            w.inv11, w.inv_ptr, w.invert!, _ = F.build_inverse(s)
+            fz1 = F.build_fused(s; kstart = 1, wcap = 256)
+            fz1 === nothing && throw(SparseDirectSolver.NotSupportedError("fused solve: no plan entry with fronts of width <= 256"))
+            w.fz = ([(fz1, 64)], true)
+            w.info = Int(F.refact_fused!(s, w.nzval, w.fp))
+            w.invert!()
+        elseif p == "refactorization"
+            w.info = Int(F.refact_fused!(s, w.nzval, w.fp))
+            w.invert!()
+        else
+            F.algo2_solve!(x, s, b, w.inv11, w.inv_ptr, w.fz)
+        end
+        return nothing
+    end
 end
 
 side_params(f) = merge(f.params, SOLVER == "cudss" ? f.cudss_params : f.sds_params)
@@ -122,24 +191,14 @@ colmax_relres(A, X, B) = maximum(relres(A, X[:, j], B[:, j]) for j in axes(B, 2)
 """
     build_system(f, Ms) -> (; fresh, solve_phase, check)
 
-`fresh()` returns `(s, x, b)`: a new solver for feature `f` on the matrices `Ms`
-(one matrix, or the batch members for `:nubatch`) with its device right-hand
-side and solution. `check(x)` returns the relative residual on the host
-(`missing` for the Schur feature).
+`fresh()` returns `(s, x, b)`: a new solver for feature `f` on the matrix `Ms`
+(a one-element vector) with its device right-hand side and solution. `check(x)`
+returns the relative residual on the host (`missing` for the Schur feature).
 """
 function build_system(f::Feature, Ms)
     T, view = f.T, f.structure == "G" ? 'F' : 'L'
     stored(A) = f.structure == "G" ? A : tril(A)
     Random.seed!(666)
-    if f.kind == :nubatch
-        As = [SparseMatrixCSC{T, Int}(M.A) for M in Ms]
-        Ads = [dev_csr(stored(A)) for A in As]
-        bs = [rand(T, size(A, 1)) for A in As]
-        bds = dev.(bs)
-        fresh = () -> (s = API.batched(Ads, f.structure, view); configure!(s, f); (s, similar.(bds), bds))
-        check = xs -> maximum(relres(As[k], Array(xs[k]), bs[k]) for k in eachindex(As))
-        return (; fresh, solve_phase = "solve", check)
-    end
     A = SparseMatrixCSC{T, Int}(only(Ms).A)
     n = size(A, 1)
     if f.kind == :ubatch
@@ -166,7 +225,7 @@ function build_system(f::Feature, Ms)
     B = f.nrhs == 1 ? rand(T, n) : rand(T, n, f.nrhs)
     Bd = dev(B)
     fresh = () -> begin
-        s = API.solver(Ad, f.structure, view)
+        s = f.kind == :fused && SOLVER == "sds" ? fused_solver(Ad, view) : API.solver(Ad, f.structure, view)
         if f.kind == :schur  # Schur block: the last min(64, n ÷ 10) rows and columns
             API.set(s, "user_schur_indices", Cint[i > n - min(64, n ÷ 10) for i in 1:n])
         end
@@ -189,7 +248,8 @@ const BEFORE = Dict("analysis" => (), "factorization" => ("analysis",),
                     "refactorization" => ("analysis", "factorization"), "solve" => ("analysis", "factorization"))
 
 phase_name(sys, p) = p == "solve" ? sys.solve_phase : p
-run_phase(sys, st, p) = API.exec(phase_name(sys, p), st[1], st[2], st[3])
+run_phase(sys, st, p) = st[1] isa FusedSolver ? fused_phase(st[1], p, st[2], st[3]) :
+                        API.exec(phase_name(sys, p), st[1], st[2], st[3])
 
 """
     time_phase(sys, phase; samples, seconds) -> (median_s, min_s)
@@ -225,10 +285,10 @@ function measure(sys; samples, seconds, single_run_above)
     st = sys.fresh()
     foreach(p -> run_phase(sys, st, p), PHASES)
     sync()
-    info = API.get(st[1], "info")
+    info = solver_info(st[1])
     all(iszero, info) || error("info = $info after the factorization")
-    stats = (relres = sys.check(solution(st)), lu_nnz = stat(s -> API.get(s, "lu_nnz"), st[1]),
-             flops = stat(API.flops, st[1]), nsuperpanels = stat(s -> API.get(s, "nsuperpanels"), st[1]))
+    stats = (relres = sys.check(solution(st)), lu_nnz = stat(s -> API.get(s, "lu_nnz"), inner(st[1])),
+             flops = stat(API.flops, inner(st[1])), nsuperpanels = stat(s -> API.get(s, "nsuperpanels"), inner(st[1])))
     st = sys.fresh()
     once = Dict{String, Float64}()
     for p in PHASES
@@ -272,7 +332,7 @@ end
 function csv_row(f, name, Ms, result, meta)
     n, nz = sum(M -> size(M.A, 1), Ms), sum(M -> nnz(M.A), Ms)
     head = [SOLVER, f.id, f.task, name, f.structure, string(n), string(nz), string(f.T), string(f.nrhs),
-            string(f.kind == :nubatch ? length(Ms) : f.nbatch)]
+            string(f.nbatch)]
     if result isa Exception
         body = vcat(fill("", 13), clean(sprint(showerror, result)))
     else
@@ -322,19 +382,19 @@ function main()
     out = joinpath(@__DIR__, "comparison", "$SOLVER.csv")
     println(SOLVER, " ", API.version, " on ", meta[1], ", samples = ", samples)
 
+    if SOLVER == "sds"
+        pending = filter(f -> !feature_implemented(f), features)
+        isempty(pending) || error("features whose task is not done in TASKS.md: ",
+                                  join(("$(f.id) ($(f.task))" for f in pending), ", "))
+    end
     rows = Vector{Vector{String}}()
     for f in features
-        if SOLVER == "cudss" && !f.cudss_supported
-            println(rpad(f.id, 18), "no cuDSS counterpart, skipped")
-            continue
-        elseif SOLVER == "sds" && !feature_implemented(f) && OPTS["force"] != "true"
-            println(rpad(f.id, 18), "pending ", f.task, ", skipped")
+        if f.kind == :fused && SOLVER == "sds" && !ON_GPU
+            println(rpad(f.id, 18), "fused pipeline needs a GPU backend, skipped")
             continue
         end
         selected = filter(M -> f.structure in M.structures && f.matrices(M), mats)
-        groups = f.kind == :nubatch ? (isempty(selected) ? [] : ["batch_of_$(length(selected))" => selected]) :
-                 [M.name => [M] for M in selected]
-        for (name, Ms) in groups
+        for (name, Ms) in [M.name => [M] for M in selected]
             print(rpad(f.id, 18), rpad(name, 42))
             flush(stdout)
             result = try

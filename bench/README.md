@@ -13,18 +13,18 @@ Baselines every later milestone is measured against (PLAN.md §5 M0, §7). The
 | `regimes.jl` | `factorize!` time on the generated matrices with regimes A+B+C (default), B+C (`subtree_budgets = []`) and C only (`factorization_alg = "algo2"`), with fronts per regime and launch counts; package environment: `julia --project=. bench/regimes.jl [--backend=cuda] [--T=Float64] [--only=lap2d_300,lap3d_40]` |
 | `report.jl` | prints the CSV files as Markdown tables |
 | `dump_madnlp_kkt.jl` | dumps MadNLP K2 and condensed KKT matrices of pglib-opf cases |
-| `features.jl` | module `BenchFeatures`: the comparison features, one per planned capability in TASKS.md order (`cholesky_f64` … `mixed_precision`), with structure, element type, matrix selector and parameters; `task_status` reads the task's marker in TASKS.md |
+| `features.jl` | module `BenchFeatures`: the comparison features, one per implemented capability in TASKS.md order (`cholesky_f64` … `cholesky_fused`), with structure, element type, matrix selector and parameters; `task_status` reads the task's marker in TASKS.md, a safety check that no listed feature is pending |
 | `compare.jl` | cuDSS vs SparseDirectSolver.jl per feature × matrix with BenchmarkTools; one solver per run (`--solver=cudss` or `--solver=sds`), results merged into `bench/comparison/<solver>.csv` |
 | `profile_phases.jl` | where SDS spends refactorization and solve time on CUDA (PERFORMANCE.md, experiment 0): schedule per matrix (regime-A subtrees, B/C fronts, launch groups) and a CUPTI trace of one warm refactorization and solve (kernels, copies, busy time, longest kernel and its grid); writes `bench/profile/phase_split.{md,csv}`: `julia --project=bench bench/profile_phases.jl [--only=m1,m2] [--structures=SPD,S]` |
-| `compare_report.jl` | renders `bench/comparison/comparison.md` (overview + one table per feature) and `comparison.png` (SDS/cuDSS ratio per feature and phase, plus a panel of the PR #107 prototypes from `comparison/prototype_pr107.csv`, numbers quoted from PERFORMANCE.md); environment `bench/report/` (CairoMakie) |
+| `compare_report.jl` | renders `bench/comparison/comparison.md` (overview + one table per feature) and `comparison.png` (SDS/cuDSS ratio per feature and phase); environment `bench/report/` (CairoMakie) |
 | `solve_proto_78k.jl`, `solve_proto_all.jl`, `solve_nd.jl`, `final_sweep.jl` | PR #107, experiment 6: partitioned-inverse solve (per-front `L₁₁` inverses, fused dependency-counter sweeps, single-block chain kernel) on the 78k-bus condensed KKT and the SPD harness, under METIS, the imported cuDSS ordering and native ND; configuration sweeps. CUDA, SPD, one right-hand side; `bench/` environment |
 | `fact_split.jl`, `fact_fused.jl` | PR #107, experiment 5: split factorization (tiled SYRK, chunked TRSM, routing by `regime_c_rows`) and the segmented dependency-counter fused factorization with private contribution blocks; each reproduces its table in one run given the KKT dump |
 | `order_search.jl`, `get_cudss_perm.jl` | PR #107 ordering study: METIS knob sweep and schedule depth; extraction of cuDSS's reordering through the raw C API for replay under `user_perm` |
 | `ordering_chooser.jl` | T22 (issue #108): AMD vs ND per harness matrix and dump (schedule depth, fundamental and column-etree depth, nnz(L), flops) and the choice of the T22 and T05 cost models; host only, no GPU: `julia --project=bench bench/ordering_chooser.jl` (`SDS_BENCH_SUITESPARSE=0` skips MatrixDepot) |
-| `amd_proto.jl`, `amd/Project.toml` | the solve prototype on ROCm (ROCArray, raw-array constructor, `Threads.atomic_fence`); environment `bench/amd/` |
+| `amd_proto.jl`, `amd/Project.toml` | the PR #107 solve kernels on ROCm (ROCArray, raw-array constructor, `Threads.atomic_fence`); environment `bench/amd/` |
 | `e2e/run_gv100.jl`, `e2e/run_amd.jl`, `e2e/fresh_machine.{jl,sh}` | full ACOPF interior-point runs through the MadNLP extension (`SparseDirectSolver.SDSSolver`, the fused pipeline of `src/fused.jl`) on CUDA and AMD, and the one-file fresh-machine workflow; environment `bench/e2e/` (MadNLP, MadNLPGPU, ExaModels, ExaModelsPower) |
-| `e2e/ldl_fused_test.jl`, `e2e/ldl_fused_race.jl`, `e2e/amd_baseline.jl`, `e2e/amd_sweep.jl` | gates and timings of the fused Cholesky/LDLᵀ refactorization and the fused solve against the stock kernels on the 78k-bus condensed KKT (CUDA; the `amd_*` scripts on ROCm), see `PERFORMANCE-2026-10.md` and `ARCH-TUNING.md` |
-| `e2e/SDSCPU.jl`, `e2e/cpu_fast_test.jl`, `e2e/hsl_cpu_bench.jl`, `e2e/ma27_bench.jl`, `e2e/ma57_bench.jl` | the task-parallel CPU refactorization prototype over the stock schedule and its HSL references (MA27/MA57 through libcoinhsl; the MA86/CHOLMOD numbers in PERFORMANCE-2026-10.md came from one-off drivers, not shipped) |
+| `e2e/ldl_fused_test.jl`, `e2e/ldl_fused_race.jl`, `e2e/amd_baseline.jl`, `e2e/amd_sweep.jl` | gates and timings of the fused Cholesky/LDLᵀ refactorization and the fused solve against the handle-API kernels on the 78k-bus condensed KKT (CUDA; the `amd_*` scripts on ROCm), see `PERFORMANCE-2026-10.md` and `ARCH-TUNING.md` |
+| `e2e/SDSCPU.jl`, `e2e/cpu_fast_test.jl`, `e2e/hsl_cpu_bench.jl`, `e2e/ma27_bench.jl`, `e2e/ma57_bench.jl` | a task-parallel CPU refactorization over the handle API's schedule and its HSL references (MA27/MA57 through libcoinhsl; the MA86/CHOLMOD numbers in PERFORMANCE-2026-10.md came from one-off drivers, not shipped) |
 | `pivot_pairs.jl` | 2×2 pivot pairs of the `S` analysis (issue #66): `pivot_pairs` = `none`/`default`/`all` on the K2 dumps and the KKT generators, with nnz(L), zero/perturbed/2×2 pivots, max abs L and factor error of the CPU reference LDLᵀ; package environment: `julia --project=. bench/pivot_pairs.jl [--only=case118,...] [--generators=false]` |
 
 ## Commands
@@ -68,13 +68,18 @@ julia --project=bench/report bench/compare_report.jl              # comparison.m
 julia --project=bench bench/compare.jl --solver=sds --features=ldlt
 ```
 
-* **Features.** Every capability planned in TASKS.md is a row of the overview
-  from the start. The SDS run skips a feature until its task is marked done
-  (`[x]`/`[!]`) in TASKS.md, so its cells stay blank; `--force` runs it anyway
-  and records the error. The gate is the task marker, not an error, because
-  some parameters (`hybrid_memory_mode`, `ir_n_steps`) are accepted and
-  ignored before their task. The cuDSS side runs every feature with a cuDSS
-  counterpart, so its column is filled before the SDS one.
+* **Features.** Every row of the overview is a capability the package
+  implements; a feature is added to `features.jl` when its task lands. The SDS
+  run checks that every listed task is marked done (`[x]`/`[!]`) in TASKS.md
+  and stops otherwise: the marker is the gate, not an error, because some
+  parameters are accepted and ignored before their task.
+* **The fused pipeline.** `cholesky_fused` measures the fused factorization
+  and partitioned-inverse solve of `SparseDirectSolver.Fused`, set up as the
+  MadNLP extension's `SDSSolver` sets them up (native ND ordering, the
+  per-architecture tuning of `Fused.default_tuning`, the plans built with the
+  first factorization, so that phase includes them); it needs a GPU backend.
+  The cuDSS side runs it as a plain SPD system, cuDSS having one path. The
+  row goes away when T24–T26 make the fused pipeline the path of `execute!`.
 * **Two processes.** CUDSS.jl and the package's CUDA extension define the same
   `cholesky(::CuSparseMatrixCSR)` methods, so one run loads one solver. The SDS
   run uses only the handle layer (`DirectSolver`, `setparam!`, `execute!`,
@@ -96,13 +101,11 @@ julia --project=bench bench/compare.jl --solver=sds --features=ldlt
 * **Synthetic inputs.** `ubatch8` builds 8 value sets on one pattern by scaling
   the diagonal of member k by 1 + 0.01(k−1). `schur` takes the last
   min(64, n/10) rows as the Schur block and times `solve_fwd_schur` as the
-  solve (no residual). `nubatch` batches all selected condensed dumps into one
-  row. The SDS calls for uniform batches assume `(n, nbatch)` right-hand sides
-  and the non-uniform batch assumes `BatchedDirectSolver` (PLAN §3); adjust
-  `compare.jl` when T17/T29 fix the API.
-* **Adding a feature.** One `Feature(...)` entry in `features.jl` (task id,
-  structure, matrix selector, parameters); `compare.jl` handles the kinds
-  `:single`, `:ubatch`, `:nubatch` and `:schur`.
+  solve (no residual). The SDS calls for uniform batches pass `(n, nbatch)`
+  right-hand sides.
+* **Adding a feature.** One `Feature(...)` entry in `features.jl` (task id or
+  pull request, structure, matrix selector, parameters); `compare.jl` handles
+  the kinds `:single`, `:ubatch`, `:schur` and `:fused`.
 
 ## What is measured
 

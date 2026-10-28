@@ -13,11 +13,13 @@ const BF = BenchCompareReport.BenchFeatures
     feats = BF.COMPARE_FEATURES
     @test allunique(f.id for f in feats)
     @test all(f.structure in ("SPD", "S", "G") for f in feats)
-    @test all(f.kind in (:single, :ubatch, :nubatch, :schur) for f in feats)
-    @test all(BF.task_status(f.task) in (' ', '~', 'x', '!') for f in feats)  # every task has a header
+    @test all(f.kind in (:single, :ubatch, :schur, :fused) for f in feats)
+    # every task id has a header in TASKS.md; a pull request (`#126`) needs none
+    @test all(BF.task_status(f.task) in (' ', '~', 'x', '!') for f in feats if occursin(BF.TASK_ID, f.task))
+    @test all(BF.feature_implemented(f) for f in feats)   # only implemented features are listed
     @test BF.feature("ldlt").task == "T15"
     @test_throws ErrorException BF.feature("nope")
-    @test !feats[findfirst(f -> f.id == "mixed_precision", feats)].cudss_supported
+    @test BF.feature("cholesky_fused").kind == :fused && BF.feature("cholesky_fused").task == "#126"
 
     # every feature selects matrices from the harness (generated, SuiteSparse names, dump names)
     fake(name, source, structures) = (; name, source, structures)
@@ -47,6 +49,7 @@ end
         @test_throws ErrorException BF.task_status("T99"; tasks_md = path)
         @test BF.feature_implemented(BF.feature("cholesky_f64"); tasks_md = path)
         @test !BF.feature_implemented(BF.feature("ldlt"); tasks_md = path)
+        @test BF.feature_implemented(BF.feature("cholesky_fused"); tasks_md = path)   # no header needed
     end
 end
 
