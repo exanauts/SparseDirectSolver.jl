@@ -11,6 +11,6 @@ SparseDirectSolver = "dc8e0fd9-41f1-440b-9624-22817132f700"
 SparseDirectSolver = {path = ".."}
 
 [compat]
-AMDGPU = "2"
-CUDA = "6"
+AMDGPU = "2.9"
+CUDA = "6.5"
 Documenter = "1"

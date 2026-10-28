@@ -457,7 +457,7 @@ end
 
 # the backend when the symbolic maps may be built on it (device.jl), else nothing
 _device_backend(solver::DirectSolver) =
-    solver.backend isa KernelAbstractions.GPU ? solver.backend : nothing
+    solver.backend isa KernelAbstractions.CPU ? nothing : solver.backend
 
 function _reorder!(solver::DirectSolver{T}) where {T}
     _check_analysis_supported(solver)
