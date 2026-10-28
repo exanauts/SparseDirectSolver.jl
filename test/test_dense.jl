@@ -131,8 +131,9 @@ end
                 F = uplo == 'L' ? LowerTriangular(to_host(X)) : UpperTriangular(to_host(X))'
                 @test norm(F * F' - S) <= tl * norm(F)^2
             end
-            # not positive definite at column j: info == j
-            for j in unique((1, cld(m, 2), m)), uplo in ('L', 'U'), impl in tested_impls(:potrf, backend, T)
+            # not positive definite at column j: info == j (33: the first column of oneMKL's
+            # second panel, which it reports as 1)
+            for j in filter(<=(m), unique((1, 33, cld(m, 2), m))), uplo in ('L', 'U'), impl in tested_impls(:potrf, backend, T)
                 Sj = copy(S)
                 Sj[j, j] = -one(T)
                 @test SDS.potrf!(uplo, dev(Sj); impl) == j
@@ -328,7 +329,7 @@ end
             Fh = to_host(F11)
             F = uplo == 'L' ? LowerTriangular(Fh) : UpperTriangular(Fh)'
             @test norm(F * F' - S) <= tl * norm(F)^2
-            for j in unique((1, cld(m, 2), m))
+            for j in filter(<=(m), unique((1, 33, cld(m, 2), m)))
                 Sj = copy(S)
                 Sj[j, j] = -one(T)
                 X = to_device(backend, Sj)

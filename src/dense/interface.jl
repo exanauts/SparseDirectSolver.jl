@@ -270,10 +270,13 @@ function potrf!(uplo, A::AbstractMatrix; impl::Symbol = :auto)
     if p === :vendor || p === :generic
         info = p === :vendor ? vendor_potrf!(ul, A) :
                Int(cholesky!(Hermitian(A, ul == 'L' ? :L : :U), NoPivot(); check = false).info)
-        info == 0 || return info
-        # cuSOLVER zpotrf (n = 32) returns info = 0 when only the last pivot is
-        # not positive (T03 CI); accept the factor only if its diagonal is.
-        return Int(only(Array(ka_chol_diag_info!(_device_info(A), A))))
+        # the factor diagonal is authoritative: cuSOLVER zpotrf (n = 32) returns info = 0
+        # when only the last pivot is not positive (T03 CI), and oneMKL reports the
+        # failing column relative to its panel (the oneAPI extension); LAPACK's potf2
+        # leaves the failed pivot in A[j, j], so the first non-positive diagonal entry
+        # is the column, and a reported failure the scan cannot see is kept
+        st = Int(only(Array(ka_chol_diag_info!(_device_info(A), A))))
+        return st != 0 ? st : info
     else
         info = ka_potrf!(ul, A, _device_info(A))
         return Int(only(Array(info)))
@@ -289,7 +292,8 @@ with the LAPACK `info` (0, or the first non-positive pivot column) written to
 the numeric phase can factor many fronts and read their status once
 (PLAN §3.9). `:vendor` (`vendor_potrf_info!`) and `:generic` results are
 validated on the device by [`ka_chol_check_info!`](@ref) (cuSOLVER can miss a
-non-positive last pivot, see `potrf!`); `:ka` is [`ka_potrf!`](@ref). The
+non-positive last pivot, oneMKL can name the wrong column, see `potrf!`); `:ka`
+is [`ka_potrf!`](@ref). The
 `:vendor` and `:ka` paths do not synchronize with the host; `:generic` does
 when the backend's `cholesky!` reads its `info` (CUDA).
 """

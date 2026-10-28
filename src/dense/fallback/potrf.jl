@@ -117,21 +117,23 @@ end
     li = @index(Local, Linear)
     b = @index(Group, Linear)
     if li == 1
-        @inbounds if info[idx + b - 1] == 0
-            st = Int32(0)
-            for j in 1:n
-                d = _get(A, j, j, b)
-                # dmin > 0: the Cholesky pivot-epsilon floor (issue #127) — potrf accepts
-                # any positive pivot, so a pivot that became tiny DURING elimination is
-                # only visible here, as a factor diagonal at or below sqrt(epsilon)
-                ok = dmin > zero(dmin) ? real(d) >= dmin : real(d) > zero(real(d))
-                if !(isfinite(real(d)) && ok && iszero(imag(d)))
-                    st = Int32(j)
-                    break
-                end
+        st = Int32(0)
+        for j in 1:n
+            d = _get(A, j, j, b)
+            # dmin > 0: the Cholesky pivot-epsilon floor (issue #127) — potrf accepts
+            # any positive pivot, so a pivot that became tiny DURING elimination is
+            # only visible here, as a factor diagonal at or below sqrt(epsilon)
+            ok = dmin > zero(dmin) ? real(d) >= dmin : real(d) > zero(real(d))
+            if !(isfinite(real(d)) && ok && iszero(imag(d)))
+                st = Int32(j)
+                break
             end
-            info[idx + b - 1] = st
         end
+        # the diagonal is authoritative wherever it shows a bad pivot: a vendor info = 0
+        # can miss one (cuSOLVER, see potrf!) and a vendor info > 0 can name the wrong
+        # column (oneMKL reports it relative to its panel, see the oneAPI extension);
+        # a reported failure the scan cannot see is kept
+        @inbounds st != 0 && (info[idx + b - 1] = st)
     end
 end
 
@@ -139,9 +141,13 @@ end
     ka_chol_check_info!(info, idx, L) -> info
 
 Device-side validation of the `info[idx]` a vendor or generic Cholesky left for
-the computed factor `L` (a matrix): when `info[idx] == 0`, it is replaced by
-the first `j` whose diagonal entry `L[j, j]` is not a finite positive real
-(still 0 if there is none); a nonzero `info[idx]` is kept. Asynchronous (see
+the computed factor `L` (a matrix): whenever some diagonal entry `L[j, j]` is
+not a finite positive real (at least `dmin` when `dmin > 0`), `info[idx]` is
+replaced by the first such `j`, whatever the vendor reported. A vendor
+`info = 0` can miss a non-positive pivot (cuSOLVER) and a vendor `info > 0`
+can name the wrong column (oneMKL reports it relative to its panel); LAPACK's
+`potf2` leaves the failed pivot in `L[j, j]`, so the diagonal is authoritative.
+A reported failure whose column the scan cannot see is kept. Asynchronous (see
 [`potrf_info!`](@ref)).
 """
 function ka_chol_check_info!(info::AbstractVector{Int32}, idx::Integer, L::AbstractMatrix, dmin::Real = 0.0)

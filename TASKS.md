@@ -3354,7 +3354,10 @@ their numbers and order.
   (the `@test_skip` of `test_api.jl`: no device allocation counter on oneAPI), 6.5 min. The CPU backend was
   not run on Aurora by owner decision (CI's CPU job covers it); a 48-worker CPU run there aborted in POCL's
   thread-pool start-up (`pthread_scheduler_init`, every worker starts a pool of all 208 hardware threads).
-  The review fixes of round 4 (below) are covered on oneAPI by the CI leg only.
+  The review fixes of round 4 (below) are covered on oneAPI by the CI leg only. Round 5, on the runner
+  `headroom` (Intel Data Center GPU Max 1100, native Float64, oneAPI.jl `main` 2ec42dc, `oneAPI_Support_jll`
+  0.11.0 = oneMKL 2026.1, KA 0.10, Julia 1.13.3): full suite incl. Aqua, CPU + oneAPI, all four element
+  types, 12 workers: 102,946 pass / 0 fail / 4 broken, 35.5 min (`test_dense` alone: 39,880 pass).
 - What was built (Metal, part 2): `ext/SparseDirectSolverMetalExt.jl` (weak dependency `Metal`, compat `1.11`: the
   offset-aware `MPSMatrix(buffer, desc, offset)` constructor and the `MPSMatrixDecompositionCholesky`
   wrapper used by the extension): Float32 CSR upload (`to_backend`), `max_local_bytes(::MetalBackend) = 32768`,
@@ -3425,7 +3428,11 @@ their numbers and order.
   (oneAPI.jl shims: uncaught oneMKL exceptions in the `*_scratchpad_size` shims, so no `vendor_sytrf!`; the
   `Ptr{ComplexF32}` declaration of `onemklZtrsm_batch_strided` and host `Ptr`s of the strided-batch trsm
   bindings; `wait_and_throw` per call; no device allocation counter). Batched `potrf`/`getrf` on oneMKL report
-  one status per batch, so uniform batches use the KA kernels. The POCL thread oversubscription of the KA 0.10
+  one status per batch, so uniform batches use the KA kernels. #150 (oneMKL's GPU `potrf` names the failing
+  column relative to its 32-column panel; worked around here, see round 5). The `exception during kernel
+  execution` lines that `test_numeric_lu[Complex*]` prints on oneAPI are the `atomic_add` capability probe
+  (complex Atomix CAS fails, the probe's `try/catch` records `false`, oneAPI.jl prints the device exception
+  anyway): expected, no issue. The POCL thread oversubscription of the KA 0.10
   CPU backend with many test workers (`JULIA_KA_CPU_THREADS`). T32 (#146): allocation-free `:ka`, `:auto` order.
 - Review fixes: round 2 — the MPS status output had been written into `N.aux` (clobbering the `max |aᵢⱼ|`
   statistic) and got its own buffer; the test-helper round trip keeps `ComplexF64` on CUDA/AMDGPU; the
@@ -3434,7 +3441,23 @@ their numbers and order.
   (`test_numeric_cholesky_c.jl`, "info: failing pivot in a wide front"; on Metal `info` must fall into the
   failing front, elsewhere equal the reference); the MPS route gated on `impl = :auto` with `vendor_c`
   (testset "offset-aware vendor potrf only under :auto"); `NotSupportedError` instead of silently replaced
-  schedule options; this Report; `_tri_decode` seed; docs (`backends.md`, `index.md`, README).
+  schedule options; this Report; `_tri_decode` seed; docs (`backends.md`, `index.md`, README). Round 5 —
+  the `oneapi` CI leg failed 80 assertions in `test_dense` (`potrf 100/257`, `potrf_info!`, every element
+  type) once round 4 made the oneAPI loops also run explicit `impl = :vendor` (`tested_impls`). oneMKL
+  2026.1's GPU `potrf` returns the failing column relative to its 32-column panel (column 50 as 18, or as
+  1042 for complex types; #150). The oneAPI.jl shim forwards oneMKL's value correctly. The factor still
+  follows LAPACK `potf2`, so the diagonal is now authoritative wherever it shows a bad pivot:
+  `_ka_chol_check_kernel!` overwrites a nonzero vendor `info` too (a reported failure the scan cannot see is
+  kept), and `potrf!` returns the `ka_chol_diag_info!` column when it is nonzero. Side effect on the `:ka`
+  path with the epsilon floor (`dmin > 0`): a pivot below the floor before the column where `ka_potrf!`
+  stopped is now reported, i.e. the first failing column under the floor. `test_dense.jl` adds `j = 33`
+  (the first column of oneMKL's second panel, reported as 1) to the failing-pivot cases on every backend.
+  Not run on CUDA or AMDGPU here: cuSOLVER and rocSOLVER must leave the failed pivot in `A[j, j]` as LAPACK
+  does, which the CUDA and AMDGPU CI legs check. oneAPI.jl: `LinearAlgebra.LAPACK.potrf!`/`getrf!`/`sytrf!`
+  dropped `info`, so `cholesky`/`lu` on `oneArray`s fail with scalar indexing. Fixed upstream in
+  JuliaGPU/oneAPI.jl#754 (its onemkl tests pass here), which marks the oneMKL bug `@test_broken`; the oneMKL
+  bug is JuliaGPU/oneAPI.jl#755. The extension keeps calling the C shims: #754 does not correct oneMKL's
+  value, and switching to its wrappers needs a oneAPI.jl release (#148).
 - Suggested plan changes: PLAN §2.6 oneAPI column: gemm/syrk/herk/trsm, potrf/getrf and strided-batched
   gemm/trsm yes, sytrf and per-member batched potrf/getrf no; record Metal's 31-buffer argument limit next to
   the 32 KiB local-memory cap in PLAN §2.7.

@@ -16,7 +16,14 @@ module SparseDirectSolverOneAPIExt
 #
 # LAPACK status: the C shims return oneMKL's `computation_error` info on the host;
 # the Julia wrappers of oneAPI.jl drop it, so `potrf`/`getrf` call the C shims
-# directly. Batched `potrf`/`getrf` report one status per batch, not per member: no
+# directly (until a oneAPI.jl release returns it from `oneMKL.potrf!`/`getrf!`).
+# oneMKL's GPU `potrf` (2026.1, Data Center GPU Max) names the failing column
+# relative to its 32-wide panel: column 50 comes back as 18 for real types and as
+# 1042 (panel 1, column 18) for complex ones; only columns 1..32 are right. The
+# factor still follows LAPACK `potf2` (the failed pivot stays in `A[j, j]`), so
+# `potrf!` and `potrf_info!` take the first non-positive diagonal entry as the
+# column (`ka_chol_diag_info!`, `ka_chol_check_info!`); `vendor_potrf!` returns
+# oneMKL's value as reported. getrf's info is right. Batched `potrf`/`getrf` report one status per batch, not per member: no
 # binding (the KA kernels serve uniform batches). No `sytrf`: oneMKL rejects it on
 # the Intel Data Center GPU Max with `unsupported_device`, thrown from the
 # scratchpad-size shim, which does not catch it, so the process aborts.
@@ -195,7 +202,8 @@ for (elty, potrf, potrf_size, getrf, getrf_size) in
          (:ComplexF32, :onemklCpotrf, :onemklCpotrf_scratchpad_size, :onemklCgetrf, :onemklCgetrf_scratchpad_size),
          (:ComplexF64, :onemklZpotrf, :onemklZpotrf_scratchpad_size, :onemklZgetrf, :onemklZgetrf_scratchpad_size))
     @eval begin
-        # LAPACK info of oneMKL's potrf (0, the failing column, or -1 for a SYCL error)
+        # LAPACK info of oneMKL's potrf (0, the failing column as oneMKL reports it, i.e.
+        # panel-relative beyond column 32 (see the header), or -1 for a SYCL error)
         function _potrf_info(uplo::Char, A::oneStridedMatrix{$elty})
             n = LinearAlgebra.checksquare(A)
             q = _queue(A)
