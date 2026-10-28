@@ -242,6 +242,7 @@ name their types).
 PLAN.md  TASKS.md  RESEARCH.md  AGENTS.md
 Project.toml  src/  ext/  test/  bench/  docs/
 .github/workflows/   ci.yml Aqua.yml (checks)  Documentation.yml DocPreviewCleanup.yml (docs)  claude-review.yml (agent)
+                     CompatHelper.yml TagBot.yml (registry housekeeping)
 .github/scripts/     pr-verdict.sh (reads the reviewer's verdict)
 .github/ISSUE_TEMPLATE/agent-finding.md  .github/pull_request_template.md
 ```

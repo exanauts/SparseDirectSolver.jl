@@ -11,13 +11,14 @@ Performance issues carry the GitHub label `performance` ([list](https://github.c
 | #81 (PR) | regime-A subtrees ran a whole KKT tree on one workgroup; flop limit `subtree_parallelism` | 0 | merged |
 | #82 | KKT refactorization and solve are level-bound after #81: 54–59 launches per refactorization, 62–85 per solve | 5, 6 | open, triaged; both phases prototyped in PR #107 (see Experiments 5–6 prototypes), in-src adoption is T24 (solve) and T25/T26 (factorization) |
 | #107 (PR) | prototypes in `bench/`: partitioned-inverse fused solve, split/fused factorization, ordering study, `subtree_max_fronts`, MadNLP end-to-end on CUDA and AMD, AMD CI leg | 0, 4, 5, 6, 7 | merged (bench only; one `Options` knob in `src/`) |
-| #108 | ordering chooser picks AMD on large KKT systems: the cost model scores column-etree depth, not supernodal schedule depth (65 vs 29 levels, 36% on the solve) | 5, 6, 10 | open (found-by-agent) |
+| #108 | ordering chooser picks AMD on large KKT systems: the cost model scores column-etree depth, not supernodal schedule depth (65 vs 29 levels, 36% on the solve) | 5, 6, 10 | closed by T22 (PR #123): the chooser scores the amalgamated supernodal schedule depth, `flops + 1e8 × sdepth` |
 | #109 | update-stack placement assumes level-synchronous execution: out-of-level-order numeric phases need private contribution blocks (4× the stack) or DAG lifetimes | 5 | open (found-by-agent) |
 | #110 | regime-C Cholesky reportedly host-synchronizes per front through its `info` check; to verify | 5 | open (found-by-agent) |
 | #75 | device LDLᵀ: serial pivot search, one workgroup per regime-B/C front, no vendor `sytrf` | 1, 2 | open, triaged; steps 1–3 in PRs from `perf/exp1-pivot-search`, `perf/exp1-regime-b-local`, `perf/exp2-regime-c-blas`; criteria partly met (see Experiments 1–2 results) |
 | #86 | device LDLᵀ differs from `ref_ldlt!` on the K2 dumps (pivot sequence, `nperturbed`; rounding with max\|L\| 1e14–1e16), pre-existing | 1, 3 | open (found-by-agent) |
 | #60 | regime-A follow-ups: CUDA timings (partly answered by experiment 0) and per-backend local-memory caps | 7 | open, triaged |
-| #22, #24, #25, #26 | T22 ordering chooser, T24 fused solve, T25 split factorization, T26 segmented fused factorization (tasks; the former T25 performance pass) | 5, 6, 7, 10 | open |
+| #22, #24, #25, #26 | T22 ordering chooser, T24 fused solve, T25 split factorization, T26 segmented fused factorization (tasks; the former T25 performance pass) | 5, 6, 7, 10 | #22 closed (T22 merged); #24–#26 open |
+| #126 (PR) | the fused pipeline in `src/` (`src/fused.jl`: dependency-counter factorization, partitioned-inverse solve, `SDSTuning`) behind the MadNLP extension `SDSSolver`; the 78k-bus ACOPF end to end on seven GPUs in `bench/PERFORMANCE-2026-10.md`, the per-architecture defaults in `bench/ARCH-TUNING.md`; the handle-API harness row `cholesky_fused` in `bench/comparison/comparison.md` | 4, 5, 6 | merged; T24–T26 move the same kernels under `execute!` |
 
 Related accuracy issues that gate the K2 results: #71 (max\|L\| 1e14–1e16 on the K2 dumps, needs scaling) and #67 (pivot-pair matching), both experiment 3 / T21.
 
@@ -28,7 +29,7 @@ Related accuracy issues that gate the K2 results: #71 (max\|L\| 1e14–1e16 on t
 
 ## Key Findings
 
-### 1. SparseDirectSolver.jl today
+### 1. SparseDirectSolver.jl today (as of experiment 0, 2026-10-02; the later state is in the Tracked issues table above and the result sections below)
 - **Scope and API.** SDS is "a portable sparse direct solver (LLᵀ/LLᴴ, LDLᵀ/LDLᴴ, LDU) for GPUs, written in Julia on KernelAbstractions.jl and GPUArrays.jl". It mirrors CUDSS.jl's phases and parameter names so that MadNLP can switch mechanically. Status is v0.1 under construction. It requires Julia ≥ 1.13 and is unregistered. Development is agent-driven: 45 commits, with strictly sequential tasks T01–T27 in TASKS.md. [github](https://github.com/exanauts/SparseDirectSolver.jl)
 - **Symbolic (host).** AMD, or METIS nested dissection through an extension. [github](https://github.com/exanauts/SparseDirectSolver.jl) Elimination tree, column counts, fundamental supernodes with GPU-tuned amalgamation; issue #64 gives the default as (32, 0.25, 8), i.e. max merged width, zero-fill budget and a min-width rule. [github](https://github.com/exanauts/SparseDirectSolver.jl/issues/64) Static factor layout and device assembly maps follow. Contribution blocks are placed offline over their lifetimes (PR #54). The update stack is still ~4.5× the factor size, and 8.7× on a 60k×25k KKT generator. [github](https://github.com/exanauts/SparseDirectSolver.jl/pull/56)
 - **Indefinite-specific analysis.** Structurally zero pivots get a partner (`pivot_pairs`, MA57-style compressed-graph ordering) so that in-front pivoting can form 2×2 blocks. [github](https://github.com/exanauts/SparseDirectSolver.jl) Measured on the CPU reference with the default pairing: case118 K2 goes from 147 to 3 perturbed pivots at 1.25× nnz(L), and case1354 K2 from 2060 to 33 at 1.40×. Pairing everything ("all") costs 1.8–2.2× nnz(L) and is worse. [github](https://github.com/exanauts/SparseDirectSolver.jl/pull/72)

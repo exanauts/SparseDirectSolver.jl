@@ -65,8 +65,9 @@ oneAPI (tested on an Intel Data Center GPU Max 1550):
   used as `madnlp(model; linear_solver = SDSSolver, kkt_system =
   MadNLP.SparseCondensedKKTSystem)`, with the options `sds_factorization`
   (`:cholesky`, or `:ldl` without pivoting, the inertia read from the signs of
-  `D`), `sds_pivoting = :bk` for the in-front Bunch–Kaufman path,
-  `sds_reordering`, `sds_user_perm` and `sds_tuning`, a bundle of performance
+  `D`), `sds_pivoting = :bk` for the in-front Bunch–Kaufman path (with
+  `sds_pivot_threshold`), `sds_reordering`, `sds_user_perm` and `sds_tuning`,
+  a bundle of performance
   knobs with measured per-architecture defaults. It runs the fused pipeline of
   `src/fused.jl`, one dependency-counter kernel per refactorization and a
   partitioned-inverse solve, on CUDA and AMDGPU; the benchmark row
@@ -233,9 +234,9 @@ that change to `test/Project.toml`.
 
 The project is developed task by task; `TASKS.md` lists the tasks and the
 report of every finished one. Each task lands through a pull request that CI
-(the CPU suite on GitHub and on a self-hosted runner, the GPU suite on the
-self-hosted `cuda`, `amdgpu` and `oneapi` runners; Metal has no CI leg) and an
-automated review must pass; between tasks the owner
+(the CPU suite on the self-hosted `kkt` machine, the GPU suite on the
+self-hosted `cuda`, `amdgpu` and `oneapi` runners, Aqua on GitHub; Metal has
+no CI leg) and an automated review must pass; between tasks the owner
 reviews the state (`STATE.md`) and refreshes `PLAN.md`. `AGENTS.md` describes
 the workflow and the code conventions.
 

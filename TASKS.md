@@ -15,18 +15,23 @@ so the **Report** block at the end of each task must be filled in honestly.
 3. Test environment on this machine: Julia 1.13 (package compat `julia = "1.13"`),
    Linux (WSL2), one NVIDIA RTX 4080 (16 GB). **Locally, tests use only the KA
    CPU backend and CUDA.** The exanauts CI runners also run the suite on an AMD
-   GPU (`amdgpu` label); oneAPI and Metal are never tested. Their extension
-   files (T23) are written by analogy and only checked for precompilation.
+   GPU (`amdgpu` leg, T23) and an Intel GPU (`oneapi` leg, T31), both required
+   checks; Metal (T31, `Float32` only) has no CI leg and is tested by hand on
+   Apple hardware (M4 Max).
 4. CUDA.jl 6.x is split into packages. Use `CUDACore` (arrays, `CUDABackend`),
    `cuSPARSE` (`CuSparseMatrixCSR`, `CuSparseMatrixCSC`), `cuBLAS` and
    `cuSOLVER` (dense routines) as weak dependencies; the umbrella `CUDA` package
    re-exports them and is what the tests load.
 5. Run the full suite with
    `julia --project=. -e 'using Pkg; Pkg.test()'`.
-   `SDS_TEST_GPU=0` skips CUDA; `SDS_TEST_ONLY="name1,name2"` restricts to the
-   named test files (both implemented in T01); `SDS_TEST_CPU=0` skips the CPU
-   backend and `SDS_TEST_SKIP="name1,name2"` leaves files out (used by the CUDA
-   CI jobs, which run `SDS_TEST_CPU=0 SDS_TEST_SKIP=test_aqua`).
+   `SDS_TEST_GPU=0` skips the GPU backends; `SDS_TEST_ONLY="name1,name2"`
+   restricts to the named test files (both implemented in T01);
+   `SDS_TEST_CPU=0` skips the CPU backend and `SDS_TEST_SKIP="name1,name2"`
+   leaves files out (used by the GPU CI jobs, which run
+   `SDS_TEST_CPU=0 SDS_TEST_SKIP=test_aqua`); `SDS_TEST_ELTYPES="Float64,ComplexF32"`
+   selects the element types (default all four); `PTR_NUM_JOBS=N` sets the
+   number of ParallelTestRunner workers. The long files run once per element
+   type (`SPLIT_FILES` in `test/runtests.jl`), see `AGENTS.md`.
 6. Every public function gets a docstring. Tests are deterministic
    (`Random.seed!(666)`). Tolerances and matrix generators come from
    `test/utils.jl` and `test/matrices.jl` (T01); do not invent new ones per file.
@@ -50,10 +55,13 @@ so the **Report** block at the end of each task must be filled in honestly.
 ## Shared test conventions (created in T01, used everywhere)
 
 * `test/backends.jl`: `BACKENDS = Any[CPU()]` (unless `SDS_TEST_CPU == "0"`),
-  plus `CUDABackend()` when `CUDA.functional()` and `SDS_TEST_GPU != "0"`; an
-  empty list is an error. `to_device(backend, x)` maps
-  `Array`/`SparseMatrixCSC` to the backend (`CuArray`, `CuSparseMatrixCSR`),
+  plus the backend of every GPU package present in the test environment and
+  functional (`CUDABackend()`, `ROCBackend()`, `MetalBackend()`,
+  `oneAPIBackend()`) when `SDS_TEST_GPU != "0"`; an empty list is an error.
+  `to_device(backend, x)` maps `Array`/`SparseMatrixCSC` to the backend
+  (`CuArray`, `CuSparseMatrixCSR`, and the AMDGPU/oneAPI/Metal equivalents),
   `to_host(x)` maps back. `backend_name(backend)` for testset names.
+  `SELECTED_ELTYPES` is the element-type selection of `SDS_TEST_ELTYPES`.
 * `test/matrices.jl` (all return `SparseMatrixCSC{T,Int}`):
   `laplacian2d(T, nx, ny)`, `laplacian3d(T, nx, ny, nz)` (SPD),
   `random_spd(T, n, density)` (`A*A' + n*I`), `random_hpd` (complex),
@@ -64,10 +72,13 @@ so the **Report** block at the end of each task must be filled in honestly.
   column `j` after natural ordering, for perturbation tests),
   the two 5×5 Schur examples and the 3×3 uniform-batch example from
   `../CUDSS.jl/docs/src/`.
-* `test/utils.jl`: `tol(T) = sqrt(eps(real(T)))`,
+* `test/utils.jl`: `tol(T) = sqrt(eps(real(T)))`, `panel_tol(T)`,
+  `growth_tol(T, Nr)`,
   `relres(A, x, b) = norm(b - A*x) / max(norm(b), one(real(eltype(b))))`,
-  `ELTYPES = (Float32, Float64, ComplexF32, ComplexF64)`,
-  `REAL_ELTYPES`, `INTTYPES = (Int32, Int64)`.
+  `ELTYPES` (the selected element types, default
+  `(Float32, Float64, ComplexF32, ComplexF64)`; in a split file the running
+  part's type), `REAL_ELTYPES`, `COMPLEX_ELTYPES`, `eltypes_among(types)`,
+  `RUN_SHARED`, `INTTYPES = (Int32, Int64)`, `ka_cpu_alloc_budget`.
 * Every numeric test loops `for backend in BACKENDS, T in ELTYPES` unless the
   task says otherwise, and asserts `relres(A, x, b) ≤ tol(T)` on
   well-conditioned generators.

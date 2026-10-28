@@ -65,7 +65,9 @@ IPM KKT systems, 2026-10-01). What it changed in this plan:
   sync-free solves and graph capture live only in the CUDA/ROCm extensions.
 * **Benchmark harness and cuDSS baseline measurements** move into M0.
 
-Status: see §5 (M0–M9 done, M11 in progress through T22–T26).
+Status: see §5 (M0–M9 done, T22 and the four backend extensions done, M11 in
+progress through T24–T26; the fused pipeline of `src/fused.jl` serves the MadNLP
+extension meanwhile).
 
 ---
 
@@ -82,7 +84,7 @@ semantics), **accept+ignore** (accepted for drop-in compatibility, warns once),
 | CSR input `rowPtr/colVal/nzVal`, `INT ∈ {Int32, Int64}` | port | Accept each backend's CSR type (`CuSparseMatrixCSR`, `ROCSparseMatrixCSR`, `oneSparseMatrixCSR`) through extensions, plus an in-package `CSR{T,INT,VI,VT}` for Metal, CPU and raw arrays. |
 | CSC input (MadNLP passes `colPtr/rowVal` as CSR of Aᵀ with view `'U'`) | port | Treated as CSR of Aᵀ with the view flipped; no copy. For complex Hermitian input the stored matrix is `conj(A)`, which the conjugated solve of `solve_mode` handles (T16). |
 | Structures `"G" "S" "H" "SPD" "HPD"` | port | Same strings. |
-| Views `'L' 'U' 'F'` | port | For `'F'` on symmetric types only one triangle (the lower) is read, as in cuDSS. For `"G"` the view is ignored and the full matrix is read, as in cuDSS (issue #84; until that fix lands `"G"` requires `'F'`). |
+| Views `'L' 'U' 'F'` | port | For `'F'` on symmetric types only one triangle (the lower) is read, as in cuDSS. For `"G"` the view is ignored and the full matrix is read, as in cuDSS (issue #84, PR #101). |
 | Index base `'Z' 'O'` | port | Handled in the symbolic maps; values never copied. |
 | `T ∈ {Float32, Float64, ComplexF32, ComplexF64}` | port | Generic in `T`. Metal: Float32/ComplexF32 factors (see mixed precision, §3.8). |
 | Double-double (`CUDSS_R_64F_64F`) | not planned | |
@@ -109,7 +111,7 @@ solve phases raise `NotSupportedError` (T20, §3.6).
 
 | Name | Plan | Portable semantics |
 | --- | --- | --- |
-| `reordering_alg` | reinterpret | `"default"`: automatic choice between ND (Metis extension) and AMD by the cost model of §2.3; `"algo3"` AMD, `"algo4"` ND, `"algo5"` natural. `"algo1"/"algo2"` (BTF_COLAMD/COLAMD with global pivoting): accepted, falls back to symmetric-pattern LU with a one-time warning (§3.3). |
+| `reordering_alg` | reinterpret | `"default"`: automatic choice between ND (METIS through CliqueTrees; Metis.jl is a dependency) and AMD by the cost model of §2.3 (flops + 1e8 × supernodal schedule depth, T22); `"algo3"` AMD, `"algo4"` ND, `"algo5"` natural. `"algo1"/"algo2"` (BTF_COLAMD/COLAMD with global pivoting): accepted, falls back to symmetric-pattern LU with a one-time warning (§3.3). |
 | `factorization_alg` | reinterpret | `"default"` auto; `"algo1"` runs the fronts above the regime-B bins on the KA tiled kernels (no vendor calls); `"algo2"` sends every front outside regime A to the regime-C path. Mirrors cuDSS keeping a separate algorithm for very sparse factors (T07, T10). |
 | `solve_alg` | reinterpret | `"default"` level-batched; `"algo1"` partitioned-inverse diagonal blocks (M11); sync-free variant selected automatically on CUDA/ROCm when available. |
 | `matching_alg` | port (T21) | `"default"` off; algo1..5 = MC64 jobs 1..5; algo6 auto → job 5. Host MC64 at reordering, from the first batch member, reused by refactorizations. `"G"` factors `(Dr A Dc)[:, q]`; the symmetric structures are scaled only (`D A D`, inertia of `A`) and take the 2×2 pivot pairs from the matching cycles for jobs 5/6. Not combined with Schur mode. |
@@ -123,7 +125,7 @@ solve phases raise `NotSupportedError` (T20, §3.6).
 | `use_cuda_register_memory` | reinterpret (M12) | Pinned host memory through the backend extension. |
 | `hybrid_execute_mode` | defer (M12) | Small levels on the KA CPU backend. |
 | `host_nthreads` | reinterpret | Julia threads for the host symbolic phase / CPU backend. |
-| `nd_nlevels`, `nd_ubfactor` | port (T05) | ND is `METIS_NodeND` through CliqueTrees; `nd_ubfactor` is passed through, `nd_nlevels` is read as cuDSS documents it, a *minimum* number of dissection levels, which NodeND's full recursion meets (a level-capped ND was 4–13× slower with more fill). It becomes meaningful with the partition-tree export (T30). |
+| `nd_nlevels`, `nd_ubfactor`, `nd_nseps`, `nd_seed` | port (T05, PR #126) | ND is `METIS_NodeND` through CliqueTrees; `nd_ubfactor`, `nd_nseps` and `nd_seed` are passed through, `nd_nlevels` is read as cuDSS documents it, a *minimum* number of dissection levels, which NodeND's full recursion meets (a level-capped ND was 4–13× slower with more fill). It becomes meaningful with the partition-tree export (T30). |
 | `ubatch_size`, `ubatch_index` | port (M6) | Uniform batch. |
 | `use_superpanels` | reinterpret | Supernode amalgamation on/off. |
 | `device_count`, `device_indices` | not planned | Raise "not supported". |
@@ -186,7 +188,7 @@ MadNLPGPU migrates).
 | `pivot_sign` | data | Per-row expected sign (`Int8`: +1, −1, 0 unknown). When a pivot must be perturbed, the replacement takes this sign instead of the sign of the tiny value. MadNLP passes +1 for primal and −1 for dual rows. |
 | `pivot_stats` | data | `(npos, nneg, nzero, nperturbed, n2x2)` from a per-front reduction, so MadNLP can raise its regularization instead of trusting a perturbed factorization. |
 | `ir_mode` | config | `"ir"` (default) or `"fgmres"`: FGMRES with the factorization as preconditioner (Krylov.jl extension). |
-| `factor_precision` | config | Element type of the factors (`Float32` or `Float64`); refinement runs in the input precision. Required on Metal. |
+| `factor_precision` | config | Element type of the factors (`Float32` or `Float64`); refinement runs in the input precision. Accepted and validated; a value other than the input precision raises `NotSupportedError` until T28 (Metal takes `Float32` input only). |
 | `amalgamation` | config | Relaxed-amalgamation parameters `(max_width, zero_fraction, min_width)`; `max_width` caps merging only (§2.3 step 4). |
 | `schedule` | config | `"auto"`, `"subtree+level"` (portable baseline), `"syncfree"` (CUDA/ROCm only, not implemented yet: raises). |
 | `pivot_pairs` | config | `"default"`: for `"S"`/`"H"` the analysis pairs every candidate row whose pivot is structurally zero in the ordering with a partner, so that in-front Bunch–Kaufman can form the 2×2 block (§2.3 step 2); `"all"` pairs every candidate (about 2× nnz(L) on KKT systems); `"none"`. Candidates are decided from the values present at analysis time: an all-zero `nzval` gives no pairs. |
@@ -214,14 +216,17 @@ user API: LinearAlgebra generics  +  handle-style layer (CUDSS.jl strings, C-wra
        │    + KA kernels for assembly, extend-add, gather/scatter, permutation
        ├─ solve (device): permute/scale → subtree/level fwd → diag → bwd → unpermute → IR/FGMRES
        └─ extensions: CUDA, AMDGPU, oneAPI, Metal (dense + sparse adapters + graph capture
-                      + sync-free solves where the hardware allows), Metis, Krylov
+                      + sync-free solves where the hardware allows), Krylov, MadNLP
 ```
 
 Only the pattern (`rowPtr`, `colVal`) travels to the host, during analysis;
 for `"S"`/`"H"` and for matching the values of the first batch member are
 copied to the host once at analysis as well (2×2 pivot pairs, MC64). Values
 otherwise stay on the device; refactorization is a fixed kernel sequence.
-Implemented extensions: CUDA, Metis, Krylov; AMDGPU, oneAPI and Metal are T23.
+Implemented extensions: CUDA, AMDGPU (T23), oneAPI and Metal (T31), Krylov
+(FGMRES-IR) and MadNLP (`SDSSolver` over the fused pipeline of `src/fused.jl`,
+PR #126). METIS is reached through CliqueTrees with Metis.jl as a hard
+dependency, not through an extension.
 
 ### 2.2 Why supernodal multifrontal, and why three regimes
 
@@ -266,20 +271,20 @@ runtime decisions.
    duplicates, rebase indices, check squareness; build the full-pattern CSR map
    used by the residual SpMV of refinement.
 2. **Ordering** via CliqueTrees.jl: `permutation(graph; alg)` with `AMD()`
-   (AMD.jl, a hard dependency) /`MMD()` or `METIS_NodeND` (Metis extension,
-   `nd_ubfactor` passed through, `nd_nlevels` a minimum); user permutation;
+   (AMD.jl, a hard dependency) /`MMD()` or `METIS_NodeND` (Metis.jl, a hard
+   dependency; `nd_ubfactor`, `nd_nseps`, `nd_seed` passed through,
+   `nd_nlevels` a minimum); user permutation;
    natural; ND-tree export/import in the cuDSS encoding (T30). **Automatic
    choice** computes both AMD and ND candidates (cheap for KKT sizes) and picks
-   by a cost model `flops × (1 + nlevels/n)` on the column etree: ND gives
-   bushier, shallower trees; AMD often gives lower fill on power grids (and
-   wins on the KKT and random harness matrices). That model is wrong for
-   large KKT systems (issue #108, PR #107): at n ≈ 7e5 it weighs depth at
-   0.2% and scores column-etree depth, which does not predict the supernodal
-   schedule depth that governs GPU time, so it picks AMD where ND halves the
-   schedule depth (65 → 29) and is 36% faster on the solve; until T22 scores
-   the schedule depth, GPU users should set `reordering_alg = "algo4"`. Schur
-   mode constrains the
-   ordering (§3.6). Matching (T21) composes a column permutation for `"G"` and
+   by the cost model `flops + 1e8 × sdepth` (T22, issue #108), where `sdepth`
+   is the depth of the amalgamated supernodal schedule the analysis builds:
+   every level costs a latency whatever its size, and the solve scales with
+   the depth alone. The previous model, `flops × (1 + nlevels/n)` on the
+   column etree, weighed depth at 0.2% at n ≈ 7e5 and picked AMD on the
+   78k-bus KKT where ND halves the schedule depth (65 → 29) and is 36% faster
+   on the solve (PR #107). One weight serves every backend, so the CPU and GPU
+   backends factor the same ordering. Schur mode constrains the ordering
+   (§3.6). Matching (T21) composes a column permutation for `"G"` and
    only scales the symmetric structures. **2×2 pivot pairs** for `"S"`/`"H"`
    (`pivot_pairs`): rows whose diagonal is absent or negligible are candidates;
    `"default"` pairs the candidates whose pivot is structurally zero in the
@@ -308,8 +313,10 @@ runtime decisions.
 5. **Assembly-tree partition** into regimes: leaf subtrees whose packed serial
    stack (fronts and contribution blocks as packed triangles, minus a small
    reserve for control words) fits one of four local-memory classes (8–48 KiB,
-   `subtree_budgets` mapped to `Val` kernel instances; 48 KiB is CUDA's static
-   shared-memory limit, per-backend caps are T23, issue #60) **and** whose
+   `subtree_budgets` mapped to `Val` kernel instances; the classes above the
+   backend's cap, `max_local_bytes(backend)`, are excluded: 48 KiB on CUDA,
+   32 KiB on Metal, from the device on AMDGPU and oneAPI; T23/T31, issue #60)
+   **and** whose
    flops are at most `1/subtree_parallelism` of the total (default 4096), so
    that a KKT tree never runs on one workgroup (#81); mid-level fronts binned
    by width class (8, 16, 32, 64) and row class; root fronts above
@@ -431,7 +438,9 @@ The dense layer is a small interface (`gemm!`, `syrk!/herk!`, `trsm!`, `potrf!`,
 3. **KA fallback kernels** (`:ka`: the regime A/B kernels and tiled
    large-front kernels) for everything a backend lacks, so every feature works
    everywhere. Batched ops have no `:generic` path. The `:ka` fallbacks still
-   allocate per call; making them allocation-free is a T23 item (issue #53).
+   allocate per call (launch configuration built from run-time flags, not
+   buffers); making them allocation-free and preferring `:ka` over `:generic`
+   under `:auto` on oneAPI and Metal is T32 (issues #146, #112, #53).
 
 Expected coverage, to be verified by the M0 capability audit (which also checks
 strided `reshape(view(...))` acceptance, float atomics, and the reported MPS LU
@@ -447,13 +456,19 @@ defect above 128×128 on macOS 27):
 | Float64 / complex | yes | yes | hardware-dependent / yes | no / no |
 
 Extensions: `…CUDAExt` (weak dependencies `CUDACore`, `cuSPARSE`, `cuBLAS`,
-`cuSOLVER` of CUDA.jl 6: dense bindings, sparse adapters; pinned memory, graph
-capture and the sync-free solve are T24/T26), `…AMDGPUExt`, `…OneAPIExt`,
-`…MetalExt` (T23), `…MetisExt` (ND), `…KrylovExt` (FGMRES-IR). Core depends on
-KernelAbstractions 0.9, GPUArrays(Core), Adapt, Atomix, LinearAlgebra,
-SparseArrays, CliqueTrees, AMD, Metis (ordering only through the extension).
-The CUDA column of the table above was verified by the T03 capability audit
-(all yes, `herk` only for complex `T`, no complex atomics).
+`cuSOLVER` of CUDA.jl 6.5: dense bindings, sparse adapters; pinned memory,
+graph capture and the sync-free solve are T24/T26), `…AMDGPUExt` (rocBLAS/
+rocSOLVER, `ROCSparseMatrixCSR`/`CSC`, T23), `…OneAPIExt` (oneMKL level-3
+BLAS on the vendor path, LAPACK kept on `:ka` because every oneMKL call
+synchronizes and LAPACK allocates a scratchpad, `oneSparseMatrixCSR`/`CSC`,
+T31), `…MetalExt` (`CSR` of `MtlArray`s, `Float32` only, MPS Cholesky for wide
+fronts, T31), `…KrylovExt` (FGMRES-IR), `…MadNLPExt` (`SDSSolver`, PR #126).
+Core depends on KernelAbstractions 0.10, GPUArrays 12 (and GPUArraysCore),
+Adapt, Atomix, LinearAlgebra, SparseArrays, CliqueTrees, AMD, Metis. The CUDA
+column of the table above was verified by the T03 capability audit (all yes,
+`herk` only for complex `T`, no complex atomics); the AMDGPU, oneAPI and Metal
+columns by the T23 and T31 Reports on an MI300X, a Data Center GPU Max 1550
+and an M4 Max.
 
 ### 2.7 Portability constraints (hard, from the research)
 
@@ -464,8 +479,8 @@ The CUDA column of the table above was verified by the T03 capability audit
 | No dynamic parallelism, no graphs in KA; one launch per level is the portable floor. | Subtree fusion and level merging are first-class analysis goals. CUDA/HIP graph capture of refactorize+solve through the extensions. |
 | Metal has no Float64. | `factor_precision = Float32` with Float64 refinement on the CPU or in double-single arithmetic; acceptable for condensed/well-conditioned systems only. |
 | Float32 atomics have codegen regressions on CUDA; atomics cost everywhere. | No atomics in assembly or extend-add (owner-pull, deterministic). Atomics only in the default forward solve, with an atomic-free variant. |
-| KernelAbstractions 0.9 CPU backend: a 2-D ndrange allocates per launch, launches with more than about 32 arguments are not specialized and allocate, `@localmem` is heap-allocated under coverage (issue #53). | Allocation-free phases use 1-D ndranges with the extra dimension folded into the group index and kernels of at most 32 arguments; the CPU allocation tests carry an explicit budget for the backend's own allocations. |
-| `@localmem` is static shared memory; CUDA rejects more than 48 KiB per kernel, Metal allows 32 KiB. | Regime-A local sizes are a fixed ladder of `Val` instances (8–48 KiB); per-backend caps are a capability (T23, #60). |
+| KernelAbstractions CPU backend: a 2-D ndrange allocates per launch, launches with more than about 32 arguments are not specialized and allocate, `@localmem` is heap-allocated under coverage (issue #53); the 0.10 backend allocates a fixed amount per launch (#145). | Allocation-free phases use 1-D ndranges with the extra dimension folded into the group index and kernels of at most 32 arguments; the CPU allocation tests carry an explicit budget for the backend's own allocations (`ka_cpu_alloc_budget`). |
+| `@localmem` is static shared memory; CUDA rejects more than 48 KiB per kernel, Metal allows 32 KiB. | Regime-A local sizes are a fixed ladder of `Val` instances (8–48 KiB); the per-backend cap is the capability `max_local_bytes(backend)` of each extension (T23/T31, #60). |
 
 ---
 
@@ -616,7 +631,7 @@ are pure "values in, factors/solution out" kernel sequences with no allocation
 and no host synchronization, so the CUDA and ROCm extensions can capture the
 refactorize+solve sequence in a graph and replay it per IPM iteration (graph
 capture itself is T26, #82). This holds for the dense implementations `:auto`,
-`:vendor` and `:ka` (the latter still allocates until T23, #53); `:generic`
+`:vendor` and `:ka` (the latter still allocates until T32, #146/#53); `:generic`
 (host LinearAlgebra) is the reference path and may allocate. Exceptions by
 design: the `ir_tol > 0` early-exit test and every FGMRES iteration read on the
 host; `getparam` of statistics and `info` are the phase-boundary reads.
@@ -625,14 +640,15 @@ host; `getparam` of statistics and `info` are the phase-boundary reads.
 
 ## 4. Repository layout
 
-As of T21 (the planned `src/numeric/root.jl`, `refactorize.jl`, `partinv.jl`,
+As of T31 (the planned `src/numeric/root.jl`, `refactorize.jl`, `partinv.jl`,
 `src/batch/`, `src/hybrid.jl` do not exist: their content lives in the files
 below or is still to come).
 
 ```
-Project.toml                  deps: KernelAbstractions 0.9, GPUArrays, GPUArraysCore, Adapt, Atomix,
-                              LinearAlgebra, SparseArrays, CliqueTrees, AMD
-                              weakdeps: CUDACore, cuSPARSE, cuBLAS, cuSOLVER (CUDA.jl 6), Metis, Krylov
+Project.toml                  deps: KernelAbstractions 0.10, GPUArrays 12, GPUArraysCore, Adapt, Atomix,
+                              LinearAlgebra, SparseArrays, CliqueTrees, AMD, Metis
+                              weakdeps: CUDACore, cuSPARSE, cuBLAS, cuSOLVER (CUDA.jl 6.5), AMDGPU, oneAPI,
+                              Metal, Krylov, MadNLP
 src/SparseDirectSolver.jl
 src/errors.jl  logging.jl     error hierarchy; SDS_LOG_LEVEL phase logging
 src/types.jl  options.jl      enums, Options, setparam!/getparam tables (CUDSS.jl names + §1.7)
@@ -661,8 +677,14 @@ src/numeric/batch.jl  schur.jl  extract.jl   uniform batch pointer arrays, Schur
 src/solve/permute.jl  sweeps.jl  refinement.jl   permutation/scaling, sweeps, IR and the FGMRES operators
 src/solver.jl                 DirectSolver, execute!, phases, parameters
 src/generic.jl                LinearAlgebra interface
-ext/SparseDirectSolverCUDAExt.jl  …MetisExt.jl  …KrylovExt.jl   (AMDGPU, oneAPI, Metal: T23)
-test/                         CPU backend always + CUDA when present; ported CUDSS.jl tests under test/ported
+src/fused.jl                  module Fused: fused factorization (Cholesky, no-pivot LDLᵀ) with dependency
+                              counters, partitioned-inverse solve, SDSTuning per-architecture bundle; the
+                              MadNLP extension's path until T24–T26 move it under execute!
+ext/SparseDirectSolverCUDAExt.jl  …AMDGPUExt.jl  …OneAPIExt.jl  …MetalExt.jl  …KrylovExt.jl  …MadNLPExt.jl
+test/                         CPU backend always + every functional GPU package in test/Project.toml;
+                              ported CUDSS.jl tests under test/ported; ParallelTestRunner, long files split
+                              per element type
+docs/                         Documenter site (built on the cuda runner), user guide and API reference
 bench/                        harness, cuDSS/CHOLMOD/UMFPACK baselines, cuDSS comparison per feature,
                               phase profiles, pglib-opf KKT dumps (ExaModelsPower), pivot-pair and
                               refinement tables
@@ -674,8 +696,9 @@ PERFORMANCE.md  STATE.md      gap analysis against cuDSS and the experiment plan
 ## 5. Milestones
 
 Every milestone ends with the test suite green on the KA CPU backend and on
-CUDA, AMDGPU, oneAPI and Metal (Float32), plus a `CHANGELOG.md` entry. Sizes are
-rough: S ≈ days, M ≈ 1–2 weeks, L ≈ 3–4 weeks, XL ≈ more.
+CUDA, AMDGPU, oneAPI and Metal (Float32); the Report blocks of `TASKS.md` are
+the change record (no `CHANGELOG.md` is kept). Sizes are rough: S ≈ days,
+M ≈ 1–2 weeks, L ≈ 3–4 weeks, XL ≈ more.
 
 | # | Milestone | Size | Definition of done |
 | --- | --- | --- | --- |
@@ -698,20 +721,25 @@ Not planned: multi-GPU (MG, MGMN), global pivoting, double-double, distributed
 input. The assembly tree keeps per-subtree ownership so MG can be added later
 by splitting the ND top level.
 
-**Status (2026-10-07)**: M0–M3 and M5–M9 are done; M4 is done except the
-MadNLPGPU integration (External task); M2 and M4 differ from the definitions
-above in that vendor batched calls are not used in regime B and vendor
-`sytrf`/`getrf` are not used in regime C (§2.4). CI runs the CPU backend and
-CUDA, plus a non-required AMD leg that passes everything but the ROC
-constructor forwarders (T23); oneAPI/Metal wait for T23. The M3 target (1.5×
-cuDSS on condensed pglib systems) is not met by the library: 2.5×
-factorization / 3.9× refactorization / 4.4× solve (geometric means, RTX 4080);
-LDLᵀ 4.4× / 6.3×. The remaining gap on KKT systems is launch- and level-bound
-(#82); bench-level prototypes (PR #107) reach 1.3× cuDSS on the refactorization
-and parity on the solve of a 78k-bus condensed KKT, and a MadNLP end-to-end run
-on CUDA and AMD exists in `bench/e2e/`, so M11 is a matter of moving measured
-designs into `src/`. Measurements and the experiment plan are in
-`PERFORMANCE.md`.
+**Status (2026-10-28)**: M0–M3 and M5–M9 are done; M4 is done except the
+MadNLPGPU integration (External task), for which the MadNLP extension
+(`SDSSolver`, PR #126, `sds_pivoting = :bk` PR #134) is the in-repository
+stand-in; M2 and M4 differ from the definitions above in that vendor batched
+calls are not used in regime B and vendor `sytrf`/`getrf` are not used in
+regime C (§2.4). The ordering chooser scores the supernodal schedule depth
+(T22, #108 closed). All four backend extensions exist: AMDGPU (T23, PR #113),
+oneAPI and Metal (T31, PR #136); CI runs the CPU suite on the self-hosted
+`kkt` machine and the GPU suite on the `cuda`, `amdgpu` and `oneapi` runners,
+every leg required; Metal (`Float32` only) is tested by hand on an M4 Max.
+The allocation-free `:ka` fallbacks are T32 (#146). The M3 target (1.5× cuDSS
+on condensed pglib systems) is not met through the handle API: 2.4×
+factorization / 3.9× refactorization / 3.5× solve for Cholesky, 5.1× / 7.3× /
+4.3× for LDLᵀ (geometric means, RTX 4080, `bench/comparison/comparison.md`);
+the fused pipeline of `src/fused.jl` reads 2.7× refactorization / 1.9× solve
+on the same harness and runs the 78k-bus ACOPF end to end on seven GPUs
+(`bench/PERFORMANCE-2026-10.md`). The remaining gap on KKT systems is launch-
+and level-bound (#82); T24–T26 move the fused pipeline under `execute!`.
+Measurements and the experiment plan are in `PERFORMANCE.md`.
 
 ---
 
@@ -740,10 +768,9 @@ designs into `src/`. Measurements and the experiment plan are in
 * **Oracle**: the KA CPU backend runs the same code (fused kernels + CPU BLAS),
   plus the plain-Julia CPU reference factorization from M1, so every GPU test
   also runs on CPU and failures are debuggable in plain Julia.
-* **Backends**: every test runs on the CPU backend (GitHub runners) and on
-  CUDA (self-hosted runner) in CI, and on the AMD runner as a non-required leg
-  (99.4% pass without the AMDGPU extension, PR #107); the leg becomes required
-  with T23, oneAPI and Metal join then. The
+* **Backends**: every test runs in CI on the CPU backend (the self-hosted
+  `kkt` machine) and on CUDA, AMDGPU and oneAPI (self-hosted runners, every
+  leg required); Metal has no CI leg and is tested by hand on an M4 Max. The
   T03 capability audit documents which implementation each op took. The suite
   runs in parallel workers with a duration history (#90); compile time is the
   dominant cost (#91).
