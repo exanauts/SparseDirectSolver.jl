@@ -44,9 +44,8 @@ Three documents define the work. Read them in this order before touching code:
 * New dependencies need a one-line justification in the Report. Never `dev`
   unregistered or local checkouts into the project (the package requires
   KernelAbstractions 0.10 and GPUArrays 12, hence CUDA.jl >= 6.5, AMDGPU.jl
-  >= 2.10 and Metal.jl >= 1.11; oneAPI.jl comes from its `main` branch in the CI
-  test environment only, until a release supports 0.10; the test allocation
-  budgets carry a per-launch allowance for the 0.10 CPU backend -- see
+  >= 2.10, Metal.jl >= 1.11 and oneAPI.jl >= 2.10; the test allocation budgets
+  carry a per-launch allowance for the 0.10 CPU backend -- see
   `ka_cpu_alloc_budget` and #145).
 * The repository is `github.com/exanauts/SparseDirectSolver.jl` (remote
   `origin`, branch `main`). Commit at the end of the task with a message
@@ -99,8 +98,7 @@ reviewing agent check; the owner merges by hand. The moving parts:
   self-hosted AMD runner (the AMDGPU extension, T23; no longer
   continue-on-error, a required check once the owner adds it to the branch
   ruleset), and from the `oneapi` leg on the self-hosted Intel GPU runner
-  `headroom` (the oneAPI extension, T31; oneAPI.jl from its `main` branch until a
-  release supports KernelAbstractions 0.10).
+  `headroom` (the oneAPI extension, T31; oneAPI.jl release, compat `2.10`).
 
 ### The owner's machine
 

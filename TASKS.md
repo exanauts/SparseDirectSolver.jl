@@ -3327,8 +3327,8 @@ their numbers and order.
 - Status: [!] — parts (1) oneAPI and (2) Metal (PR #136), both tested on hardware; the allocation-free `:ka`
   fallbacks and the `:auto` order of #112 are T32 (#146) after the owner's split. Deviations below.
 - What was built (oneAPI, part 1): `ext/SparseDirectSolverOneAPIExt.jl` (weak dependency `oneAPI`, compat
-  `2.10`: oneAPI.jl 2.10 is the first version with KernelAbstractions 0.10 support, from its `main` branch in
-  the CI test environment until it is released): `CSR(::oneSparseMatrixCSR)`/`CSR(::oneSparseMatrixCSC)` sharing the
+  `2.10`: oneAPI.jl 2.10 is the first version with KernelAbstractions 0.10 support; CI adds the release to the
+  test environment, whose `test/Project.toml` carries the compat under `[extras]` without installing it): `CSR(::oneSparseMatrixCSR)`/`CSR(::oneSparseMatrixCSC)` sharing the
   arrays, `oneSparseMatrixCSR(::CSR)`, `to_backend` (Float64/ComplexF64 rejected on devices without FP64),
   the T13 forwarders (`DirectSolver`, `update!`, `cholesky`/`ldlt`/`lu` and the wrappers),
   `max_local_bytes(::oneAPIBackend)` from `maxSharedLocalMemory` (128 KiB on the Max 1550), oneMKL bindings
@@ -3341,7 +3341,7 @@ their numbers and order.
   `test/backends.jl`, the oneMKL column and the `:auto` policy in `test_dense.jl` (whose `potrf`/`getrf` loops
   also run the explicit `impl = :vendor` oneMKL path on oneAPI, `tested_impls`), the extension check, the
   local-memory cap. CI: a `oneapi` leg of `test-gpu` on the runner `headroom` (labels `gpu`, `oneapi`;
-  oneAPI.jl `main`); the `test-metal` job on GitHub's hosted `macos-latest` was removed by owner decision
+  oneAPI.jl release 2.10); the `test-metal` job on GitHub's hosted `macos-latest` was removed by owner decision
   (the Metal suite does not work on that runner), so Metal has no CI leg. Docs:
   `lib/oneapi.md`, backend table, README. Base commit (also in this PR): `backend isa
   KernelAbstractions.GPU` was true for the CPU backend under KA 0.10 (`GPU` is an alias of `Backend` there),

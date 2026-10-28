@@ -96,12 +96,10 @@ jobs:
         if: matrix.backend == 'amdgpu'
         run: |
           julia --project=test -e 'using Pkg; Pkg.add("AMDGPU")'
-      # oneAPI.jl main: the released oneAPI.jl does not support KernelAbstractions 0.10 yet,
-      # which the oneAPI extension needs; switch to Pkg.add("oneAPI") once a release does
       - name: Add oneAPI.jl to the test environment
         if: matrix.backend == 'oneapi'
         run: |
-          julia --project=test -e 'using Pkg; Pkg.add(url = "https://github.com/JuliaGPU/oneAPI.jl", rev = "main")'
+          julia --project=test -e 'using Pkg; Pkg.add("oneAPI")'
           julia --project=test -e 'using oneAPI; oneAPI.versioninfo()'
       - uses: julia-actions/julia-runtest@latest
       - uses: julia-actions/julia-processcoverage@v1
