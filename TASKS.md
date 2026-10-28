@@ -3341,7 +3341,8 @@ their numbers and order.
   `test/backends.jl`, the oneMKL column and the `:auto` policy in `test_dense.jl` (whose `potrf`/`getrf` loops
   also run the explicit `impl = :vendor` oneMKL path on oneAPI, `tested_impls`), the extension check, the
   local-memory cap. CI: a `oneapi` leg of `test-gpu` on the runner `headroom` (labels `gpu`, `oneapi`;
-  oneAPI.jl `main`) and a `test-metal` job on GitHub's hosted `macos-latest`, Float32 only. Docs:
+  oneAPI.jl `main`); the `test-metal` job on GitHub's hosted `macos-latest` was removed by owner decision
+  (the Metal suite does not work on that runner), so Metal has no CI leg. Docs:
   `lib/oneapi.md`, backend table, README. Base commit (also in this PR): `backend isa
   KernelAbstractions.GPU` was true for the CPU backend under KA 0.10 (`GPU` is an alias of `Backend` there),
   so the CPU took the device symbolic-map route; now `!(backend isa CPU)`.
@@ -3383,13 +3384,13 @@ their numbers and order.
   Measurements.
 - Tests (Metal, M4 Max, Float32, implementer's run before the round-4 review fixes): full suite 23,399 pass /
   0 fail / 1 broken (existing). The round-4 fixes (MPS status, `:auto` gating, `NotSupportedError`, the new
-  wide-front `info` testsets in `test_numeric_cholesky_c.jl`) are covered on Metal by the `test-metal` CI
-  leg only. This machine (2× NVIDIA H200, Julia 1.13.3, not the RTX 4080 of AGENTS.md) after the round-4
+  wide-front `info` testsets in `test_numeric_cholesky_c.jl`) are not tested on Metal: the `test-metal` CI
+  leg was removed by owner decision. This machine (2× NVIDIA H200, Julia 1.13.3, not the RTX 4080 of AGENTS.md) after the round-4
   fixes, all four element types, CUDA.jl added to the test environment as CI does,
   `SDS_TEST_ONLY="test_numeric_cholesky_a,test_numeric_cholesky_b,test_numeric_cholesky_c,test_solve,test_dense,
   test_symbolic_schedule,test_api,test_numeric_ldlt,test_numeric_lu,test_ubatch,test_schur,test_helpers,
-  test_aqua"`: CPU + CUDA 77,371 pass / 0 fail / 0 broken (5.0 min, 24 workers). Full suite, AMDGPU, oneAPI
-  and Metal: CI on the PR.
+  test_aqua"`: CPU + CUDA 77,371 pass / 0 fail / 0 broken (5.0 min, 24 workers). Full suite, AMDGPU and oneAPI:
+  CI on the PR (no Metal leg).
 - Measurements (M4 Max, Metal.jl 1.11.1, Float32, warmed median, `lap2d_300`, n = 90,000): refactorization
   142 → 62 ms (2.29×), solve 5.19 → 5.18 ms; 113 regime-C fronts, 18 at least 64 wide; MPS potrf 5–14×
   faster than KA potrf at widths 128–256, crossover near 64; MPS trsm was correct but slower end to end

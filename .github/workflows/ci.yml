@@ -109,35 +109,3 @@ jobs:
         with:
           file: lcov.info
           token: ${{ secrets.CODECOV_TOKEN }}
-
-  # Metal (T31) on GitHub's hosted Apple Silicon runner. Metal has no Float64 and the extension takes Float32
-  # only (`to_backend` raises NotSupportedError otherwise), so this leg tests Float32 whatever the
-  # workflow-level element types are.
-  test-metal:
-    env:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      SDS_TEST_ELTYPES: 'Float32'
-      SDS_TEST_CPU: '0'
-      SDS_TEST_SKIP: 'test_aqua'
-      # the hosted macOS arm64 runner has 3 cores and 7 GB
-      PTR_NUM_JOBS: '3'
-    runs-on: macos-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        julia-version: ['1']
-        julia-arch: [aarch64]
-
-    steps:
-      - uses: actions/checkout@v4
-      - uses: julia-actions/setup-julia@latest
-        with:
-          version: ${{ matrix.julia-version }}
-          arch: ${{ matrix.julia-arch }}
-      - name: Machine
-        run: sysctl -n hw.ncpu machdep.cpu.brand_string && system_profiler SPDisplaysDataType | grep -E "Chipset|Metal" || true
-      - name: Add Metal.jl to the test environment
-        run: |
-          julia --project=test -e 'using Pkg; Pkg.add("Metal")'
-          julia --project=test -e 'using Metal; Metal.versioninfo(); Metal.functional() || error("Metal is not functional on this runner")'
-      - uses: julia-actions/julia-runtest@latest

@@ -112,8 +112,8 @@ reviewing agent check; the owner merges by hand. The moving parts:
   KernelAbstractions CPU backend and on CUDA only. GitHub CI
   (`.github/workflows/ci.yml`, modelled on `../ExaPF.jl`) runs the CPU suite and
   the GPU suite on the exanauts self-hosted runners (CPU suite: the `kkt`
-  machine; GPU suite: the runners labelled `cuda`, `amdgpu` and `oneapi`; Metal:
-  GitHub's hosted `macos-latest` runner, `Float32` only, job `test-metal`).
+  machine; GPU suite: the runners labelled `cuda`, `amdgpu` and `oneapi`; Metal has no CI
+  leg: the hosted `macos-latest` runner could not run the Metal suite).
 * CUDA.jl 6.x is split into packages: `CUDACore` (`CuArray`, `CUDABackend`),
   `cuSPARSE` (`CuSparseMatrixCSR`, `CuSparseMatrixCSC`), `cuBLAS`, `cuSOLVER`.
   Use these as weak dependencies; tests load the umbrella `CUDA`.
