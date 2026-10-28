@@ -3446,14 +3446,12 @@ their numbers and order.
   type) once round 4 made the oneAPI loops also run explicit `impl = :vendor` (`tested_impls`). oneMKL
   2026.1's GPU `potrf` returns the failing column relative to its 32-column panel (column 50 as 18, or as
   1042 for complex types; #150). The oneAPI.jl shim forwards oneMKL's value correctly. The factor still
-  follows LAPACK `potf2`, so the diagonal is now authoritative wherever it shows a bad pivot:
-  `_ka_chol_check_kernel!` overwrites a nonzero vendor `info` too (a reported failure the scan cannot see is
-  kept), and `potrf!` returns the `ka_chol_diag_info!` column when it is nonzero. Side effect on the `:ka`
-  path with the epsilon floor (`dmin > 0`): a pivot below the floor before the column where `ka_potrf!`
-  stopped is now reported, i.e. the first failing column under the floor. `test_dense.jl` adds `j = 33`
-  (the first column of oneMKL's second panel, reported as 1) to the failing-pivot cases on every backend.
-  Not run on CUDA or AMDGPU here: cuSOLVER and rocSOLVER must leave the failed pivot in `A[j, j]` as LAPACK
-  does, which the CUDA and AMDGPU CI legs check. oneAPI.jl: `LinearAlgebra.LAPACK.potrf!`/`getrf!`/`sytrf!`
+  follows LAPACK `potf2`, so the oneAPI extension's `vendor_potrf!`/`vendor_potrf_info!` take the first
+  diagonal entry that is not a finite positive real as the column after a failure (`_onemkl_potrf_column`;
+  oneMKL's value is kept when the scan finds none). The first push of round 5 did this in the core status
+  checks for every vendor; on the reviewer's nit it moved into the extension, so the cuSOLVER/rocSOLVER
+  paths and `ka_chol_check_info!` are as in round 4. `test_dense.jl` adds `j = 33` (the first column of
+  oneMKL's second panel, reported as 1) to the failing-pivot cases on every backend. oneAPI.jl: `LinearAlgebra.LAPACK.potrf!`/`getrf!`/`sytrf!`
   dropped `info`, so `cholesky`/`lu` on `oneArray`s fail with scalar indexing. Fixed upstream in
   JuliaGPU/oneAPI.jl#754 (its onemkl tests pass here), which marks the oneMKL bug `@test_broken`; the oneMKL
   bug is JuliaGPU/oneAPI.jl#755. The extension keeps calling the C shims: #754 does not correct oneMKL's

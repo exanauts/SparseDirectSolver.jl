@@ -19,11 +19,12 @@ module SparseDirectSolverOneAPIExt
 # directly (until a oneAPI.jl release returns it from `oneMKL.potrf!`/`getrf!`).
 # oneMKL's GPU `potrf` (2026.1, Data Center GPU Max) names the failing column
 # relative to its 32-wide panel: column 50 comes back as 18 for real types and as
-# 1042 (panel 1, column 18) for complex ones; only columns 1..32 are right. The
-# factor still follows LAPACK `potf2` (the failed pivot stays in `A[j, j]`), so
-# `potrf!` and `potrf_info!` take the first non-positive diagonal entry as the
-# column (`ka_chol_diag_info!`, `ka_chol_check_info!`); `vendor_potrf!` returns
-# oneMKL's value as reported. getrf's info is right. Batched `potrf`/`getrf` report one status per batch, not per member: no
+# 1042 (panel 1, column 18) for complex ones; only columns 1..32 are right (#150,
+# JuliaGPU/oneAPI.jl#755). The factor still follows LAPACK `potf2` (the failed
+# pivot stays in `A[j, j]`), so after a failure `vendor_potrf!`/`vendor_potrf_info!`
+# take the first diagonal entry that is not a finite positive real as the column
+# (`_onemkl_potrf_column`). This stays here, not in the core's status checks, so
+# the cuSOLVER/rocSOLVER paths are untouched. getrf's info is right. Batched `potrf`/`getrf` report one status per batch, not per member: no
 # binding (the KA kernels serve uniform batches). No `sytrf`: oneMKL rejects it on
 # the Intel Data Center GPU Max with `unsupported_device`, thrown from the
 # scratchpad-size shim, which does not catch it, so the process aborts.
@@ -202,8 +203,8 @@ for (elty, potrf, potrf_size, getrf, getrf_size) in
          (:ComplexF32, :onemklCpotrf, :onemklCpotrf_scratchpad_size, :onemklCgetrf, :onemklCgetrf_scratchpad_size),
          (:ComplexF64, :onemklZpotrf, :onemklZpotrf_scratchpad_size, :onemklZgetrf, :onemklZgetrf_scratchpad_size))
     @eval begin
-        # LAPACK info of oneMKL's potrf (0, the failing column as oneMKL reports it, i.e.
-        # panel-relative beyond column 32 (see the header), or -1 for a SYCL error)
+        # LAPACK info of oneMKL's potrf as reported (0, the failing column, panel-relative
+        # beyond column 32 (see the header), or -1 for a SYCL error)
         function _potrf_info(uplo::Char, A::oneStridedMatrix{$elty})
             n = LinearAlgebra.checksquare(A)
             q = _queue(A)
@@ -227,12 +228,22 @@ for (elty, potrf, potrf_size, getrf, getrf_size) in
     end
 end
 
-SDS.vendor_potrf!(uplo::Char, A::oneStridedMatrix{<:MklT}) = _potrf_info(uplo, A)
+# oneMKL's potrf status with the failing column read from the factor diagonal (see the
+# header). The shim has already waited for the queue, so the extra launch and read on
+# the failure path add no synchronization; a failure the scan cannot see keeps oneMKL's value.
+function _onemkl_potrf_column(uplo::Char, A::oneStridedMatrix{<:MklT})
+    info = _potrf_info(uplo, A)
+    info > 0 || return info
+    st = Int(only(Array(SDS.ka_chol_diag_info!(oneVector{Int32}(undef, 1), A))))
+    return st != 0 ? st : info
+end
+
+SDS.vendor_potrf!(uplo::Char, A::oneStridedMatrix{<:MklT}) = _onemkl_potrf_column(uplo, A)
 
 # the status is a host value (see the header): written into `info[idx]` on the device
 function SDS.vendor_potrf_info!(uplo::Char, A::oneStridedMatrix{<:MklT}, info::oneVector{Int32}, idx::Integer)
     1 <= idx <= length(info) || throw(DimensionMismatch("info index $idx outside 1:$(length(info))"))
-    fill!(view(info, idx:idx), Int32(_potrf_info(uplo, A)))
+    fill!(view(info, idx:idx), Int32(_onemkl_potrf_column(uplo, A)))
     return info
 end
 
