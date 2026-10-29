@@ -97,8 +97,16 @@ reviewing agent check; the owner merges by hand. The moving parts:
   `ci.yml` on the PR, and from the `amdgpu` leg of `ci.yml` on the
   self-hosted AMD runner (the AMDGPU extension, T23; no longer
   continue-on-error, a required check once the owner adds it to the branch
-  ruleset), and from the `oneapi` leg on the self-hosted Intel GPU runner
-  `headroom` (the oneAPI extension, T31; oneAPI.jl release, compat `2.10`).
+  ruleset). The oneAPI extension (T31; oneAPI.jl release, compat `2.10`) is
+  tested on Aurora (Intel Max 1550, LTS driver stack) through ALCF GitLab CI:
+  `alcf.yml` starts a pipeline on the GitLab mirror
+  `gitlab-ci.alcf.anl.gov/mschanen/SparseDirectSolver-jl` (`.gitlab-ci.yml`:
+  build on the login node, tests in the PBS `debug-scaling` queue, 1 h
+  walltime) and sets the commit status `ALCF / LTS stack (Aurora)` to pending;
+  GitLab's pipeline webhook calls `alcf-report.yml`, which sets the result and
+  copies the job logs into its run (the GitLab instance needs an ALCF login).
+  Fork PRs run only after a maintainer applies the `alcf-ci` label. The setup
+  is oneAPI.jl's; it replaced the `oneapi` leg on the runner `headroom`.
 
 ### The owner's machine
 
@@ -110,8 +118,9 @@ reviewing agent check; the owner merges by hand. The moving parts:
   KernelAbstractions CPU backend and on CUDA only. GitHub CI
   (`.github/workflows/ci.yml`, modelled on `../ExaPF.jl`) runs the CPU suite and
   the GPU suite on the exanauts self-hosted runners (CPU suite: the `kkt`
-  machine; GPU suite: the runners labelled `cuda`, `amdgpu` and `oneapi`; Metal has no CI
-  leg: the hosted `macos-latest` runner could not run the Metal suite).
+  machine; GPU suite: the runners labelled `cuda` and `amdgpu`, and Aurora through
+  ALCF GitLab CI for oneAPI; Metal has no CI leg: the hosted `macos-latest` runner
+  could not run the Metal suite).
 * CUDA.jl 6.x is split into packages: `CUDACore` (`CuArray`, `CUDABackend`),
   `cuSPARSE` (`CuSparseMatrixCSR`, `CuSparseMatrixCSC`), `cuBLAS`, `cuSOLVER`.
   Use these as weak dependencies; tests load the umbrella `CUDA`.
@@ -242,7 +251,8 @@ name their types).
 PLAN.md  TASKS.md  RESEARCH.md  AGENTS.md
 Project.toml  src/  ext/  test/  bench/  docs/
 .github/workflows/   ci.yml Aqua.yml (checks)  Documentation.yml DocPreviewCleanup.yml (docs)  claude-review.yml (agent)
-                     CompatHelper.yml TagBot.yml (registry housekeeping)
+                     alcf.yml alcf-report.yml (Aurora via ALCF GitLab CI)  CompatHelper.yml TagBot.yml (registry housekeeping)
+.gitlab-ci.yml       the Aurora pipeline, run on the ALCF GitLab mirror only
 .github/scripts/     pr-verdict.sh (reads the reviewer's verdict)
 .github/ISSUE_TEMPLATE/agent-finding.md  .github/pull_request_template.md
 ```

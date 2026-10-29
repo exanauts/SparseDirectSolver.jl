@@ -1,0 +1,126 @@
+# ALCF GitLab CI: the oneAPI GPU suite on Aurora (Intel Data Center GPU Max 1550, LTS driver stack).
+#
+# This file only does something on the ALCF GitLab mirror
+# (https://gitlab-ci.alcf.anl.gov/mschanen/SparseDirectSolver-jl), which pull-mirrors this repository
+# and runs pipelines on mirrored branches. .github/workflows/alcf.yml starts the pipeline and
+# .github/workflows/alcf-report.yml (called by a GitLab pipeline webhook) reports the result as the
+# commit status `ALCF / LTS stack (Aurora)`. GitHub.com itself ignores this file. The setup is the
+# one of oneAPI.jl (https://github.com/JuliaGPU/oneAPI.jl, .gitlab-ci.yml and the same two workflows).
+#
+# Layout: the Aurora PBS debug queues cap walltime at 1 h, so everything that doesn't need a GPU —
+# package instantiation and precompilation — runs on the login-node shell runner into a persistent
+# depot on flare, and only the test run itself goes through PBS. The test job uses `debug-scaling`
+# rather than `debug`: each queue admits one queued and one running job per user, and oneAPI.jl's
+# Aurora pipeline (same ALCF user) uses `debug`, so the two projects don't refuse each other's qsub.
+
+include:
+  - project: 'anl/ci-resources/defaults'
+    ref: main
+    file: ['/runners.yml']
+
+workflow:
+  rules:
+    # "trigger" covers fork-PR pipelines, created via a pipeline trigger token by
+    # .github/workflows/alcf.yml so they run as a real user instead of the mirror
+    # project's bot (which the Jacamar runners refuse).
+    - if: $CI_PIPELINE_SOURCE == "push" || $CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "api" || $CI_PIPELINE_SOURCE == "trigger"
+
+default:
+  interruptible: true  # force-pushes cancel stale runs instead of queueing behind them
+
+variables:
+  # Global (not per-script) for two reasons: the ~/.bashrc julia module load warns on stdout when
+  # JULIA_DEPOT_PATH is unset, corrupting the PBS job ID that Jacamar parses from qsub; and the CPU
+  # target must be identical in every job or the batch job rebuilds the package images the build job
+  # precompiled (icelake = login nodes, sapphirerapids = compute nodes, -avx512fp16 = the host Float16
+  # miscompile workaround of oneAPI.jl's CI).
+  JULIA_VERSION: "1.13"  # package compat is julia = "1.13" and CI tests that release only
+  JULIA_DEPOT_PATH: /lus/flare/projects/Julia/mschanen/ci/sds_julia_depot-1.13
+  JULIA_CPU_TARGET: "generic;icelake-server;sapphirerapids,-avx512fp16"
+  # Single-target variant for the runtime JIT (-C): multi-target strings are image-only syntax and
+  # are rejected at runtime.
+  JULIA_JIT_TARGET: "native,-avx512fp16"
+
+stages: [build, test, coverage]
+
+.aurora-env:
+  script:
+    # The site julia modules supply ONEAPI_LTS=1 and the ZE_* settings; the version is loaded
+    # explicitly. errexit off across it — profile.d scripts reference unset variables and return
+    # non-zero freely.
+    - set +eu; source /etc/profile >/dev/null 2>&1; module load julia/$JULIA_VERSION >/dev/null 2>&1; set -eu
+    - command -v julia || { echo "ERROR no julia on PATH after site profile" >&2; exit 1; }
+    - julia --version; echo "depot=$JULIA_DEPOT_PATH"
+
+# Both jobs share one resource group, so the pipeline is serialized, also across pipelines: a build
+# must not touch the depot while a test job reads it, and the queue admits a single queued job per
+# user.
+build:
+  stage: build
+  extends: .aurora-shell-runner
+  timeout: 2h
+  resource_group: aurora-ci
+  script:
+    - !reference [.aurora-env, script]
+    # Instantiate and precompile here so the 1 h batch job spends its walltime on tests, not on Pkg
+    # (the compute nodes have no outbound network either). Manifests are gitignored, so the test env
+    # is resolved here with SparseDirectSolver dev'ed at the checkout and oneAPI.jl added (as the
+    # `oneapi` leg of ci.yml does); test/Project.toml and test/Manifest.toml travel to the test job
+    # as artifacts. The test job runs test/runtests.jl directly rather than Pkg.test, which would
+    # resolve a fresh sandbox environment.
+    - julia --color=yes --project=. -e 'using Pkg; Pkg.instantiate()'
+    - julia --color=yes --project=test -e 'using Pkg; Pkg.develop(path="."); Pkg.add("oneAPI"); Pkg.instantiate(); Pkg.precompile()'
+    # Coverage tooling into a depot-shared env here, where the network is available; the test job
+    # only loads it.
+    - julia --color=yes --project=$JULIA_DEPOT_PATH/environments/coverage -e 'using Pkg; Pkg.add("CoverageTools")'
+  artifacts:
+    paths:
+      - test/Project.toml
+      - test/Manifest.toml
+    expire_in: 1 week
+
+test:
+  stage: test
+  extends: .aurora-batch-runner
+  needs: ["build"]
+  timeout: 5h  # must cover PBS queue wait, not just the 1 h walltime
+  resource_group: aurora-ci
+  variables:
+    ANL_AURORA_SCHEDULER_PARAMETERS: "-A Julia -q debug-scaling -l select=1,walltime=01:00:00,filesystems=home:flare,place=scatter"
+  script:
+    - !reference [.aurora-env, script]
+    # As the GPU legs of ci.yml: the CPU backend and Aqua are covered by the CPU-only job.
+    # ONEAPI_SYNC_EACH_SUBMISSION works around the Aurora LTS NEO dropped-tail corruption
+    # (oneAPI.jl lib/level-zero/cmdlist.jl).
+    - export ZE_FLAT_DEVICE_HIERARCHY=FLAT ONEAPI_LTS=1 ONEAPI_SYNC_EACH_SUBMISSION=1
+    - export SDS_TEST_CPU=0 SDS_TEST_SKIP=test_aqua PTR_NUM_JOBS=24
+    # oneMKL's SYCL runtime comes from the JLL artifacts, but LD_LIBRARY_PATH wins over RUNPATH, so
+    # the site oneAPI module would substitute its own libur_adapter_level_zero/libumf underneath it;
+    # a version mismatch aborts in sycl::platform::get_platforms. Drop the site oneAPI entries.
+    - export LD_LIBRARY_PATH="$(echo "${LD_LIBRARY_PATH:-}" | tr ':' '\n' | grep -v '^/opt/aurora/[^/]*/oneapi/' | paste -sd:)"
+    # -C and --code-coverage propagate to the ParallelTestRunner workers via Base.julia_cmd().
+    # Coverage tracks the checkout only: `user` would also cover every dependency and flood the
+    # depot on flare with .cov files.
+    - julia -C "$JULIA_JIT_TARGET" --code-coverage=@$CI_PROJECT_DIR --color=yes --project=test test/runtests.jl
+    - julia --color=yes --project=$JULIA_DEPOT_PATH/environments/coverage -e '
+          using CoverageTools;
+          cov = mapreduce(process_folder, vcat, ["src", "ext"]);
+          LCOV.writefile("lcov.info", cov)'
+  artifacts:
+    paths: [lcov.info]
+    expire_in: 1 week
+
+# Coverage reporting must not be able to fail the build. Only created when the CODECOV_TOKEN CI/CD
+# variable is set on the GitLab project.
+coverage:upload:
+  stage: coverage
+  extends: .aurora-shell-runner
+  needs: ["test"]
+  timeout: 30m
+  rules:
+    - if: $CODECOV_TOKEN
+  allow_failure: true
+  script:
+    - curl -sSf -o codecov https://cli.codecov.io/latest/linux/codecov && chmod +x codecov
+    - ./codecov upload-process -t "$CODECOV_TOKEN" --git-service github
+        --slug exanauts/SparseDirectSolver.jl --commit-sha "$CI_COMMIT_SHA" -f lcov.info
