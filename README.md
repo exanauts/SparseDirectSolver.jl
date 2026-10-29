@@ -61,6 +61,11 @@ oneAPI (tested on an Intel Data Center GPU Max 1550):
   layer (`cholesky`, `cholesky!`, `ldlt`, `ldlt!`, `lu`, `lu!`, `ldiv!`, `\`, `logabsdet`),
   checked by the test suite of CUDSS.jl ported to this package; phase logging
   through `SDS_LOG_LEVEL`;
+* `FusedSolver`: the fused pipeline of `src/fused.jl` (one dependency-counter
+  factorization kernel, a partitioned-inverse solve) behind the same verbs as
+  `DirectSolver`, on the GPU backends, for real `"SPD"` and no-pivot `"S"`
+  matrices and one right-hand side (everything else raises
+  `NotSupportedError`);
 * a MadNLP linear solver (`using MadNLP` enables the extension): `SDSSolver`,
   used as `madnlp(model; linear_solver = SDSSolver, kkt_system =
   MadNLP.SparseCondensedKKTSystem)`, with the options `sds_factorization`

@@ -1,5 +1,5 @@
-# 20 gated fused-LDL refactorizations (race validation) + the in-kernel-wides
-# Cholesky control that isolates the wide-strategy cost from the LDL cost.
+# 20 gated fused-LDL refactorizations (race validation) + the fused Cholesky control
+# with the same wide-front strategy, which isolates the wide-strategy cost from the LDL cost.
 #   CUDA_VISIBLE_DEVICES=1 julia +1.13 --project=bench bench/e2e/ldl_fused_race.jl
 using SparseDirectSolver, SparseArrays, LinearAlgebra, Random, Statistics, Printf
 using CUDA, CUDA.CUSPARSE
@@ -17,26 +17,32 @@ Random.seed!(666)
 bh = rand(n)
 S3 = (p = Vector{Int32}(undef, n); read!(joinpath(BD, "perm_cand3.bin"), p); Int.(p))
 
+# host wides (the LDL wide fronts on the Cholesky vendor path, wides_potrf), workgroup 128,
+# spin cap 128: the plan this gate was written for
+const TUNING = SDSFused.SDSTuning(; wides = :host, workgroup = 128, spin_cap = 128)
+
+# a FusedSolver whose analysis also ran the stock factorization and solve on its inner
+# DirectSolver; the stock factor of the same matrix is the gate reference
 function setup(structure)
     bd = CuArray(bh); xd = similar(bd)
-    s = DirectSolver(CuSparseMatrixCSR(Lh), structure, 'L')
-    SDS.setparam!(s, "user_perm", S3)
-    structure == "S" && SDS.setparam!(s, "pivot_type", 'N')
-    ex(ph) = SDS.execute!(ph, s, xd, bd; asynchronous = false)
-    ex("analysis"); ex("factorization"); ex("refactorization"); ex("solve")
+    F = FusedSolver(CuSparseMatrixCSR(Lh), structure, 'L'; tuning = TUNING)
+    setparam!(F, "user_perm", S3)
+    analyze!(F; asynchronous = false)
+    ex(ph) = SDS.execute!(ph, F.inner, xd, bd; asynchronous = false)
+    ex("refactorization"); ex("solve")
     CUDA.synchronize()
-    return s
+    return F
 end
 
-s = setup("S")
+F = setup("S")
+s = F.inner
 fac0 = Array(s.numeric.factor)
 d0 = Array(s.numeric.d)
 mref = maximum(abs, fac0)
-nz = SDS._factor_values(s)
-fp = SDSFused.build_fused_plan(s; ldl = true, wides_potrf = true, wgf = 128, scap = 128)
 nbad = 0
 for t in 1:20
-    info = SDSFused.refact_fused!(s, nz, fp); CUDA.synchronize()
+    factorize!(F; asynchronous = false)
+    info = getparam(F, "info")
     df = maximum(abs, Array(s.numeric.factor) - fac0) / mref
     dd = maximum(abs, Array(s.numeric.d) - d0) / maximum(abs, d0)
     ok = info == 0 && df < 1e-6 && dd < 1e-6
@@ -47,15 +53,12 @@ end
 println("bad: ", nbad, " of 20")
 nbad == 0 || error("fused LDL race gate FAILED: $nbad of 20 runs bad")   # a gate must exit nonzero
 
-# Cholesky with the SAME wide strategy as the LDL plan above (wides_potrf forces
-# HOST wides, so the matching control is the host-wides Cholesky plan -- the
-# in-kernel plan used before was a different strategy and confounded the ratio)
-s2 = setup("SPD")
-nz2 = SDS._factor_values(s2)
-fp2h = SDSFused.build_fused_plan(s2; wgf = 128, scap = 128)   # host wides (default)
-SDSFused.refact_fused!(s2, nz2, fp2h)
-tr_chol_host = median([CUDA.@elapsed SDSFused.refact_fused!(s2, nz2, fp2h) for _ in 1:7])
-tr_ldl = median([CUDA.@elapsed SDSFused.refact_fused!(s, nz, fp) for _ in 1:7])
+# Cholesky with the SAME wide strategy (host wides) as the LDL solver above
+F2 = setup("SPD")
+refactorize!(F2)
+# refactorize! = the fused factorization + the per-front inverses of the solve
+tr_chol_host = median([CUDA.@elapsed refactorize!(F2) for _ in 1:7])
+tr_ldl = median([CUDA.@elapsed refactorize!(F) for _ in 1:7])
 @printf "fused SPD (host wides) refact %8.2f ms\n" tr_chol_host*1e3
 @printf "fused S/N (host wides) refact %8.2f ms   ratio same-strategy %.3f\n" tr_ldl*1e3 tr_ldl/tr_chol_host
 println("done")

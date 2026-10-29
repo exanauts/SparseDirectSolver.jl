@@ -44,7 +44,9 @@ a factorization without pivoting never consumes them.
 
 ## What it runs
 
-With `sds_pivoting = :none` the solver runs the fused pipeline of
+`SDSSolver` is a shell over an inner solver driven by `refactorize!`,
+`solve!` and `getparam(inner, "inertia")`. With `sds_pivoting = :none` the
+inner solver is a [`FusedSolver`](@ref SparseDirectSolver.FusedSolver), the fused pipeline of
 `SparseDirectSolver.Fused` (`src/fused.jl`) over the symbolic analysis of a
 regular [`DirectSolver`](@ref): one dependency-counter kernel per
 refactorization that covers the whole elimination tree (the wide root fronts
@@ -52,14 +54,16 @@ either inside the kernel or on the vendor `potrf` path, chosen by the tuning),
 per-front inverses of the diagonal blocks computed after each factorization,
 and a partitioned-inverse solve in one dependency-counter sweep per direction.
 This is the path that `cholesky_fused` measures on the [Performance](@ref) page;
-tasks T24–T26 of the repository move the same kernels under `execute!`.
+tasks T24–T26 of the repository move the same kernels under the `execute!` of
+`DirectSolver`. With `:bk` the inner solver is a `DirectSolver` with the same
+tuning.
 
 The inertia MadNLP asks for after every factorization is `(n, 0, 0)` for
 `:cholesky` when the factorization succeeded; a failed factorization (a
 non-positive pivot, or a sign flip inside a wide front with `:ldl`) is reported
 as `(n - 2, 1, 1)`, so that MadNLP regularizes and factorizes again. With `:ldl`
-the inertia is counted from the signs of `D` (`:none`) or read from the
-`inertia` parameter (`:bk`, 2×2 blocks included).
+the inertia is the `inertia` parameter of the inner solver: the signs of `D`
+(`:none`) or, with `:bk`, the stock pivot statistics (2×2 blocks included).
 
 ## Tuning
 
@@ -74,8 +78,5 @@ madnlp(model; linear_solver = SDSSolver, sds_tuning = tuning,
        kkt_system = MadNLP.SparseCondensedKKTSystem)
 ```
 
-```@docs
-SparseDirectSolver.Fused.SDSTuning
-SparseDirectSolver.Fused.default_tuning
-SparseDirectSolver.Fused.resolve_tuning
-```
+The bundle and its defaults are documented on the
+[Fused pipeline](../lib/fused.md) page.

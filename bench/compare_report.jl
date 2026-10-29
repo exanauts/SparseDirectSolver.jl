@@ -92,9 +92,10 @@ function render_markdown(io::IO, cudss_rows, sds_rows; features = COMPARE_FEATUR
         println(io, "## ", f.title, "\n")
         println(io, "`", f.id, "`, ", f.task, " (", state(f, implemented(f)), "), structure `", f.structure, "`, ",
                 f.T, ", nrhs = ", f.nrhs, f.kind == :ubatch ? ", uniform batch of $(f.nbatch)" : "",
-                f.kind == :fused ? ", SDS through the fused factorization and partitioned-inverse solve of " *
-                                   "`SparseDirectSolver.Fused` as the MadNLP extension runs them (the factorization " *
-                                   "phase includes building the fused plans), cuDSS through its one path" : "", ".\n")
+                f.kind == :fused ? ", SDS through a `FusedSolver` (the fused factorization and partitioned-inverse " *
+                                   "solve the MadNLP extension runs; its analysis phase includes a stock " *
+                                   "factorization and building the fused plans), cuDSS through its one path" : "",
+                ".\n")
         names = matrices_of(f, cudss_rows, sds_rows)
         if isempty(names)
             println(io, "Not run yet.\n")

@@ -2101,4 +2101,367 @@ function refact_fused!(s, nzval, fp)
     return SDS._numeric_info!(N, S, true)
 end
 
+# ---------------------------------------------------------------------------
+# FusedSolver: the fused pipeline behind the handle-layer verbs of PLAN §3.1 (T33).
+# The recipe below is the one the MadNLP extension ran inline before (inner
+# DirectSolver: tuning, analysis, factorization, a solve; then the three plans), so
+# the kernels, plans and launch sequence are those of `SDSSolver`.
+
+# the knobs of an `SDSTuning` that live in the options of a DirectSolver, and the
+# native nested dissection with the tuning's METIS knobs (a `user_perm` set later wins)
+function _apply_tuning!(s, t::SDSTuning)
+    o = s.options
+    o.amalgamation = t.amalgamation
+    o.regime_c_width = t.regime_c_width
+    o.regime_c_rows = t.regime_c_rows          # the fused kernels own both phases: no coupling conflict
+    o.subtree_parallelism = t.subtree_parallelism
+    o.subtree_budgets = copy(t.subtree_budgets)
+    SDS.setparam!(s, "reordering_alg", "algo4")
+    SDS.setparam!(s, "nd_nseps", t.nd_nseps)
+    SDS.setparam!(s, "nd_seed", t.nd_seed)
+    return s
+end
+
+# the parameters `setparam!` accepts on a FusedSolver (read by the next analysis)
+const FUSED_SETTABLE = ("user_perm", "reordering_alg", "nd_nseps", "nd_seed", "pivot_epsilon")
+# the analysis data parameters `getparam` forwards to the inner DirectSolver
+const FUSED_FORWARDED = ("perm_reorder_row", "perm_reorder_col", "perm_row", "perm_col", "lu_nnz", "flops",
+                         "nsuperpanels", "memory_estimates")
+
+"""
+    FusedSolver(A, structure, view; tuning = nothing, index = 'O')
+    FusedSolver(rowptr, colval, nzval, structure, view; tuning = nothing, index = 'O')
+
+The fused pipeline of `SparseDirectSolver.Fused` (dependency-counter
+factorization mega-kernel and partitioned-inverse solve, the `SDSSolver` path
+of the MadNLP extension) as an `AbstractDirectSolver`, driven by the same verbs
+as [`DirectSolver`](@ref SparseDirectSolver.DirectSolver): [`execute!`](@ref SparseDirectSolver.execute!), [`analyze!`](@ref SparseDirectSolver.analyze!),
+[`factorize!`](@ref SparseDirectSolver.factorize!), [`refactorize!`](@ref SparseDirectSolver.refactorize!), [`solve!`](@ref SparseDirectSolver.solve!),
+[`setparam!`](@ref SparseDirectSolver.setparam!), [`getparam`](@ref SparseDirectSolver.getparam), [`update!`](@ref SparseDirectSolver.update!), `ldiv!` and `\\`
+for one right-hand side. `A` is anything [`DirectSolver`](@ref SparseDirectSolver.DirectSolver) accepts with
+these arguments (a [`CSR`](@ref SparseDirectSolver.CSR), `CuSparseMatrixCSR`/`CuSparseMatrixCSC`,
+`ROCSparseMatrixCSR`, …) on a GPU backend; the values alias the caller's
+`nzval`, so writing new values into it and calling `refactorize!` is the
+interior-point loop (`update!` with the same pattern is forwarded).
+
+`structure` is `"SPD"` (fused Cholesky) or `"S"` (fused LDLᵀ without pivoting:
+`pivot_type = 'N'`, `pivot_pairs = "none"`). `tuning` is an
+[`SDSTuning`](@ref SparseDirectSolver.Fused.SDSTuning), `nothing` meaning
+[`default_tuning`](@ref SparseDirectSolver.Fused.default_tuning)`(backend)`,
+resolved by [`resolve_tuning`](@ref SparseDirectSolver.Fused.resolve_tuning);
+the constructor applies it to the inner `DirectSolver` (amalgamation, regime-C
+width and rows, subtree parallelism and budgets, `reordering_alg = "algo4"`,
+`nd_nseps`, `nd_seed`). The inner solver is the field `inner`.
+
+Phases (`execute!(phase, F, X, B; asynchronous = true)`):
+
+* `"reordering"`, `"symbolic_factorization"`, `"analysis"`: the inner
+  solver's phase; the symbolic part then factorizes and solves once with the
+  inner solver (stock kernels, it sizes the solve workspace) and builds the
+  fused factorization plan, the per-front inverses and the fused solve
+  segments. `X` and `B` are not used.
+* `"factorization"`, `"refactorization"` (needs a previous
+  `"factorization"`): the fused factorization of the current values, then the
+  inverses of the diagonal blocks; sets `"info"` (`0`, or the original column
+  of the first failed pivot: a non-positive Cholesky pivot, or for `"S"` a zero
+  or non-finite pivot, or a pivot of a wide front whose sign differs from the
+  front's other pivots when the tuning factors wide fronts on the host,
+  `wides = :host`). A failed factorization does not throw.
+* `"solve"`: `X = A⁻¹ B` with the partitioned-inverse solve, for a vector (or
+  an `n × 1` matrix) on the solver's backend; `X === B` is allowed.
+
+`setparam!` accepts `"user_perm"`, `"reordering_alg"`, `"nd_nseps"`,
+`"nd_seed"` and `"pivot_epsilon"` (the Cholesky pivot epsilon; the fused
+LDLᵀ factors with epsilon `0`), all read by the next analysis. `getparam`
+returns `"info"`, `"inertia"` (`(npos, nneg)`; `"SPD"`: the positive pivots and
+`0`; `"S"`: the counts of positive and negative entries of `D`), `"npivots"`
+(`0` for `"S"`: the fused LDLᵀ perturbs no pivot), the analysis data
+`"perm_reorder_row"`, `"perm_reorder_col"`, `"perm_row"`, `"perm_col"`,
+`"lu_nnz"`, `"flops"`, `"nsuperpanels"`, `"memory_estimates"` of the inner
+solver, and the configuration parameters.
+
+Everything the pipeline does not do raises [`NotSupportedError`](@ref SparseDirectSolver.NotSupportedError), at
+construction or in the phase, never a silent switch to the stock path: the
+KernelAbstractions `CPU()` backend (the dependency-counter kernels spin on
+resident workgroups, which the CPU backend runs one after another), complex
+element types, the structures `"HPD"`, `"H"` and `"G"`, a uniform batch
+(`nbatch > 1`), `nrhs > 1`, a transposed solve (`solve_mode ≠ 0`), the solve
+sub-phases (`"solve_fwd_perm"` … `"solve_refinement"`, the Schur phases),
+Schur mode, `matching_alg ≠ "default"`, `ir_n_steps > 0`,
+`deterministic_mode = 1` (the concurrent extend-add sums in arrival order),
+a `factor_precision` other than the working precision, `"S"` with
+`pivot_type ≠ 'N'`, a matrix without a front of width ≤ 256 for the fused
+solve, and every `setparam!` name not listed above. The options of the inner
+solver are checked again at the analysis. [`DirectSolver`](@ref SparseDirectSolver.DirectSolver) remains the
+general solver.
+"""
+mutable struct FusedSolver{T, INT, S <: SDS.DirectSolver{T, INT}} <: SDS.AbstractDirectSolver{T, INT}
+    inner::S                 # the DirectSolver: analysis, numeric storage, solve workspace
+    tuning::SDSTuning        # resolved (`wides` is :host or :merged)
+    ldl::Bool                # "S": no-pivot LDLᵀ
+    nzval::Any               # the values the fused factorization reads (`_factor_values(inner)`)
+    fp::Any                  # factorization plan (`build_fused_plan`)
+    inv11::Any               # per-front L11 inverses (`build_inverse`)
+    inv_ptr::Any
+    invert!::Any
+    fz::Any                  # fused solve segments (`build_fused`)
+    info::Int
+    stage::Int
+end
+
+function FusedSolver(A, structure, view; tuning::Union{Nothing, SDSTuning} = nothing, kwargs...)
+    return _fused_solver(SDS.DirectSolver(A, structure, view; kwargs...), tuning)
+end
+
+function FusedSolver(rowptr::AbstractVector{<:Integer}, colval::AbstractVector{<:Integer}, nzval::AbstractVecOrMat,
+                     structure, view; tuning::Union{Nothing, SDSTuning} = nothing, kwargs...)
+    return _fused_solver(SDS.DirectSolver(rowptr, colval, nzval, structure, view; kwargs...), tuning)
+end
+
+function _fused_solver(s::SDS.DirectSolver{T, INT}, tuning::Union{Nothing, SDSTuning}) where {T, INT}
+    backend = s.backend
+    backend isa KA.CPU &&
+        throw(SDS.NotSupportedError("FusedSolver: the KernelAbstractions CPU backend is not supported (the " *
+                                    "dependency-counter kernels spin on resident workgroups); use DirectSolver"))
+    T <: Real ||
+        throw(SDS.NotSupportedError("FusedSolver: complex element type $T is not supported (the fused kernels " *
+                                    "have no conjugation); use DirectSolver"))
+    st = s.structure
+    st == SDS.STRUCTURE_SPD || st == SDS.STRUCTURE_SYMMETRIC ||
+        throw(SDS.NotSupportedError("FusedSolver: structure \"$(convert(String, st))\" is not supported; " *
+                                    "expected \"SPD\" or \"S\" (use DirectSolver)"))
+    s.nbatch == 1 ||
+        throw(SDS.NotSupportedError("FusedSolver: a uniform batch ($(s.nbatch) members) is not supported"))
+    t = resolve_tuning(something(tuning, default_tuning(backend)), backend)
+    ldl = st == SDS.STRUCTURE_SYMMETRIC
+    if ldl
+        SDS.setparam!(s, "pivot_type", 'N')
+        # no-pivot LDL never consumes 2x2 pivot pairs, and "S" analysis pays dearly for
+        # detecting them on saddle systems (augmented 78k KKT, n = 2.09M: analysis 316 s
+        # with the default pair detection, 64 s without -- measured on a GV100)
+        SDS.setparam!(s, "pivot_pairs", "none")
+    end
+    _apply_tuning!(s, t)
+    return FusedSolver{T, INT, typeof(s)}(s, t, ldl, nothing, nothing, nothing, nothing, nothing, nothing, 0,
+                                          SDS.STAGE_NONE)
+end
+
+Base.size(F::FusedSolver) = size(F.inner)
+Base.size(F::FusedSolver, d::Integer) = size(F.inner, d)
+
+function Base.show(io::IO, F::FusedSolver{T, INT}) where {T, INT}
+    s = F.inner
+    print(io, "FusedSolver{", T, ", ", INT, "}(n = ", size(F, 1), ", nnz = ", SDS.nnz(s.A), ", structure = \"",
+          convert(String, s.structure), "\", backend = ", nameof(typeof(s.backend)), ", wides = :",
+          F.tuning.wides, ", ", SDS._STAGE_NAMES[F.stage + 1])
+    F.stage == SDS.STAGE_FACTORIZED && print(io, ", info = ", F.info)
+    print(io, ")")
+    return nothing
+end
+
+# the options a FusedSolver cannot honour: set only by mutating `F.inner.options` directly
+# (setparam! rejects them), checked again at every analysis
+function _check_fused_options(F::FusedSolver{T}) where {T}
+    o = F.inner.options
+    unsupported(what) = throw(SDS.NotSupportedError("FusedSolver: $what is not supported; use DirectSolver"))
+    o.matching_alg == SDS.MATCHING_NONE || unsupported("matching_alg = \"$(convert(String, o.matching_alg))\"")
+    o.schur_mode == 0 || unsupported("schur_mode = 1")
+    o.ir_n_steps == 0 || unsupported("ir_n_steps = $(o.ir_n_steps) (iterative refinement)")
+    o.deterministic_mode == 0 || unsupported("deterministic_mode = 1")
+    o.factor_precision === nothing || o.factor_precision === real(T) ||
+        unsupported("factor_precision = $(o.factor_precision) for $T input")
+    o.ubatch_size == 0 || o.ubatch_size == 1 || unsupported("ubatch_size = $(o.ubatch_size)")
+    o.solve_alg == SDS.SOLVE_DEFAULT || unsupported("solve_alg = \"$(convert(String, o.solve_alg))\"")
+    F.ldl && o.pivot_type != SDS.PIVOT_NONE &&
+        unsupported("structure \"S\" with pivot_type = '$(convert(Char, o.pivot_type))'")
+    o.user_schur_indices === nothing || unsupported("user_schur_indices")
+    return nothing
+end
+
+# drop the plans of an earlier analysis (a new analysis rebuilds them)
+function _clear_plans!(F::FusedSolver)
+    F.nzval = F.fp = F.inv11 = F.inv_ptr = F.invert! = F.fz = nothing
+    F.info = 0
+    return F
+end
+
+# the symbolic part of the analysis: inner symbolic phase, one stock factorization and
+# solve (the solve workspace), then the three fused plans
+function _fused_symbolic!(F::FusedSolver{T}) where {T}
+    s = F.inner
+    SDS.execute!("symbolic_factorization", s, nothing, nothing; asynchronous = false)
+    n = size(s, 1)
+    x = KA.zeros(s.backend, T, n)
+    b = KA.zeros(s.backend, T, n)
+    SDS.execute!("factorization", s, x, b; asynchronous = false)
+    SDS.execute!("solve", s, x, b; asynchronous = false)   # allocates the solve workspace
+    t = F.tuning
+    merged = t.wides === :merged
+    # LDL wide fronts run the verbatim Cholesky vendor path (wides_potrf): valid while a
+    # front's pivots share a sign; a sign flip fails potrf -> info != 0
+    fp = build_fused_plan(s; ldl = F.ldl, inkernel_wides = merged, merge_segments = merged,
+                          wides_potrf = !merged, wgf = t.workgroup, scap = t.spin_cap)
+    inv11, inv_ptr, invertf, _ = build_inverse(s)
+    # the solve plan: one merged dependency-counter sweep over the whole tree
+    fz1 = build_fused(s; kstart = 1, wcap = 256)
+    fz1 === nothing && throw(SDS.NotSupportedError("fused solve: no plan entry with fronts of width <= 256"))
+    F.nzval = SDS._factor_values(s)
+    F.fp = fp
+    F.inv11, F.inv_ptr, F.invert! = inv11, inv_ptr, invertf
+    F.fz = ([(fz1, 64)], true)
+    F.info = 0
+    F.stage = SDS.STAGE_ANALYZED
+    return F
+end
+
+# the fused factorization behind a function barrier (the plans are untyped fields)
+function _fused_refactor!(s, nzval, fp, invertf)
+    info = Int(refact_fused!(s, nzval, fp))
+    invertf()
+    return info
+end
+
+function _fused_factorize!(F::FusedSolver, p::SDS.Phase)
+    name = convert(String, p)
+    F.stage >= SDS.STAGE_ANALYZED || throw(SDS._phase_error(name, "needs \"analysis\""))
+    p == SDS.PHASE_REFACTORIZATION && F.stage < SDS.STAGE_FACTORIZED &&
+        throw(SDS._phase_error(name, "needs a previous \"factorization\""))
+    F.nzval = SDS._factor_values(F.inner)
+    F.info = _fused_refactor!(F.inner, F.nzval, F.fp, F.invert!)
+    F.stage = SDS.STAGE_FACTORIZED
+    return F
+end
+
+# a right-hand side of the fused solve: a vector, or an n × 1 matrix, on the solver's backend
+function _fused_rhs(F::FusedSolver{T}, X, name) where {T}
+    if X isa AbstractMatrix
+        size(X, 2) == 1 ||
+            throw(SDS.NotSupportedError("FusedSolver: $(size(X, 2)) right-hand sides; the fused solve takes one"))
+        X = vec(X)
+    end
+    X isa AbstractVector ||
+        throw(SDS.NotSupportedError("FusedSolver: $name must be a vector (or an n × 1 matrix), got a " *
+                                    "$(typeof(X)); batches and descriptors are not supported"))
+    eltype(X) == T || throw(SDS.InvalidValueError("$name ($(eltype(X))) must have the solver's element type $T"))
+    length(X) == size(F, 1) ||
+        throw(SDS.InvalidValueError("$name has $(length(X)) entries, the matrix has $(size(F, 1)) rows"))
+    SDS._check_rhs_backend(F.inner, X, name)
+    return X
+end
+
+function _fused_solve!(F::FusedSolver, X, B)
+    F.stage >= SDS.STAGE_FACTORIZED || throw(SDS._phase_error("solve", "needs a \"factorization\""))
+    o = F.inner.options
+    o.solve_mode == 0 ||
+        throw(SDS.NotSupportedError("FusedSolver: solve_mode = $(o.solve_mode) (transposed solve) is not supported"))
+    o.ir_n_steps == 0 ||
+        throw(SDS.NotSupportedError("FusedSolver: ir_n_steps = $(o.ir_n_steps) (iterative refinement) is not supported"))
+    x = _fused_rhs(F, X, "X")
+    b = _fused_rhs(F, B, "B")
+    algo2_solve!(x, F.inner, b, F.inv11, F.inv_ptr, F.fz)
+    return F
+end
+
+function SDS.execute!(phase::AbstractString, F::FusedSolver, X, B; asynchronous::Bool = true)
+    p = SDS._parse_phase(phase)
+    if p == SDS.PHASE_REORDERING || p == SDS.PHASE_ANALYSIS
+        _check_fused_options(F)
+        _clear_plans!(F)
+        F.stage = SDS.STAGE_NONE
+        SDS.execute!("reordering", F.inner, nothing, nothing; asynchronous = false)
+        F.stage = SDS.STAGE_REORDERED
+        p == SDS.PHASE_ANALYSIS && _fused_symbolic!(F)
+    elseif p == SDS.PHASE_SYMBOLIC_FACTORIZATION
+        F.stage >= SDS.STAGE_REORDERED || throw(SDS._phase_error(phase, "needs \"reordering\""))
+        _check_fused_options(F)
+        _clear_plans!(F)
+        F.stage = SDS.STAGE_REORDERED
+        _fused_symbolic!(F)
+    elseif p == SDS.PHASE_FACTORIZATION || p == SDS.PHASE_REFACTORIZATION
+        _fused_factorize!(F, p)
+    elseif p == SDS.PHASE_SOLVE
+        _fused_solve!(F, X, B)
+    else
+        throw(SDS.NotSupportedError("FusedSolver: phase \"$phase\" is not supported; the fused solve runs as " *
+                                    "the one phase \"solve\""))
+    end
+    asynchronous || KA.synchronize(F.inner.backend)
+    return nothing
+end
+
+function SDS.analyze!(F::FusedSolver, X = nothing, B = nothing; asynchronous::Bool = true)
+    SDS.execute!("analysis", F, X, B; asynchronous)
+    return F
+end
+
+function SDS.factorize!(F::FusedSolver, X = nothing, B = nothing; asynchronous::Bool = true)
+    SDS.execute!("factorization", F, X, B; asynchronous)
+    return F
+end
+
+function SDS.refactorize!(F::FusedSolver, X = nothing, B = nothing; asynchronous::Bool = true)
+    SDS.execute!("refactorization", F, X, B; asynchronous)
+    return F
+end
+
+function SDS.solve!(F::FusedSolver, X, B; asynchronous::Bool = true)
+    SDS.execute!("solve", F, X, B; asynchronous)
+    return X
+end
+
+function SDS.setparam!(F::FusedSolver, name::AbstractString, value)
+    SDS.parameter_spec(name)                   # unknown names: the ArgumentError of DirectSolver
+    name in FUSED_SETTABLE ||
+        throw(SDS.NotSupportedError("FusedSolver: parameter \"$name\" cannot be set; the fused pipeline takes " *
+                                    join(("\"$p\"" for p in FUSED_SETTABLE), ", ") * " (use DirectSolver)"))
+    SDS.setparam!(F.inner, name, value)
+    return nothing
+end
+
+function SDS.getparam(F::FusedSolver{T, INT}, name::AbstractString) where {T, INT}
+    spec = SDS.parameter_spec(name)
+    name == "info" && return F.info
+    if name == "inertia" || name == "npivots"
+        F.stage >= SDS.STAGE_FACTORIZED ||
+            throw(SDS.FactorizationError(0, "the data parameter \"$name\" needs the \"factorization\" phase"))
+        F.ldl || return SDS.getparam(F.inner, name)   # Cholesky: the stats of the fused factorization
+        name == "npivots" && return zero(INT)          # the fused LDLᵀ perturbs no pivot
+        d = view(F.inner.numeric.d, 1:size(F, 1))
+        return (INT(count(>(zero(T)), d)), INT(count(<(zero(T)), d)))
+    end
+    name in FUSED_FORWARDED && return SDS.getparam(F.inner, name)
+    spec.status === :output || spec.status === :solver ||
+        return SDS.getparam(F.inner.options, name)
+    throw(SDS.NotSupportedError("FusedSolver: the data parameter \"$name\" is not provided (use DirectSolver)"))
+end
+
+function SDS.update!(F::FusedSolver, A)
+    SDS.update!(F.inner, A)
+    F.nzval = SDS._factor_values(F.inner)
+    return F
+end
+
+function SDS.update!(F::FusedSolver, rowptr::AbstractVector{<:Integer}, colval::AbstractVector{<:Integer},
+                     nzval::AbstractVecOrMat)
+    SDS.update!(F.inner, rowptr, colval, nzval)
+    F.nzval = SDS._factor_values(F.inner)
+    return F
+end
+
+# one method per argument kind (LinearAlgebra's Factorization methods would make a Union ambiguous)
+for RHS in (AbstractVector, AbstractMatrix)
+    @eval function LinearAlgebra.ldiv!(F::FusedSolver, B::$RHS)
+        SDS.execute!("solve", F, B, B; asynchronous = false)
+        return B
+    end
+    @eval function LinearAlgebra.ldiv!(X::$RHS, F::FusedSolver, B::$RHS)
+        SDS.execute!("solve", F, X, B; asynchronous = false)
+        return X
+    end
+    @eval Base.:\(F::FusedSolver, B::$RHS) = LinearAlgebra.ldiv!(similar(B), F, B)
+end
+# disambiguation with LinearAlgebra's real-factorization / complex-RHS method
+Base.:\(F::FusedSolver{T}, B::Union{Array{Complex{T}, 1}, Array{Complex{T}, 2}}) where {T <: Union{Float32, Float64}} =
+    LinearAlgebra.ldiv!(similar(B), F, B)
+
 end # module

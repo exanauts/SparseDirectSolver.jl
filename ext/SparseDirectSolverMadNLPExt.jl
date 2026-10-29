@@ -20,10 +20,11 @@ Base.@kwdef mutable struct SDSSolverOptions <: MadNLP.AbstractOptions
     # :cholesky (SPD; the condensed-KKT default) or :ldl (no-pivot LDL^T: factors
     # indefinite matrices and reports TRUE inertia from the signs of D)
     sds_factorization::Symbol = :cholesky
-    # :ldl only. :none factors in identity pivot order through the fused pipeline;
-    # :bk routes factorization and solve through the stock in-front Bunch-Kaufman
-    # path (src/numeric/ldlt.jl and the pivot-aware sweep solve): more robust on
-    # ill-conditioned KKT systems, at stock (launch-per-level) speed
+    # :ldl only. :none factors in identity pivot order through the fused pipeline
+    # (a FusedSolver); :bk routes factorization and solve through the stock in-front
+    # Bunch-Kaufman path (a DirectSolver: src/numeric/ldlt.jl and the pivot-aware
+    # sweep solve): more robust on ill-conditioned KKT systems, at stock
+    # (launch-per-level) speed
     sds_pivoting::Symbol = :none
     # in-front pivot acceptance threshold of :bk (nothing keeps the SDS default
     # 0.01; cuDSS's default is 1.0)
@@ -36,41 +37,36 @@ Base.@kwdef mutable struct SDSSolverOptions <: MadNLP.AbstractOptions
     sds_user_perm::Union{Nothing, Vector{Int}} = nothing
 end
 
-# shared solver construction knobs: the custom reordering (nd knobs or a user
-# permutation) and the amalgamation, applied before the analysis. No caching of
-# any kind: every solver instance recomputes its ordering (owner call, 2026-10-12);
-# pin one explicitly with sds_user_perm.
-function _apply_reordering!(s, opt::SDSSolverOptions, t::SDSTuning)
-    s.options.amalgamation = t.amalgamation
+# the reordering of the options, applied before the analysis on top of the tuning's
+# (native ND with the tuning's nd_nseps/nd_seed): a user permutation bypasses the
+# reordering entirely, else `sds_reordering`. No caching of any kind: every solver
+# instance recomputes its ordering (owner call, 2026-10-12); pin one explicitly with
+# sds_user_perm.
+function _apply_reordering!(s, opt::SDSSolverOptions)
     if opt.sds_user_perm !== nothing
         SDS.setparam!(s, "user_perm", opt.sds_user_perm)
-        return nothing
+    else
+        SDS.setparam!(s, "reordering_alg", opt.sds_reordering)
     end
-    SDS.setparam!(s, "reordering_alg", opt.sds_reordering)
-    SDS.setparam!(s, "nd_nseps", t.nd_nseps)
-    SDS.setparam!(s, "nd_seed", t.nd_seed)
     return nothing
 end
 
 """
     SDSSolver(csc; opt = SDSSolverOptions(), logger = MadNLP.MadNLPLogger())
 
-The MadNLP linear solver backed by the fused SparseDirectSolver pipeline
-(factorization mega-kernel + partitioned-inverse solve), with per-architecture
-tuning from `Fused.default_tuning`. Available as `SparseDirectSolver.SDSSolver`
-(exported) once MadNLP is loaded.
+The MadNLP linear solver backed by SparseDirectSolver.jl: a shell over an inner
+`AbstractDirectSolver`, a [`FusedSolver`](@ref SparseDirectSolver.FusedSolver)
+(the fused factorization mega-kernel and partitioned-inverse solve, with the
+per-architecture tuning of `Fused.default_tuning`) for `sds_pivoting = :none`,
+a `DirectSolver` (stock Bunch-Kaufman LDLᵀ, same tuning) for `:bk`; both are
+driven by `refactorize!`, `solve!` and `getparam(inner, "inertia")`. Available
+as `SparseDirectSolver.SDSSolver` (exported) once MadNLP is loaded.
 """
 mutable struct SDSSolver{T} <: MadNLP.AbstractLinearSolver{T}
-    inner::Any
+    inner::SDS.AbstractDirectSolver
     tril::Any
     x::Any
     b::Any
-    nzval::Any
-    fp::Any                                    # fused factorization plan
-    fz::Any                                    # fused solve segments
-    inv11::Any
-    inv_ptr::Any
-    invert!::Any
     last_info::Int
     opt::SDSSolverOptions
     logger::MadNLP.MadNLPLogger
@@ -83,73 +79,39 @@ function SDSSolver(
     )
     T = eltype(csc.nzVal)
     n = size(csc, 1)
-    backend = KA.get_backend(csc.nzVal)
-    t = Fused.resolve_tuning(something(opt.sds_tuning, Fused.default_tuning(backend)), backend)
     ldl = opt.sds_factorization === :ldl
     opt.sds_pivoting in (:none, :bk) ||
         throw(ArgumentError("sds_pivoting must be :none or :bk, got $(repr(opt.sds_pivoting))"))
     bk = opt.sds_pivoting === :bk
     bk && !ldl && throw(ArgumentError("sds_pivoting = :bk needs sds_factorization = :ldl"))
-    s = SDS.DirectSolver(csc.colPtr, csc.rowVal, csc.nzVal, ldl ? "S" : "SPD", 'U')
-    # :bk keeps pivot_type AUTO (Bunch-Kaufman for "S") and the default 2x2 pivot
-    # pairs; a user threshold reaches the in-front acceptance test
-    ldl && !bk && SDS.setparam!(s, "pivot_type", 'N')
-    bk && opt.sds_pivot_threshold !== nothing &&
-        SDS.setparam!(s, "pivot_threshold", opt.sds_pivot_threshold)
-    # no-pivot LDL never consumes 2x2 pivot pairs, and "S" analysis pays dearly for
-    # detecting them on saddle systems (augmented 78k KKT, n = 2.09M: analysis 316 s
-    # with the default pair detection, 64 s without -- measured on a GV100)
-    ldl && !bk && SDS.setparam!(s, "pivot_pairs", "none")
-    s.options.regime_c_width = t.regime_c_width
-    s.options.regime_c_rows = t.regime_c_rows  # the fused kernels own BOTH phases: no coupling conflict
-    s.options.subtree_parallelism = t.subtree_parallelism
-    s.options.subtree_budgets = copy(t.subtree_budgets)
-    _apply_reordering!(s, opt, t)
+    s = if bk
+        # the stock path is the whole pipeline: pivot_type AUTO (Bunch-Kaufman for "S") and
+        # the default 2x2 pivot pairs; a user threshold reaches the in-front acceptance test
+        backend = KA.get_backend(csc.nzVal)
+        t = Fused.resolve_tuning(something(opt.sds_tuning, Fused.default_tuning(backend)), backend)
+        d = SDS.DirectSolver(csc.colPtr, csc.rowVal, csc.nzVal, "S", 'U')
+        opt.sds_pivot_threshold !== nothing && SDS.setparam!(d, "pivot_threshold", opt.sds_pivot_threshold)
+        Fused._apply_tuning!(d, t)
+    else
+        SDS.FusedSolver(csc.colPtr, csc.rowVal, csc.nzVal, ldl ? "S" : "SPD", 'U'; tuning = opt.sds_tuning)
+    end
+    _apply_reordering!(s, opt)
     x = similar(csc.nzVal, n)
     b = similar(csc.nzVal, n)
-    SDS.execute!("analysis", s, x, b; asynchronous = false)
-    SDS.execute!("factorization", s, x, b; asynchronous = false)
-    SDS.execute!("solve", s, x, b; asynchronous = false)   # allocates the solve workspace
-    nzval = SDS._factor_values(s)
-    if bk
-        # the stock path is the whole pipeline: no fused plan, no partitioned inverse
-        fp = fz = inv11 = inv_ptr = nothing
-        invertf = Returns(nothing)
-    else
-        merged = t.wides === :merged
-        # LDL wide fronts run the verbatim Cholesky vendor path (wides_potrf): valid while a
-        # front's pivots share a sign; a sign flip fails potrf -> info != 0 -> MadNLP regularizes
-        fp = Fused.build_fused_plan(s; ldl, inkernel_wides = merged, merge_segments = merged,
-                                    wides_potrf = !merged, wgf = t.workgroup, scap = t.spin_cap)
-        inv11, inv_ptr, invertf, _ = Fused.build_inverse(s)
-        # the solve plan: one merged dependency-counter sweep over the whole tree
-        fz1 = Fused.build_fused(s; kstart = 1, wcap = 256)
-        fz1 === nothing && throw(SDS.NotSupportedError("fused solve: no plan entry with fronts of width <= 256"))
-        fz = ([(fz1, 64)], true)
-    end
-    M = SDSSolver{T}(s, csc, x, b, nzval, fp, fz, inv11, inv_ptr, invertf, 0, opt, logger)
-    MadNLP.factorize!(M)                       # prime the factorization path once
-    return M
+    SDS.analyze!(s, x, b; asynchronous = false)
+    SDS.factorize!(s, x, b; asynchronous = false)   # primes the factorization path once
+    return SDSSolver{T}(s, csc, x, b, Int(SDS.getparam(s, "info")), opt, logger)
 end
 
 function MadNLP.factorize!(M::SDSSolver)
-    if M.opt.sds_pivoting === :bk
-        SDS.execute!("refactorization", M.inner, M.x, M.b; asynchronous = false)
-        M.last_info = Int(SDS.getparam(M.inner, "info"))
-    else
-        M.last_info = Int(Fused.refact_fused!(M.inner, M.nzval, M.fp))
-        M.invert!()
-    end
+    SDS.refactorize!(M.inner, M.x, M.b; asynchronous = false)
+    M.last_info = Int(SDS.getparam(M.inner, "info"))
     return M
 end
 
 function _solve!(M::SDSSolver, xb)
     copyto!(M.b, xb)
-    if M.opt.sds_pivoting === :bk
-        SDS.execute!("solve", M.inner, M.x, M.b; asynchronous = false)
-    else
-        Fused.algo2_solve!(M.x, M.inner, M.b, M.inv11, M.inv_ptr, M.fz)
-    end
+    SDS.solve!(M.inner, M.x, M.b)
     copyto!(xb, M.x)
     KA.synchronize(KA.get_backend(xb))
     return xb
@@ -164,17 +126,11 @@ MadNLP.is_inertia(::SDSSolver) = true
 # regularizes and factorizes again
 function MadNLP.inertia(M::SDSSolver)
     n = size(M.tril, 1)
-    if M.opt.sds_factorization === :ldl
-        # failure tuple must sum to n (the inertia contract), same as the Cholesky branch
-        M.last_info == 0 || return (n - 2, 1, 1)
-        if M.opt.sds_pivoting === :bk
-            npos, nneg = SDS.getparam(M.inner, "inertia")   # of D, 2x2 blocks included
-            return (Int(npos), n - Int(npos) - Int(nneg), Int(nneg))
-        end
-        l = count(x -> x < zero(x), view(M.inner.numeric.d, 1:n))   # true inertia from D
-        return (n - l, 0, l)
-    end
-    return M.last_info == 0 ? (n, 0, 0) : (n - 2, 1, 1)
+    # failure tuple must sum to n (the inertia contract)
+    M.last_info == 0 || return (n - 2, 1, 1)
+    M.opt.sds_factorization === :ldl || return (n, 0, 0)
+    npos, nneg = SDS.getparam(M.inner, "inertia")   # of D (2x2 blocks included for :bk)
+    return (Int(npos), n - Int(npos) - Int(nneg), Int(nneg))
 end
 MadNLP.improve!(::SDSSolver) = false
 MadNLP.introduce(::SDSSolver) = "SparseDirectSolver.jl (fused pipeline)"
