@@ -19,6 +19,11 @@ The named wrappers [`analyze!`](@ref), [`factorize!`](@ref),
 [`refactorize!`](@ref) and [`solve!`](@ref) are the corresponding `execute!`
 calls.
 
+A [`FusedSolver`](@ref SparseDirectSolver.FusedSolver) accepts only
+`"reordering"`, `"symbolic_factorization"`, `"analysis"`, `"factorization"`,
+`"refactorization"` and `"solve"`; the solve sub-phases and the Schur phases
+raise a [`NotSupportedError`](@ref).
+
 ## Typical sequence
 
 ```julia

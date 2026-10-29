@@ -39,7 +39,7 @@ The options are passed as keywords of `madnlp` (or in an `SDSSolverOptions`).
 
 With `sds_pivoting = :bk` the 2×2 pivot pairs of the `"S"` analysis are chosen
 from the values present in the KKT matrix when the solver is built (see
-`pivot_pairs` under [Parameters](parameters.md)); with `:none` the pairs are off, since
+[Pivot pairs](@ref) under Parameters); with `:none` the pairs are off, since
 a factorization without pivoting never consumes them.
 
 ## What it runs

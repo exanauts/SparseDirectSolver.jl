@@ -32,6 +32,8 @@ The performance knobs of the pipeline live in one bundle, a platform's tuning
 being a single value; how each field was measured and the per-architecture
 champions are in
 [`bench/ARCH-TUNING.md`](https://github.com/exanauts/SparseDirectSolver.jl/blob/main/bench/ARCH-TUNING.md).
+`default_tuning` gives oneAPI, Metal and any other backend that reports no CUDA
+thread count per multiprocessor the AMD profile.
 
 ```@docs
 SparseDirectSolver.Fused.SDSTuning
