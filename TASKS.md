@@ -3745,6 +3745,60 @@ PLAN wording. Refs #82; closes #152.
     counter kernel already exist in `src/fused.jl`; what remains of T24–T26 is the `execute!`/`DirectSolver`
     integration and #109's placement, to be re-cut by the owner after T34.
 
+### T34 — Fused pipeline: close the sm_89 gap (issue #156)   `[ ]`
+
+Proposed in the T33 Report and added at the owner's request (2026-10-29) to run
+**before T24**: performance work on the kernels of `src/fused.jl` that
+`FusedSolver` and the MadNLP extension's `SDSSolver` run, with the public surface
+and the tests of T33 unchanged.
+
+**Why.** On the RTX 4080 (sm_89) the fused pipeline is well behind cuDSS 0.8.0.
+On the 78k-bus condensed KKT a refactorization takes 28.2 ms against 16.2 ms
+(1.74×) and a solve 3.9 ms against 1.8 ms (2.2×); on the harness matrices the
+refactorization ratio is 1.6× to 3.3×. The time is inside the two
+dependency-counter kernels, not in the launch count (T33 Report, measured with
+`bench/e2e/fused_probe.jl` on an idle GPU).
+
+**Deliverables**, in order of measured payoff on the 78k; each step is kept only
+if it passes its gate (below):
+
+1. The inverse of `L₁₁` written by the PANEL_B, PANEL_C and WPANEL roles from
+   the triangle they hold in local memory, which drops the
+   `invert_l11_kernel!` launch (#155; 2.4 ms of the 78k's 28.2).
+2. A `device_fence()` hook used by the fused factorization and solve kernels:
+   `Threads.atomic_fence()` by default, the gpu-scope `CUDA.threadfence()` in
+   the CUDA extension (#154; −3.5% on the 78k, −8% on lap3d_40 in the T33 A/B).
+3. The subtree bucket (3.5 ms on the 78k) and the fixed launches re-measured on
+   sm_89 after 1–2: `subtree_budgets` 8K vs 16K, `subtree_parallelism`, one
+   `scatter_A!` launch for all C-group fronts.
+4. The fused solve on 76-SM parts (3.9 vs 1.8 ms): the occupancy of
+   `fwd2`/`bwd2` with 64-thread workgroups and `MW = 256` buffers, and the
+   unused `chain_*` kernels for the narrow top of the tree.
+5. A per-front wide strategy in merged mode: fronts above a measured width on
+   the host vendor path at a segment boundary, for lap3d-class roots (lap3d_40:
+   91.0 ms merged, 79.3 ms host wides, 46.2 ms cuDSS).
+6. CUDA-graph replay of refactorize + inverse and of the solve in the CUDA
+   extension for n ≲ 1e5, where the ~0.5 ms launch floor is 40–80% of the time.
+
+New tuning knobs go into `SDSTuning` with per-architecture defaults in
+`default_tuning`; `bench/ARCH-TUNING.md` records what was measured.
+
+**Tests.** Every step is gated as in `bench/ARCH-TUNING.md`: `info = 0`, factor
+delta ≤ 1e-8 against the stock factorization, 20 repeated refactorizations,
+and an interleaved A/B on an idle GPU on CUDA locally and on the `amdgpu`
+runner. A step that is slower on either backend is dropped or made
+per-architecture. `test/test_fused.jl` and every existing suite pass unchanged,
+including the allocation budget of a refactorization plus a solve, and the
+full default suite passes on CPU and CUDA. The end-to-end check is
+`bench/e2e/fresh_machine.jl` on the 78k ACOPF: iterations within the run-to-run
+spread (100 or 101 in T33) and the objective to `1e-12` relative.
+
+Report: for each step, the `fused_probe.jl` refactorization and solve medians
+before and after on the 78k and the harness matrices (CUDA, and AMDGPU where
+the runner allows), kept or dropped; the final ratios against cuDSS; the
+`fresh_machine.jl` iterations, objective and linear-solver time; and what
+remains of T24–T26 for the owner to re-cut. Closes #156; refs #154, #155.
+
 ### External — MadNLPGPU integration (in the MadNLP repository)   `[ ]`
 
 Add a `SparseDirectSolver`-backed `AbstractLinearSolver` next to
