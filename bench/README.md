@@ -17,15 +17,13 @@ Baselines every later milestone is measured against (PLAN.md §5 M0, §7). The
 | `compare.jl` | cuDSS vs SparseDirectSolver.jl per feature × matrix with BenchmarkTools; one solver per run (`--solver=cudss` or `--solver=sds`), results merged into `bench/comparison/<solver>.csv` |
 | `profile_phases.jl` | where SDS spends refactorization and solve time on CUDA (PERFORMANCE.md, experiment 0): schedule per matrix (regime-A subtrees, B/C fronts, launch groups) and a CUPTI trace of one warm refactorization and solve (kernels, copies, busy time, longest kernel and its grid); writes `bench/profile/phase_split.{md,csv}`: `julia --project=bench bench/profile_phases.jl [--only=m1,m2] [--structures=SPD,S]` |
 | `compare_report.jl` | renders `bench/comparison/comparison.md` (overview + one table per feature) and `comparison.png` (SDS/cuDSS ratio per feature and phase); environment `bench/report/` (CairoMakie) |
-| `solve_proto_78k.jl`, `solve_proto_all.jl`, `solve_nd.jl`, `final_sweep.jl` | PR #107, experiment 6: partitioned-inverse solve (per-front `L₁₁` inverses, fused dependency-counter sweeps, single-block chain kernel) on the 78k-bus condensed KKT and the SPD harness, under METIS, the imported cuDSS ordering and native ND; configuration sweeps. CUDA, SPD, one right-hand side; `bench/` environment |
-| `fact_split.jl`, `fact_fused.jl` | PR #107, experiment 5: split factorization (tiled SYRK, chunked TRSM, routing by `regime_c_rows`) and the segmented dependency-counter fused factorization with private contribution blocks; each reproduces its table in one run given the KKT dump |
-| `order_search.jl`, `get_cudss_perm.jl` | PR #107 ordering study: METIS knob sweep and schedule depth; extraction of cuDSS's reordering through the raw C API for replay under `user_perm` |
+| `fact_split.jl` | PR #107, experiment 5: split factorization (tiled SYRK, chunked TRSM, routing by `regime_c_rows`); reproduces its table in one run given the KKT dump. The other PR #107 prototypes (partitioned-inverse solve, segmented fused factorization, ordering study, ROCm and Metal ports) were removed and are at `https://github.com/exanauts/SparseDirectSolver.jl/tree/prototypes-2026-10/bench/` |
 | `ordering_chooser.jl` | T22 (issue #108): AMD vs ND per harness matrix and dump (schedule depth, fundamental and column-etree depth, nnz(L), flops) and the choice of the T22 and T05 cost models; host only, no GPU: `julia --project=bench bench/ordering_chooser.jl` (`SDS_BENCH_SUITESPARSE=0` skips MatrixDepot) |
-| `amd_proto.jl`, `amd/Project.toml` | the PR #107 solve kernels on ROCm (ROCArray, raw-array constructor, `Threads.atomic_fence`); environment `bench/amd/` |
-| `e2e/run_gv100.jl`, `e2e/run_amd.jl`, `e2e/fresh_machine.{jl,sh}` | full ACOPF interior-point runs through the MadNLP extension (`SparseDirectSolver.SDSSolver`, the fused pipeline of `src/fused.jl`) on CUDA and AMD, and the one-file fresh-machine workflow; environment `bench/e2e/` (MadNLP, MadNLPGPU, ExaModels, ExaModelsPower) |
+| `refinement.jl` | T16: relative residual of iterative refinement (`--mode=ir`) or FGMRES-IR (`--mode=fgmres`, T18) after `--steps=0,2,5` steps on the K2 dumps; package environment: `julia --project=. bench/refinement.jl [--only=...] [--steps=0,2,5] [--backend=cpu\|cuda] [--mode=ir\|fgmres]` |
+| `e2e/workflow.jl`, `e2e/fresh_machine.{jl,sh}` | full 78k-bus ACOPF interior-point run through the MadNLP extension (`SparseDirectSolver.SDSSolver`, the fused pipeline of `src/fused.jl`) on CUDA or AMD, and the one-file fresh-machine workflow; environment `bench/e2e/` (MadNLP, MadNLPGPU, ExaModels, ExaModelsPower) |
 | `e2e/fused_probe.jl` | kernel-level gate of the fused pipeline (`FusedSolver`) against the stock path and cuDSS (`--solver=cudss`, a second process) on the harness matrices and an optional KKT dump (`--dump=<mtx>`, e.g. the 78k-bus condensed KKT from `dump_madnlp_kkt.jl`): steady-state refactorization and solve medians, launch composition (`CUDA.@profile`), both wide-front strategies; the T33 Report's numbers (always on an idle GPU) |
-| `e2e/ldl_fused_test.jl`, `e2e/ldl_fused_race.jl`, `e2e/amd_baseline.jl`, `e2e/amd_sweep.jl` | gates and timings of the fused Cholesky/LDLᵀ refactorization and the fused solve against the handle-API kernels on the 78k-bus condensed KKT (CUDA; the `amd_*` scripts on ROCm), see `PERFORMANCE-2026-10.md` and `ARCH-TUNING.md` |
-| `e2e/SDSCPU.jl`, `e2e/cpu_fast_test.jl`, `e2e/hsl_cpu_bench.jl`, `e2e/ma27_bench.jl`, `e2e/ma57_bench.jl` | a task-parallel CPU refactorization over the handle API's schedule and its HSL references (MA27/MA57 through libcoinhsl; the MA86/CHOLMOD numbers in PERFORMANCE-2026-10.md came from one-off drivers, not shipped) |
+| `e2e/ldl_fused_test.jl`, `e2e/ldl_fused_race.jl`, `e2e/amd_sweep.jl` | gates and timings of the fused Cholesky/LDLᵀ refactorization and the fused solve against the handle-API kernels on the 78k-bus condensed KKT (CUDA; `amd_sweep.jl` on ROCm), see `PERFORMANCE-2026-10.md` and `ARCH-TUNING.md` |
+| `e2e/SDSCPU.jl`, `e2e/cpu_fast_test.jl` | a task-parallel CPU refactorization over the handle API's schedule and its gate (the MA27/MA57/MA86/CHOLMOD numbers in PERFORMANCE-2026-10.md came from drivers no longer in the tree) |
 | `pivot_pairs.jl` | 2×2 pivot pairs of the `S` analysis (issue #66): `pivot_pairs` = `none`/`default`/`all` on the K2 dumps and the KKT generators, with nnz(L), zero/perturbed/2×2 pivots, max abs L and factor error of the CPU reference LDLᵀ; package environment: `julia --project=. bench/pivot_pairs.jl [--only=case118,...] [--generators=false]` |
 
 ## Commands
@@ -77,8 +75,9 @@ julia --project=bench bench/compare.jl --solver=sds --features=ldlt
 * **The fused pipeline.** `cholesky_fused` measures the fused factorization
   and partitioned-inverse solve of `SparseDirectSolver.Fused`, set up as the
   MadNLP extension's `SDSSolver` sets them up (native ND ordering, the
-  per-architecture tuning of `Fused.default_tuning`, the plans built with the
-  first factorization, so that phase includes them); it needs a GPU backend.
+  per-architecture tuning of `Fused.default_tuning`, the fused plans built by
+  the analysis, so the factorization phases do not include them); it needs a
+  GPU backend.
   The cuDSS side runs it as a plain SPD system, cuDSS having one path. The
   row goes away when T24–T26 make the fused pipeline the path of `execute!`.
 * **Two processes.** CUDSS.jl and the package's CUDA extension define the same
