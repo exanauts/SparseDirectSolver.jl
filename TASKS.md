@@ -3494,7 +3494,7 @@ choice). `:generic` stays the allocating reference path (PLAN §3.9).
 Tests: the `:ka` allocation budget and the `select_impl` order on the KA CPU
 backend; on CUDA, AMDGPU, oneAPI and Metal through CI. Closes #112 and #53.
 
-### T33 — `FusedSolver`: the fused pipeline as an `AbstractDirectSolver` (issue #152)   `[~]`
+### T33 — `FusedSolver`: the fused pipeline as an `AbstractDirectSolver` (issue #152)   `[!]`
 
 Inserted by owner decision (2026-10-28) to run **before T24**: a pure refactor
 of the driver code around `src/fused.jl` plus the first unit tests of that
@@ -3627,7 +3627,7 @@ objective before and after; the list of restrictions raised; the proposed
 PLAN wording. Refs #82; closes #152.
 
 ### Report
-- Status: [~] (code, docs and tests complete; the before/after benchmark measurements are pending, see below)
+- Status: [!] (done; the no-regression check is the kernel-level comparison and the interleaved `fresh_machine.jl` runs below instead of the fused `compare.jl` rows, by owner decision)
 - What was built:
   * `src/fused.jl`: `FusedSolver{T, INT, S} <: AbstractDirectSolver{T, INT}` (exported; `Fused.FusedSolver` is the
     defining name) with the constructors `FusedSolver(A, structure, view; tuning, index)` (anything `DirectSolver`
@@ -3666,10 +3666,25 @@ PLAN wording. Refs #82; closes #152.
   * Allocation of one `refactorize!` + `solve!` on CUDA (RTX 4080): 36–42 KB, independent of n (n = 400 to 5832,
     Float32/Float64, `"SPD"`/`"S"`): ~256 B per KA launch and ~240 B per `fill!`/`copyto!` of a view, plus the
     `info` read. The stock `DirectSolver` allocates 130–190 KB for the same cycle. Budget 64 KiB.
-  * `fresh_machine.jl` (78k ACOPF, RTX 4080) before: 100 iterations, objective 1.5314931034929343e7 (warm solve
-    1.531493103492938e7). After: PENDING.
-  * Fused `compare.jl` rows before/after: PENDING (the first runs overlapped other GPU jobs and were discarded; to
-    be re-measured on an idle RTX 4080).
+  * `fresh_machine.jl` (78k ACOPF, RTX 4080, idle GPU, the two trees interleaved after/before/after/before, two
+    warm solves each): after 13.9, 13.9, 14.1, 14.0 s wall (linear solver 6.8, 6.9, 7.2, 7.1 s); before 13.7, 13.9,
+    14.4, 14.1 s (7.1, 7.0, 7.3, 7.2 s). Iterations 100 or 101 on both trees, varying run to run (the arrival-order
+    extend-add of `deterministic_mode = 0`); objectives 1.53149310349293e7 agreeing to ~2e-15 relative. No change.
+  * Fused `compare.jl` rows: not re-measured. The first runs overlapped other GPU jobs and were discarded; the
+    owner accepted the kernel-level check below as the no-regression check instead. In `compare.jl` the plans are
+    now built by `"analysis"`, so the `cholesky_fused` analysis column grows and its factorization column becomes
+    a refactorization.
+  * Kernel-level check (`bench/e2e/fused_probe.jl`, added by this task; idle RTX 4080, medians of 11, the same
+    `FusedSolver` objects driven through `refactorize!`/`solve!` and through the module functions the deleted
+    extension copy called, i.e. the pre-T33 launch sequence): refactorization 78k-bus condensed KKT (n = 674562,
+    dumped at MadNLP iteration 10 with `bench/dump_madnlp_kkt.jl`) 28.5 vs 28.4 ms, lap3d_40 95.3 vs 95.4,
+    lap2d_300 11.1 vs 10.0, bcsstk38 7.8 vs 7.4, bcsstk17 6.9 vs 6.9; solve 78k 3.94 vs 3.88 ms, lap3d_40 10.0 vs
+    10.1, lap2d_300 1.18 vs 1.21, bcsstk38 0.65 vs 0.57, bcsstk17 0.68 vs 0.67. The first block of a run is taken
+    during the device clock ramp and is not comparable (case118: 4.3 ms `refactorize!` vs 0.65 ms repeated at the
+    end of the block; case1354: 8.9 vs 1.15, the module recipe measured right after reads 1.92). The launch
+    sequence is the same by construction (`_fused_factorize!` calls `refact_fused!` then `invert!`, `_fused_solve!`
+    calls `algo2_solve!`); the per-call differences are `_factor_values(inner)` (returns the aliased `nzval`) and two
+    device `count`s for the `"S"` inertia instead of one.
 - Deviations from PLAN.md / this task:
   * `"perm"` in the task is not a parameter name; `getparam` forwards the cuDSS names `"perm_reorder_row"`,
     `"perm_reorder_col"`, `"perm_row"`, `"perm_col"` (and `"nsuperpanels"`).
@@ -3684,9 +3699,26 @@ PLAN wording. Refs #82; closes #152.
     `(n − nneg, 0, nneg)`); they differ only for an exactly zero or NaN entry of `D` with `info = 0`.
   * `setparam!` of the five analysis parameters is accepted at any stage and read by the next analysis
     (`pivot_epsilon` is captured by the plan at analysis).
-- Open issues / follow-ups: with the `wides = :host` tuning (the default on 2048-thread NVIDIA parts) the fused
-  `"S"` factors wide fronts on the Cholesky vendor path and reports `info ≠ 0` on a sign change inside a wide
-  front (pre-existing, documented in the docstring); the local tests ran with `:merged` (RTX 4080).
+- Open issues / follow-ups:
+  * With the `wides = :host` tuning (the default on 2048-thread NVIDIA parts) the fused `"S"` factors wide fronts
+    on the Cholesky vendor path and reports `info ≠ 0` on a sign change inside a wide front (pre-existing,
+    documented in the docstring); the local tests ran with `:merged` (RTX 4080).
+  * Standing of the fused pipeline on the RTX 4080 (sm_89), pre-existing (PR #126), measured with
+    `bench/e2e/fused_probe.jl` against cuDSS 0.8.0 on an idle GPU: refactorization of the 78k condensed KKT 28.2 ms
+    vs cuDSS 16.2 (1.74×; the campaign's L40S, the same architecture, read 1.25× with CUDA-graph replay and
+    `nd_nseps = 4`; GV100 0.99×), solve 3.9 vs 1.8 ms (2.2×; the GV100 was ahead); harness refactorization ratios
+    1.6× (case118) to 3.3× (bcsstk38). One refactorization is 34 launches: the mega-kernel 23.0 ms (one launch,
+    40,294 roles), the subtree kernel 3.5 ms (one launch), `invert_l11_kernel!` 2.4 ms, 28 `scatter_A!` launches
+    0.14 ms, statistics/zeroing 0.6 ms, one 4-byte `info` read; the solve is 4 launches (`fwd2` 2.3 + `bwd2` 2.1 ms).
+    The launch count is not the issue; the time is inside the two counter kernels.
+  * #154 (found-by-agent): the fences of `src/fused.jl` are system scope on NVIDIA (`Threads.atomic_fence()` lowers
+    to `fence.sc.sys`); gpu-scope fences measured −3.5% on the 78k and −8% on lap3d_40.
+  * The wide-front strategy is per device, not per front: on sm_89 `:merged` wins everywhere except lap3d_40
+    (1600-wide root: 91.0 ms merged vs 79.3 host wides vs 46.2 cuDSS).
+  * #155 (found-by-agent): the `invert_l11_kernel!` launch (2.4 ms of the 78k's 28.2) recomputes what the panel
+    roles hold in local memory when they write `L₁₁` back.
+  * Two sessions benchmarking on the same GPU contaminate each other (seen on 2026-10-29 between 09:40 and 09:58
+    CDT, linear-solver wall 23.5 vs 7 s for the same tree); every number in this Report was taken on an idle GPU.
 - Suggested plan changes:
   * §3.1: add after the handle layer: "`FusedSolver(A, structure, view; tuning)` drives the fused pipeline of
     `src/fused.jl` with the same verbs (`execute!`, the named phases, `setparam!`/`getparam`, `update!`) for real
@@ -3697,6 +3729,21 @@ PLAN wording. Refs #82; closes #152.
     `DirectSolver`, resolved `SDSTuning`, the three plans, `info`, stage).
   * §4: `src/fused.jl` line: "… SDSTuning per-architecture bundle and `FusedSolver`, its handle-layer driver
     (the MadNLP extension's inner solver); `test/test_fused.jl` (GPU backends only)".
+  * A task before T24, proposed `T34 — fused pipeline: close the sm_89 gap`, from the open issues above, each step
+    gated as in `bench/ARCH-TUNING.md` (info 0, factor delta ≤ 1e-8 vs stock, 20 repeats, interleaved A/B on an
+    idle GPU, CUDA locally and the `amdgpu` runner), in order of measured payoff on the 78k: (1) the inverse of
+    `L₁₁` written by the PANEL_B/PANEL_C/WPANEL roles from the local-memory triangle, dropping the
+    `invert_l11_kernel!` launch (−2.4 ms); (2) a `device_fence()` hook, `Threads.atomic_fence()` by default and
+    `CUDA.threadfence()` in the CUDA extension, in the factorization and solve kernels (−3.5% 78k, −8% lap3d_40);
+    (3) the subtree bucket (3.5 ms) and the fixed launches re-measured on sm_89 after (1)–(2) (`subtree_budgets`
+    8K vs 16K, `subtree_parallelism`, one `scatter_A!` launch for all C-group fronts); (4) the solve on 76-SM parts
+    (3.9 vs cuDSS 1.8 ms: `fwd2`/`bwd2` occupancy with 64-thread workgroups and `MW = 256` buffers, the unused
+    `chain_*` kernels for the narrow top of the tree); (5) a per-front wide strategy in merged mode (fronts above
+    a measured width on the host vendor path at a segment boundary, for lap3d-class roots); (6) CUDA-graph replay
+    of refactorize + inverse and of the solve in the CUDA extension for n ≲ 1e5, where the ~0.5 ms launch floor is
+    40–80% of the time (neutral on the 78k, measured in the campaign). T25's split kernels and T26's segmented
+    counter kernel already exist in `src/fused.jl`; what remains of T24–T26 is the `execute!`/`DirectSolver`
+    integration and #109's placement, to be re-cut by the owner after T34.
 
 ### External — MadNLPGPU integration (in the MadNLP repository)   `[ ]`
 
