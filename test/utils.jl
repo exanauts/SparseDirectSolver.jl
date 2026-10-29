@@ -809,3 +809,20 @@ function all_permutations(n::Integer)
     end
     return out
 end
+
+# ---------------------------------------------------------------------------
+# fused pipeline (T33)
+
+"""
+    FUSED_CYCLE_ALLOC_BUDGET
+
+Host bytes one `refactorize!` plus one `solve!` of a [`FusedSolver`](@ref) may
+allocate on a GPU backend after the first factorization and solve (PLAN §2.4,
+§3.9: no allocation that grows with the problem). What remains is the launch
+allowance of the GPU packages: on CUDA (RTX 4080, T33) about 256 B per
+KernelAbstractions launch and 240 B per `fill!`/`copyto!` of a view, plus the
+host read of `info`, measured at 36–42 KB per cycle for n = 400 to 5832
+(Float32 and Float64, `"SPD"` and `"S"`), independent of n; the stock
+`DirectSolver` allocates 130–190 KB for the same cycle.
+"""
+const FUSED_CYCLE_ALLOC_BUDGET = 64 * 1024

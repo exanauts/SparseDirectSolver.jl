@@ -60,6 +60,7 @@ makedocs(
             "Solver" => "lib/solver.md",
             "Matrices" => "lib/matrices.md",
             "LinearAlgebra interface" => "lib/linearalgebra.md",
+            "Fused pipeline" => "lib/fused.md",
             "CUDA extension" => "lib/cuda.md",
             "AMDGPU extension" => "lib/amdgpu.md",
             "oneAPI extension" => "lib/oneapi.md",

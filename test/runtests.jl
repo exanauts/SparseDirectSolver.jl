@@ -53,9 +53,10 @@ BackendBanner.print_backends()
 # a worker compiles the solver for every element type it tests, and that compilation, not the tests, sets the wall
 # time. The testsets that do not loop over the element types run in the Float64 part, or in the first selected
 # type's part when SDS_TEST_ELTYPES leaves Float64 out (`RUN_SHARED`).
-const SPLIT_FILES = ["test_api", "test_dense", "test_fgmres", "test_matching", "test_numeric_cholesky_a",
-                     "test_numeric_cholesky_b", "test_numeric_cholesky_c", "test_numeric_ldlt", "test_numeric_lu",
-                     "test_ported", "test_refinement", "test_schur", "test_solve", "test_ubatch"]
+const SPLIT_FILES = ["test_api", "test_dense", "test_fgmres", "test_fused", "test_matching",
+                     "test_numeric_cholesky_a", "test_numeric_cholesky_b", "test_numeric_cholesky_c",
+                     "test_numeric_ldlt", "test_numeric_lu", "test_ported", "test_refinement", "test_schur",
+                     "test_solve", "test_ubatch"]
 const SPLIT_ELTYPES = BackendBanner.SELECTED_ELTYPES
 const SHARED_ELTYPE = Float64 in SPLIT_ELTYPES ? Float64 : first(SPLIT_ELTYPES)
 

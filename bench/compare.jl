@@ -19,10 +19,10 @@
 #
 # Every feature of `features.jl` is implemented; a feature whose task is not
 # marked done in TASKS.md is a configuration error and stops the SDS run. The
-# `cholesky_fused` feature runs the fused factorization and partitioned-inverse
-# solve of `SparseDirectSolver.Fused` exactly as the MadNLP extension's
-# `SDSSolver` does (ND ordering, per-architecture tuning, plans built with the
-# first factorization); it needs a GPU backend.
+# `cholesky_fused` feature runs a `FusedSolver` (the fused factorization and
+# partitioned-inverse solve, the inner solver of the MadNLP extension's
+# `SDSSolver`: ND ordering, per-architecture tuning, the fused plans built by the
+# analysis) through the same calls as every other solver; it needs a GPU backend.
 #
 # Each phase is timed on a fresh solver: the `setup` of the benchmark creates the
 # solver and runs the phases it depends on, the timed expression runs the phase
@@ -117,70 +117,6 @@ else
      version = string(pkgversion(SparseDirectSolver)))
 end
 
-# --- the fused pipeline (`SparseDirectSolver.Fused`), as the MadNLP extension's SDSSolver runs it ---
-
-# The `DirectSolver` does the analysis and owns the numeric storage and the solve
-# workspace; the fused plans are built with the first factorization, as the
-# `SDSSolver` constructor does (`ext/SparseDirectSolverMadNLPExt.jl`).
-mutable struct FusedSolver
-    s::Any          # the DirectSolver
-    tuning::Any     # Fused.SDSTuning, the per-architecture defaults of the backend
-    nzval::Any      # the values the numeric phase factors
-    fp::Any         # fused factorization plan
-    fz::Any         # fused solve segments
-    inv11::Any
-    inv_ptr::Any
-    invert!::Any
-    info::Int
-end
-
-inner(s) = s isa FusedSolver ? s.s : s
-solver_info(s) = s isa FusedSolver ? s.info : API.get(s, "info")
-
-if SOLVER == "sds"
-    function fused_solver(Ad, view)
-        F = SparseDirectSolver.Fused
-        backend = get_backend(Ad isa SparseMatrixCSC ? Ad.nzval : Ad.nzVal)
-        t = F.resolve_tuning(F.default_tuning(backend), backend)
-        s = API.solver(Ad, "SPD", view)
-        s.options.amalgamation = t.amalgamation
-        s.options.regime_c_width = t.regime_c_width
-        s.options.regime_c_rows = t.regime_c_rows
-        s.options.subtree_parallelism = t.subtree_parallelism
-        s.options.subtree_budgets = copy(t.subtree_budgets)
-        API.set(s, "reordering_alg", "algo4")        # native nested dissection
-        API.set(s, "nd_nseps", t.nd_nseps)
-        API.set(s, "nd_seed", t.nd_seed)
-        return FusedSolver(s, t, nothing, nothing, nothing, nothing, nothing, nothing, 0)
-    end
-
-    function fused_phase(w::FusedSolver, p, x, b)
-        F, s, t = SparseDirectSolver.Fused, w.s, w.tuning
-        if p == "analysis"
-            API.exec("analysis", s, x, b)
-        elseif p == "factorization"
-            API.exec("factorization", s, x, b)
-            API.exec("solve", s, x, b)              # allocates the solve workspace the fused solve uses
-            w.nzval = SparseDirectSolver._factor_values(s)
-            merged = t.wides === :merged
-            w.fp = F.build_fused_plan(s; ldl = false, inkernel_wides = merged, merge_segments = merged,
-                                      wides_potrf = !merged, wgf = t.workgroup, scap = t.spin_cap)
-            w.inv11, w.inv_ptr, w.invert!, _ = F.build_inverse(s)
-            fz1 = F.build_fused(s; kstart = 1, wcap = 256)
-            fz1 === nothing && throw(SparseDirectSolver.NotSupportedError("fused solve: no plan entry with fronts of width <= 256"))
-            w.fz = ([(fz1, 64)], true)
-            w.info = Int(F.refact_fused!(s, w.nzval, w.fp))
-            w.invert!()
-        elseif p == "refactorization"
-            w.info = Int(F.refact_fused!(s, w.nzval, w.fp))
-            w.invert!()
-        else
-            F.algo2_solve!(x, s, b, w.inv11, w.inv_ptr, w.fz)
-        end
-        return nothing
-    end
-end
-
 side_params(f) = merge(f.params, SOLVER == "cudss" ? f.cudss_params : f.sds_params)
 
 relres(A, x, b) = norm(b - A * x) / norm(b)
@@ -225,7 +161,8 @@ function build_system(f::Feature, Ms)
     B = f.nrhs == 1 ? rand(T, n) : rand(T, n, f.nrhs)
     Bd = dev(B)
     fresh = () -> begin
-        s = f.kind == :fused && SOLVER == "sds" ? fused_solver(Ad, view) : API.solver(Ad, f.structure, view)
+        s = f.kind == :fused && SOLVER == "sds" ? SparseDirectSolver.FusedSolver(Ad, f.structure, view) :
+            API.solver(Ad, f.structure, view)
         if f.kind == :schur  # Schur block: the last min(64, n ÷ 10) rows and columns
             API.set(s, "user_schur_indices", Cint[i > n - min(64, n ÷ 10) for i in 1:n])
         end
@@ -248,8 +185,7 @@ const BEFORE = Dict("analysis" => (), "factorization" => ("analysis",),
                     "refactorization" => ("analysis", "factorization"), "solve" => ("analysis", "factorization"))
 
 phase_name(sys, p) = p == "solve" ? sys.solve_phase : p
-run_phase(sys, st, p) = st[1] isa FusedSolver ? fused_phase(st[1], p, st[2], st[3]) :
-                        API.exec(phase_name(sys, p), st[1], st[2], st[3])
+run_phase(sys, st, p) = API.exec(phase_name(sys, p), st[1], st[2], st[3])
 
 """
     time_phase(sys, phase; samples, seconds) -> (median_s, min_s)
@@ -285,10 +221,10 @@ function measure(sys; samples, seconds, single_run_above)
     st = sys.fresh()
     foreach(p -> run_phase(sys, st, p), PHASES)
     sync()
-    info = solver_info(st[1])
+    info = API.get(st[1], "info")
     all(iszero, info) || error("info = $info after the factorization")
-    stats = (relres = sys.check(solution(st)), lu_nnz = stat(s -> API.get(s, "lu_nnz"), inner(st[1])),
-             flops = stat(API.flops, inner(st[1])), nsuperpanels = stat(s -> API.get(s, "nsuperpanels"), inner(st[1])))
+    stats = (relres = sys.check(solution(st)), lu_nnz = stat(s -> API.get(s, "lu_nnz"), st[1]),
+             flops = stat(API.flops, st[1]), nsuperpanels = stat(s -> API.get(s, "nsuperpanels"), st[1]))
     st = sys.fresh()
     once = Dict{String, Float64}()
     for p in PHASES

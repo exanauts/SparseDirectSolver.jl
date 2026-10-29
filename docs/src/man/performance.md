@@ -17,3 +17,23 @@ julia --project=bench bench/compare.jl --solver=cudss
 julia --project=bench bench/compare.jl --solver=sds --backend=cuda
 julia --project=bench/report bench/compare_report.jl
 ```
+
+## Fused pipeline
+
+[`FusedSolver`](@ref SparseDirectSolver.FusedSolver) is the fast path of the
+interior-point loop: the analysis builds a plan in which one
+dependency-counter kernel factorizes the whole elimination tree per
+refactorization (instead of one launch per level and size bin), followed by
+the inverses of the diagonal blocks of the fronts, and the solve is a
+partitioned-inverse sweep, one dependency-counter kernel per direction. The
+feature `cholesky_fused` of the comparison measures it; its analysis phase
+includes a stock factorization and building the plans.
+
+It is restricted to what the kernels do: a GPU backend (the
+dependency-counter kernels spin on resident workgroups, so the
+KernelAbstractions CPU backend is refused), real `"SPD"` matrices and real
+`"S"` matrices factored without pivoting, one right-hand side, no uniform
+batch, Schur complement, matching, iterative refinement, deterministic mode or
+mixed precision; each raises `NotSupportedError` (the docstring lists them).
+[`DirectSolver`](@ref) remains the general solver; T24–T26 move the same
+kernels under its `execute!`.

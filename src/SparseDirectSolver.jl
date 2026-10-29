@@ -84,9 +84,12 @@ include("solve/refinement.jl")
 include("solver.jl")
 include("generic.jl")
 
-# the fused pipeline (factorization mega-kernel + partitioned-inverse solve)
-# and its per-architecture tuning bundle; consumed by the MadNLP extension
+# the fused pipeline (factorization mega-kernel + partitioned-inverse solve),
+# its per-architecture tuning bundle and `FusedSolver`, the pipeline behind the
+# handle-layer verbs (the MadNLP extension's `SDSSolver` runs it)
 include("fused.jl")
+using .Fused: FusedSolver
+export FusedSolver
 
 # The MadNLP linear-solver type (SDSSolver) and its options type live in the
 # SparseDirectSolverMadNLPExt package extension (they subtype MadNLP types, so

@@ -22,9 +22,9 @@ One comparison feature. `structure` is the cuDSS structure string, `T` the
 element type, `nrhs` the right-hand sides per system. `kind` selects how the
 systems are built: `:single` (one matrix per row), `:ubatch` (uniform batch of
 `nbatch` value sets on one pattern), `:schur` (partial factorization with a
-Schur block), `:fused` (the fused factorization and partitioned-inverse solve
-of `SparseDirectSolver.Fused`, set up as the MadNLP extension's `SDSSolver`
-sets them up; cuDSS runs it as a plain `:single` system). `matrices(M)` decides
+Schur block), `:fused` (a `FusedSolver`: the fused factorization and
+partitioned-inverse solve, the inner solver of the MadNLP extension's
+`SDSSolver`; cuDSS runs it as a plain `:single` system). `matrices(M)` decides
 whether harness matrix `M` belongs to the feature. `params` are set on both
 solvers (the names mirror cuDSS), `cudss_params` and `sds_params` on one side
 only. `task` is the TASKS.md task id (`"T13"`) or the pull request (`"#126"`)
