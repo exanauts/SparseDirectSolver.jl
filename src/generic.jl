@@ -141,38 +141,42 @@ function LinearAlgebra.cholesky!(solver::DirectSolver, A; check::Bool = false)
 end
 
 # one method per argument kind: LinearAlgebra has `ldiv!` methods for `Factorization` with
-# vectors and with matrices, so a `Union` here would be ambiguous
+# vectors and with matrices, so a `Union` here would be ambiguous. On `AbstractDirectSolver`:
+# `DirectSolver` and `Fused.FusedSolver` share these through their `execute!` methods.
 for RHS in (AbstractVector, AbstractMatrix, AbstractArray{<:Any, 3}, MatrixDescriptor)
-    @eval function LinearAlgebra.ldiv!(solver::DirectSolver, B::$RHS)
+    @eval function LinearAlgebra.ldiv!(solver::AbstractDirectSolver, B::$RHS)
         execute!("solve", solver, B, B; asynchronous = false)
         return B
     end
-    @eval function LinearAlgebra.ldiv!(X::$RHS, solver::DirectSolver, B::$RHS)
+    @eval function LinearAlgebra.ldiv!(X::$RHS, solver::AbstractDirectSolver, B::$RHS)
         execute!("solve", solver, X, B; asynchronous = false)
         return X
     end
 end
 
 @doc """
-    ldiv!(solver::DirectSolver, B) -> B
-    ldiv!(X, solver::DirectSolver, B) -> X
+    ldiv!(solver::AbstractDirectSolver, B) -> B
+    ldiv!(X, solver::AbstractDirectSolver, B) -> X
 
 Solve `A X = B` with the factorization in `solver` (`"solve"`, synchronized),
-in place in `B` or into `X`. `B`, `X`: vectors, matrices,
-`n × nrhs × nbatch` arrays (uniform batch) or [`MatrixDescriptor`](@ref)s on
-the solver's backend.
-""" LinearAlgebra.ldiv!(::DirectSolver, ::AbstractVector)
+in place in `B` or into `X`. For a [`DirectSolver`](@ref), `B`, `X`: vectors,
+matrices, `n × nrhs × nbatch` arrays (uniform batch) or
+[`MatrixDescriptor`](@ref)s on the solver's backend; for a
+[`FusedSolver`](@ref SparseDirectSolver.Fused.FusedSolver), one right-hand side
+(a vector or an `n × 1` matrix; anything else raises `NotSupportedError`).
+""" LinearAlgebra.ldiv!(::AbstractDirectSolver, ::AbstractVector)
 
 """
     solver \\ B
 
-`ldiv!(similar(B), solver, B)` for a vector, matrix or `n × nrhs × nbatch` array `B`.
+`ldiv!(similar(B), solver, B)` for a vector, matrix or `n × nrhs × nbatch` array `B`
+(any `AbstractDirectSolver`; see `ldiv!` for what each solver type accepts).
 """
-Base.:\(solver::DirectSolver, B::AbstractVector) = ldiv!(similar(B), solver, B)
-Base.:\(solver::DirectSolver, B::AbstractMatrix) = ldiv!(similar(B), solver, B)
-Base.:\(solver::DirectSolver, B::AbstractArray{<:Any, 3}) = ldiv!(similar(B), solver, B)
+Base.:\(solver::AbstractDirectSolver, B::AbstractVector) = ldiv!(similar(B), solver, B)
+Base.:\(solver::AbstractDirectSolver, B::AbstractMatrix) = ldiv!(similar(B), solver, B)
+Base.:\(solver::AbstractDirectSolver, B::AbstractArray{<:Any, 3}) = ldiv!(similar(B), solver, B)
 # disambiguation with LinearAlgebra's real-factorization / complex-RHS method: the element types must match
-Base.:\(solver::DirectSolver{T}, B::Union{Array{Complex{T}, 1}, Array{Complex{T}, 2}}) where {T <: Union{Float32, Float64}} =
+Base.:\(solver::AbstractDirectSolver{T}, B::Union{Array{Complex{T}, 1}, Array{Complex{T}, 2}}) where {T <: Union{Float32, Float64}} =
     ldiv!(similar(B), solver, B)
 
 """

@@ -401,27 +401,8 @@ function trsm_strided_batched!(side, uplo, trans, diag, α, A::AbstractArray{<:A
     return B
 end
 
-"""
-    potrf_batched_info!(uplo, A, info, offset = 0; impl = :auto) -> info
-
-Uniform strided batch of [`potrf_info!`](@ref): Cholesky of the `uplo`
-triangle of every member `A[:, :, b]` of the 3-D array `A` in place, its
-status (0, or the first non-positive pivot column) into `info[offset + b]`.
-Implementations: `:vendor` (`vendor_potrf_batched!`, validated on the device
-as `potrf_info!`) and `:ka` ([`ka_potrf!`](@ref), one workgroup per member).
-Asynchronous.
-"""
-function potrf_batched_info!(uplo, A::AbstractArray{<:Any, 3}, info::AbstractVector{Int32}, offset::Integer = 0;
-                             impl::Symbol = :auto)
-    ul = _uplo_char(uplo)
-    size(A, 1) == size(A, 2) || throw(DimensionMismatch("potrf: members are $(size(A, 1))×$(size(A, 2)), not square"))
-    0 <= offset && offset + size(A, 3) <= length(info) ||
-        throw(DimensionMismatch("info has length $(length(info)) < offset $offset + batch count $(size(A, 3))"))
-    size(A, 3) == 0 && return info
-    return _potrf_batched_impl!(select_impl(:potrf_batched, A, impl), A, info, offset, ul)
-end
-
-# `potrf_batched_info!` with an already resolved implementation `p` (no capability lookup)
+# batched potrf_info! (status of member b into info[offset + b]) with an already
+# resolved implementation `p` (no capability lookup)
 function _potrf_batched_impl!(p::Symbol, A::AbstractArray{<:Any, 3}, info::AbstractVector{Int32}, offset::Integer,
                               ul::Char = 'L')
     if p === :vendor

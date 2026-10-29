@@ -244,19 +244,6 @@ end
     return nothing
 end
 
-# unit diagonals of both panels, statistics and status
-@inline function _lu_front_finish!(factor, ufactor, stats, info, ctl, li, ::Val{WG}) where {WG}
-    @inbounds begin
-        Fl, Fu = _lt_front(factor, ctl, Val(false)), _lt_front(ufactor, ctl, Val(false))
-        for j in li:WG:Int(ctl[_ST_W])
-            _fset!(Fl, j, j, one(eltype(factor)))
-            _fset!(Fu, j, j, one(eltype(factor)))
-        end
-        li == 1 && _lt_stats!(stats, info, ctl, ctl[_ST_NODE])
-    end
-    return nothing
-end
-
 """
     front_lu_kernel!(backend, WG)(factor, ufactor, stack, ustack, info, stats, d, piv, pivot_kind, aux, nzval, amap,
                                   amap_ptr, amap_src, nodes, bm, super_ptr, front_ptr, front_nrows, front_ncols,
@@ -339,7 +326,7 @@ updates its two packed contribution blocks (`cb_ptr[s] > 0`) with
     nb = bm.nbatch
     _lu_cb_update!(factor, ufactor, ctl, _mview(stack, k, nb), _mview(ustack, k, nb), coff, _mview(d, k, nb), li,
                    Val(WG), Val(false))
-    _lu_front_finish!(factor, ufactor, _mview(stats, k, nb), _iview(info, k, nb), ctl, li, Val(WG))
+    _front_finish!(_mview(stats, k, nb), _iview(info, k, nb), ctl, li, Val(WG), factor, ufactor)
 end
 
 # ---------------------------------------------------------------------------
@@ -446,11 +433,7 @@ write them to the update stacks.
     ubuf = @localmem TT (NE,)
     ctl = @localmem IT (_LT_CTL,)
     pv = @localmem TT (1,)
-    if li == 1
-        @inbounds t = trees[bm.first + _bm_node(bm, G) - 1]
-        @inbounds ctl[_ST_FIRST] = subtree_ptr[t]
-        @inbounds ctl[_ST_COUNT] = subtree_ptr[t + 1] - subtree_ptr[t]
-    end
+    li == 1 && _subtree_begin!(ctl, trees, bm, subtree_ptr, G)
     @synchronize
     for k in 1:ctl[_ST_COUNT]
         if li == 1
@@ -563,18 +546,9 @@ function factorize_lu!(N::Numeric{T}, S::Symbolic, nzval::AbstractVector; opts::
     prm.scaled && abs_max!(N.aux, nzval, batch_map(N))
     plan = N.plan
     flag = opts.user_host_interrupt
-    for k in eachindex(plan.sub_first)
-        _poll_interrupt(flag)
-        a, b = plan.sub_first[k], plan.sub_last[k]
-        _with_local_bytes(plan.sub_local[k]) do lb
-            _launch_subtrees_lu!(N, S, nzval, a, b - a + 1, prm, lb, Val(SUBTREE_WORKGROUP))
-        end
-    end
-    for k in eachindex(plan.group_first)
-        _poll_interrupt(flag)
-        a, b = plan.group_first[k], plan.group_last[k]
-        _launch_front_lu!(N, S, nzval, a, b - a + 1, plan.group_maxchild[k], prm, Val(LU_WORKGROUP))
-    end
+    sub = (a, c, lb) -> _launch_subtrees_lu!(N, S, nzval, a, c, prm, lb, Val(SUBTREE_WORKGROUP))
+    group = (k, a, b) -> _launch_front_lu!(N, S, nzval, a, b - a + 1, plan.group_maxchild[k], prm, Val(LU_WORKGROUP))
+    _factorize_groups!(N, flag, sub, group)
     assemble_schur!(N, S, nzval)
     reduce_stats!(N, S)
     return _numeric_info!(N, S, iszero(prm.eps) || prm.scaled)

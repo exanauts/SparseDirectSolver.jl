@@ -16,7 +16,7 @@ vendor sparse matrix container, so the returned [`CSR`](@ref) directly owns
 `MtlVector` index and value arrays.
 """
 function SparseDirectSolver.to_backend(A::SparseMatrixCSC, ::MetalBackend; index = INDEX_ONE)
-    eltype(A) === Float32 || throw(SparseDirectSolver.NotSupportedError(
+    eltype(A) === Float32 || throw(NotSupportedError(
         "Metal currently supports Float32 matrices; got $(eltype(A))"))
     B = CSR(A; index)
     return CSR(MtlVector(B.rowptr), MtlVector(B.colval), MtlArray(B.nzval), B.nrows, B.ncols;

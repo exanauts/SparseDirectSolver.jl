@@ -8,7 +8,6 @@
 # parent package this extension assigns in its __init__, the MadNLPGPU idiom).
 module SparseDirectSolverMadNLPExt
 
-using LinearAlgebra, SparseArrays
 using MadNLP
 using SparseDirectSolver
 const SDS = SparseDirectSolver
@@ -16,6 +15,37 @@ const KA = SDS.KernelAbstractions
 const Fused = SDS.Fused
 const SDSTuning = Fused.SDSTuning
 
+"""
+    SDSSolverOptions(; sds_factorization = :cholesky, sds_pivoting = :none,
+                       sds_pivot_threshold = nothing, sds_reordering = "algo4",
+                       sds_tuning = nothing, sds_user_perm = nothing)
+
+The MadNLP options of [`SDSSolver`](@ref), passed as keywords of `madnlp` or
+in an `SDSSolverOptions`. Available as `SparseDirectSolver.SDSSolverOptions`
+once MadNLP is loaded.
+
+* `sds_factorization::Symbol = :cholesky`: `:cholesky` factors the KKT matrix
+  as `"SPD"` (the condensed-KKT default); `:ldl` as `"S"`, `L D Lᵀ`, and
+  reports the true inertia from the signs of `D`.
+* `sds_pivoting::Symbol = :none`: `:ldl` only. `:none` factors in identity
+  pivot order through the fused pipeline (a [`FusedSolver`](@ref SparseDirectSolver.FusedSolver));
+  `:bk` runs the stock in-front Bunch–Kaufman path of a
+  [`DirectSolver`](@ref SparseDirectSolver.DirectSolver): more robust on
+  ill-conditioned KKT systems, at the level-batched speed of the handle API.
+* `sds_pivot_threshold::Union{Nothing, Float64} = nothing`: `:bk` only, the
+  `pivot_threshold` of the in-front acceptance test (`nothing` keeps the
+  package default `0.01`; cuDSS's default is `1.0`).
+* `sds_reordering::String = "algo4"`: the `reordering_alg` of the analysis
+  (`"algo4"` nested dissection, `"algo3"` AMD, `"default"` the cost-model
+  choice).
+* `sds_tuning::Union{Nothing, SDSTuning} = nothing`: a
+  [`SDSTuning`](@ref SparseDirectSolver.Fused.SDSTuning) bundle of performance
+  knobs; `nothing` selects the per-architecture profile of
+  [`default_tuning`](@ref SparseDirectSolver.Fused.default_tuning).
+* `sds_user_perm::Union{Nothing, Vector{Int}} = nothing`: a 1-based
+  permutation of length `n` that replaces the reordering (`user_perm`); every
+  solver instance otherwise recomputes its ordering.
+"""
 Base.@kwdef mutable struct SDSSolverOptions <: MadNLP.AbstractOptions
     # :cholesky (SPD; the condensed-KKT default) or :ldl (no-pivot LDL^T: factors
     # indefinite matrices and reports TRUE inertia from the signs of D)
@@ -88,7 +118,7 @@ function SDSSolver(
         # the stock path is the whole pipeline: pivot_type AUTO (Bunch-Kaufman for "S") and
         # the default 2x2 pivot pairs; a user threshold reaches the in-front acceptance test
         backend = KA.get_backend(csc.nzVal)
-        t = Fused.resolve_tuning(something(opt.sds_tuning, Fused.default_tuning(backend)), backend)
+        t = Fused._resolved_tuning(opt.sds_tuning, backend)
         d = SDS.DirectSolver(csc.colPtr, csc.rowVal, csc.nzVal, "S", 'U')
         opt.sds_pivot_threshold !== nothing && SDS.setparam!(d, "pivot_threshold", opt.sds_pivot_threshold)
         Fused._apply_tuning!(d, t)
@@ -133,7 +163,8 @@ function MadNLP.inertia(M::SDSSolver)
     return (Int(npos), n - Int(npos) - Int(nneg), Int(nneg))
 end
 MadNLP.improve!(::SDSSolver) = false
-MadNLP.introduce(::SDSSolver) = "SparseDirectSolver.jl (fused pipeline)"
+MadNLP.introduce(M::SDSSolver) = M.inner isa SDS.FusedSolver ? "SparseDirectSolver.jl (fused pipeline)" :
+                                 "SparseDirectSolver.jl (Bunch-Kaufman LDLᵀ, DirectSolver)"
 MadNLP.is_supported(::Type{SDSSolver}, ::Type{Float32}) = true
 MadNLP.is_supported(::Type{SDSSolver}, ::Type{Float64}) = true
 

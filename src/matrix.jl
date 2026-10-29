@@ -294,3 +294,163 @@ function update!(desc::MatrixDescriptor{T, A}, x::AbstractArray) where {T, A}
     desc.data = x
     return desc
 end
+
+# ---------------------------------------------------------------------------
+# glue for the sparse types of a vendor backend (expanded in `ext/`)
+
+_glue_name(ex::Symbol) = string(ex)
+_glue_name(ex::Expr) = Meta.isexpr(ex, :., 2) && ex.args[2] isa QuoteNode ? string(ex.args[2].value) :
+                       throw(ArgumentError("@vendor_sparse_glue: expected a (qualified) type name, got $ex"))
+
+"""
+    @vendor_sparse_glue(CSRType, CSCType, VecType, ArrType, device = "…", cudss = true)
+    @vendor_sparse_glue(CSRType, CSCType, VecType, ArrType, device = "…", platform = "…")
+
+Define, in the calling module (a backend extension), the glue between the
+backend's sparse matrices and the package, each method with its docstring:
+
+* `CSR(::CSRType)` and `CSR(::CSCType)`: zero-copy wraps (`index = INDEX_ONE`;
+  the CSC one as the CSR of the transpose, `transposed = true`);
+* `CSRType(::CSR{T, INT, <:VecType{INT}, <:ArrType{T}})`: the stored CSR matrix
+  (batches rejected, zero-based index arrays rebased, matrix `nzval` flattened);
+* `DirectSolver(::CSRType / ::CSCType, structure, view; index)` and
+  `update!(::DirectSolver, ::Union{CSRType, CSCType})`;
+* `LinearAlgebra.cholesky` (bare, `Symmetric` for real `T`, `Hermitian`),
+  `ldlt` (bare, `Symmetric` for real `T`, `Hermitian`) and `lu` on `CSRType`.
+
+`CSRType` is the qualified name of the type (`cuSPARSE.CuSparseMatrixCSR`), since
+the constructor method extends it. `device` names the hardware in the docstrings
+("GPU", "AMD GPU", …); `cudss = true` adds the cuDSS equivalents to them, else
+`platform` ("ROCm", …) names the backend as the twin of the CUDA methods. Every
+package and `LinearAlgebra` name in the expansion is qualified, so the extension
+needs no imports beyond the four type names.
+"""
+macro vendor_sparse_glue(csr, csc, vec, arr, kwargs...)
+    opts = Dict{Symbol, Any}(:cudss => false, :platform => nothing, :device => nothing)
+    for kw in kwargs
+        Meta.isexpr(kw, :(=), 2) && haskey(opts, kw.args[1]) ||
+            throw(ArgumentError("@vendor_sparse_glue: unknown option $kw"))
+        opts[kw.args[1]] = kw.args[2]
+    end
+    device, cudss, platform = opts[:device], opts[:cudss], opts[:platform]
+    device isa String || throw(ArgumentError("@vendor_sparse_glue: `device = \"…\"` is required"))
+    cudss isa Bool || throw(ArgumentError("@vendor_sparse_glue: `cudss` must be a literal Bool"))
+    cudss || platform isa String ||
+        throw(ArgumentError("@vendor_sparse_glue: `platform = \"…\"` is required without `cudss = true`"))
+    SDS, LA = SparseDirectSolver, LinearAlgebra
+    ncsr, ncsc = _glue_name(csr), _glue_name(csc)
+    eq(f) = cudss ? " (≅ CUDSS.jl's `$f`)" : ""
+
+    doc_csr = """
+        CSR(A::$ncsr)
+
+    Wrap `A` without copying: the `CSR` shares `rowPtr`, `colVal` and `nzVal`
+    (one-based, `transposed = false`).
+    """
+    doc_csc = """
+        CSR(A::$ncsc)
+
+    Wrap `A` (`m × n`) without copying as the CSR of `transpose(A)` (`n × m`,
+    `transposed = true`), sharing `colPtr`, `rowVal` and `nzVal`.
+    """
+    doc_back = """
+        $ncsr(A::CSR)
+
+    The stored CSR matrix of `A` (the `transposed` flag is not applied) as a
+    `$ncsr`. One-based arrays are shared; zero-based index arrays are
+    copied and rebased. Batches (`nbatch(A) > 1`) are rejected.
+    """
+    twin = cudss ? "≅ `CudssSolver(A, structure, view)`" :
+           "the $platform twin of\n`DirectSolver(::CuSparseMatrixCSR, …)`"
+    madnlp = cudss ? "\n(MadNLP's lower-triangle CSC becomes an upper-triangle CSR)," : ","
+    doc_solver = """
+        DirectSolver(A::$ncsr, structure::String, view::Char; index = 'O')
+        DirectSolver(A::$ncsc, structure::String, view::Char; index = 'O')
+
+    Solver on `A`'s arrays, without copies ($twin). A
+    `$ncsc` is read as the CSR of its transpose with the view flipped$madnlp see
+    [`DirectSolver`](@ref).
+    """
+    upd = cudss ? " (≅ `cudss_update(solver, A)`)" : ""
+    doc_update = """
+        update!(solver::DirectSolver, A::$ncsr)
+        update!(solver::DirectSolver, A::$ncsc)
+
+    Point `solver` at the arrays of `A`$upd, see
+    [`update!`](@ref SparseDirectSolver.update!).
+    """
+    doc_chol = """
+        cholesky(A::$ncsr, NoPivot(); view = 'F', check = false) -> DirectSolver
+        cholesky(Symmetric(A::$ncsr)) / cholesky(Hermitian(A::$ncsr))
+
+    LLᵀ/LLᴴ factorization of `A` on the $device$(eq("cholesky")); the wrappers
+    pass their `uplo` as the view. See `cholesky(::CSR)`.
+    """
+    doc_ldlt = """
+        ldlt(A::$ncsr; view = 'F', check = false) -> DirectSolver
+        ldlt(Symmetric(A::$ncsr)) / ldlt(Hermitian(A::$ncsr))
+
+    LDLᵀ/LDLᴴ factorization of `A` on the $device$(eq("ldlt")); the wrappers
+    pass their `uplo` as the view. See `ldlt(::CSR)`.
+    """
+    doc_lu = """
+        lu(A::$ncsr; check = false) -> DirectSolver
+
+    `L D U` factorization (structure `"G"`) of `A` on the $device$(eq("lu")).
+    See `lu(::CSR)`.
+    """
+
+    ex = quote
+        Core.@doc $doc_csr function $SDS.CSR(A::$csr)
+            m, n = size(A)
+            return $SDS.CSR(A.rowPtr, A.colVal, A.nzVal, m, n; index = $SDS.INDEX_ONE, transposed = false)
+        end
+
+        Core.@doc $doc_csc function $SDS.CSR(A::$csc)
+            m, n = size(A)
+            return $SDS.CSR(A.colPtr, A.rowVal, A.nzVal, n, m; index = $SDS.INDEX_ONE, transposed = true)
+        end
+
+        Core.@doc $doc_back function $csr(A::$SDS.CSR{T, INT, <:$vec{INT}, <:$arr{T}}) where {T, INT}
+            $SDS.nbatch(A) == 1 ||
+                throw($SDS.InvalidValueError("cannot convert a batch of $($SDS.nbatch(A)) matrices to " * $ncsr))
+            nzval = A.nzval isa $vec ? A.nzval : vec(A.nzval)
+            rowptr, colval = A.rowptr, A.colval
+            if A.index == $SDS.INDEX_ZERO
+                rowptr = rowptr .+ one(INT)
+                colval = colval .+ one(INT)
+            end
+            return $csr{T, INT}(rowptr, colval, nzval, (A.nrows, A.ncols))
+        end
+
+        Core.@doc $doc_solver $SDS.DirectSolver(A::$csr, structure, view; index = $SDS.INDEX_ONE) =
+            $SDS.DirectSolver($SDS.CSR(A), structure, view; index)
+        $SDS.DirectSolver(A::$csc, structure, view; index = $SDS.INDEX_ONE) =
+            $SDS.DirectSolver($SDS.CSR(A), structure, view; index)
+
+        Core.@doc $doc_update $SDS.update!(solver::$SDS.DirectSolver, A::Union{$csr, $csc}) =
+            $SDS.update!(solver, $SDS.CSR(A))
+
+        Core.@doc $doc_chol $LA.cholesky(A::$csr, p::$LA.NoPivot = $LA.NoPivot(); view::Char = 'F',
+                                         check::Bool = false) =
+            $LA.cholesky($SDS.CSR(A), p; view, check)
+        $LA.cholesky(A::$LA.Symmetric{T, <:$csr{T}}, p::$LA.NoPivot = $LA.NoPivot();
+                     check::Bool = false) where {T <: Union{Float32, Float64}} =
+            $LA.cholesky($SDS.CSR(A.data), p; view = A.uplo, check)
+        $LA.cholesky(A::$LA.Hermitian{T, <:$csr{T}}, p::$LA.NoPivot = $LA.NoPivot();
+                     check::Bool = false) where {T} =
+            $LA.cholesky($SDS.CSR(A.data), p; view = A.uplo, check)
+
+        Core.@doc $doc_ldlt $LA.ldlt(A::$csr; view::Char = 'F', check::Bool = false) =
+            $LA.ldlt($SDS.CSR(A); view, check)
+        $LA.ldlt(A::$LA.Symmetric{T, <:$csr{T}}; check::Bool = false) where {T <: Real} =
+            $LA.ldlt($SDS.CSR(A.data); view = A.uplo, check)
+        $LA.ldlt(A::$LA.Hermitian{T, <:$csr{T}}; check::Bool = false) where {T} =
+            $LA.ldlt($SDS.CSR(A.data); view = A.uplo, check)
+
+        Core.@doc $doc_lu $LA.lu(A::$csr; check::Bool = false) = $LA.lu($SDS.CSR(A); check)
+
+        nothing
+    end
+    return esc(ex)
+end

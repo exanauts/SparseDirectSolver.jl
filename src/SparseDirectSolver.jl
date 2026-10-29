@@ -10,8 +10,6 @@ module SparseDirectSolver
 using Adapt
 using Atomix
 using CliqueTrees
-using GPUArrays
-using GPUArraysCore
 using KernelAbstractions
 using LinearAlgebra
 using SparseArrays

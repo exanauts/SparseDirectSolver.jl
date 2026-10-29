@@ -955,12 +955,14 @@ end
     return nothing
 end
 
-# unit diagonal of the panel, statistics and status
-@inline function _lt_front_finish!(factor, stats, info, ctl, li, ::Val{WG}) where {WG}
+# unit diagonal of each panel in `factors` (`(factor,)` for LDLᵀ, `(factor, ufactor)` for LU),
+# statistics and status
+@inline function _front_finish!(stats, info, ctl, li, ::Val{WG}, factors::Vararg{Any, NF}) where {WG, NF}
     @inbounds begin
-        F = _lt_front(factor, ctl, Val(false))
+        Fs = map(F -> _lt_front(F, ctl, Val(false)), factors)     # tuple map/foreach: unrolled, no allocation
+        o = one(eltype(first(factors)))
         for j in li:WG:Int(ctl[_ST_W])
-            _fset!(F, j, j, one(eltype(factor)))
+            foreach(F -> _fset!(F, j, j, o), Fs)
         end
         li == 1 && _lt_stats!(stats, info, ctl, ctl[_ST_NODE])
     end
@@ -1105,42 +1107,11 @@ statistics, updates its packed contribution block on the update stack
     nb = bm.nbatch
     _lt_cb_update!(factor, ctl, _mview(stack, k, nb), coff, _mview(d, k, nb), _mview(pivot_kind, k, nb), li, Val(WG),
                    Val(false), Val(HERM))
-    _lt_front_finish!(factor, _mview(stats, k, nb), _iview(info, k, nb), ctl, li, Val(WG))
+    _front_finish!(_mview(stats, k, nb), _iview(info, k, nb), ctl, li, Val(WG), factor)
 end
 
 # ---------------------------------------------------------------------------
 # regime A: one workgroup per subtree, fronts in local memory
-
-# offset (0-based) of the trailing packed m×m triangle of the local packed front
-@inline _lt_local_cb_offset(ctl) =
-    @inbounds Int(ctl[_ST_LF]) - 1 + Int(ctl[_ST_W]) * (2 * Int(ctl[_ST_F]) - Int(ctl[_ST_W]) + 1) ÷ 2
-
-# write the unit-lower panel, statistics and status; the subtree root writes its contribution block
-@inline function _lt_subtree_write!(factor, stack, info, stats, buf, ctl, front_ptr, cb_ptr, li, ::Val{WG}) where {WG}
-    @inbounds begin
-        v = ctl[_ST_NODE]
-        f = Int(ctl[_ST_F])
-        w = Int(ctl[_ST_W])
-        lf = Int(ctl[_ST_LF]) - 1
-        p0 = Int(front_ptr[v])
-        T = eltype(factor)
-        for q in (li - 1):WG:(f * w - 1)
-            j = q ÷ f + 1
-            i = q - (j - 1) * f + 1
-            factor[p0 + q] = i > j ? buf[lf + _packed(i, j, f)] : i == j ? one(T) : zero(T)
-        end
-        li == 1 && _lt_stats!(stats, info, ctl, v)
-        c0 = cb_ptr[v]
-        if c0 > 0
-            m = f - w
-            src = _lt_local_cb_offset(ctl) + 1
-            for q in (li - 1):WG:(m * (m + 1) ÷ 2 - 1)
-                stack[c0 + q] = buf[src + q]
-            end
-        end
-    end
-    return nothing
-end
 
 """
     subtree_ldlt_kernel!(backend, WG)(factor, stack, info, stats, d, piv, pivot_kind, psign, perm, aux, nzval, amap,
@@ -1173,11 +1144,7 @@ stack.
     pv = @localmem TT (_LT_NPV,)
     red = @localmem R (3 * _LT_S1,)
     redi = @localmem IT (2 * _LT_S1,)
-    if li == 1
-        @inbounds t = trees[bm.first + _bm_node(bm, G) - 1]
-        @inbounds ctl[_ST_FIRST] = subtree_ptr[t]
-        @inbounds ctl[_ST_COUNT] = subtree_ptr[t + 1] - subtree_ptr[t]
-    end
+    li == 1 && _subtree_begin!(ctl, trees, bm, subtree_ptr, G)
     @synchronize
     for k in 1:ctl[_ST_COUNT]
         if li == 1
@@ -1249,8 +1216,9 @@ stack.
         @synchronize
         mb = _bm_gmember(bm, G)
         nb = bm.nbatch
-        _lt_subtree_write!(factor, _mview(stack, mb, nb), _iview(info, mb, nb), _mview(stats, mb, nb), buf, ctl,
-                           member_panels(front_ptr, mb, nb), cb_ptr, li, Val(WG))
+        _subtree_write!(factor, _mview(stack, mb, nb), _iview(info, mb, nb), buf, ctl, member_panels(front_ptr, mb, nb),
+                        cb_ptr, li, Val(WG), Val(true))
+        li == 1 && _lt_stats!(_mview(stats, mb, nb), _iview(info, mb, nb), ctl, ctl[_ST_NODE])
         @synchronize
         for r in 1:ctl[_ST_ROUNDS]
             _subtree_move!(buf, ctl, r, li, Val(WG))
@@ -1416,16 +1384,8 @@ end
 function _factorize_ldlt_groups!(N::Numeric, S::Symbolic, nzval::AbstractVector, prm, flag, gimpl::Symbol,
                                  nbv::Val, herm::Val)
     plan = N.plan
-    for k in eachindex(plan.sub_first)
-        _poll_interrupt(flag)
-        a, b = plan.sub_first[k], plan.sub_last[k]
-        _with_local_bytes(plan.sub_local[k]) do lb
-            _launch_subtrees_ldlt!(N, S, nzval, a, b - a + 1, prm, lb, Val(SUBTREE_WORKGROUP))
-        end
-    end
-    for k in eachindex(plan.group_first)
-        _poll_interrupt(flag)
-        a, b = plan.group_first[k], plan.group_last[k]
+    sub = (a, c, lb) -> _launch_subtrees_ldlt!(N, S, nzval, a, c, prm, lb, Val(SUBTREE_WORKGROUP))
+    group = function (k, a, b)
         W = plan.group_width[k]
         if W == 0 || ldlt_blocked_path(S.schedule, S.schedule.group_nodes[a])   # blocked steps and GEMMs (ldlt_c.jl)
             _factorize_ldlt_c_group!(N, S, nzval, a, b, plan.group_maxchild[k], prm, gimpl, nbv, herm)
@@ -1436,7 +1396,9 @@ function _factorize_ldlt_groups!(N::Numeric, S::Symbolic, nzval::AbstractVector,
                 _launch_front_ldlt!(N, S, nzval, a, b - a + 1, plan.group_maxchild[k], prm, w, Val(LDLT_WORKGROUP))
             end
         end
+        return nothing
     end
+    _factorize_groups!(N, flag, sub, group)
     return nothing
 end
 

@@ -529,7 +529,7 @@ _format_option(x) = x
 
 function _warn_deferred(name, value)
     @warn "parameter \"$name\" = $(repr(value)) is accepted but has no effect yet " *
-          "(hybrid modes are planned for milestone M12)" maxlog = 1 _id = Symbol("deferred_", name)
+          "(hybrid modes are planned for T27)" maxlog = 1 _id = Symbol("deferred_", name)
     return nothing
 end
 
