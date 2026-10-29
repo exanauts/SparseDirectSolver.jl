@@ -2,13 +2,6 @@
 # kernels must produce ELEMENT-IDENTICAL results to the host originals, on
 # every backend (the CPU backend runs the same kernels through KA).
 
-random_pattern_csr(n, density, view) = begin
-    A = random_spd(Float64, n, density)
-    T = view == 'U' ? triu(A) : tril(A)
-    C = SDS.CSR(SparseMatrixCSC{Float64, Int}(T))
-    (Vector{Int}(C.rowptr), Vector{Int}(C.colval))
-end
-
 @testset "device symbolic maps ($(backend_name(backend)))" for backend in BACKENDS
     for (n, density) in ((0, 0.0), (1, 0.0), (40, 0.15), (300, 0.02), (1500, 0.004)),
         view in ('L', 'U'), structure in ("SPD", "S")

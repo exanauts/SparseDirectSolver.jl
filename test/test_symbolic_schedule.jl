@@ -189,8 +189,6 @@ function reconstruct_pull(S::SDS.Symbolic, nzval::AbstractVector{T}) where {T}
     return buf
 end
 
-triangle(A, view) = view == 'L' ? tril(A) : view == 'U' ? triu(A) : A
-
 @testset "options: schedule tuning knobs" begin
     opts = Options(regime_c_width = 128, regime_c_rows = 1024, subtree_budgets = (48 * 1024, 16 * 1024),
                    memory_budget = 1 << 20)
@@ -382,7 +380,7 @@ end
     @test A == (structure == "S" ? transpose(A) : A')
     for opts in (Options(), Options(use_superpanels = 0, subtree_budgets = Int[]),
                  Options(regime_c_width = 8, regime_c_rows = 16, memory_budget = 64))
-        C = SDS.CSR(triangle(A, view); index)
+        C = SDS.CSR(triangle_view(A, view); index)
         S = SDS.symbolic_analysis(C, structure, view; opts)
         perm = S.partition.perm
         ref = dropzeros!(tril(A[perm, perm]))

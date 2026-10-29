@@ -11,8 +11,6 @@ solve_matrices(::Type{T}) where {T} =
 
 solve_rhs(::Type{T}, n, nrhs) where {T} = nrhs == 1 ? rand(T, n) : rand(T, n, nrhs)
 
-nregime(S, r) = count(==(r), S.schedule.regime)
-
 solve_allocated(x, ws, S, N, b; kwargs...) = @allocated SDS.sweep_solve!(x, ws, S, N, b; kwargs...)
 
 RUN_SHARED && @testset "solve plan and workspace" begin

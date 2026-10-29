@@ -345,6 +345,20 @@ function numeric_alloc_budget(S, ::Type{T}) where {T}
 end
 
 """
+    nregime(S, r) -> Int
+
+Number of supernodes of the analysis `S` that the schedule assigns to regime `r`
+(`SparseDirectSolver.REGIME_A`, `REGIME_B` or `REGIME_C`).
+"""
+nregime(S, r) = count(==(r), S.schedule.regime)
+
+# bytes allocated by one `factorize!(N, S, nz)`, checked against `numeric_alloc_budget`; one (identical)
+# function per numeric test file (T09 regime C, T10 regime B, T11 regime A)
+numeric_a_allocated(N, S, nz) = @allocated SparseDirectSolver.factorize!(N, S, nz)
+numeric_b_allocated(N, S, nz) = @allocated SparseDirectSolver.factorize!(N, S, nz)
+numeric_c_allocated(N, S, nz) = @allocated SparseDirectSolver.factorize!(N, S, nz)
+
+"""
     pack_lower(C) -> Vector
 
 Column-major packed lower triangle of the square matrix `C` (`m(m+1)/2`
@@ -455,6 +469,10 @@ function ldlt_backward_error(A, S, N; herm = true)
 end
 
 ldlt_factor_tol(::Type{T}) where {T} = real(T) == Float64 ? 1.0e-10 : tol(T)
+
+# tolerance of the CPU reference Cholesky ‖P A Pᵀ − L Lᴴ‖_F / ‖A‖_F (T08): tighter than `ldlt_factor_tol`
+# (no pivoting, hence no element growth)
+cholesky_factor_tol(::Type{T}) where {T} = real(T) == Float64 ? 1.0e-12 : 1.0e-5
 
 # (npos, nneg) of the eigenvalues (test/utils.jl), requiring no zero eigenvalue
 function eigen_npos_nneg(A)

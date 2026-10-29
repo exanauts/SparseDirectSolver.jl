@@ -13,10 +13,6 @@ numeric_b_matrices(::Type{T}) where {T} =
      ("laplacian3d(10,10,10)", laplacian3d(T, 10, 10, 10), NUMERIC_B_OPTS),
      ("laplacian3d(10,10,10) B+C", laplacian3d(T, 10, 10, 10), NUMERIC_BC_OPTS))
 
-numeric_b_allocated(N, S, nz) = @allocated SDS.factorize!(N, S, nz)
-
-nregime(S, r) = count(==(r), S.schedule.regime)
-
 RUN_SHARED && @testset "plan: regime-B groups" begin
     for opts in (NUMERIC_B_OPTS, NUMERIC_BC_OPTS, Options(subtree_budgets = Int[], regime_c_width = 128))
         A = laplacian3d(Float64, 10, 10, 10)
