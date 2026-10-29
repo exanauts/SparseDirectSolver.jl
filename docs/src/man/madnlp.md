@@ -79,4 +79,4 @@ madnlp(model; linear_solver = SDSSolver, sds_tuning = tuning,
 ```
 
 The bundle and its defaults are documented on the
-[Fused pipeline](@ref) page.
+[Fused pipeline](../lib/fused.md) page.

@@ -2135,11 +2135,11 @@ const FUSED_FORWARDED = ("perm_reorder_row", "perm_reorder_col", "perm_row", "pe
 The fused pipeline of `SparseDirectSolver.Fused` (dependency-counter
 factorization mega-kernel and partitioned-inverse solve, the `SDSSolver` path
 of the MadNLP extension) as an `AbstractDirectSolver`, driven by the same verbs
-as [`DirectSolver`](@ref): [`execute!`](@ref), [`analyze!`](@ref),
-[`factorize!`](@ref), [`refactorize!`](@ref), [`solve!`](@ref),
-[`setparam!`](@ref), [`getparam`](@ref), [`update!`](@ref), `ldiv!` and `\\`
-for one right-hand side. `A` is anything [`DirectSolver`](@ref) accepts with
-these arguments (a [`CSR`](@ref), `CuSparseMatrixCSR`/`CuSparseMatrixCSC`,
+as [`DirectSolver`](@ref SparseDirectSolver.DirectSolver): [`execute!`](@ref SparseDirectSolver.execute!), [`analyze!`](@ref SparseDirectSolver.analyze!),
+[`factorize!`](@ref SparseDirectSolver.factorize!), [`refactorize!`](@ref SparseDirectSolver.refactorize!), [`solve!`](@ref SparseDirectSolver.solve!),
+[`setparam!`](@ref SparseDirectSolver.setparam!), [`getparam`](@ref SparseDirectSolver.getparam), [`update!`](@ref SparseDirectSolver.update!), `ldiv!` and `\\`
+for one right-hand side. `A` is anything [`DirectSolver`](@ref SparseDirectSolver.DirectSolver) accepts with
+these arguments (a [`CSR`](@ref SparseDirectSolver.CSR), `CuSparseMatrixCSR`/`CuSparseMatrixCSC`,
 `ROCSparseMatrixCSR`, …) on a GPU backend; the values alias the caller's
 `nzval`, so writing new values into it and calling `refactorize!` is the
 interior-point loop (`update!` with the same pattern is forwarded).
@@ -2180,7 +2180,7 @@ returns `"info"`, `"inertia"` (`(npos, nneg)`; `"SPD"`: the positive pivots and
 `"lu_nnz"`, `"flops"`, `"nsuperpanels"`, `"memory_estimates"` of the inner
 solver, and the configuration parameters.
 
-Everything the pipeline does not do raises [`NotSupportedError`](@ref), at
+Everything the pipeline does not do raises [`NotSupportedError`](@ref SparseDirectSolver.NotSupportedError), at
 construction or in the phase, never a silent switch to the stock path: the
 KernelAbstractions `CPU()` backend (the dependency-counter kernels spin on
 resident workgroups, which the CPU backend runs one after another), complex
@@ -2192,7 +2192,7 @@ Schur mode, `matching_alg ≠ "default"`, `ir_n_steps > 0`,
 a `factor_precision` other than the working precision, `"S"` with
 `pivot_type ≠ 'N'`, a matrix without a front of width ≤ 256 for the fused
 solve, and every `setparam!` name not listed above. The options of the inner
-solver are checked again at the analysis. [`DirectSolver`](@ref) remains the
+solver are checked again at the analysis. [`DirectSolver`](@ref SparseDirectSolver.DirectSolver) remains the
 general solver.
 """
 mutable struct FusedSolver{T, INT, S <: SDS.DirectSolver{T, INT}} <: SDS.AbstractDirectSolver{T, INT}
