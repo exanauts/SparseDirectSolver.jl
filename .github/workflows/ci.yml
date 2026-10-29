@@ -73,11 +73,12 @@ jobs:
         julia-version: ['1']
         julia-arch: [x64]
         # Every leg must pass: the AMDGPU extension (T23) runs the suite on
-        # ROCBackend with rocBLAS/rocSOLVER, the oneAPI extension (T31) on
-        # oneAPIBackend with oneMKL (the runner `headroom`); test/backends.jl adds
-        # each backend when its package is functional. Making a check required is
-        # a branch ruleset setting of the owner.
-        backend: ['cuda', 'amdgpu', 'oneapi']
+        # ROCBackend with rocBLAS/rocSOLVER; test/backends.jl adds each backend
+        # when its package is functional. The oneAPI extension (T31) is tested on
+        # Aurora through ALCF GitLab CI (.gitlab-ci.yml, alcf.yml, alcf-report.yml),
+        # which replaced the `oneapi` leg on the runner `headroom`. Making a check
+        # required is a branch ruleset setting of the owner.
+        backend: ['cuda', 'amdgpu']
     runs-on: [self-hosted, linux, X64, gpu, '${{ matrix.backend }}']
 
     steps:
@@ -96,11 +97,6 @@ jobs:
         if: matrix.backend == 'amdgpu'
         run: |
           julia --project=test -e 'using Pkg; Pkg.add("AMDGPU")'
-      - name: Add oneAPI.jl to the test environment
-        if: matrix.backend == 'oneapi'
-        run: |
-          julia --project=test -e 'using Pkg; Pkg.add("oneAPI")'
-          julia --project=test -e 'using oneAPI; oneAPI.versioninfo()'
       - uses: julia-actions/julia-runtest@latest
       - uses: julia-actions/julia-processcoverage@v1
       - uses: codecov/codecov-action@v4

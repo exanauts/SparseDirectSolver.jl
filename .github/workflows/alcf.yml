@@ -1,0 +1,180 @@
+name: ALCF CI
+
+# Bridges GitHub to ALCF GitLab CI (https://gitlab-ci.alcf.anl.gov/mschanen/SparseDirectSolver-jl),
+# which pull-mirrors this repository and runs the LTS-stack test suite on Aurora (see
+# .gitlab-ci.yml). This workflow only starts the GitLab pipeline and sets the commit status
+# `ALCF / LTS stack (Aurora)` to pending; alcf-report.yml, which GitLab calls when the
+# pipeline finishes, sets the result. No runner waits for the pipeline.
+#
+#  - push to main / same-repo PRs: the mirror already carries the branch; force a mirror
+#    sync (instead of waiting for the ~30 min schedule), which creates the pipeline.
+#  - fork PRs: never run automatically — GitLab CI jobs execute as an ALCF user on
+#    Aurora, so running fork code is opt-in. A maintainer applies the 'alcf-ci' label,
+#    which pushes the PR head to GitLab as branch gh-pr-<N> and triggers a pipeline.
+#    Re-apply the label to re-run after new pushes. This workflow only moves refs; it
+#    never checks out or executes PR code.
+#
+# The push uses ci.skip and the pipeline is created through a pipeline trigger token
+# (ALCF_GITLAB_TRIGGER_TOKEN secret) instead: ALCF_GITLAB_TOKEN is a project access
+# token, i.e. a bot user, and ALCF's Jacamar runners refuse bot-attributed pipelines
+# ("bot account token used for job, unsupported by runner"). Trigger-token pipelines
+# run as the user who created the token, which Jacamar accepts.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  pull_request_target:
+    types: [labeled]
+
+permissions:
+  contents: read
+  statuses: write  # the pending status
+  actions: write   # re-dispatching alcf-report.yml for an already finished pipeline
+
+jobs:
+  aurora:
+    name: LTS stack (ALCF GitLab CI, Aurora)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # On the job rather than the workflow, so that runs whose job is skipped (e.g. a same-repo
+    # PR being labeled) don't cancel the one actually starting the pipeline.
+    concurrency:
+      group: alcf-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository) ||
+      (github.event_name == 'pull_request_target' &&
+       github.event.label.name == 'alcf-ci' &&
+       github.event.pull_request.head.repo.full_name != github.repository)
+    env:
+      GITLAB_HOST: gitlab-ci.alcf.anl.gov
+      GITLAB_PROJECT: mschanen/SparseDirectSolver-jl
+      API: https://gitlab-ci.alcf.anl.gov/api/v4/projects/276
+      GITLAB_TOKEN: ${{ secrets.ALCF_GITLAB_TOKEN }}
+      GITLAB_TRIGGER_TOKEN: ${{ secrets.ALCF_GITLAB_TRIGGER_TOKEN }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      CONTEXT: ALCF / LTS stack (Aurora)
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Push fork PR head to GitLab (label-gated)
+        if: github.event_name == 'pull_request_target'
+        env:
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          if [ -z "$GITLAB_TRIGGER_TOKEN" ]; then
+            echo "::error::ALCF_GITLAB_TRIGGER_TOKEN secret not set (create a pipeline trigger token in the GitLab project settings)"
+            exit 1
+          fi
+          git init -q head && cd head
+          git fetch -q "https://github.com/$GITHUB_REPOSITORY" "pull/$PR/head"
+          if [ "$(git rev-parse FETCH_HEAD)" != "$HEAD_SHA" ]; then
+            echo "::error::PR head moved since labeling; re-apply the label"
+            exit 1
+          fi
+          # ci.skip: a push pipeline would be attributed to the project access token's
+          # bot user, which the Jacamar runners refuse (see header comment). Move the
+          # ref only, then create the pipeline via the trigger token below.
+          git push -q -f -o ci.skip \
+            "https://oauth2:${GITLAB_TOKEN}@${GITLAB_HOST}/${GITLAB_PROJECT}.git" \
+            "FETCH_HEAD:refs/heads/gh-pr-$PR"
+          RESP=$(curl -sS -X POST "$API/trigger/pipeline" \
+            -F "token=${GITLAB_TRIGGER_TOKEN}" -F "ref=gh-pr-$PR")
+          if ! echo "$RESP" | jq -e '.id' >/dev/null 2>&1; then
+            echo "::error::failed to trigger GitLab pipeline: $RESP"
+            exit 1
+          fi
+
+      - name: Force mirror sync
+        if: github.event_name != 'pull_request_target'
+        run: |
+          # Best-effort: if this fails, the scheduled mirror sync still triggers the
+          # pipeline, just later, and the webhook reports it whenever it finishes.
+          curl -sS -X POST -H "PRIVATE-TOKEN: ${GITLAB_TOKEN}" "$API/mirror/pull" \
+            || echo "::warning::mirror sync request failed; relying on scheduled sync"
+
+      # A mirror sync does not create a new pipeline for a SHA GitLab already has, so a
+      # plain re-run would re-adopt the old (e.g. runner-outage) result. On re-runs,
+      # create a fresh pipeline through the trigger token if the newest one for the SHA
+      # finished unsuccessfully. (Retrying the old pipeline is not an option: the retry
+      # would be attributed to the bot user, which the Jacamar runners refuse; see
+      # header comment.)
+      - name: Trigger a fresh pipeline on re-run
+        if: github.run_attempt > 1 && github.event_name != 'pull_request_target'
+        env:
+          REF: ${{ github.head_ref || github.ref_name }}
+        run: |
+          api() { curl -sS --max-time 30 -H "PRIVATE-TOKEN: ${GITLAB_TOKEN}" "$@" || true; }
+
+          # Only replace a pipeline that finished unsuccessfully. Anything else (none
+          # yet, still active, succeeded, lookup failed) is left to the steps below.
+          STATUS=$(api "$API/pipelines?sha=$HEAD_SHA&order_by=id&sort=desc&per_page=1" \
+            | jq -r '.[0].status // empty' 2>/dev/null || true)
+          case "$STATUS" in
+            failed|canceled|skipped) ;;
+            *) echo "latest pipeline for $HEAD_SHA: ${STATUS:-none}; nothing to re-trigger"; exit 0 ;;
+          esac
+          if [ -z "$GITLAB_TRIGGER_TOKEN" ]; then
+            echo "::error::ALCF_GITLAB_TRIGGER_TOKEN secret not set; cannot create a fresh pipeline"
+            exit 1
+          fi
+          # The trigger runs the ref's current tip, which must still be HEAD_SHA.
+          TIP=$(api "$API/repository/branches/$(jq -rn --arg r "$REF" '$r | @uri')" \
+            | jq -r '.commit.id // empty' 2>/dev/null || true)
+          if [ "$TIP" != "$HEAD_SHA" ]; then
+            echo "::error::$REF is at ${TIP:-unknown} on GitLab, not $HEAD_SHA; re-run the newest commit instead"
+            exit 1
+          fi
+          RESP=$(curl -sS -X POST "$API/trigger/pipeline" \
+            --form-string "token=${GITLAB_TRIGGER_TOKEN}" --form-string "ref=$REF" || true)
+          if [ "$(echo "$RESP" | jq -r '.sha // empty' 2>/dev/null)" != "$HEAD_SHA" ]; then
+            echo "::error::failed to trigger a GitLab pipeline for $HEAD_SHA: $RESP"
+            exit 1
+          fi
+          echo "triggered fresh pipeline $(echo "$RESP" | jq -r .id) for $HEAD_SHA"
+
+      - name: Set pending status
+        run: |
+          # Transient API failures must not fail the check: api() degrades to empty
+          # output, which is treated as "no pipeline yet".
+          api() { curl -sS --max-time 30 -H "PRIVATE-TOKEN: ${GITLAB_TOKEN}" "$@" || true; }
+          newest() { api "$API/pipelines?sha=$HEAD_SHA&order_by=id&sort=desc&per_page=1"; }
+
+          # The mirror sync is asynchronous. Wait a little for the pipeline so that the
+          # status can link to it; if it takes longer, the webhook still reports it.
+          ID=""
+          for i in $(seq 1 20); do
+            ID=$(newest | jq -r '.[0].id // empty' 2>/dev/null || true)
+            if [ -n "$ID" ]; then break; fi
+            sleep 30
+          done
+          if [ -n "$ID" ]; then
+            URL="https://${GITLAB_HOST}/${GITLAB_PROJECT}/-/pipelines/$ID"
+            DESC="Pipeline $ID on Aurora"
+            echo "pipeline: $URL"
+            echo "[ALCF GitLab pipeline $ID]($URL)" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$(api "$API/pipelines/$ID" | jq -r '.status // empty' 2>/dev/null)" = skipped ]; then
+              echo "pipeline $ID was skipped; not setting a status"
+              exit 0
+            fi
+          else
+            URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            DESC="Waiting for the ALCF GitLab mirror"
+            echo "::warning::no GitLab pipeline for $HEAD_SHA yet; it is reported when it finishes"
+          fi
+          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" \
+            -f state=pending -f context="$CONTEXT" -f description="$DESC" -f target_url="$URL" >/dev/null
+
+          # A pipeline that finished before the status above was set (an existing branch
+          # opened as a PR, a re-run, a fast failure) has been reported already, and that
+          # report was just overwritten. Report it again.
+          if [ -n "$ID" ]; then
+            STATUS=$(api "$API/pipelines/$ID" | jq -r '.status // empty' 2>/dev/null || true)
+            case "$STATUS" in
+              success|failed|canceled)
+                echo "pipeline $ID already $STATUS; reporting it"
+                gh workflow run alcf-report.yml -R "$GITHUB_REPOSITORY" -f pipeline_id="$ID" ;;
+            esac
+          fi

@@ -240,8 +240,8 @@ that change to `test/Project.toml`.
 The project is developed task by task; `TASKS.md` lists the tasks and the
 report of every finished one. Each task lands through a pull request that CI
 (the CPU suite on the self-hosted `kkt` machine, the GPU suite on the
-self-hosted `cuda`, `amdgpu` and `oneapi` runners, Aqua on GitHub; Metal has
-no CI leg) and an automated review must pass; between tasks the owner
+self-hosted `cuda` and `amdgpu` runners and on Aurora through ALCF GitLab CI
+for oneAPI, Aqua on GitHub; Metal has no CI leg) and an automated review must pass; between tasks the owner
 reviews the state (`STATE.md`) and refreshes `PLAN.md`. `AGENTS.md` describes
 the workflow and the code conventions.
 
