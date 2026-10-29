@@ -3627,7 +3627,7 @@ objective before and after; the list of restrictions raised; the proposed
 PLAN wording. Refs #82; closes #152.
 
 ### Report
-- Status: [~] (code, docs and tests complete; the local full-suite counts and the after measurements are being re-run, see below)
+- Status: [~] (code, docs and tests complete; the before/after benchmark measurements are pending, see below)
 - What was built:
   * `src/fused.jl`: `FusedSolver{T, INT, S} <: AbstractDirectSolver{T, INT}` (exported; `Fused.FusedSolver` is the
     defining name) with the constructors `FusedSolver(A, structure, view; tuning, index)` (anything `DirectSolver`
@@ -3659,15 +3659,17 @@ PLAN wording. Refs #82; closes #152.
   analysis (an `F.inner.options` mutation is refused there, `solve_mode` at the solve).
 - Tests: `SDS_TEST_ONLY=test_fused julia --project=. -e 'using Pkg; Pkg.test()'` (CPU + CUDA, all four element
   types): 281 pass, 0 fail, 0 broken; CPU only (`SDS_TEST_GPU=0`): 5 pass (the constructor's
-  `NotSupportedError`). Full default suite: PENDING (re-running with `PTR_NUM_JOBS=8`; the default 24 workers
-  exhausted the 62 GB of this machine). AMDGPU/oneAPI: pending CI.
+  `NotSupportedError`). Full default suite (`PTR_NUM_JOBS=8 julia --project=. -e 'using Pkg; Pkg.test()'`, CPU + CUDA, all four element
+  types, 73 test parts): 107357 pass, 0 fail, 0 broken, 18m19s (the default ~24 workers exhausted the 62 GB of
+  this machine). CI: `cuda` and `amdgpu` legs pass; `oneapi` pending.
 - Measurements:
   * Allocation of one `refactorize!` + `solve!` on CUDA (RTX 4080): 36–42 KB, independent of n (n = 400 to 5832,
     Float32/Float64, `"SPD"`/`"S"`): ~256 B per KA launch and ~240 B per `fill!`/`copyto!` of a view, plus the
     `info` read. The stock `DirectSolver` allocates 130–190 KB for the same cycle. Budget 64 KiB.
   * `fresh_machine.jl` (78k ACOPF, RTX 4080) before: 100 iterations, objective 1.5314931034929343e7 (warm solve
     1.531493103492938e7). After: PENDING.
-  * Fused `compare.jl` rows before/after: PENDING (the before run has to be redone, its log was lost).
+  * Fused `compare.jl` rows before/after: PENDING (the first runs overlapped other GPU jobs and were discarded; to
+    be re-measured on an idle RTX 4080).
 - Deviations from PLAN.md / this task:
   * `"perm"` in the task is not a parameter name; `getparam` forwards the cuDSS names `"perm_reorder_row"`,
     `"perm_reorder_col"`, `"perm_row"`, `"perm_col"` (and `"nsuperpanels"`).
