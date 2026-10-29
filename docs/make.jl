@@ -53,6 +53,7 @@ makedocs(
             "Symmetric indefinite systems" => "man/indefinite.md",
             "Migrating from CUDSS.jl" => "man/cudss.md",
             "Backends" => "man/backends.md",
+            "MadNLP" => "man/madnlp.md",
             "Performance" => "man/performance.md",
         ],
         "Library" => [

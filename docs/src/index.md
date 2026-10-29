@@ -61,13 +61,19 @@ Loading CUDA.jl enables the CUDA extension (`CuSparseMatrixCSR` and
 `CuSparseMatrixCSC` inputs, cuBLAS and cuSOLVER dense kernels); loading
 AMDGPU.jl enables the AMDGPU extension (`ROCSparseMatrixCSR` and
 `ROCSparseMatrixCSC` inputs, rocBLAS and rocSOLVER dense kernels); loading
-Krylov.jl enables FGMRES refinement.
+oneAPI.jl enables the oneAPI extension (`oneSparseMatrixCSR` and
+`oneSparseMatrixCSC` inputs, oneMKL BLAS kernels); loading Metal.jl enables the
+Metal extension ([`CSR`](@ref) of `MtlArray`s, `Float32`); loading Krylov.jl
+enables FGMRES refinement; loading MadNLP.jl enables the `SDSSolver` linear
+solver ([MadNLP](@ref)).
 
 ## Where to go next
 
 * [Quick start](@ref): factor and solve on the CPU backend and on CUDA.
 * [Phases](man/phases.md) and [Parameters](man/parameters.md): the handle API, phase by phase.
 * [Symmetric indefinite systems](@ref): KKT matrices, pivoting and inertia.
+* [Backends](@ref): CUDA, AMDGPU, oneAPI, Metal and the CPU backend.
+* [MadNLP](@ref): the `SDSSolver` linear solver and its options.
 * [Performance](@ref): comparison with cuDSS.
 * The design documents in the repository: [`PLAN.md`](https://github.com/exanauts/SparseDirectSolver.jl/blob/main/PLAN.md)
   (architecture and API), [`TASKS.md`](https://github.com/exanauts/SparseDirectSolver.jl/blob/main/TASKS.md)
