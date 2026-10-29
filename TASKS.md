@@ -3494,6 +3494,138 @@ choice). `:generic` stays the allocating reference path (PLAN §3.9).
 Tests: the `:ka` allocation budget and the `select_impl` order on the KA CPU
 backend; on CUDA, AMDGPU, oneAPI and Metal through CI. Closes #112 and #53.
 
+### T33 — `FusedSolver`: the fused pipeline as an `AbstractDirectSolver` (issue #152)   `[ ]`
+
+Inserted by owner decision (2026-10-28) to run **before T24**: a pure refactor
+of the driver code around `src/fused.jl` plus the first unit tests of that
+module. No kernel changes; the kernels, plans and launch sequence of PR #126
+stay byte-for-byte what `SDSSolver` runs today.
+
+**Why.** The fused factorization and partitioned-inverse solve of
+`src/fused.jl` are built, refactorized and solved by one recipe of about
+twenty-five lines (apply the `SDSTuning` to the inner options, analysis,
+factorization, a solve to allocate the workspace, `_factor_values`,
+`build_fused_plan`, `build_inverse`, `build_fused`; then `refact_fused!` +
+`invert!` per factorization and `algo2_solve!` per solve). That recipe is
+copied verbatim into `ext/SparseDirectSolverMadNLPExt.jl` (`SDSSolver` and
+`_apply_reordering!`), `bench/compare.jl` (the private `FusedSolver`,
+`fused_solver`, `fused_phase`) and by hand into `bench/e2e/amd_sweep.jl`,
+`bench/e2e/ldl_fused_race.jl` and `bench/e2e/ldl_fused_test.jl`. Nothing in
+`test/` exercises `SparseDirectSolver.Fused`: every "fused" in the suite
+refers to the stock regime-A/B kernels. A user without MadNLP cannot reach the
+fast path. T24–T26 move the pipeline under `execute!` (`solve_alg = "algo1"`);
+this task fixes the public surface and the tests they must preserve first, so
+that the three copies are one before the kernels are reworked.
+
+**Deliverables.**
+
+1. `FusedSolver{T, INT} <: AbstractDirectSolver{T, INT}` in `src/fused.jl`,
+   exported by `SparseDirectSolver` (`Fused.FusedSolver` stays the defining
+   name). Constructors mirror `DirectSolver`: `FusedSolver(A::CSR, structure,
+   view)` and `FusedSolver(rowptr, colval, nzval, structure, view)`, with
+   `structure` `"SPD"` → fused Cholesky and `"S"` → no-pivot LDLᵀ
+   (`pivot_type = 'N'`, `pivot_pairs = "none"`, as the extension sets them),
+   and the keyword `tuning::Union{Nothing, SDSTuning} = nothing` meaning
+   `default_tuning(backend)`, resolved through `resolve_tuning`. The
+   constructor applies the tuning to the inner `DirectSolver` exactly as the
+   extension does today (`amalgamation`, `regime_c_width`, `regime_c_rows`,
+   `subtree_parallelism`, `subtree_budgets`, `reordering_alg = "algo4"`,
+   `nd_nseps`, `nd_seed`). Fields: the inner `DirectSolver`, the resolved
+   tuning, the factored values (`_factor_values`), the factorization plan, the
+   inverse (`inv11`, `inv_ptr`, `invert!`), the solve segments, `info`. The
+   values alias the caller's buffer as `DirectSolver` does, so writing new
+   values into `nzval` and refactorizing is the MadNLP loop (`update!` with the
+   same pattern is accepted and forwarded; a new pattern is rejected as
+   `DirectSolver` does).
+2. The handle-layer verbs of PLAN §3.1 on it, by dispatch, so the two solver
+   types are interchangeable to a caller: `execute!(phase, F, x, b;
+   asynchronous)` with `"analysis"` (inner analysis and factorization, the
+   solve workspace, the three plans), `"factorization"` and
+   `"refactorization"` (`refact_fused!` then `invert!`), `"solve"`
+   (`algo2_solve!`) and the combined phases of §1.2 composed from these;
+   `analyze!`, `factorize!`, `refactorize!`, `solve!`; `setparam!` for
+   `"user_perm"`, `"reordering_alg"`, `"nd_nseps"`, `"nd_seed"`,
+   `"pivot_epsilon"` before the analysis; `getparam` for `"info"`,
+   `"inertia"` (for `"S"` the counts of positive and negative entries of `D`,
+   as the extension computes them, so that the MadNLP inertia tuple is
+   derived identically on both inner types), and the analysis data parameters
+   (`"perm"`, `"lu_nnz"`, `"npivots"`, `"flops"`, `"memory_estimates"`)
+   forwarded to the inner solver. `Base.show` and the LinearAlgebra `ldiv!`
+   and `\` for a single vector.
+3. Everything the pipeline does not do raises `NotSupportedError` at
+   construction or at the phase, never a silent fallback or a silent switch to
+   the stock path: the KA `CPU()` backend (the dependency-counter kernels spin
+   on resident workgroups; the serial CPU backend deadlocks), complex element
+   types (both structures; `src/fused.jl` has no conjugation), `"HPD"`, `"G"`,
+   `nrhs > 1`, a transposed solve, the `solve_mode` sub-phases, `nbatch > 1`,
+   Schur mode, `matching_alg ≠ "default"`, `ir_n_steps > 0`,
+   `deterministic_mode = 1` (the concurrent extend-add sums in arrival
+   order), `factor_precision` other than the working precision, `"S"` with
+   `pivot_type ≠ 'N'`; fronts wider than 256 on the inverse path keep the
+   existing `NotSupportedError` of `build_fused`. Every parameter not listed
+   in (2) is rejected by `setparam!` with the same error. The docstring lists
+   all of these.
+4. `SDSSolver` (`ext/SparseDirectSolverMadNLPExt.jl`) becomes a shell:
+   fields `inner::AbstractDirectSolver`, `tril`, `x`, `b`, `last_info`,
+   `opt`, `logger`; `inner` is a `FusedSolver` for `sds_pivoting = :none`
+   and a `DirectSolver` for `:bk`. `MadNLP.factorize!`, `_solve!` and
+   `MadNLP.inertia` lose their `:bk` branches: `refactorize!`, `solve!` and
+   `getparam(inner, "inertia")` on `inner`. Option semantics are unchanged
+   (`sds_tuning`, `sds_reordering`, `sds_user_perm`, `sds_pivot_threshold`,
+   the analysis-time pivot pairs of `:bk`); `bench/e2e/fresh_machine.jl` runs
+   as is.
+5. `bench/compare.jl`: delete the private `FusedSolver`, `fused_solver`,
+   `fused_phase`, `inner` and `solver_info`; the `:fused` features build a
+   `FusedSolver` and run it through `API.exec`/`API.get` like every other
+   solver. `bench/e2e/ldl_fused_race.jl` and `ldl_fused_test.jl` use the
+   struct; `amd_sweep.jl` may keep calling `build_fused_plan` where it varies
+   plan keywords the struct does not expose. The committed
+   `bench/comparison/comparison.md` is not regenerated: re-run the fused rows
+   (`compare.jl --solver=sds --backend=cuda`) on the RTX 4080 and put them
+   next to the committed numbers in the Report as the no-regression check;
+   a difference beyond run-to-run noise is a bug in the refactor, not a
+   reason to re-measure.
+6. Docs: `docs/src/lib/fused.md` with `FusedSolver`, `SDSTuning`,
+   `default_tuning`, `resolve_tuning` (moving the `@docs` block out of
+   `man/madnlp.md`, which links to it) and a short "Fused pipeline" section
+   in `man/performance.md` stating what it does, its restrictions and that
+   `DirectSolver` remains the general solver; `checkdocs = :exports` requires
+   the docstring since the name is exported. The Report proposes the PLAN
+   §3.1, §3.2 and §4 wording for the owner (do not edit `PLAN.md`).
+
+**Tests.** New `test/test_fused.jl`, a split file (per element type), on the
+GPU backends of `BACKENDS` only: this is the first file that leaves the CPU
+backend out, so it skips `CPU()` explicitly with the reason in a comment and
+instead asserts that the constructor raises `NotSupportedError` there. Over
+`eltypes_among((Float32, Float64))`: (a) `"SPD"` on every SPD generator of
+`test/matrices.jl`: factorization, solve, relative residual within `tol(T)`;
+new values written into the aliased buffer, refactorization, the same gate;
+`getparam(F, "info") == 0`; (b) the solution agrees with the stock
+`DirectSolver` on the same ordering (`"user_perm"` from the fused solver's
+`"perm"`) within `tol(T)`; (c) `"S"` on the indefinite generators
+(`kkt_matrix` with `hessian = :indefinite`, the symmetric indefinite
+generators): residual gate, `getparam(F, "inertia")` equal to the reference
+inertia of the CPU reference LDLᵀ (`src/reference/ldlt.jl`, the oracle), and a zero pivot sets
+`info ≠ 0` without throwing; (d) every restriction of (3) raises
+`NotSupportedError` (complex types through `eltypes_among(Complex)` when
+selected, `nrhs = 2`, `"HPD"`, `"G"`, `nbatch > 1`, Schur, matching,
+refinement, `deterministic_mode = 1`, an unsupported `setparam!` name);
+(e) after the first factorization and solve, a refactorization and a solve
+allocate nothing on the host beyond the per-call launch allowance measured
+in the Report (`@allocated`; the PLAN §2.4 and §3.9 contract). `test_api` and
+every existing suite unchanged. CI: the file runs on the `cuda`, `amdgpu` and
+`oneapi` legs (`SDS_TEST_CPU=0`); if a leg cannot run the fused kernels, the
+backend is `@test_broken` with the reason and the Report says which backend
+and why, never a silent skip. The MadNLP extension has no unit test (MadNLP
+is not in the test environment); the end-to-end check of (4) is
+`bench/e2e/fresh_machine.jl` on the RTX 4080, iteration count and objective
+identical to before the change, recorded in the Report.
+
+Report: test counts on CPU (the error assertions) and CUDA; the fused
+`compare.jl` rows before and after; `fresh_machine.jl` iterations and
+objective before and after; the list of restrictions raised; the proposed
+PLAN wording. Refs #82; closes #152.
+
 ### External — MadNLPGPU integration (in the MadNLP repository)   `[ ]`
 
 Add a `SparseDirectSolver`-backed `AbstractLinearSolver` next to
