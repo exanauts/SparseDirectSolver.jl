@@ -41,7 +41,7 @@ variables:
   # are rejected at runtime.
   JULIA_JIT_TARGET: "native,-avx512fp16"
 
-stages: [build, test, coverage]
+stages: [build, test]
 
 .aurora-env:
   script:
@@ -70,9 +70,6 @@ build:
     # resolve a fresh sandbox environment.
     - julia --color=yes --project=. -e 'using Pkg; Pkg.instantiate()'
     - julia --color=yes --project=test -e 'using Pkg; Pkg.develop(path="."); Pkg.add("oneAPI"); Pkg.instantiate(); Pkg.precompile()'
-    # Coverage tooling into a depot-shared env here, where the network is available; the test job
-    # only loads it.
-    - julia --color=yes --project=$JULIA_DEPOT_PATH/environments/coverage -e 'using Pkg; Pkg.add("CoverageTools")'
   artifacts:
     paths:
       - test/Project.toml
@@ -98,29 +95,6 @@ test:
     # the site oneAPI module would substitute its own libur_adapter_level_zero/libumf underneath it;
     # a version mismatch aborts in sycl::platform::get_platforms. Drop the site oneAPI entries.
     - export LD_LIBRARY_PATH="$(echo "${LD_LIBRARY_PATH:-}" | tr ':' '\n' | grep -v '^/opt/aurora/[^/]*/oneapi/' | paste -sd:)"
-    # -C and --code-coverage propagate to the ParallelTestRunner workers via Base.julia_cmd().
-    # Coverage tracks the checkout only: `user` would also cover every dependency and flood the
-    # depot on flare with .cov files.
-    - julia -C "$JULIA_JIT_TARGET" --code-coverage=@$CI_PROJECT_DIR --color=yes --project=test test/runtests.jl
-    - julia --color=yes --project=$JULIA_DEPOT_PATH/environments/coverage -e '
-          using CoverageTools;
-          cov = mapreduce(process_folder, vcat, ["src", "ext"]);
-          LCOV.writefile("lcov.info", cov)'
-  artifacts:
-    paths: [lcov.info]
-    expire_in: 1 week
-
-# Coverage reporting must not be able to fail the build. Only created when the CODECOV_TOKEN CI/CD
-# variable is set on the GitLab project.
-coverage:upload:
-  stage: coverage
-  extends: .aurora-shell-runner
-  needs: ["test"]
-  timeout: 30m
-  rules:
-    - if: $CODECOV_TOKEN
-  allow_failure: true
-  script:
-    - curl -sSf -o codecov https://cli.codecov.io/latest/linux/codecov && chmod +x codecov
-    - ./codecov upload-process -t "$CODECOV_TOKEN" --git-service github
-        --slug exanauts/SparseDirectSolver.jl --commit-sha "$CI_COMMIT_SHA" -f lcov.info
+    # -C propagates to the ParallelTestRunner workers via Base.julia_cmd(). No coverage: the CPU and
+    # CUDA jobs report it.
+    - julia -C "$JULIA_JIT_TARGET" --color=yes --project=test test/runtests.jl
