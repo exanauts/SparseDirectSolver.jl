@@ -1,10 +1,8 @@
 # T08: CPU reference multifrontal Cholesky (the oracle), host only.
 
-triangle_of(A, view) = view == 'L' ? tril(A) : view == 'U' ? triu(A) : A
-
 # analysis + numeric storage + factorization of A given through `view`
 function reference_cholesky(A::SparseMatrixCSC{T}; view = 'L', index = 'O', opts = Options()) where {T}
-    C = SDS.CSR(triangle_of(A, view); index)
+    C = SDS.CSR(triangle_view(A, view); index)
     S = SDS.symbolic_analysis(C, spd_structure(T), view; opts)
     N = SDS.allocate_numeric(S, T, CPU())
     info = SDS.ref_factorize!(N, S, C.nzval)
@@ -17,8 +15,6 @@ function factor_error(A, S, N)
     L = SDS.extract_L(S, N)
     return norm(A[p, p] - L * L') / norm(A)
 end
-
-factor_tol(::Type{T}) where {T} = real(T) == Float64 ? 1.0e-12 : 1.0e-5
 
 reference_matrices(::Type{T}) where {T} =
     T <: Complex ? (("laplacian2d(40,40)", laplacian2d(T, 40, 40)), ("random_spd(500,0.01)", random_spd(T, 500, 0.01)),
@@ -53,7 +49,7 @@ end
         @testset "$name" begin
             S, N, info, _ = reference_cholesky(A)
             @test info == 0
-            @test factor_error(A, S, N) <= factor_tol(T)
+            @test factor_error(A, S, N) <= cholesky_factor_tol(T)
             L = SDS.extract_L(S, N)
             @test istril(L) && nnz(L) == S.partition.nnz_stored
             @test all(s -> N.stats[(s - 1) * SDS.FRONT_STATS_FIELDS + 1] == SDS.snwidth(S.partition, s),
@@ -95,12 +91,12 @@ end
     @test SparseMatrixCSC(B .!= 0) == SparseMatrixCSC(A .!= 0)
     for view in ('L', 'U', 'F')
         Sv, Nv, _, _ = reference_cholesky(A; view)
-        Cb = SDS.CSR(triangle_of(B, view))
+        Cb = SDS.CSR(triangle_view(B, view))
         @test SDS.ref_factorize!(Nv, Sv, Cb.nzval) == 0
-        @test factor_error(B, Sv, Nv) <= factor_tol(T)
+        @test factor_error(B, Sv, Nv) <= cholesky_factor_tol(T)
         b = rand(T, size(B, 1), 2)
         @test relres(B, SDS.ref_solve!(similar(b), Sv, Nv, b), b) <= tol(T)
-        @test SDS.ref_factorize!(Nv, Sv, SDS.CSR(triangle_of(A, view)).nzval) == 0     # and back
+        @test SDS.ref_factorize!(Nv, Sv, SDS.CSR(triangle_view(A, view)).nzval) == 0     # and back
         @test SDS.extract_L(Sv, Nv) == L0
     end
 end
@@ -113,7 +109,7 @@ end
         A[j, j] = 3
         S, N, info, _ = reference_cholesky(A; opts)
         @test info == 0
-        @test factor_error(A, S, N) <= factor_tol(T)
+        @test factor_error(A, S, N) <= cholesky_factor_tol(T)
         A[j, j] = -3                                    # not positive definite at column j
         S, N, info, _ = reference_cholesky(A; opts)
         @test info == j

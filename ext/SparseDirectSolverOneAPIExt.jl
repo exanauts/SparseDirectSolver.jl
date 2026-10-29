@@ -24,13 +24,10 @@ module SparseDirectSolverOneAPIExt
 # pivot stays in `A[j, j]`), so after a failure `vendor_potrf!`/`vendor_potrf_info!`
 # take the first diagonal entry that is not a finite positive real as the column
 # (`_onemkl_potrf_column`). This stays here, not in the core's status checks, so
-# the cuSOLVER/rocSOLVER paths are untouched. getrf's info is right. Batched `potrf`/`getrf` report one status per batch, not per member: no
-# binding (the KA kernels serve uniform batches). No `sytrf`: oneMKL rejects it on
-# the Intel Data Center GPU Max with `unsupported_device`, thrown from the
-# scratchpad-size shim, which does not catch it, so the process aborts.
+# the cuSOLVER/rocSOLVER paths are untouched. getrf's info is right.
 
 using SparseDirectSolver
-using SparseDirectSolver: CSR, DirectSolver, INDEX_ONE, INDEX_ZERO, InvalidValueError, NotSupportedError
+using SparseDirectSolver: CSR, INDEX_ONE, NotSupportedError
 using SparseArrays
 using LinearAlgebra
 using KernelAbstractions
@@ -41,45 +38,10 @@ using oneAPI.oneMKL: oneSparseMatrixCSR, oneSparseMatrixCSC
 
 const SDS = SparseDirectSolver
 
-"""
-    CSR(A::oneSparseMatrixCSR)
-
-Wrap `A` without copying: the `CSR` shares `rowPtr`, `colVal` and `nzVal`
-(one-based, `transposed = false`).
-"""
-function SparseDirectSolver.CSR(A::oneSparseMatrixCSR)
-    m, n = size(A)
-    return CSR(A.rowPtr, A.colVal, A.nzVal, m, n; index = INDEX_ONE, transposed = false)
-end
-
-"""
-    CSR(A::oneSparseMatrixCSC)
-
-Wrap `A` (`m × n`) without copying as the CSR of `transpose(A)` (`n × m`,
-`transposed = true`), sharing `colPtr`, `rowVal` and `nzVal`.
-"""
-function SparseDirectSolver.CSR(A::oneSparseMatrixCSC)
-    m, n = size(A)
-    return CSR(A.colPtr, A.rowVal, A.nzVal, n, m; index = INDEX_ONE, transposed = true)
-end
-
-"""
-    oneSparseMatrixCSR(A::CSR)
-
-The stored CSR matrix of `A` (the `transposed` flag is not applied) as a
-`oneSparseMatrixCSR`. One-based arrays are shared; zero-based index arrays are
-copied and rebased. Batches (`nbatch(A) > 1`) are rejected.
-"""
-function oneMKL.oneSparseMatrixCSR(A::CSR{T, INT, <:oneVector{INT}, <:oneArray{T}}) where {T, INT}
-    nbatch(A) == 1 || throw(InvalidValueError("cannot convert a batch of $(nbatch(A)) matrices to oneSparseMatrixCSR"))
-    nzval = A.nzval isa oneVector ? A.nzval : vec(A.nzval)
-    rowptr, colval = A.rowptr, A.colval
-    if A.index == INDEX_ZERO
-        rowptr = rowptr .+ one(INT)
-        colval = colval .+ one(INT)
-    end
-    return oneSparseMatrixCSR{T, INT}(rowptr, colval, nzval, (A.nrows, A.ncols))
-end
+# CSR adapters and the public API (T13, PLAN §3.1) on oneMKL sparse matrices: solver
+# constructors, update!, the LinearAlgebra layer (see `@vendor_sparse_glue`)
+SDS.@vendor_sparse_glue(oneMKL.oneSparseMatrixCSR, oneSparseMatrixCSC, oneVector, oneArray,
+                        device = "Intel GPU", platform = "oneAPI")
 
 _check_eltype(::Type{T}) where {T} =
     real(T) === Float64 && !KernelAbstractions.supports_float64(oneAPIBackend()) &&
@@ -107,66 +69,6 @@ Center GPU Max): the regime-A kernels may use their largest class, 64 KiB.
 """
 SparseDirectSolver.max_local_bytes(::oneAPIBackend) =
     Int(oneL0.compute_properties(oneAPI.device()).maxSharedLocalMemory)
-
-# ---------------------------------------------------------------------------
-# public API (T13, PLAN §3.1): solver constructors, update!, the LinearAlgebra layer
-
-"""
-    DirectSolver(A::oneSparseMatrixCSR, structure::String, view::Char; index = 'O')
-    DirectSolver(A::oneSparseMatrixCSC, structure::String, view::Char; index = 'O')
-
-Solver on `A`'s arrays, without copies (the oneAPI twin of
-`DirectSolver(::CuSparseMatrixCSR, …)`). A `oneSparseMatrixCSC` is read as the
-CSR of its transpose with the view flipped, see [`DirectSolver`](@ref).
-"""
-SparseDirectSolver.DirectSolver(A::oneSparseMatrixCSR, structure, view; index = INDEX_ONE) =
-    DirectSolver(CSR(A), structure, view; index)
-SparseDirectSolver.DirectSolver(A::oneSparseMatrixCSC, structure, view; index = INDEX_ONE) =
-    DirectSolver(CSR(A), structure, view; index)
-
-"""
-    update!(solver::DirectSolver, A::oneSparseMatrixCSR)
-    update!(solver::DirectSolver, A::oneSparseMatrixCSC)
-
-Point `solver` at the arrays of `A`, see [`update!`](@ref).
-"""
-SparseDirectSolver.update!(solver::DirectSolver, A::Union{oneSparseMatrixCSR, oneSparseMatrixCSC}) =
-    SparseDirectSolver.update!(solver, CSR(A))
-
-"""
-    cholesky(A::oneSparseMatrixCSR, NoPivot(); view = 'F', check = false) -> DirectSolver
-    cholesky(Symmetric(A::oneSparseMatrixCSR)) / cholesky(Hermitian(A::oneSparseMatrixCSR))
-
-LLᵀ/LLᴴ factorization of `A` on the Intel GPU; the wrappers pass their `uplo` as
-the view. See `cholesky(::CSR)`.
-"""
-LinearAlgebra.cholesky(A::oneSparseMatrixCSR, p::NoPivot = NoPivot(); view::Char = 'F', check::Bool = false) =
-    cholesky(CSR(A), p; view, check)
-LinearAlgebra.cholesky(A::Symmetric{T, <:oneSparseMatrixCSR{T}}, p::NoPivot = NoPivot();
-                       check::Bool = false) where {T <: Union{Float32, Float64}} =
-    cholesky(CSR(A.data), p; view = A.uplo, check)
-LinearAlgebra.cholesky(A::Hermitian{T, <:oneSparseMatrixCSR{T}}, p::NoPivot = NoPivot(); check::Bool = false) where {T} =
-    cholesky(CSR(A.data), p; view = A.uplo, check)
-
-"""
-    ldlt(A::oneSparseMatrixCSR; view = 'F', check = false) -> DirectSolver
-    ldlt(Symmetric(A::oneSparseMatrixCSR)) / ldlt(Hermitian(A::oneSparseMatrixCSR))
-
-LDLᵀ/LDLᴴ factorization of `A` on the Intel GPU; the wrappers pass their `uplo`
-as the view. See `ldlt(::CSR)`.
-"""
-LinearAlgebra.ldlt(A::oneSparseMatrixCSR; view::Char = 'F', check::Bool = false) = ldlt(CSR(A); view, check)
-LinearAlgebra.ldlt(A::Symmetric{T, <:oneSparseMatrixCSR{T}}; check::Bool = false) where {T <: Real} =
-    ldlt(CSR(A.data); view = A.uplo, check)
-LinearAlgebra.ldlt(A::Hermitian{T, <:oneSparseMatrixCSR{T}}; check::Bool = false) where {T} =
-    ldlt(CSR(A.data); view = A.uplo, check)
-
-"""
-    lu(A::oneSparseMatrixCSR; check = false) -> DirectSolver
-
-`L D U` factorization (structure `"G"`) of `A` on the Intel GPU. See `lu(::CSR)`.
-"""
-LinearAlgebra.lu(A::oneSparseMatrixCSR; check::Bool = false) = lu(CSR(A); check)
 
 # ---------------------------------------------------------------------------
 # dense implementation policy (see the header)
@@ -247,18 +149,11 @@ function SDS.vendor_potrf_info!(uplo::Char, A::oneStridedMatrix{<:MklT}, info::o
     return info
 end
 
-# oneMKL pivots are `Int64`; other index vectors go through a temporary
-function _with_int64(f, ipiv::oneVector, k::Integer)
-    ipiv isa oneVector{Int64} && length(ipiv) == k && return f(ipiv)
-    p = oneVector{Int64}(undef, k)
-    info = f(p)
-    view(ipiv, 1:k) .= p
-    oneAPI.unsafe_free!(p)
-    return info
-end
+SDS.vendor_free!(x::oneArray) = oneAPI.unsafe_free!(x)
 
+# oneMKL pivots are `Int64`; other index vectors go through a temporary
 SDS.vendor_getrf!(A::oneStridedMatrix{<:MklT}, ipiv::oneVector{<:Integer}) =
-    _with_int64(p -> _getrf_info(A, p), ipiv, min(size(A)...))
+    SDS._with_pivot_vector(p -> _getrf_info(A, p), ipiv, min(size(A)...), Int64)
 
 function SDS.vendor_gemm_strided_batched!(tA::Char, tB::Char, α, A::oneStridedArray{T, 3}, B::oneStridedArray{T, 3}, β,
                                           C::oneStridedArray{T, 3}) where {T <: MklT}

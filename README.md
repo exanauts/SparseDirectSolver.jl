@@ -3,8 +3,18 @@
 [![docs-dev](https://img.shields.io/badge/docs-dev-blue.svg)](https://exanauts.github.io/SparseDirectSolver.jl/dev/)
 [![Run tests](https://github.com/exanauts/SparseDirectSolver.jl/actions/workflows/ci.yml/badge.svg)](https://github.com/exanauts/SparseDirectSolver.jl/actions/workflows/ci.yml)
 
+> **This package is vibe-coded.** The background research (`RESEARCH.md`), the
+> design (`PLAN.md`), the task breakdown (`TASKS.md`), the implementation, the
+> tests, the benchmarks and this documentation were written by coding agents
+> (Claude) in agent-driven sessions. The owner wrote the prompts and the review
+> notes, reviewed and merged the pull requests and ran the benchmarks, but did
+> not write the code by hand. Treat the text as a description of what the agents
+> built, and the test suite, the ported CUDSS.jl tests and the cuDSS comparison
+> as the evidence. Validate the numerics on your own matrices before relying on
+> them.
+
 A portable sparse direct solver (LLᵀ/LLᴴ, LDLᵀ/LDLᴴ, LDU) for GPUs, written in
-Julia on KernelAbstractions.jl and GPUArrays.jl. It keeps the parameter names
+Julia on KernelAbstractions.jl. It keeps the parameter names
 and phases of [CUDSS.jl](https://github.com/exanauts/CUDSS.jl) so that MadNLP
 and other cuDSS users can switch to it mechanically, and targets CUDA, AMDGPU,
 oneAPI, Metal and the KernelAbstractions CPU backend.
@@ -24,8 +34,11 @@ oneAPI (tested on an Intel Data Center GPU Max 1550):
 * GPU multifrontal Cholesky (`"SPD"`, `"HPD"`) in three regimes: fused
   subtree-per-workgroup kernels for the many small fronts at the bottom of the
   tree, fused level-batched per-front kernels for medium fronts, and dense
-  `potrf`/`trsm`/`syrk` through a backend-agnostic dense interface (cuBLAS and
-  cuSOLVER on CUDA, KernelAbstractions fallbacks elsewhere) for large fronts;
+  `potrf`/`trsm`/`syrk` through a backend-agnostic dense interface for large
+  fronts: cuBLAS and cuSOLVER on CUDA, rocBLAS and rocSOLVER on AMDGPU, oneMKL
+  level-3 BLAS on oneAPI (the LAPACK steps on the KernelAbstractions
+  fallbacks), MPS GEMM/SYRK and MPS Cholesky for fronts at least 64 wide on
+  Metal, KernelAbstractions fallbacks otherwise;
 * GPU LDLᵀ/LDLᴴ (`"S"`, `"H"`) with in-front Bunch–Kaufman 1×1/2×2 pivoting,
   `pivot_threshold`, static perturbation (`pivot_epsilon`, `pivot_epsilon_alg`)
   with a user-chosen sign per row (`pivot_sign`, which cuDSS cannot do), and
@@ -58,14 +71,15 @@ oneAPI (tested on an Intel Data Center GPU Max 1550):
   `perm_matching`, `scale_row`, `scale_col`;
 * the public API: `DirectSolver`, `execute!` with cuDSS phase strings, named
   phase wrappers, `update!`, `setparam!`/`getparam`, and the `LinearAlgebra`
-  layer (`cholesky`, `cholesky!`, `ldlt`, `ldlt!`, `lu`, `lu!`, `ldiv!`, `\`, `logabsdet`),
+  layer (`cholesky`, `cholesky!`, `ldlt`, `ldlt!`, `lu`, `lu!`, `ldiv!`, `\`,
+  `logabsdet`, `logdet`, `diag`, `nnz`),
   checked by the test suite of CUDSS.jl ported to this package; phase logging
   through `SDS_LOG_LEVEL`;
 * `FusedSolver`: the fused pipeline of `src/fused.jl` (one dependency-counter
   factorization kernel, a partitioned-inverse solve) behind the same verbs as
-  `DirectSolver`, on the GPU backends, for real `"SPD"` and no-pivot `"S"`
-  matrices and one right-hand side (everything else raises
-  `NotSupportedError`);
+  `DirectSolver`, on every GPU backend (the CPU backend is refused), for real
+  `"SPD"` and no-pivot `"S"` matrices and one right-hand side (everything else
+  raises `NotSupportedError`);
 * a MadNLP linear solver (`using MadNLP` enables the extension): `SDSSolver`,
   used as `madnlp(model; linear_solver = SDSSolver, kkt_system =
   MadNLP.SparseCondensedKKTSystem)`, with the options `sds_factorization`
@@ -73,14 +87,16 @@ oneAPI (tested on an Intel Data Center GPU Max 1550):
   `D`), `sds_pivoting = :bk` for the in-front Bunch–Kaufman path (with
   `sds_pivot_threshold`), `sds_reordering`, `sds_user_perm` and `sds_tuning`,
   a bundle of performance
-  knobs with measured per-architecture defaults. It runs the fused pipeline of
-  `src/fused.jl`, one dependency-counter kernel per refactorization and a
-  partitioned-inverse solve, on CUDA and AMDGPU; the benchmark row
-  `cholesky_fused` below measures that path.
+  knobs with measured per-architecture defaults (oneAPI and Metal get the AMD
+  profile). It runs the fused pipeline of `src/fused.jl`, one
+  dependency-counter kernel per refactorization and a partitioned-inverse
+  solve, on every GPU backend; the benchmark row `cholesky_fused` below
+  measures that path.
 
-Not there yet: the fused pipeline under `execute!` (`solve_alg = "algo1"`,
-tasks T24–T26, after which it is the Cholesky and LDLᵀ path of every
-`DirectSolver`), non-uniform batches, ND partition-tree export, mixed
+Not there yet: the fused pipeline under the `execute!` of `DirectSolver`
+(`solve_alg = "algo1"`, tasks T24–T26, after which it is the Cholesky and LDLᵀ
+path of every `DirectSolver`; `FusedSolver` has its own `execute!` today), the
+sm_89 performance work of T34, non-uniform batches, ND partition-tree export, mixed
 precision, hybrid host memory, delayed pivots, allocation-free
 KernelAbstractions dense fallbacks on oneAPI and Metal (T32), and `ComplexF32`
 on Metal. Unsupported structures, phases and parameters raise
@@ -105,8 +121,10 @@ Time of SparseDirectSolver.jl divided by the time of cuDSS per feature and
 phase, geometric mean over the benchmark matrices (below 1 is faster), measured
 on an RTX 4080. Every row is a feature the package implements, through the
 handle API; `cholesky_fused` is the fused pipeline that the MadNLP extension
-runs, until T24–T26 make it the path of `execute!` (its fused plans are built
-with the first factorization, which is why that phase is slower there).
+runs, until T24–T26 make it the path of `DirectSolver`'s `execute!`. The
+comparison was measured at commit d750376 (2026-10-28), before T33 moved the
+construction of the fused plans into the analysis; the `cholesky_fused`
+factorization column there still includes building the plans.
 Per-matrix numbers are in
 [`bench/comparison/comparison.md`](bench/comparison/comparison.md); the plot
 is regenerated by hand with `bench/compare.jl` and `bench/compare_report.jl`
@@ -126,7 +144,8 @@ using Pkg
 Pkg.add(url = "https://github.com/exanauts/SparseDirectSolver.jl")
 ```
 
-Loading CUDA.jl enables the CUDA extension (`CuSparseMatrixCSR`/`CuSparseMatrixCSC`
+The CUDA extension is triggered by CUDA.jl's packages CUDACore, cuBLAS,
+cuSOLVER and cuSPARSE, which `using CUDA` loads (`CuSparseMatrixCSR`/`CuSparseMatrixCSC`
 constructors, cuBLAS/cuSOLVER dense kernels; CUDA.jl 6.5 exports an `update!`
 of its own, so import this package's explicitly with
 `using SparseDirectSolver: update!` when both are loaded); loading AMDGPU.jl
@@ -198,10 +217,11 @@ robust choice there.
 General matrices use `"G"` and the same phases; `getparam(solver, "perm_row")`
 and `"perm_col"` give the composed permutations.
 
-The same code runs on the CPU backend by wrapping the host CSR arrays in a
-`CSR` (or passing a `SparseMatrixCSC`) instead of a `CuSparseMatrixCSR`. The
-`LinearAlgebra` layer offers the usual shortcuts, with two refinement steps per
-solve by default:
+The same `DirectSolver` code runs on the CPU backend by wrapping the host CSR
+arrays in a `CSR` (or passing a `SparseMatrixCSC`) instead of a
+`CuSparseMatrixCSR`. The `LinearAlgebra` layer offers the usual shortcuts, with
+two refinement steps per solve by default; on the host it takes `CSR(A)`, since
+`cholesky` of a `SparseMatrixCSC` belongs to CHOLMOD:
 
 ```julia
 F = cholesky(A_gpu; view = 'L')        # analysis + factorization
@@ -241,9 +261,12 @@ The project is developed task by task; `TASKS.md` lists the tasks and the
 report of every finished one. Each task lands through a pull request that CI
 (the CPU suite on the self-hosted `kkt` machine, the GPU suite on the
 self-hosted `cuda` and `amdgpu` runners and on Aurora through ALCF GitLab CI
-for oneAPI, Aqua on GitHub; Metal has no CI leg) and an automated review must pass; between tasks the owner
-reviews the state (`STATE.md`) and refreshes `PLAN.md`. `AGENTS.md` describes
-the workflow and the code conventions.
+for oneAPI, Aqua on GitHub; Metal has no CI leg) and an automated review must
+pass; between tasks the owner reviews the state (`STATE.md`) and refreshes
+`PLAN.md`. Besides the task PRs, out-of-chain housekeeping PRs clean up
+documentation, tests and the repository between tasks; the prototypes they
+removed are kept at the tag `prototypes-2026-10`. `AGENTS.md` describes the
+workflow and the code conventions.
 
 ## License
 

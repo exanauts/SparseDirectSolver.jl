@@ -13,8 +13,6 @@ numeric_c_matrices(::Type{T}) where {T} =
 # shared with T10: `numeric_setup`, `panel_error`, `numeric_alloc_budget` (test/utils.jl)
 numeric_c_setup(backend, A, INT = Int32; opts = NUMERIC_C_OPTS, kw...) = numeric_setup(backend, A, INT; opts, kw...)
 
-numeric_c_allocated(N, S, nz) = @allocated SDS.factorize!(N, S, nz)
-
 RUN_SHARED && @testset "storage and plan" begin
     A = laplacian2d(Float64, 20, 20)
     S, _, _, _, Nd, _ = numeric_c_setup(CPU(), A)

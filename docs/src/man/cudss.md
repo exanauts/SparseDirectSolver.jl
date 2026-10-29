@@ -9,8 +9,9 @@ functions are renamed after Julia conventions.
 | `cudss(phase, solver, x, b)` | [`execute!`](@ref)`(phase, solver, x, b)` |
 | `cudss_set(solver, name, value)` | [`setparam!`](@ref)`(solver, name, value)` |
 | `cudss_get(solver, name)` | [`getparam`](@ref)`(solver, name)` (or [`getparam!`](@ref) into a buffer) |
-| `cudss_update(solver, A)` | [`update!`](@ref)`(solver, A)` |
-| `CudssMatrix`, `CudssData`, `CudssConfig` | [`CSR`](@ref), [`MatrixDescriptor`](@ref), [`Options`](@ref) |
+| `cudss_update(solver, A)` | [`update!`](@ref)`(solver, A)`; with CUDA.jl ≥ 6.5 both packages export `update!`, so write `using SparseDirectSolver: update!` |
+| `CudssMatrix` (sparse), `CudssMatrix` (dense), `CudssConfig` | [`CSR`](@ref), [`MatrixDescriptor`](@ref), [`Options`](@ref) |
+| `CudssData` | no public counterpart: the data object lives inside the [`DirectSolver`](@ref) |
 | `cholesky`, `ldlt`, `lu` on `CuSparseMatrixCSR` | the same functions, see [LinearAlgebra interface](@ref) |
 
 Structures (`"G"`, `"S"`, `"H"`, `"SPD"`, `"HPD"`), views (`'L'`, `'U'`, `'F'`),
@@ -37,9 +38,10 @@ execute!("solve", solver, x_gpu, b_gpu)
 
 ## Differences
 
-* cuDSS parameters that are not implemented (hybrid memory and execution
-  modes, multiple devices, non-uniform batches) raise a
-  [`NotSupportedError`](@ref) instead of being ignored.
+* cuDSS parameters that are not implemented are not silently dropped: the
+  multi-device parameters raise a [`NotSupportedError`](@ref), the hybrid memory
+  and execution modes warn once and are ignored; see
+  [How unimplemented parameters are handled](@ref).
 * `"factorization_alg"` and `"solve_alg"` keep their spellings but select this
   package's own algorithms (see [`SparseDirectSolver.FactorizationAlg`](@ref)
   and [`SparseDirectSolver.SolveAlg`](@ref)).

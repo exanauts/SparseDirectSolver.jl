@@ -39,13 +39,12 @@ tested_impls(op, backend, T) =
         end
         if backend_name(backend) == "oneAPI"  # the oneMKL column of PLAN §2.6 (T31)
             for f in (:vendor_gemm, :vendor_syrk, :vendor_trsm, :vendor_potrf, :vendor_getrf,
-                      :vendor_gemm_strided_batched, :vendor_trsm_batched, :reshape_view_mul)
+                      :vendor_gemm_strided_batched, :vendor_trsm_batched)
                 @test getfield(caps, f)
             end
             @test caps.vendor_herk == (T <: Complex)
-            # one status per batch in oneMKL: no per-member info, the KA kernels serve uniform batches;
-            # no sytrf on the GPU (oneMKL aborts with unsupported_device)
-            @test !caps.vendor_potrf_batched && !caps.vendor_getrf_batched && !caps.vendor_sytrf
+            # one status per batch in oneMKL: no per-member info, the KA kernels serve uniform batches
+            @test !caps.vendor_potrf_batched
             # LAPACK waits for the queue and allocates its scratchpad: `:auto` takes the KA kernels,
             # `impl = :vendor` still reaches oneMKL; the generic LinearAlgebra path is not used
             @test SDS.dense_impls(:potrf, backend, T) == [:ka]

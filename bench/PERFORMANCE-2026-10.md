@@ -144,7 +144,8 @@ validated configuration each; all gated.
 | 2x Xeon 8160, 1 thread | 449 | - | CHOLMOD 966 / MA86 963 |
 
 More 1-thread references: MA57 1909 ms, MA27 2798 ms (both LDL^T, libcoinhsl,
-committed drivers `e2e/ma27_bench.jl` / `e2e/ma57_bench.jl`; the MA86 numbers
+drivers `https://github.com/exanauts/SparseDirectSolver.jl/tree/prototypes-2026-10/bench/e2e/ma27_bench.jl` /
+`https://github.com/exanauts/SparseDirectSolver.jl/tree/prototypes-2026-10/bench/e2e/ma57_bench.jl`, removed; the MA86 numbers
 came from a one-off HSL.jl raw-wrapper driver with MadNLP-matching controls,
 not shipped;
 MA27 on the augmented k2 system of the same problem: 3709 ms at n = 2.09M).

@@ -104,4 +104,4 @@ correctness), `e2e/ldl_fused_test.jl` (fused vs stock + same-strategy ratio)
 and `e2e/amd_sweep.jl` (knob sweep). Read the procedure above with those
 substitutions; CUDA-graph replay (step 7's `graph_ab.jl`) retired with the
 consolidation cleanup (no graph kwarg at HEAD). All gates take the
-matrix from `bench/data/` and the tuned permutation from `bench/perm_cand3.bin`.
+matrix from `bench/data/` and the tuned permutation from `bench/perm_cand3.bin` (not committed).

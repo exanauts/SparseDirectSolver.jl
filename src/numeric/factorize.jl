@@ -335,14 +335,11 @@ function factorize_cholesky!(N::Numeric{T}, S::Symbolic, nzval::AbstractVector; 
     # (0, epsc] are statically perturbed to epsc so a near-singular SPD system
     # factors with bounded growth; nonpositive/NaN pivots still fail the front
     epsc = resolved_pivot_epsilon(opts, real(T))
-    for k in eachindex(plan.sub_first)
-        _poll_interrupt(flag)
-        a, b = plan.sub_first[k], plan.sub_last[k]
-        factorize_subtrees!(N, S, nzval, a, b - a + 1, plan.sub_local[k], epsc)
+    sub = function (a, c, lb)
+        c > 0 && _launch_subtrees!(N, S, nzval, a, c, epsc, lb, Val(SUBTREE_WORKGROUP))   # as factorize_subtrees!
+        return nothing
     end
-    for k in eachindex(plan.group_first)
-        _poll_interrupt(flag)
-        a, b = plan.group_first[k], plan.group_last[k]
+    group = function (k, a, b)
         W = plan.group_width[k]
         if W > 0
             factorize_fronts_b!(N, S, nzval, a, b - a + 1, plan.group_maxchild[k], W, epsc)
@@ -354,10 +351,31 @@ function factorize_cholesky!(N::Numeric{T}, S::Symbolic, nzval::AbstractVector; 
                 _factor_front_c!(N, S, nodes[q], p, epsc)
             end
         end
+        return nothing
     end
+    _factorize_groups!(N, flag, sub, group)
     assemble_schur!(N, S, nzval)
     cholesky_stats!(N, S)
     return _numeric_info!(N, S, true)
+end
+
+# the launch loop of the numeric phase, shared by the three structures: the regime-A subtree groups (one launch per
+# budget class, `launch_sub(first, count, Val(local_bytes))`), then the launch groups in plan order
+# (`launch_group(k, first, last)`); `flag` is polled before every launch group
+@inline function _factorize_groups!(N::Numeric, flag, launch_sub::F1, launch_group::F2) where {F1, F2}
+    plan = N.plan
+    for k in eachindex(plan.sub_first)
+        _poll_interrupt(flag)
+        a, b = plan.sub_first[k], plan.sub_last[k]
+        _with_local_bytes(plan.sub_local[k]) do lb
+            launch_sub(a, b - a + 1, lb)
+        end
+    end
+    for k in eachindex(plan.group_first)
+        _poll_interrupt(flag)
+        launch_group(k, plan.group_first[k], plan.group_last[k])
+    end
+    return nothing
 end
 
 # the reduced `info` of the active members into `plan.info_host` (`read`: copied from the device, the phase's only

@@ -20,10 +20,6 @@ numeric_a_matrices(::Type{T}, backend = CPU()) where {T} =
      ("random_spd(500,0.01)", random_spd(T, 500, 0.01), NUMERIC_A_OPTS),
      ("laplacian3d(10,10,10)", laplacian3d(T, 10, 10, 10), NUMERIC_A_OPTS))
 
-numeric_a_allocated(N, S, nz) = @allocated SDS.factorize!(N, S, nz)
-
-nregime_a(S, r) = count(==(r), S.schedule.regime)
-
 # rounds of the local move of the contribution block of a non-root regime-A node (host replica of the kernel)
 function subtree_move_rounds(S, v)
     sc, L = S.schedule, S.layout
@@ -84,9 +80,9 @@ end
     for (name, A, opts) in numeric_a_matrices(T, backend), INT in (name == "laplacian2d(40,40) A+B+C" ? INTTYPES : (Int32,))
         @testset "$name $INT" begin
             S, Nr, info_ref, Sd, Nd, nz = numeric_setup(backend, A, INT; opts)
-            @test nregime_a(S, SDS.REGIME_A) > 0
+            @test nregime(S, SDS.REGIME_A) > 0
             if name == "laplacian2d(40,40) A+B+C"
-                @test nregime_a(S, SDS.REGIME_B) > 0 && nregime_a(S, SDS.REGIME_C) > 0
+                @test nregime(S, SDS.REGIME_B) > 0 && nregime(S, SDS.REGIME_C) > 0
             end
             @test info_ref == 0
             @test SDS.factorize!(Nd, Sd, nz) == 0
@@ -164,7 +160,7 @@ end
     A = random_spd(T, 300, 0.02)
     for opts in (NUMERIC_A_OPTS, numeric_abc_opts(backend))
         S, Nr, _, Sd, Nd, nz = numeric_setup(backend, A; opts)
-        @test nregime_a(S, SDS.REGIME_A) > 0
+        @test nregime(S, SDS.REGIME_A) > 0
         @test SDS.factorize!(Nd, Sd, nz) == 0
         F0 = copy(SDS.host_numeric(Nd).factor)
         @test maximum(abs, F0 - Nr.factor) <= panel_tol(T) * maximum(abs, Nr.factor)

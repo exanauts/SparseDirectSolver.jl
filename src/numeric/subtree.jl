@@ -142,7 +142,7 @@ end
 # (every work item recomputes `rd` from local memory: cheaper than sharing it through
 # a barrier, and it keeps the second half free of divisions; the diagonal itself is
 # written in the second half, so no work item reads a value another is overwriting)
-@inline function _subtree_chol_update!(buf, ctl, piv, j, li, epsc, ::Val{WG}) where {WG}
+@inline function _subtree_chol_update!(buf, ctl, j, li, epsc, ::Val{WG}) where {WG}
     @inbounds begin
         if ctl[_ST_STATUS] == 0
             f = ctl[_ST_F]
@@ -169,7 +169,7 @@ end
 # (multiply-add only: the former divide-in-the-update doubled the flop cost in f64
 # divisions; the packed-triangle enumeration halves the work items of the old
 # guarded full-square loop)
-@inline function _subtree_chol_scale!(buf, ctl, piv, j, li, epsc, ::Val{WG}) where {WG}
+@inline function _subtree_chol_scale!(buf, ctl, j, li, epsc, ::Val{WG}) where {WG}
     @inbounds begin
         if ctl[_ST_STATUS] == 0
             f = ctl[_ST_F]
@@ -188,8 +188,22 @@ end
     return nothing
 end
 
-# write the panel and the status; the subtree root writes its contribution block to the update stack
-@inline function _subtree_write!(factor, stack, info, buf, ctl, front_ptr, cb_ptr, li, ::Val{WG}) where {WG}
+# work item 1, kernel prologue: the range of subtree t = trees[...] of workgroup G in `subtree_nodes`
+@inline function _subtree_begin!(ctl, trees, bm, subtree_ptr, G)
+    @inbounds begin
+        t = trees[bm.first + _bm_node(bm, G) - 1]
+        ctl[_ST_FIRST] = subtree_ptr[t]
+        ctl[_ST_COUNT] = subtree_ptr[t + 1] - subtree_ptr[t]
+    end
+    return nothing
+end
+
+# write the panel; the subtree root writes its contribution block to the update stack.
+# UNIT = false: the lower triangle of `buf` as is (Cholesky; the fused LDLᵀ keeps its unit
+# diagonal in `buf`) and the status in `info`; UNIT = true: a unit diagonal, and the caller
+# writes the status and the statistics (`_lt_stats!`)
+@inline function _subtree_write!(factor, stack, info, buf, ctl, front_ptr, cb_ptr, li, ::Val{WG},
+                                 ::Val{UNIT}) where {WG, UNIT}
     @inbounds begin
         v = ctl[_ST_NODE]
         f = ctl[_ST_F]
@@ -200,13 +214,17 @@ end
         for q in (li - 1):WG:(f * w - 1)
             j = q ÷ f + 1
             i = q - (j - 1) * f + 1
-            factor[p0 + q] = i >= j ? buf[lf + _packed(i, j, f)] : z
+            if UNIT
+                factor[p0 + q] = i > j ? buf[lf + _packed(i, j, f)] : i == j ? one(eltype(factor)) : z
+            else
+                factor[p0 + q] = i >= j ? buf[lf + _packed(i, j, f)] : z
+            end
         end
-        li == 1 && (info[v] = ctl[_ST_STATUS] % Int32)
+        UNIT || (li == 1 && (info[v] = ctl[_ST_STATUS] % Int32))
         c0 = cb_ptr[v]
         if c0 > 0
             m = f - w
-            src = lf + w * (2 * f - w + 1) ÷ 2 + 1      # the trailing packed m×m triangle
+            src = _lt_local_cb_offset(ctl) + 1          # the trailing packed m×m triangle
             for q in (li - 1):WG:(m * (m + 1) ÷ 2 - 1)
                 stack[c0 + q] = buf[src + q]
             end
@@ -214,6 +232,10 @@ end
     end
     return nothing
 end
+
+# offset (0-based) of the trailing packed m×m triangle of the local packed front
+@inline _lt_local_cb_offset(ctl) =
+    @inbounds Int(ctl[_ST_LF]) - 1 + Int(ctl[_ST_W]) * (2 * Int(ctl[_ST_F]) - Int(ctl[_ST_W]) + 1) ÷ 2
 
 # round r of the move of the contribution block from the tail of the front down to `local_cb[v]`
 @inline function _subtree_move!(buf, ctl, r, li, ::Val{WG}) where {WG}
@@ -254,18 +276,12 @@ write it to the update stack (packed lower triangle).
                                           local_front, local_cb, child_ptr, child_list, relind_ptr, relind,
                                           epsc, ::Val{NE}, ::Val{WG}) where {NE, WG}
     @uniform TT = eltype(factor)
-    @uniform RT = real(eltype(factor))
     @uniform IT = eltype(subtree_nodes)
     li = @index(Local, Linear)
     G = @index(Group, Linear)
     buf = @localmem TT (NE,)
     ctl = @localmem IT (_ST_CTL,)
-    piv = @localmem RT (1,)
-    if li == 1
-        @inbounds t = trees[bm.first + _bm_node(bm, G) - 1]
-        @inbounds ctl[_ST_FIRST] = subtree_ptr[t]
-        @inbounds ctl[_ST_COUNT] = subtree_ptr[t + 1] - subtree_ptr[t]
-    end
+    li == 1 && _subtree_begin!(ctl, trees, bm, subtree_ptr, G)
     @synchronize
     for k in 1:ctl[_ST_COUNT]
         if li == 1
@@ -283,14 +299,14 @@ write it to the update stack (packed lower triangle).
             @synchronize
         end
         for j in 1:ctl[_ST_W]
-            _subtree_chol_update!(buf, ctl, piv, j, li, epsc, Val(WG))
+            _subtree_chol_update!(buf, ctl, j, li, epsc, Val(WG))
             @synchronize
-            _subtree_chol_scale!(buf, ctl, piv, j, li, epsc, Val(WG))
+            _subtree_chol_scale!(buf, ctl, j, li, epsc, Val(WG))
             @synchronize
         end
         mb = _bm_gmember(bm, G)
         _subtree_write!(factor, _mview(stack, mb, bm.nbatch), _iview(info, mb, bm.nbatch), buf, ctl,
-                        member_panels(front_ptr, mb, bm.nbatch), cb_ptr, li, Val(WG))
+                        member_panels(front_ptr, mb, bm.nbatch), cb_ptr, li, Val(WG), Val(false))
         @synchronize
         for r in 1:ctl[_ST_ROUNDS]
             _subtree_move!(buf, ctl, r, li, Val(WG))

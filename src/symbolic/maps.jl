@@ -316,8 +316,8 @@ element type `T` and device indices `INT` (default: the index type of
 | 2 | peak device memory: slot 1 + update stack high-water mark |
 | 3 | permanent host memory (the host analysis data) |
 | 4 | peak host memory (= slot 3) |
-| 5 | minimum device memory of the hybrid memory mode (= slot 2 until M12) |
-| 6 | maximum host memory of the hybrid memory mode (0 until M12) |
+| 5 | minimum device memory of the hybrid memory mode (= slot 2 until T27) |
+| 6 | maximum host memory of the hybrid memory mode (0 until T27) |
 | 7 | factor panels (`Layout.factor_len` entries of `T`; twice that for `"G"`: `L` and `Uᵀ`) |
 | 8 | D (`2n` entries of `T`) |
 | 9 | update stack (`Layout.stack_len` entries of `T`; twice that for `"G"`) |

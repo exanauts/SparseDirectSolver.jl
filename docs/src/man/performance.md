@@ -2,11 +2,14 @@
 
 Time of SparseDirectSolver.jl divided by the time of cuDSS per feature and
 phase (BenchmarkTools medians), geometric mean over the benchmark matrices
-(below 1 is faster). Features whose task is not done yet are empty.
+(below 1 is faster).
 
 ![SparseDirectSolver.jl vs cuDSS time ratio per feature](../assets/comparison.png)
 
-The per-matrix numbers are in
+The comparison was measured at commit d750376 (2026-10-28), before T33 moved
+the construction of the fused plans into the analysis; the `cholesky_fused`
+factorization column there still includes building the plans. The per-matrix
+numbers are in
 [`bench/comparison/comparison.md`](https://github.com/exanauts/SparseDirectSolver.jl/blob/main/bench/comparison/comparison.md).
 The benchmark harness and the cuDSS baselines are described in
 [`bench/README.md`](https://github.com/exanauts/SparseDirectSolver.jl/blob/main/bench/README.md);

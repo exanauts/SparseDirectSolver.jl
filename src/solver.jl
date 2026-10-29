@@ -448,7 +448,7 @@ function _check_analysis_supported(solver::DirectSolver{T}) where {T}
     opts.schur_mode == 0 || solver.nbatch == 1 ||
         throw(NotSupportedError("schur_mode = 1 is not supported for uniform batches"))
     opts.user_nd_partition_tree === nothing ||
-        throw(NotSupportedError("user_nd_partition_tree is not implemented yet (T24)"))
+        throw(NotSupportedError("user_nd_partition_tree is not implemented yet (T30)"))
     opts.schedule == SCHEDULE_SYNCFREE && throw(NotSupportedError("schedule = \"syncfree\" is not implemented yet"))
     opts.factor_precision === nothing || opts.factor_precision === real(T) ||
         throw(NotSupportedError("factor_precision = $(opts.factor_precision) for $T input is not implemented yet"))
@@ -712,7 +712,7 @@ function _solve!(solver::DirectSolver{T}, p::Phase, X, B) where {T}
     solver.stage >= STAGE_FACTORIZED || throw(_phase_error(name, "needs a \"factorization\""))
     opts = solver.options
     opts.solve_alg == SOLVE_DEFAULT ||
-        throw(NotSupportedError("solve_alg = \"$(convert(String, opts.solve_alg))\" is not implemented yet (M11)"))
+        throw(NotSupportedError("solve_alg = \"$(convert(String, opts.solve_alg))\" is not implemented yet (T24–T26)"))
     Bd, bt = _rhs_data(B)
     Xd, xt = _rhs_data(X)
     xt == bt || throw(InvalidValueError("X and B must have the same layout (transposed or not)"))
@@ -878,8 +878,8 @@ const SOLVER_OUTPUTS = ("lu_nnz", "flops", "nsuperpanels", "memory_estimates", "
 
 # task that provides the other computed data parameters
 function _output_task(name)
-    name == "nd_partition_tree" && return "T24"
-    return "M12"   # hybrid_device_memory_min
+    name == "nd_partition_tree" && return "T30"
+    return "T27"   # hybrid_device_memory_min
 end
 
 """

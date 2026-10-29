@@ -23,7 +23,10 @@ The kernels follow portability rules that let them run on every backend: 1-D
 workgroups, `@localmem` reductions and no warp intrinsics, no atomics in
 assembly (an atomic-free variant exists for the one atomic kernel, selected by
 `deterministic_mode = 1`), and no allocation or host synchronization inside the
-numeric and solve phases. The symbolic analysis runs on the host.
+numeric and solve phases. The symbolic analysis runs on the host. The fused
+pipeline of [`FusedSolver`](@ref SparseDirectSolver.FusedSolver) is the
+exception: its dependency counters are Atomix atomics on which workgroups spin,
+which needs resident workgroups, so it refuses the CPU backend.
 
 Element types are `Float32`, `Float64`, `ComplexF32` and `ComplexF64`; index
 types are `Int32` and `Int64`. Metal currently supports `Float32` factors;
@@ -31,8 +34,8 @@ Apple GPUs do not expose Float64 arithmetic.
 
 On Metal, the default SPD schedule uses narrower regime-C thresholds than the
 CUDA/ROCm schedule (`32` columns and `128` rows), Metal.jl's panel GEMM/SYRK,
-and fused level solves for every front. Under `impl = :auto` with vendor calls
-allowed (not `factorization_alg = "algo1"`), regime-C Cholesky fronts at least
+and fused level solves for every front. When vendor calls are allowed (not
+`factorization_alg = "algo1"`), regime-C Cholesky fronts at least
 64 columns wide use offset-aware MPS decomposition objects built when the
 numeric storage is allocated; the MPS status is folded into `info` (MPS names no
 column, so a failure it alone detects is reported at the last column of the

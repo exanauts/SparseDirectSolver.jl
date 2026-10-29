@@ -68,6 +68,20 @@ end
 random_spd(n::Integer, density::Real; kwargs...) = random_spd(Float64, n, density; kwargs...)
 
 """
+    random_pattern_csr(n, density, view) -> (rowptr, colval)
+
+The `Vector{Int}` CSR pattern (one-based) of the stored triangle of
+`random_spd(Float64, n, density)` for matrix view `view` (`'U'`: upper,
+otherwise lower), the input of the symbolic map kernels (`src/symbolic/device.jl`).
+"""
+function random_pattern_csr(n::Integer, density::Real, view)
+    A = random_spd(Float64, n, density)
+    T = view == 'U' ? triu(A) : tril(A)
+    C = SparseDirectSolver.CSR(SparseMatrixCSC{Float64, Int}(T))
+    return (Vector{Int}(C.rowptr), Vector{Int}(C.colval))
+end
+
+"""
     badly_scaled_spd(T, n, density; exponent = 4, rng)
 
 `D A D` with `A = random_spd(T, n, density)` and `D` diagonal with entries

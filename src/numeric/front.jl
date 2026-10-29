@@ -36,7 +36,7 @@ end
 # column j of the unblocked Cholesky, first half: check the pivot and apply the
 # rank-1 update of the trailing block with the scaled column (column j itself is
 # not written, so every work item reads the same unscaled values)
-@inline function _front_chol_update!(L11, st, piv, j, s, li, front_ncols, epsc, ::Val{W}, ::Val{WG}) where {W, WG}
+@inline function _front_chol_update!(L11, st, j, s, li, front_ncols, epsc, ::Val{W}, ::Val{WG}) where {W, WG}
     @inbounds begin
         w = front_ncols[s]
         if j <= w && st[1] == 0
@@ -60,7 +60,7 @@ end
 
 # column j, second half: rank-1 update of the trailing block with the scaled column
 # (multiply-add only; the packed-triangle enumeration replaces the guarded square)
-@inline function _front_chol_scale!(L11, st, piv, j, s, li, front_ncols, epsc, ::Val{W}, ::Val{WG}) where {W, WG}
+@inline function _front_chol_scale!(L11, st, j, s, li, front_ncols, epsc, ::Val{W}, ::Val{WG}) where {W, WG}
     @inbounds begin
         w = front_ncols[s]
         if j <= w && st[1] == 0
@@ -156,12 +156,10 @@ Without `ASM` the panels and contribution blocks must already be assembled.
                                         relind_ptr, relind, maxchild, epsc, ::Val{ASM}, ::Val{W}, ::Val{NL},
                                         ::Val{WG}) where {ASM, W, NL, WG}
     @uniform TT = eltype(factor)
-    @uniform RT = real(eltype(factor))
     li = @index(Local, Linear)
     G = @index(Group, Linear)
     L11 = @localmem TT (NL,)
     st = @localmem Int32 (1,)
-    piv = @localmem RT (1,)
     if ASM
         @inbounds s = nodes[bm.first + _bm_node(bm, G) - 1]
         k = _bm_gmember(bm, G)
@@ -190,10 +188,10 @@ Without `ASM` the panels and contribution blocks must already be assembled.
     @synchronize
     for j in 1:W
         @inbounds s = nodes[bm.first + _bm_node(bm, G) - 1]
-        _front_chol_update!(L11, st, piv, j, s, li, front_ncols, epsc, Val(W), Val(WG))
+        _front_chol_update!(L11, st, j, s, li, front_ncols, epsc, Val(W), Val(WG))
         @synchronize
         @inbounds s = nodes[bm.first + _bm_node(bm, G) - 1]
-        _front_chol_scale!(L11, st, piv, j, s, li, front_ncols, epsc, Val(W), Val(WG))
+        _front_chol_scale!(L11, st, j, s, li, front_ncols, epsc, Val(W), Val(WG))
         @synchronize
     end
     @inbounds s = nodes[bm.first + _bm_node(bm, G) - 1]

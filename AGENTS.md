@@ -130,6 +130,8 @@ reviewing agent check; the owner merges by hand. The moving parts:
   ecosystem). Read them; never modify them. How the main consumer uses the
   solver: MadNLPGPU's cuDSS binding in the `MadNLP/MadNLP.jl` repository
   (`lib/MadNLPGPU`).
+* The PR #107 prototype scripts and the GPU METIS port were removed from
+  `bench/` on 2026-10-29 and remain at tag `prototypes-2026-10`.
 
 ## Commands
 

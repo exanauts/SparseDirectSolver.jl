@@ -9,3 +9,4 @@ docs/build/
 .vscode/
 bench/kkt/
 docs/src/assets/comparison.png
+bench/*.bin

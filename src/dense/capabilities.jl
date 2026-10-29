@@ -12,10 +12,8 @@ Result of [`capabilities`](@ref): one `Bool` per probe.
 * `generic_mul`, `generic_trsm` (triangular `ldiv!`/`rdiv!`), `generic_cholesky`
   (`cholesky!`), `generic_lu` (`lu!`): LinearAlgebra entry points.
 * `vendor_gemm`, `vendor_syrk`, `vendor_herk`, `vendor_trsm`, `vendor_potrf`,
-  `vendor_getrf`, `vendor_sytrf`, `vendor_gemm_strided_batched`,
-  `vendor_trsm_batched`, `vendor_potrf_batched`, `vendor_getrf_batched`: the
-  `vendor_*` bindings of the backend.
-* `reshape_view_mul`: `mul!` accepts a panel view `reshape(view(buf, r), f, w)`.
+  `vendor_getrf`, `vendor_gemm_strided_batched`, `vendor_trsm_batched`,
+  `vendor_potrf_batched`: the `vendor_*` bindings of the backend.
 * `atomic_add`: `Atomix.@atomic x[i] += v` works on `T` in a KA kernel.
 """
 struct DenseCapabilities
@@ -29,12 +27,9 @@ struct DenseCapabilities
     vendor_trsm::Bool
     vendor_potrf::Bool
     vendor_getrf::Bool
-    vendor_sytrf::Bool
     vendor_gemm_strided_batched::Bool
     vendor_trsm_batched::Bool
     vendor_potrf_batched::Bool
-    vendor_getrf_batched::Bool
-    reshape_view_mul::Bool
     atomic_add::Bool
 end
 
@@ -235,11 +230,6 @@ function _probe_capabilities(backend, ::Type{T}) where {T}
         ipiv = KernelAbstractions.zeros(backend, Int32, n)
         vendor_getrf!(X, ipiv) == 0 && _probe_close(X, F.factors) && Array(ipiv) == F.ipiv
     end
-    vendor_sytrf = _probe() do
-        X = dev(Matrix{T}(Symmetric(A + transpose(A))))
-        ipiv = KernelAbstractions.zeros(backend, Int32, n)
-        vendor_sytrf!('L', X, ipiv) == 0
-    end
     vendor_gemm_strided_batched = _probe() do
         C = dev(zeros(T, n, n, 2))
         vendor_gemm_strided_batched!('N', 'N', one(T), dev(batch(A, B)), dev(batch(B, A)), zero(T), C)
@@ -257,26 +247,9 @@ function _probe_capabilities(backend, ::Type{T}) where {T}
         H = Array(X)
         all(iszero, Array(info)) && isapprox(tril(H[:, :, 2]), L; rtol = sqrt(eps(real(T))))
     end
-    vendor_getrf_batched = _probe() do
-        X = dev(batch(A, A))
-        ipiv = KernelAbstractions.zeros(backend, Int32, n, 2)
-        info = KernelAbstractions.zeros(backend, Int32, 2)
-        vendor_getrf_batched!(X, ipiv, info)
-        all(iszero, Array(info)) && _probe_close(X, batch(F.factors, F.factors)) && Array(ipiv)[:, 2] == F.ipiv
-    end
-    reshape_view_mul = _probe() do
-        f, w = 6, 3
-        P = _probe_general(T, f, w)
-        buf = dev(vcat(zeros(T, 3), vec(P), zeros(T, 2)))
-        Pv = reshape(view(buf, 4:(3 + f * w)), f, w)
-        C = dev(zeros(T, f, 2))
-        mul!(C, Pv, dev(B[1:w, 1:2]))
-        _probe_close(C, P * B[1:w, 1:2])
-    end
     atomic_add = _probe(() -> _probe_atomic(backend, T))
 
     return DenseCapabilities(generic_mul, generic_trsm, generic_cholesky, generic_lu,
-                             vendor_gemm, vendor_syrk, vendor_herk, vendor_trsm, vendor_potrf, vendor_getrf, vendor_sytrf,
-                             vendor_gemm_strided_batched, vendor_trsm_batched, vendor_potrf_batched, vendor_getrf_batched,
-                             reshape_view_mul, atomic_add)
+                             vendor_gemm, vendor_syrk, vendor_herk, vendor_trsm, vendor_potrf, vendor_getrf,
+                             vendor_gemm_strided_batched, vendor_trsm_batched, vendor_potrf_batched, atomic_add)
 end

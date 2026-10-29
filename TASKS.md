@@ -2868,7 +2868,7 @@ is robust across the harness, the fallback is a backend-dependent default
 options table. (3) `Ordering.stats` reports the schedule depth of every
 candidate and the chosen one. (4) A METIS knob sweep is not part of this task
 (seed, ufactor and nseps move the depth 28–41 within noise in
-`bench/order_search.jl`; plain ND is enough).
+`bench/order_search.jl` (at tag `prototypes-2026-10`); plain ND is enough).
 
 Tests: on the KKT generators of `test/matrices.jl` the chooser selects the
 candidate with the smaller schedule depth, asserted through `Ordering.stats`;
@@ -2876,7 +2876,7 @@ explicit `reordering_alg = "algo1"`/`"algo4"` reproduce the current orderings
 bit for bit; `test_symbolic_*`, `test_options` and every numeric suite
 unchanged. Report: table of schedule depth, column-etree depth, nnz(L) and
 flops for AMD, ND and the chosen ordering on every T04 harness matrix, and on
-the 78k-bus dump if the owner provides it (`bench/order_search.jl`,
+the 78k-bus dump if the owner provides it (`bench/order_search.jl` at tag `prototypes-2026-10`,
 `bench/dump_madnlp_kkt.jl`). Closes #108. The PLAN §2.3 step 2 sentence
 "until T25 scores the schedule depth" is updated by the owner after the merge.
 
@@ -2889,7 +2889,7 @@ the 78k-bus dump if the owner provides it (`bench/order_search.jl`,
     level_flops × sdepth` with `ORDERING_LEVEL_FLOPS = 1e8`; the model and its rationale are in the
     `ordering_cost` docstring. `schedule_depth(parent, post, counts, amalgamation)`: fundamental supernodes, relaxed
     by `amalgamate` with the analysis' limits (`nothing` for `use_superpanels = 0`), `tree_levels(snparent)`; it
-    equals the `Schedule.nlevels` the analysis builds (outside Schur mode), the metric of `bench/order_search.jl`
+    equals the `Schedule.nlevels` the analysis builds (outside Schur mode), the metric of `bench/order_search.jl` (at tag `prototypes-2026-10`)
     and of issue #108. `evaluate_ordering` returns `sdepth` and `nsupernodes` too and takes `level_flops` and
     `amalgamation`; the cost uses the real flop count, so `T` still does not change the choice.
   - `OrderingCandidate` gains `sdepth`, `nsupernodes`; `Ordering.stats` gains `sdepth`, `nsupernodes`,
@@ -3013,7 +3013,7 @@ the missing `DirectSolver(::ROCSparseMatrixCSR)`, `CSR(::ROCSparse…)` and
 `cholesky(::ROCSparseMatrixCSR)` forwarders. The AMDGPU extension's required
 core is therefore that constructor surface; the rocBLAS/rocSOLVER bindings are
 the second half (the KA fallbacks carried the dense path). Promote the leg to
-a required check when it is green. `bench/amd_proto.jl` shows the three shims
+a required check when it is green. `bench/amd_proto.jl` (at tag `prototypes-2026-10`) shows the three shims
 the prototypes needed on ROCm (`ROCArray`, the raw-array constructor, a device
 fence through `Threads.atomic_fence`).
 
@@ -3091,7 +3091,7 @@ needed to load them on Linux); Metal only by review. Mark both as untested.
     device tests that use the 64 KiB class are cap-aware instead, and `allocate_numeric` guards the mismatch.
 - Owner note (PR #107): both halves are in (the rocSPARSE constructor forwarders and the rocBLAS/rocSOLVER
   bindings); the ROCm suite that failed 174 checks on the forwarders now passes completely, so the `amdgpu` leg is
-  no longer `continue-on-error`. Of the three shims of `bench/amd_proto.jl`, `ROCArray` and the raw-array
+  no longer `continue-on-error`. Of the three shims of `bench/amd_proto.jl` (at tag `prototypes-2026-10`), `ROCArray` and the raw-array
   constructor are what `to_backend`/`CSR(::ROCSparseMatrixCSR)` provide; the `Threads.atomic_fence` device fence
   serves the prototypes' sync-free kernels (T25) and is not needed by the core, so the extension has none.
 - Open issues / follow-ups:
@@ -3109,7 +3109,7 @@ needed to load them on Linux); Metal only by review. Mark both as untested.
 ### T24 — Partitioned-inverse fused solve (`solve_alg = "algo1"`, issue #82 solve half)   `[ ]`
 
 **Prototype adopted (PR #107)**: `bench/solve_proto_78k.jl`,
-`bench/solve_proto_all.jl`, `bench/final_sweep.jl`, `bench/e2e/SDSProto.jl`
+`bench/solve_proto_all.jl`, `bench/final_sweep.jl` (at tag `prototypes-2026-10`), `src/fused.jl` (the adopted prototype)
 (solve part). On the 78k-bus condensed KKT under the ND ordering: 18.0 ms
 (stock level-batched sweeps) → 3.5 ms, cuDSS 3.8 ms, GV100; 20.5 → 8.05 ms on
 a Radeon VII. Two states of the prototype were faster and wrong (an
@@ -3134,7 +3134,7 @@ table that justifies it. (4) Cholesky and LDLᵀ (the inverse is of `L₁₁`, D
 applied by `solve_diag` as today), real and complex, `nrhs > 1`, both
 permutation paths, `solve_mode` variants; LU may stay on the level sweeps with
 a documented reason. (5) No host synchronization in the solve
-(PLAN §3.9); the per-call synchronization measured in `bench/e2e/MadNLPSDS.jl`
+(PLAN §3.9); the per-call synchronization measured in `bench/e2e/MadNLPSDS.jl` (since replaced by `ext/SparseDirectSolverMadNLPExt.jl`)
 belongs to the wrapper, not here.
 
 Tests: every solve suite (`test_solve_*`, `test_api`, `test_refinement`,
@@ -3190,7 +3190,7 @@ Cholesky and LDLᵀ, with the per-class time split from `bench/profile_phases.jl
 
 ### T26 — Segmented fused factorization with dependency counters (issues #82, #109, #110)   `[ ]`
 
-**Prototype adopted (PR #107)**: `bench/fact_fused.jl`, `bench/e2e/SDSProto.jl`
+**Prototype adopted (PR #107)**: `bench/fact_fused.jl` (at tag `prototypes-2026-10`), `src/fused.jl` (the adopted prototype)
 (factorization part). On top of T25: 40.6 → 33.5 ms (segmented
 dependency-counter kernel) → 33.1 (native ND) → 31.9 ms (`subtree_budgets =
 [16384]`); cuDSS 24.3 ms. Remaining buckets at 31.9: mega-kernel 11.0,
@@ -3261,7 +3261,7 @@ through the factor equality on a matrix with deep CB reuse). Report:
 refactorization and refactorization+solve tables vs cuDSS on every harness
 matrix, launches per refactorization (#82's criterion: ≥ 3× fewer), the
 #110 synchronization count before and after, stack bytes with and without
-private slots; `bench/e2e/MadNLPSDS.jl` on the 78k-bus ACOPF as the
+private slots; `ext/SparseDirectSolverMadNLPExt.jl` on the 78k-bus ACOPF as the
 end-to-end check. Closes #82.
 
 ### T27 — Hybrid memory / hybrid execute   `[ ]`
@@ -3378,8 +3378,8 @@ their numbers and order.
   `_solve_workgroup`, `_offset_potrf_status`/`_offset_potrf_plan`/`_offset_potrf_info!`), MPS Cholesky for
   single-matrix regime-C fronts at least 64 wide (plans and the Int32 status buffer preallocated in
   `allocate_numeric` when the schedule allows vendor calls), every Metal front in the fused level solve,
-  128-item solve workgroups; Metal in `test/backends.jl`, docs, `bench/metal_*.jl` and the implementer's plan
-  and execution record `bench/metal_optimization.md` (was `METAL_OPTIMIZATION_PLAN.md` at the top level).
+  128-item solve workgroups; Metal in `test/backends.jl`, docs, `bench/metal_*.jl` (`metal_mps_proto.jl` and `metal_tune.jl` at tag `prototypes-2026-10`) and the implementer's plan
+  and execution record `bench/metal_optimization.md` (at tag `prototypes-2026-10`) (was `METAL_OPTIMIZATION_PLAN.md` at the top level).
   The MPS route is an `impl = :auto` decision (`_front_impls(...).mps`, only with `vendor_c`): `impl = :ka`
   and `factorization_alg = "algo1"` keep the KA potrf, as PLAN §1.3 defines `"algo1"` (no vendor calls).
   `info` on that route: `ka_chol_check_info!` scans the factor diagonal, then `_mps_status_info_kernel!`
@@ -3806,7 +3806,7 @@ Add a `SparseDirectSolver`-backed `AbstractLinearSolver` next to
 with the same iteration count ±2 as with cuDSS and the same final objective
 to `1e-6`.
 
-**Owner note (PR #107)**: `bench/e2e/MadNLPSDS.jl` is a working prototype of
+**Owner note (PR #107)**: `bench/e2e/MadNLPSDS.jl` (since replaced by `ext/SparseDirectSolverMadNLPExt.jl`) is a working prototype of
 this interface over the public handle API (device CSC read as the CSR of the
 upper triangle with view `'U'`, as `CUDSSSolver` does; values aliased with an
 `update!` fallback; Cholesky `info` mapped to inertia), backend-agnostic, run
