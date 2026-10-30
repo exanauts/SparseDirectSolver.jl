@@ -28,15 +28,13 @@ const WGF = 128
                                         @Const(amap_src), @Const(nodes), bm, @Const(front_ptr),
                                         @Const(front_nrows), @Const(front_ncols), @Const(cb_ptr),
                                         @Const(child_ptr), @Const(child_list), @Const(relind_ptr),
-                                        @Const(relind), maxchild, ::Val{ASM}, ::Val{W}, ::Val{NL},
+                                        @Const(relind), maxchild, epsc, ::Val{ASM}, ::Val{W}, ::Val{NL},
                                         ::Val{WG}) where {ASM, W, NL, WG}
     @uniform TT = eltype(factor)
-    @uniform RT = real(eltype(factor))
     li = @index(Local, Linear)
     G = @index(Group, Linear)
     L11 = @localmem TT (NL,)
     st = @localmem Int32 (1,)
-    piv = @localmem RT (1,)
     if ASM
         @inbounds s = nodes[bm.first + SDS._bm_node(bm, G) - 1]
         k = SDS._bm_gmember(bm, G)
@@ -66,10 +64,10 @@ const WGF = 128
     @synchronize
     for j in 1:W
         @inbounds s = nodes[bm.first + SDS._bm_node(bm, G) - 1]
-        SDS._front_chol_update!(L11, st, piv, j, s, li, front_ncols, Val(W), Val(WG))
+        SDS._front_chol_update!(L11, st, j, s, li, front_ncols, epsc, Val(W), Val(WG))
         @synchronize
         @inbounds s = nodes[bm.first + SDS._bm_node(bm, G) - 1]
-        SDS._front_chol_scale!(L11, st, piv, j, s, li, front_ncols, Val(W), Val(WG))
+        SDS._front_chol_scale!(L11, st, j, s, li, front_ncols, epsc, Val(W), Val(WG))
         @synchronize
     end
     @inbounds s = nodes[bm.first + SDS._bm_node(bm, G) - 1]
@@ -329,6 +327,7 @@ function refact_split!(s, nzval, tiles, chunks, cnodes, cwide, ea, ssub)
     plan = N.plan
     nodes = S.schedule.group_nodes
     backend = KA.get_backend(N.factor)
+    epsc = real(eltype(N.factor))(SDS.resolved_pivot_epsilon(s.options, real(eltype(N.factor))))   # as factorize_cholesky!
     for k in eachindex(plan.sub_first)
         launch_subtrees_sorted!(N, S, nzval, ssub[k], plan.sub_local[k], backend)
     end
@@ -339,7 +338,7 @@ function refact_split!(s, nzval, tiles, chunks, cnodes, cwide, ea, ssub)
             bm = SDS.batch_map(N; first)
             args = (N.factor, N.stack, N.info, nzval, S.amap, S.amap_ptr, S.amap_src, nodearr, bm,
                     S.front_ptr, S.front_nrows, S.front_ncols, S.cb_ptr, S.child_ptr, S.child_list,
-                    S.relind_ptr, S.relind, maxchild)
+                    S.relind_ptr, S.relind, maxchild, epsc)
             nd = WGF * count
             if W == 8
                 panel_cholesky_kernel!(backend, WGF)(args..., asm, Val(8), Val(36), Val(WGF); ndrange = nd)
