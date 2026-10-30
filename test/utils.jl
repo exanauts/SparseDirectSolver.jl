@@ -832,15 +832,19 @@ end
 # fused pipeline (T33)
 
 """
-    FUSED_CYCLE_ALLOC_BUDGET
+    fused_cycle_alloc_budget(backend) -> Int
 
 Host bytes one `refactorize!` plus one `solve!` of a [`FusedSolver`](@ref) may
-allocate on a GPU backend after the first factorization and solve (PLAN §2.4,
+allocate on a GPU `backend` after the first factorization and solve (PLAN §2.4,
 §3.9: no allocation that grows with the problem). What remains is the launch
 allowance of the GPU packages: on CUDA (RTX 4080, T33) about 256 B per
 KernelAbstractions launch and 240 B per `fill!`/`copyto!` of a view, plus the
 host read of `info`, measured at 36–42 KB per cycle for n = 400 to 5832
 (Float32 and Float64, `"SPD"` and `"S"`), independent of n; the stock
-`DirectSolver` allocates 130–190 KB for the same cycle.
+`DirectSolver` allocates 130–190 KB for the same cycle. oneAPI.jl allocates
+352–368 B per launch and per `fill!` of a view (Aurora, Max 1550, LTS stack),
+measured at 66–78 KB per cycle for the same matrices, with or without
+`ONEAPI_SYNC_EACH_SUBMISSION` and coverage, hence 96 KiB there.
 """
-const FUSED_CYCLE_ALLOC_BUDGET = 64 * 1024
+fused_cycle_alloc_budget(backend) = 64 * 1024
+ONEAPI_LOADED && (fused_cycle_alloc_budget(::oneAPIBackend) = 96 * 1024)

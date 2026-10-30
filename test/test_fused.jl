@@ -241,8 +241,8 @@ end
             F, _, xd, _ = fused_solve(backend, A, structure)
             bd = to_device(backend, rand(T, size(A, 1)))
             bytes = fused_cycle_allocated(F, xd, bd)
-            @test bytes <= FUSED_CYCLE_ALLOC_BUDGET
-            bytes <= FUSED_CYCLE_ALLOC_BUDGET ||
+            @test bytes <= fused_cycle_alloc_budget(backend)
+            bytes <= fused_cycle_alloc_budget(backend) ||
                 @info "fused refactorization + solve on $(backend_name(backend)), $structure, $T: $bytes bytes"
         end
     end
