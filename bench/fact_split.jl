@@ -432,7 +432,12 @@ function run_config(label; cw = 32, rows = 512, sp = 16384, amalg = nothing, T =
     nt = sum(t === nothing ? 0 : length(t[1]) for t in values(tiles))
     tg = NaN
     try
-        g = CUDA.capture() do
+        # capture on a stream the library handles are bound to beforehand: cuSOLVER 12.3.5
+        # (CUDA 13.4) invalidates a capture when cusolverDnSetStream runs inside it, which
+        # CUDA.jl >= 6's pooled capture stream triggers on the first vendor call (#174)
+        cs = CuStream(; flags = CUDA.STREAM_NON_BLOCKING)
+        CUDA.stream!(CUDA.CUSOLVER.dense_handle, cs); CUDA.stream!(CUDA.CUBLAS.handle, cs)
+        g = CUDA.capture(; stream = cs) do
             refact_split!(s, nzval, tiles, chunks, cnodes, cwide, ea, ssub)
         end
         exec = CUDA.instantiate(g)
