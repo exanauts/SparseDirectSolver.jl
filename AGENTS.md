@@ -70,13 +70,14 @@ reviewing agent check; the owner merges by hand. The moving parts:
   be finished, the PR is opened as a draft with the state described in the
   body and the Report; never a silent stop.
 * **Reviewer** (`.github/workflows/claude-review.yml`, Claude Fable 5.1, effort
-  high) reviews every push on a `task/**` or `claude:pr` PR against the task
-  text, this file and `PLAN.md`, posts inline comments and a verdict (a
-  neutral review comment, so it never blocks a merge by itself) whose first
-  line is `VERDICT: APPROVE (head <sha>)` or
-  `VERDICT: CHANGES_REQUESTED (head <sha>)`. On changes requested nothing is
-  fixed automatically: the owner decides how the findings are addressed, and
-  a push to the branch starts a new review.
+  high) reviews a `task/**` or `claude:pr` PR once against the task text,
+  this file and `PLAN.md`, posts inline comments and a verdict (a neutral
+  review comment, so it never blocks a merge by itself) whose first line is
+  `VERDICT: APPROVE (head <sha>)` or `VERDICT: CHANGES_REQUESTED (head <sha>)`.
+  A push to a PR that already has a verdict is not reviewed again; on changes
+  requested nothing is fixed automatically: the owner decides how the findings
+  are addressed and asks for a new review explicitly, by removing and
+  re-adding the `claude:pr` label.
 * **Merging** is done by the owner. No workflow implements a task, fixes
   failing CI or review findings, merges a PR or starts the next task: the
   owner squash-merges (which closes the issue) and starts the next task.

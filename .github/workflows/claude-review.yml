@@ -1,9 +1,10 @@
 name: Claude review
 
-# Reviews every task PR with Claude Fable 5.1 at effort "high". The review ends with a
-# `VERDICT:` line. On CHANGES_REQUESTED nothing is fixed automatically: the owner decides
-# how the findings are addressed (a push to the PR starts a new review).
-# See AGENTS.md, section "GitHub workflow".
+# Reviews every task PR with Claude Fable 5.1 at effort "high", once: the review ends
+# with a `VERDICT:` line, and a PR that has a verdict is not reviewed again on a push.
+# On CHANGES_REQUESTED nothing is fixed automatically: the owner decides how the
+# findings are addressed, and asks for a new review explicitly by removing and
+# re-adding the `claude:pr` label. See AGENTS.md, section "GitHub workflow".
 
 on:
   pull_request:
@@ -21,8 +22,9 @@ permissions:
 # review, and a label added after creation starts the review that was skipped.
 # `gh pr create` with several labels fires one `labeled` event per label; the
 # surviving run may be the one for a label other than `claude:pr`, so the job
-# condition below looks at the PR's labels, not at the label of the event (a
-# label added to a `claude:pr` PR later therefore re-reviews its head).
+# condition below looks at the PR's labels, not at the label of the event. The
+# gate step then lets a `synchronize`, `reopened` or other-label `labeled` event
+# through only while the PR has no verdict; re-adding `claude:pr` always reviews.
 concurrency:
   group: claude-review-${{ github.event.pull_request.number }}
   cancel-in-progress: true
@@ -46,7 +48,39 @@ jobs:
         with:
           fetch-depth: 0
 
+      # A PR is reviewed once. A push (`synchronize`), a reopen or a label other
+      # than `claude:pr` reviews only a PR without a verdict (the first review
+      # was skipped or cancelled); a re-review is asked for by re-adding `claude:pr`.
+      - name: Review once unless asked
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTION: ${{ github.event.action }}
+          LABEL: ${{ github.event.label.name }}
+        run: |
+          set -euo pipefail
+          run=true
+          if [ "$ACTION" = synchronize ] || [ "$ACTION" = reopened ] ||
+             { [ "$ACTION" = labeled ] && [ "$LABEL" != "claude:pr" ]; }; then
+            verdicts=$(
+              {
+                gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews" \
+                  --jq '.[] | select(.user.login == "claude[bot]") | .body | split("\n")[0]'
+                gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR/comments" \
+                  --jq '.[] | select(.user.login == "claude[bot]") | .body | split("\n")[0]'
+              } | grep -c '^VERDICT: ' || true
+            )
+            [ "$verdicts" -eq 0 ] || run=false
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          if [ "$run" = true ]; then
+            echo "event $ACTION${LABEL:+ ($LABEL)}: reviewing $HEAD_SHA"
+          else
+            echo "event $ACTION${LABEL:+ ($LABEL)}: PR #$PR has a verdict, not reviewing again (re-add claude:pr to ask)"
+          fi
+
       - name: Review with Claude
+        if: steps.gate.outputs.run == 'true'
         uses: anthropics/claude-code-action@v1
         env:
           CLAUDE_CODE_EFFORT_LEVEL: high
@@ -108,6 +142,7 @@ jobs:
             Do not change code, do not push, do not merge.
 
       - name: Read the verdict for this head
+        if: steps.gate.outputs.run == 'true'
         id: verdict
         env:
           GH_TOKEN: ${{ github.token }}
