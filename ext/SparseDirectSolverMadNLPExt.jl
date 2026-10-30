@@ -84,6 +84,11 @@ function _apply_reordering!(s, opt::SDSSolverOptions)
     return nothing
 end
 
+# the CSC arrays of MadNLP's matrix (#175): a vendor CSC's colPtr/rowVal/nzVal on a GPU
+# backend, a SparseMatrixCSC's colptr/rowval/nzval on the CPU backend
+_csc_arrays(csc::SparseMatrixCSC) = (csc.colptr, csc.rowval, csc.nzval)
+_csc_arrays(csc) = (csc.colPtr, csc.rowVal, csc.nzVal)
+
 """
     SDSSolver(csc; opt = SDSSolverOptions(), logger = MadNLP.MadNLPLogger())
 
@@ -101,11 +106,6 @@ a `DirectSolver` (stock Bunch-Kaufman LDLᵀ, same tuning) for `:bk`; both are
 driven by `refactorize!`, `solve!` and `getparam(inner, "inertia")`. Available
 as `SparseDirectSolver.SDSSolver` (exported) once MadNLP is loaded.
 """
-# the CSC arrays of MadNLP's matrix (#175): a vendor CSC's colPtr/rowVal/nzVal on a GPU
-# backend, a SparseMatrixCSC's colptr/rowval/nzval on the CPU backend
-_csc_arrays(csc::SparseMatrixCSC) = (csc.colptr, csc.rowval, csc.nzval)
-_csc_arrays(csc) = (csc.colPtr, csc.rowVal, csc.nzVal)
-
 mutable struct SDSSolver{T} <: MadNLP.AbstractLinearSolver{T}
     inner::SDS.AbstractDirectSolver
     tril::Any
