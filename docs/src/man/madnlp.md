@@ -50,7 +50,9 @@ inner solver is a [`FusedSolver`](@ref SparseDirectSolver.FusedSolver), the fuse
 `SparseDirectSolver.Fused` (`src/fused.jl`) over the symbolic analysis of a
 regular [`DirectSolver`](@ref): one dependency-counter kernel per
 refactorization that covers the whole elimination tree (the wide root fronts
-either inside the kernel or on the vendor `potrf` path, chosen by the tuning),
+of an LDLᵀ always inside the kernel, since a saddle-point root mixes pivot
+signs; those of a Cholesky inside the kernel or on the vendor `potrf` path,
+chosen by the tuning),
 per-front inverses of the diagonal blocks computed after each factorization,
 and a partitioned-inverse solve in one dependency-counter sweep per direction.
 This is the path that `cholesky_fused` measures on the [Performance](@ref) page;

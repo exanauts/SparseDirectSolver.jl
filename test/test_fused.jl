@@ -152,6 +152,25 @@ end
         @test getparam(F, "inertia") == inertia
     end
 
+    # issue #141: under nested dissection the root front of a saddle-point matrix is wider than 64 columns and
+    # its pivots take both signs. Both wide-front strategies factor it (`wides = :host` once handed it to the
+    # potrf-derived LDLᵀ, whose Cholesky fails on the first pivot of the other sign).
+    @testset "\"S\": a wide front with pivots of both signs, wides = :$wides: $T" for T in eltypes_among((Float32, Float64)),
+                                                                                    wides in (:host, :merged)
+        nx = 40
+        m = nx * nx
+        A = grid_kkt_matrix(T, nx, nx, 1.0)
+        F, _, _, r = fused_solve(backend, A, "S"; tuning = SDS.Fused.SDSTuning(; wides))
+        @test maximum(F.inner.symbolic.schedule.width) > 64     # the wide front exists (the mechanism is exercised)
+        @test isempty(F.fp.wides)                               # and no LDLᵀ front goes to the host path
+        @test getparam(F, "info") == 0
+        @test getparam(F, "inertia") == (m, m)
+        @test r <= tol(T)
+        refactorize!(F)
+        @test getparam(F, "info") == 0
+        @test getparam(F, "inertia") == (m, m)
+    end
+
     @testset "\"S\": a zero pivot sets info without throwing: $T" for T in eltypes_among((Float32, Float64))
         n, j = 40, 17
         A = singular_block_matrix(T, n, j; stored_zero = true)

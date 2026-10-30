@@ -17,8 +17,12 @@ permissions:
   id-token: write
 
 # One review per PR at a time, and a newer event supersedes a running one: the
-# `opened` + `labeled` pair from `gh pr create --label` collapses to a single
+# `opened` + `labeled` events from `gh pr create --label` collapse to a single
 # review, and a label added after creation starts the review that was skipped.
+# `gh pr create` with several labels fires one `labeled` event per label; the
+# surviving run may be the one for a label other than `claude:pr`, so the job
+# condition below looks at the PR's labels, not at the label of the event (a
+# label added to a `claude:pr` PR later therefore re-reviews its head).
 concurrency:
   group: claude-review-${{ github.event.pull_request.number }}
   cancel-in-progress: true
@@ -31,7 +35,6 @@ env:
 jobs:
   review:
     if: >-
-      (github.event.action != 'labeled' || github.event.label.name == 'claude:pr') &&
       github.event.pull_request.draft == false &&
       github.event.pull_request.head.repo.full_name == github.repository &&
       (startsWith(github.event.pull_request.head.ref, 'task/') ||

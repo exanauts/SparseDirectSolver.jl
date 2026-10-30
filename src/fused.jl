@@ -23,7 +23,8 @@ field was measured and the per-architecture champions). All fields are
 runtime parameters — no environment variables, no recompilation.
 """
 Base.@kwdef struct SDSTuning
-    wides::Symbol = :auto                     # :auto | :host | :merged
+    wides::Symbol = :auto                     # :auto | :host | :merged (Cholesky; an LDLᵀ
+                                              # factors wides in-kernel, :host keeps the split)
     subtree_budgets::Vector{Int} = [16384]    # regime-A local-memory class(es)
     subtree_parallelism::Int = 16384
     regime_c_width::Int = 32
@@ -1574,7 +1575,9 @@ end
 # L = C diag(C)⁻¹ and d = diag(C)², and F21_chol = L21 D^½ makes the Cholesky
 # herk CB bit-identical to the LDL one — so the host path is the VERBATIM
 # Cholesky vendor sequence plus three micro-kernels. Valid only where the
-# front's pivots share a sign (always, for an SPD matrix factored as "S").
+# front is positive definite (always, for an SPD matrix factored as "S"); a
+# saddle-point front fails potrf, so FusedSolver never selects it (#141): only an
+# explicit `build_fused_plan(...; wides_potrf = true)` does.
 @kernel function chol2ldl_d_kernel!(factor, d, p0, f, g0)
     j = @index(Global, Linear)
     @inbounds begin
@@ -2028,9 +2031,11 @@ Phases (`execute!(phase, F, X, B; asynchronous = true)`):
   `"factorization"`): the fused factorization of the current values, then the
   inverses of the diagonal blocks; sets `"info"` (`0`, or the original column
   of the first failed pivot: a non-positive Cholesky pivot, or for `"S"` a zero
-  or non-finite pivot, or a pivot of a wide front whose sign differs from the
-  front's other pivots when the tuning factors wide fronts on the host,
-  `wides = :host`). A failed factorization does not throw.
+  or non-finite pivot). A failed factorization does not throw. `"S"` factors
+  its wide fronts in the fused kernel under either `wides` strategy (a front's
+  pivots may take both signs), so the in-kernel wide-front limit applies to it
+  on every part: a front with more than `1023 · 32` rows below a panel raises
+  `NotSupportedError` at analysis.
 * `"solve"`: `X = A⁻¹ B` with the partitioned-inverse solve, for a vector (or
   an `n × 1` matrix) on the solver's backend; `X === B` is allowed.
 
@@ -2165,10 +2170,15 @@ function _fused_symbolic!(F::FusedSolver{T}) where {T}
     SDS.execute!("solve", s, x, b; asynchronous = false)   # allocates the solve workspace
     t = F.tuning
     merged = t.wides === :merged
-    # LDL wide fronts run the verbatim Cholesky vendor path (wides_potrf): valid while a
-    # front's pivots share a sign; a sign flip fails potrf -> info != 0
-    fp = build_fused_plan(s; ldl = F.ldl, inkernel_wides = merged, merge_segments = merged,
-                          wides_potrf = !merged, wgf = t.workgroup, scap = t.spin_cap)
+    # LDL wide fronts are always factored in-kernel (the no-pivot LDLᵀ of the fused
+    # kernel), whatever the tuning: the host path for them would be the potrf-derived
+    # LDL (wides_potrf), which is valid only while a front's pivots share a sign. The
+    # root separators of a saddle-point matrix under nested dissection hold primal and
+    # dual rows, so potrf fails on a matrix the no-pivot LDLᵀ factors (#141). `wides =
+    # :host` keeps its meaning for Cholesky; for LDL it only keeps the segment split.
+    inkernel = merged || F.ldl
+    fp = build_fused_plan(s; ldl = F.ldl, inkernel_wides = inkernel, merge_segments = merged,
+                          wides_potrf = false, wgf = t.workgroup, scap = t.spin_cap)
     inv11, inv_ptr, invertf, _ = build_inverse(s)
     # the solve plan: one merged dependency-counter sweep over the whole tree
     fz1 = build_fused(s; kstart = 1, wcap = 256)
