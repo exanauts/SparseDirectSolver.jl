@@ -23,7 +23,8 @@ field was measured and the per-architecture champions). All fields are
 runtime parameters — no environment variables, no recompilation.
 """
 Base.@kwdef struct SDSTuning
-    wides::Symbol = :auto                     # :auto | :host | :merged
+    wides::Symbol = :auto                     # :auto | :host | :merged (Cholesky; an LDLᵀ
+                                              # factors wides in-kernel, :host keeps the split)
     subtree_budgets::Vector{Int} = [16384]    # regime-A local-memory class(es)
     subtree_parallelism::Int = 16384
     regime_c_width::Int = 32
@@ -2032,7 +2033,9 @@ Phases (`execute!(phase, F, X, B; asynchronous = true)`):
   of the first failed pivot: a non-positive Cholesky pivot, or for `"S"` a zero
   or non-finite pivot). A failed factorization does not throw. `"S"` factors
   its wide fronts in the fused kernel under either `wides` strategy (a front's
-  pivots may take both signs).
+  pivots may take both signs), so the in-kernel wide-front limit applies to it
+  on every part: a front with more than `1023 · 32` rows below a panel raises
+  `NotSupportedError` at analysis.
 * `"solve"`: `X = A⁻¹ B` with the partitioned-inverse solve, for a vector (or
   an `n × 1` matrix) on the solver's backend; `X === B` is allowed.
 
