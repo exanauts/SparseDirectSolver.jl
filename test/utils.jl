@@ -268,22 +268,25 @@ growth_tol(::Type{T}, Nr) where {T} = panel_tol(T) * max(one(real(T)), real(T)(f
 
 Bytes the KernelAbstractions CPU backend itself may allocate for `launches`
 kernel launches whose `@localmem` buffers total `localmem_bytes`, on top of
-the 1024 B allowed to an allocation-free phase (PLAN §3.9). Measured (T09
-review round 1): 0 without coverage (the local runs, Julia ≥ 1.13 is required);
-with `--code-coverage` (CI's `julia-runtest`) the `@localmem` `MArray`s are
-heap-allocated, hence `localmem_bytes` plus 64 B of header per launch. The
-KernelAbstractions 0.10 CPU backend heap-allocates on every launch (~230 B
-measured; 0.9 was allocation-free), hence 320 B per launch. (Julia ≤ 1.11
-also boxed the arguments of every launch behind KA's `__run` inference
+the 1024 B allowed to an allocation-free phase (PLAN §3.9). Without coverage
+that is 0: a warmed launch on the KernelAbstractions ≥ 0.10.3 CPU backend
+allocates nothing (measured for #145 with a trivial and a `@localmem` kernel:
+KA 0.10.3 with and without `--code-coverage=all`, KA 0.10.4 with 1 and 4
+threads; `test_helpers` guards it). With `--code-coverage` (CI's
+`julia-runtest`) the `@localmem` `MArray`s may be heap-allocated (T09 review
+round 1), hence `localmem_bytes` plus 64 B of header per launch. KA 0.10.0–0.10.2
+heap-allocated on every launch (96 B measured with a trivial kernel, ~230 B in
+PR #133), which a 320 B/launch allowance covered; that allowance hid real
+allocations of the numeric phase (~62 KB of headroom, 195 launches, for one
+`factorize!` of `random_spd(500, 0.01)`, which itself allocates 512 B), so
+it went with the `[compat] KernelAbstractions = "0.10.3"` bound (#145). (Julia
+≤ 1.11 also boxed the arguments of every launch behind KA's `__run` inference
 barrier; that allowance went with the Julia 1.10 support.)
 """
 function ka_cpu_alloc_budget(launches::Integer, localmem_bytes::Integer)
     b = 1024
-    # KernelAbstractions 0.10's CPU backend heap-allocates per launch (~230 B measured
-    # with a trivial precompiled kernel; the new backend's task machinery). 320 B of
-    # per-launch headroom keeps the budgets meaningful -- they still scale with the
-    # phase's launch count -- until the upstream allocation is fixed.
-    b += 320 * launches
+    # no per-launch term: KA >= 0.10.3 (the compat bound) launches allocation-free on the
+    # CPU backend (#145); only coverage instrumentation may heap-allocate `@localmem`
     Base.JLOptions().code_coverage != 0 && (b += localmem_bytes + 64 * launches)
     return b
 end
@@ -548,7 +551,7 @@ assembly launches and, per chunk (`ldlt_c_chunk_end`) and batch member, one
 columns, the finish kernel and one contribution-block pack per front; plus the
 `max |aᵢⱼ|` and statistics reductions. `lu = true` budgets `factorize_lu!`
 instead: every launch group is one fused launch, plus the two Schur assembly
-launches. `@localmem` (heap-allocated only under `--code-coverage` on KA 0.9):
+launches. `@localmem` (heap-allocated only under `--code-coverage`):
 the largest regime-A kernel (48 KiB) per subtree launch and per launch group,
 blocked groups included as before, plus the two reductions (T15).
 """
