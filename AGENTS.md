@@ -43,9 +43,10 @@ Three documents define the work. Read them in this order before touching code:
   mechanically.
 * New dependencies need a one-line justification in the Report. Never `dev`
   unregistered or local checkouts into the project (the package requires
-  KernelAbstractions 0.10 and GPUArrays 12, hence CUDA.jl >= 6.5, AMDGPU.jl
-  >= 2.10, Metal.jl >= 1.11 and oneAPI.jl >= 2.10; the test allocation budgets
-  carry a per-launch allowance for the 0.10 CPU backend -- see
+  KernelAbstractions 0.10 (>= 0.10.3) and GPUArrays 12, hence CUDA.jl >= 6.5,
+  AMDGPU.jl >= 2.10, Metal.jl >= 1.11 and oneAPI.jl >= 2.10; KA >= 0.10.3
+  launches allocation-free on the CPU backend, so the test allocation budgets
+  carry no per-launch allowance outside coverage runs -- see
   `ka_cpu_alloc_budget` and #145).
 * The repository is `github.com/exanauts/SparseDirectSolver.jl` (remote
   `origin`, branch `main`). Commit at the end of the task with a message
