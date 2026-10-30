@@ -111,8 +111,9 @@ reviewing agent check; the owner merges by hand. The moving parts:
 ### The owner's machine
 
 * Julia 1.13 via juliaup (`/home/michel/.juliaup/bin/julia`); package compat is
-  `julia = "1.13"` (the minimum; CI tests the latest release only), so do not
-  use syntax or stdlib features newer than 1.13.
+  `julia = "1.13"` (the minimum; CI tests it on the CPU-only job, setup-julia
+  `'min'`, and the latest release on the GPU legs, Aqua and the docs), so do
+  not use syntax or stdlib features newer than 1.13.
 * Linux (WSL2). One NVIDIA RTX 4080 (16 GB); CUDA.jl is functional.
 * **No AMDGPU, oneAPI or Metal hardware here.** Local tests run on the
   KernelAbstractions CPU backend and on CUDA only. GitHub CI
