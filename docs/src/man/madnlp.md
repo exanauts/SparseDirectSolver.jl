@@ -16,9 +16,12 @@ result = madnlp(model; linear_solver = SDSSolver,
 
 The extension is backend-agnostic: it accepts any device CSC matrix whose
 `colPtr`, `rowVal` and `nzVal` are device vectors (`CuSparseMatrixCSC`,
-`ROCSparseMatrixCSC`) and reads MadNLP's lower-triangular KKT matrix as the CSR
-of the upper triangle (view `'U'`), exactly as `CUDSSSolver` does. `Float32` and
-`Float64` are supported. The end-to-end runs on CUDA and AMD, including the
+`ROCSparseMatrixCSC`), and the `SparseMatrixCSC` of MadNLP's CPU KKT systems
+(the KernelAbstractions CPU backend, where only `sds_pivoting = :bk` runs: the
+fused pipeline needs a GPU, so `:none` raises `NotSupportedError` there), and
+reads MadNLP's lower-triangular KKT matrix as the CSR of the upper triangle
+(view `'U'`), exactly as `CUDSSSolver` does. `Float32` and `Float64` are
+supported. The end-to-end runs on CUDA and AMD, including the
 78k-bus ACOPF system, are recorded in
 [`bench/PERFORMANCE-2026-10.md`](https://github.com/exanauts/SparseDirectSolver.jl/blob/main/bench/PERFORMANCE-2026-10.md)
 and reproduced by the scripts of

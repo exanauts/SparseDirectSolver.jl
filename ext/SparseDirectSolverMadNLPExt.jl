@@ -1,7 +1,9 @@
 # MadNLP linear-solver interface to SparseDirectSolver.jl, as a package
 # extension (loads when MadNLP and SparseDirectSolver are both present).
 # Backend-agnostic: accepts any device CSC (CUSPARSE.CuSparseMatrixCSC,
-# rocSPARSE.ROCSparseMatrixCSC) whose colPtr/rowVal/nzVal are device vectors.
+# rocSPARSE.ROCSparseMatrixCSC) whose colPtr/rowVal/nzVal are device vectors,
+# and the SparseMatrixCSC of MadNLP's CPU KKT systems (the `:bk` path on the
+# KernelAbstractions CPU backend; the fused pipeline needs a GPU, #175).
 # The CSC arrays of MadNLP's lower-triangular KKT matrix are read as the CSR
 # of the upper triangle, exactly as MadNLPGPU's CUDSSSolver does (view 'U').
 # Access from user code: SparseDirectSolver.SDSSolver (a declared global of the
@@ -10,6 +12,7 @@ module SparseDirectSolverMadNLPExt
 
 using MadNLP
 using SparseDirectSolver
+using SparseArrays: SparseMatrixCSC
 const SDS = SparseDirectSolver
 const KA = SDS.KernelAbstractions
 const Fused = SDS.Fused
@@ -84,6 +87,12 @@ end
 """
     SDSSolver(csc; opt = SDSSolverOptions(), logger = MadNLP.MadNLPLogger())
 
+`csc` is the lower triangle of the KKT matrix as MadNLP passes it: a vendor CSC
+(`CuSparseMatrixCSC`, `ROCSparseMatrixCSC`, `oneSparseMatrixCSC`) on a GPU backend,
+or a `SparseMatrixCSC` on the KernelAbstractions CPU backend, where only
+`sds_pivoting = :bk` runs (`:none` raises `NotSupportedError`: the fused pipeline
+needs a GPU).
+
 The MadNLP linear solver backed by SparseDirectSolver.jl: a shell over an inner
 `AbstractDirectSolver`, a [`FusedSolver`](@ref SparseDirectSolver.FusedSolver)
 (the fused factorization mega-kernel and partitioned-inverse solve, with the
@@ -92,6 +101,11 @@ a `DirectSolver` (stock Bunch-Kaufman LDLᵀ, same tuning) for `:bk`; both are
 driven by `refactorize!`, `solve!` and `getparam(inner, "inertia")`. Available
 as `SparseDirectSolver.SDSSolver` (exported) once MadNLP is loaded.
 """
+# the CSC arrays of MadNLP's matrix (#175): a vendor CSC's colPtr/rowVal/nzVal on a GPU
+# backend, a SparseMatrixCSC's colptr/rowval/nzval on the CPU backend
+_csc_arrays(csc::SparseMatrixCSC) = (csc.colptr, csc.rowval, csc.nzval)
+_csc_arrays(csc) = (csc.colPtr, csc.rowVal, csc.nzVal)
+
 mutable struct SDSSolver{T} <: MadNLP.AbstractLinearSolver{T}
     inner::SDS.AbstractDirectSolver
     tril::Any
@@ -107,27 +121,32 @@ function SDSSolver(
         opt = SDSSolverOptions(),
         logger = MadNLP.MadNLPLogger(),
     )
-    T = eltype(csc.nzVal)
+    colptr, rowval, nzval = _csc_arrays(csc)
+    T = eltype(nzval)
     n = size(csc, 1)
+    backend = KA.get_backend(nzval)
     ldl = opt.sds_factorization === :ldl
     opt.sds_pivoting in (:none, :bk) ||
         throw(ArgumentError("sds_pivoting must be :none or :bk, got $(repr(opt.sds_pivoting))"))
     bk = opt.sds_pivoting === :bk
     bk && !ldl && throw(ArgumentError("sds_pivoting = :bk needs sds_factorization = :ldl"))
+    bk || !(backend isa KA.CPU) ||
+        throw(SDS.NotSupportedError("SDSSolver: sds_pivoting = :none runs the fused pipeline, which the " *
+                                    "KernelAbstractions CPU backend cannot run; use sds_factorization = :ldl, " *
+                                    "sds_pivoting = :bk on the CPU"))
     s = if bk
         # the stock path is the whole pipeline: pivot_type AUTO (Bunch-Kaufman for "S") and
         # the default 2x2 pivot pairs; a user threshold reaches the in-front acceptance test
-        backend = KA.get_backend(csc.nzVal)
         t = Fused._resolved_tuning(opt.sds_tuning, backend)
-        d = SDS.DirectSolver(csc.colPtr, csc.rowVal, csc.nzVal, "S", 'U')
+        d = SDS.DirectSolver(colptr, rowval, nzval, "S", 'U')
         opt.sds_pivot_threshold !== nothing && SDS.setparam!(d, "pivot_threshold", opt.sds_pivot_threshold)
         Fused._apply_tuning!(d, t)
     else
-        SDS.FusedSolver(csc.colPtr, csc.rowVal, csc.nzVal, ldl ? "S" : "SPD", 'U'; tuning = opt.sds_tuning)
+        SDS.FusedSolver(colptr, rowval, nzval, ldl ? "S" : "SPD", 'U'; tuning = opt.sds_tuning)
     end
     _apply_reordering!(s, opt)
-    x = similar(csc.nzVal, n)
-    b = similar(csc.nzVal, n)
+    x = similar(nzval, n)
+    b = similar(nzval, n)
     SDS.analyze!(s, x, b; asynchronous = false)
     SDS.factorize!(s, x, b; asynchronous = false)   # primes the factorization path once
     return SDSSolver{T}(s, csc, x, b, Int(SDS.getparam(s, "info")), opt, logger)
