@@ -232,21 +232,21 @@ end
 end
 
 # host: per B-group tile lists for fronts with m > SYRK_IN (built once per analysis)
-function launch_subtrees_sorted!(N, S, nzval, list, lb, backend)
+function launch_subtrees_sorted!(N, S, nzval, list, lb, epsc, backend)
     SDS._with_local_bytes(Int(lb)) do LBv
-        _sorted_subtree_launch(N, S, nzval, list, LBv, Val(SDS.SUBTREE_WORKGROUP), backend)
+        _sorted_subtree_launch(N, S, nzval, list, epsc, LBv, Val(SDS.SUBTREE_WORKGROUP), backend)
     end
 end
-function _sorted_subtree_launch(N, S, nzval, list, ::Val{LB}, ::Val{WG}, backend) where {LB, WG}
+function _sorted_subtree_launch(N, S, nzval, list, epsc, ::Val{LB}, ::Val{WG}, backend) where {LB, WG}
     bm = SDS.batch_map(N; first = 1)
     k! = SDS.subtree_cholesky_kernel!(backend, WG)
-    _sorted_subtree_launch2(N, S, nzval, list, bm, k!, Val(LB), Val(WG))
+    _sorted_subtree_launch2(N, S, nzval, list, bm, k!, epsc, Val(LB), Val(WG))
 end
-function _sorted_subtree_launch2(N::SDS.Numeric{T}, S, nzval, list, bm, k!, ::Val{LB}, ::Val{WG}) where {T, LB, WG}
+function _sorted_subtree_launch2(N::SDS.Numeric{T}, S, nzval, list, bm, k!, epsc, ::Val{LB}, ::Val{WG}) where {T, LB, WG}
     k!(N.factor, N.stack, N.info, nzval, S.amap, S.amap_ptr, S.amap_src, list, bm, S.subtree_ptr,
        S.subtree_nodes, S.front_ptr, S.front_nrows, S.front_ncols, S.cb_ptr, S.local_front, S.local_cb,
        S.child_ptr, S.child_list, S.relind_ptr, S.relind,
-       real(T)(SDS.resolved_pivot_epsilon(SDS.Options(), real(T))),   # production default (#127)
+       epsc,   # the solver's resolved pivot_epsilon, the same on every front (#127)
        Val((LB - SDS.SUBTREE_LOCAL_RESERVE) ÷ sizeof(T)), Val(WG); ndrange = WG * length(list) * bm.nact)
     return nothing
 end
@@ -329,7 +329,7 @@ function refact_split!(s, nzval, tiles, chunks, cnodes, cwide, ea, ssub)
     backend = KA.get_backend(N.factor)
     epsc = real(eltype(N.factor))(SDS.resolved_pivot_epsilon(s.options, real(eltype(N.factor))))   # as factorize_cholesky!
     for k in eachindex(plan.sub_first)
-        launch_subtrees_sorted!(N, S, nzval, ssub[k], plan.sub_local[k], backend)
+        launch_subtrees_sorted!(N, S, nzval, ssub[k], plan.sub_local[k], epsc, backend)
     end
     for k in eachindex(plan.group_first)
         a, b = plan.group_first[k], plan.group_last[k]
@@ -376,7 +376,7 @@ function refact_split!(s, nzval, tiles, chunks, cnodes, cwide, ea, ssub)
             nn === nothing || launch_panel(nn, 1, length(nn), 0, 64, Val(false))
             run_split(k)
             for v in cwide[k]
-                SDS._factor_front_c!(N, S, Int(v), p)
+                SDS._factor_front_c!(N, S, Int(v), p, epsc)
             end
         end
     end
