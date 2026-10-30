@@ -193,6 +193,29 @@ block instead of eliminating a (near-)zero dual pivot on its own.
 """
 kkt_interleaved_perm(nh::Integer, nj::Integer) = vcat([[i, nh + i] for i in 1:nj]..., (nj + 1):nh)
 
+"""
+    grid_kkt_matrix(T, nx, ny, δ)
+
+Saddle-point matrix of a PDE-constrained problem on an `nx × ny` grid
+(issue #141), `n = 2 nx ny`:
+
+    [L + I   L ; L   −δI]      L = laplacian2d(T, nx, ny)
+
+primal rows `1:nx·ny`, dual rows after them. The primal block is SPD and the
+dual Schur complement `−δI − L (L + I)⁻¹ L` negative definite, so the inertia is
+exactly `(nx·ny, 0, nx·ny)` and the matrix factors without pivoting. Under
+nested dissection the separators of the grid hold primal and dual rows
+together: for `nx = ny ≥ 40` the root front is wider than 64 columns and its
+pivots take both signs (the wide fronts a no-pivot LDLᵀ must not hand to a
+Cholesky kernel).
+"""
+function grid_kkt_matrix(::Type{T}, nx::Integer, ny::Integer, δ::Real) where {T}
+    L = laplacian2d(T, nx, ny)
+    m = size(L, 1)
+    return [L + _speye(T, m) L; L sparse(1:m, 1:m, fill(T(-δ), m), m, m)]
+end
+grid_kkt_matrix(nx::Integer, ny::Integer, δ::Real) = grid_kkt_matrix(Float64, nx, ny, δ)
+
 # orderings of the MadNLP-style loops on kkt_matrix(T, 200, 100, 0; hessian = :indefinite) (T14, T15)
 const MADNLP_ORDERINGS = (("default ordering", Options()),
                           ("default ordering, pivot_pairs = all", Options(pivot_pairs = "all")),
