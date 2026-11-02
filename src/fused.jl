@@ -1995,7 +1995,7 @@ function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, B
         return nothing
     end
 
-    segments = NTuple{3, Any}[]                  # (base, count, wides-at-boundary)
+    segments = Tuple{Int, Int, Vector{Int}}[]   # (base, count, wides-at-boundary)
     seg_base = 0
     for k in eachindex(plan.group_first)
         a, b = plan.group_first[k], plan.group_last[k]
@@ -2065,11 +2065,10 @@ function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, B
     end
 
     stp2 = stp
-    ssub = Vector{Any}()
-    for k in eachindex(plan.sub_first)
+    ssub = map(eachindex(plan.sub_first)) do k    # typed: the launches dispatch statically
         ids = [nodes[q] for q in plan.sub_first[k]:plan.sub_last[k]]
         sort!(ids; by = e -> stp2[e + 1] - stp2[e], rev = true)
-        push!(ssub, _dvec(backend, ids))
+        _dvec(backend, ids)
     end
 
     SDS._log(SDS.LOG_DEBUG, () -> "fused plan: $(length(role)) roles, $(length(segments)) segments, " *
@@ -2089,6 +2088,9 @@ function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, B
             wcb_b = _dvec(backend, wcb_b), wupd = KA.zeros(backend, Int32, max(nwslots, 1)),
             wtl = KA.zeros(backend, Int32, max(nwslots, 1)), wpd = KA.zeros(backend, Int32, max(nwslots, 1)),
             wcb = KA.zeros(backend, Int32, ns), wgf, scap = Int32(scap), eac = Int32(ea_chunk), ldl,
+            # the kernel object and its Val parameters, typed in the plan so that the launch
+            # in refact_fused_launches! is statically dispatched (T34: no boxing of its arguments)
+            kfact = fused_fact_kernel!(backend, wgf), ldlv = Val(ldl), wgv = Val(wgf),
             # captured at plan build: a later setparam!("pivot_epsilon") changes the stock
             # path but not an already-built fused plan (rebuild the plan to change it)
             chol_eps = ldl ? 0.0 : Float64(SDS.resolved_pivot_epsilon(s.options, real(T))),
@@ -2139,15 +2141,15 @@ function refact_fused_launches!(s, nzval, fp; inv = nothing)
                                             S.front_nrows, S.front_ncols, Val(WGF); ndrange = WGF * length(fp.czero))
     for (base, count, gwides) in fp.segments
         count > 0 &&
-            fused_fact_kernel!(backend, fp.wgf)(N.factor, N.stack, fp.pcb, N.info, nzval, S.amap, S.amap_ptr,
+            fp.kfact(N.factor, N.stack, fp.pcb, N.info, nzval, S.amap, S.amap_ptr,
                                              S.amap_src, fp.cb2, fp.wt, fp.role, fp.ra, fp.rb, fp.rc, fp.nchild,
                                              fp.arrived, fp.ea, fp.pdone, fp.trsm, fp.tiles, fp.tiles_base, fp.cbd,
                                              S.snparent, S.front_ptr, S.front_nrows, S.front_ncols,
                                              S.cb_ptr, S.child_ptr, S.child_list, S.relind_ptr, S.relind,
                                              Int32(base), fp.wbase, fp.wupd, fp.wpd, fp.wtl, fp.wcb,
                                              fp.scap, fp.eac, real(eltype(N.factor))(fp.chol_eps), N.d,
-                                             S.super_ptr, inv11, inv_ptr, Val(fp.ldl), Val(fp.wgf),
-                                             Val(inv !== nothing);
+                                             S.super_ptr, inv11, inv_ptr, fp.ldlv, fp.wgv,
+                                             Val(!(inv isa Nothing));
                                              ndrange = fp.wgf * count)
         for v in gwides                              # host-wide fronts at the segment boundary
             if fp.ldl && fp.ldl_potrf
