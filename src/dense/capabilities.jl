@@ -117,6 +117,17 @@ no host or peer device reads them while a kernel runs (#154).
 """
 @inline device_fence(::Any) = Threads.atomic_fence()
 
+"""
+    capture_graph(backend, f) -> callable or nothing
+
+Records the device work `f()` launches on `backend` without running it and returns a
+callable that replays it (a CUDA graph in the CUDA extension), or `nothing` when the
+backend has no graphs (the default) or the capture fails. `f` must not synchronize with
+the host. The fused pipeline replays its refactorization and solve sweeps through it for
+`n <= SDSTuning.graph_max_n` (T34).
+"""
+capture_graph(backend, f) = nothing
+
 # Backend extensions may adjust scheduling options for hard kernel ABI limits.
 _backend_schedule_options(backend, structure::Structure, opts::Options) = opts
 _backend_schedule_options(backend, structure::Structure, opts::Options, nbatch::Integer) =

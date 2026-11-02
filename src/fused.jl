@@ -37,6 +37,10 @@ Base.@kwdef struct SDSTuning
     # at ~2x the reordering time -- opt in through `sds_tuning` when factor time dominates.
     nd_nseps::Int = 1
     nd_seed::Int = 3
+    # T34 knobs
+    solve_workgroup::Int = 64                 # fused-solve (fwd2/bwd2) workgroup size: 32..512, multiple of 32
+    wide_host_min::Int = typemax(Int)         # :merged Cholesky: fronts wider than this on the host vendor path
+    graph_max_n::Int = 0                      # CUDA-graph replay of refactorization and solve when n <= this
 end
 
 """
@@ -68,9 +72,8 @@ end
 """
 function resolve_tuning(t::SDSTuning, backend)
     t.wides === :auto || return t
-    return SDSTuning(default_tuning(backend).wides, t.subtree_budgets, t.subtree_parallelism,
-                     t.regime_c_width, t.regime_c_rows, t.amalgamation, t.workgroup, t.spin_cap,
-                     t.nd_nseps, t.nd_seed)
+    w = default_tuning(backend).wides
+    return SDSTuning((f === :wides ? w : getfield(t, f) for f in fieldnames(SDSTuning))...)
 end
 
 # device copy of a host integer vector (empty vectors included)
@@ -775,8 +778,14 @@ function build_fused(s; kstart::Int = 1, wcap::Int = MW, merged::Bool = (kstart 
             nfused = length(flist_h), slist = _dvec(backend, sub_ids), nsub = length(sub_ids))
 end
 
+# the dependency-counter sweeps take a workgroup of 32..512 work items, a multiple of 32
+# (`SDSTuning.solve_workgroup`; 64 is the size they were written for)
+_check_solve_workgroup(wg) = (32 <= wg <= 512 && wg % 32 == 0) ||
+    throw(SDS.InvalidValueError("fused solve: workgroup size $wg; expected a multiple of 32 in 32:512 " *
+                                "(or > 512 for the chain kernel)"))
+
 # one fused segment, forward sweep: `wg > 512` runs the single-workgroup chain kernel,
-# `wg == 64` the dependency-counter sweep (the workgroup size the sweep is tuned for)
+# otherwise the dependency-counter sweep with workgroups of `wg` work items
 function run_fused!(fz, wg, Yv, s, inv11, inv_ptr, backend)
     S, N = s.symbolic, s.numeric
     if wg > 512
@@ -785,12 +794,12 @@ function run_fused!(fz, wg, Yv, s, inv11, inv_ptr, backend)
                                          ndrange = CHWG)
         return nothing
     end
-    wg == 64 || throw(SDS.InvalidValueError("fused solve: workgroup size $wg; expected 64 or > 512 (chain)"))
+    _check_solve_workgroup(wg)
     copyto!(fz.arrived, fz.arrived_base)
-    fwd2_kernel!(backend, 64)(Yv, N.factor, inv11, inv_ptr, fz.flist, fz.slist, fz.nsub, S.subtree_ptr,
+    fwd2_kernel!(backend, wg)(Yv, N.factor, inv11, inv_ptr, fz.flist, fz.slist, fz.nsub, S.subtree_ptr,
                               S.subtree_nodes, S.snparent, fz.arrived, fz.nchild,
                               S.super_ptr, S.rowptr, S.rowval, S.front_ptr, S.front_nrows, S.front_ncols,
-                              Val(64); ndrange = 64 * (fz.nfused + fz.nsub))
+                              Val(wg); ndrange = wg * (fz.nfused + fz.nsub))
     return nothing
 end
 
@@ -803,12 +812,12 @@ function run_fused_bwd!(fz, wg, Yv, s, inv11, inv_ptr, backend)
                                          ndrange = CHWG)
         return nothing
     end
-    wg == 64 || throw(SDS.InvalidValueError("fused solve: workgroup size $wg; expected 64 or > 512 (chain)"))
+    _check_solve_workgroup(wg)
     copyto!(fz.done, fz.done_base)
-    bwd2_kernel!(backend, 64)(Yv, N.factor, inv11, inv_ptr, fz.flist, fz.slist, fz.nsub, S.subtree_ptr,
+    bwd2_kernel!(backend, wg)(Yv, N.factor, inv11, inv_ptr, fz.flist, fz.slist, fz.nsub, S.subtree_ptr,
                               S.subtree_nodes, S.snparent, fz.done,
                               S.super_ptr, S.rowptr, S.rowval, S.front_ptr, S.front_nrows, S.front_ncols,
-                              Val(64); ndrange = 64 * (fz.nfused + fz.nsub))
+                              Val(wg); ndrange = wg * (fz.nfused + fz.nsub))
     return nothing
 end
 
@@ -820,6 +829,15 @@ function algo2_solve!(x, s, b, inv11, inv_ptr, fz)
     S, N, ws = s.symbolic, s.numeric, s.workspace
     bm = SDS.batch_map(N; nrhs = 1)
     SDS.permute_rhs!(ws.Y, b, S.perm; transposed = false, bm)
+    algo2_sweeps!(s, inv11, inv_ptr, fz)
+    SDS.unpermute_solution!(x, ws.Y, S.perm; transposed = false, bm)
+    return x
+end
+
+# the sweeps of `algo2_solve!` on the solve workspace `Y` (the permuted right-hand side in,
+# the permuted solution out): the part a CUDA graph replays (T34)
+function algo2_sweeps!(s, inv11, inv_ptr, fz)
+    S, N, ws = s.symbolic, s.numeric, s.workspace
     plan = ws.plan
     nodes = S.schedule.group_nodes
     widths = S.schedule.width
@@ -883,8 +901,7 @@ function algo2_solve!(x, s, b, inv11, inv_ptr, fz)
     while k >= 1
         bwd_entry(k); k -= 1
     end
-    SDS.unpermute_solution!(x, ws.Y, S.perm; transposed = false, bm)
-    return x
+    return nothing
 end
 
 const SYRK_IN = 64
@@ -1818,7 +1835,8 @@ end
 # host: the topologically ordered role list + counter bases + stream-2 program
 function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, Bool} = nothing,
                           wides_potrf::Bool = false, merge_segments::Bool = false,
-                          wgf::Int = WGF, scap::Integer = 128, ea_chunk::Integer = 16384)
+                          wgf::Int = WGF, scap::Integer = 128, ea_chunk::Integer = 16384,
+                          host_min::Integer = typemax(Int))
     S = s.symbolic
     plan = s.numeric.plan
     backend = KA.get_backend(s.numeric.factor)
@@ -1831,6 +1849,8 @@ function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, B
     # LDL host-wide fronts exist only as the potrf-derived path (wides_potrf = true);
     # otherwise LDL wides are factored in-kernel
     inkernel_wides = inkernel_wides === nothing ? (ldl && !wides_potrf) : inkernel_wides
+    ldl && host_min < typemax(Int) && !wides_potrf &&
+        throw(SDS.InvalidValueError("fused LDL plan: host-wide fronts (host_min = $host_min) need wides_potrf = true"))
     ldl && !inkernel_wides && !wides_potrf &&
         throw(SDS.InvalidValueError("fused LDL plan: host-wide fronts need wides_potrf = true " *
                                     "(or inkernel_wides = true)"))
@@ -1988,10 +2008,12 @@ function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, B
             end
             if !isempty(gwides)
                 if inkernel_wides
-                    foreach(emit_wide, gwides)
-                    gwides = Int[]
+                    # per-front strategy (T34): a front wider than `host_min` stays on the host
+                    # vendor path at a segment boundary, the others are factored in-kernel
+                    foreach(emit_wide, filter(v -> width_h[v] <= host_min, gwides))
+                    gwides = filter(v -> width_h[v] > host_min, gwides)
                 end
-                if !(inkernel_wides && merge_segments)   # merged: one launch, no split
+                if !(inkernel_wides && merge_segments) || !isempty(gwides)   # merged: one launch, no split
                     push!(segments, (seg_base, length(role) - seg_base, gwides))
                     seg_base = length(role)
                 end
@@ -2056,8 +2078,16 @@ function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, B
 end
 
 # `inv = (inv11, inv_ptr)` (from `build_inverse(s; skip = fp.panel_mask)`): the panel roles
-# also write the inverses of their L11 blocks; the caller runs the closure for the rest
+# also write the inverses of their L11 blocks; the caller runs the closure for the rest.
+# Returns the info (one host read after the launches of `refact_fused_launches!`).
 function refact_fused!(s, nzval, fp; inv = nothing)
+    refact_fused_launches!(s, nzval, fp; inv)
+    return SDS._numeric_info!(s.numeric, s.symbolic, true)
+end
+
+# the device work of `refact_fused!`: no host synchronization, the part a CUDA graph
+# replays when no front takes the host vendor path (T34)
+function refact_fused_launches!(s, nzval, fp; inv = nothing)
     N, S = s.numeric, s.symbolic
     plan = N.plan
     backend = KA.get_backend(N.factor)
@@ -2118,7 +2148,7 @@ function refact_fused!(s, nzval, fp; inv = nothing)
     # fields are Cholesky-interpretation garbage; inertia comes from the signs of
     # d (the MadNLP extension), never from these stats.
     SDS.cholesky_stats!(N, S)
-    return SDS._numeric_info!(N, S, true)
+    return nothing
 end
 
 # ---------------------------------------------------------------------------
@@ -2229,6 +2259,12 @@ mutable struct FusedSolver{T, INT, S <: SDS.DirectSolver{T, INT}} <: SDS.Abstrac
     fz::Any                  # fused solve segments (`build_fused`)
     info::Int
     stage::Int
+    # CUDA-graph replay (T34, `SDSTuning.graph_max_n`): the captured refactorization and solve
+    # sweeps (`nothing`: not captured yet; `false`: not capturable), and the values the
+    # refactorization graph was captured with (a new `nzval` buffer captures again)
+    gfact::Any
+    gsolve::Any
+    gnz::Any
 end
 
 function FusedSolver(A, structure, view; tuning::Union{Nothing, SDSTuning} = nothing, kwargs...)
@@ -2259,6 +2295,7 @@ function _fused_solver(s::SDS.DirectSolver{T, INT}, tuning::Union{Nothing, SDSTu
     s.nbatch == 1 ||
         throw(SDS.NotSupportedError("FusedSolver: a uniform batch ($(s.nbatch) members) is not supported"))
     t = _resolved_tuning(tuning, backend)
+    _check_solve_workgroup(t.solve_workgroup)
     ldl = st == SDS.STRUCTURE_SYMMETRIC
     if ldl
         SDS.setparam!(s, "pivot_type", 'N')
@@ -2269,7 +2306,7 @@ function _fused_solver(s::SDS.DirectSolver{T, INT}, tuning::Union{Nothing, SDSTu
     end
     _apply_tuning!(s, t)
     return FusedSolver{T, INT, typeof(s)}(s, t, ldl, nothing, nothing, nothing, nothing, nothing, nothing, 0,
-                                          SDS.STAGE_NONE)
+                                          SDS.STAGE_NONE, nothing, nothing, nothing)
 end
 
 Base.size(F::FusedSolver) = size(F.inner)
@@ -2307,6 +2344,7 @@ end
 # drop the plans of an earlier analysis (a new analysis rebuilds them)
 function _clear_plans!(F::FusedSolver)
     F.nzval = F.fp = F.inv11 = F.inv_ptr = F.invert! = F.fz = nothing
+    F.gfact = F.gsolve = F.gnz = nothing
     F.info = 0
     return F
 end
@@ -2330,8 +2368,11 @@ function _fused_symbolic!(F::FusedSolver{T}) where {T}
     # dual rows, so potrf fails on a matrix the no-pivot LDLᵀ factors (#141). `wides =
     # :host` keeps its meaning for Cholesky; for LDL it only keeps the segment split.
     inkernel = merged || F.ldl
+    # `wide_host_min`: the per-front wide strategy of a merged Cholesky plan (LDL keeps every
+    # wide front in-kernel, see above)
+    host_min = merged && !F.ldl ? t.wide_host_min : typemax(Int)
     fp = build_fused_plan(s; ldl = F.ldl, inkernel_wides = inkernel, merge_segments = merged,
-                          wides_potrf = false, wgf = t.workgroup, scap = t.spin_cap)
+                          wides_potrf = false, wgf = t.workgroup, scap = t.spin_cap, host_min)
     inv11, inv_ptr, invertf, _ = build_inverse(s; skip = fp.panel_mask)
     # the solve plan: one merged dependency-counter sweep over the whole tree
     fz1 = build_fused(s; kstart = 1, wcap = 256)
@@ -2339,18 +2380,48 @@ function _fused_symbolic!(F::FusedSolver{T}) where {T}
     F.nzval = SDS._factor_values(s)
     F.fp = fp
     F.inv11, F.inv_ptr, F.invert! = inv11, inv_ptr, invertf
-    F.fz = ([(fz1, 64)], true)
+    F.fz = ([(fz1, t.solve_workgroup)], true)
     F.info = 0
     F.stage = SDS.STAGE_ANALYZED
     return F
 end
 
-# the fused factorization behind a function barrier (the plans are untyped fields); the panel
-# roles write the inverses of their fronts, `invertf` the others
-function _fused_refactor!(s, nzval, fp, inv11, inv_ptr, invertf)
-    info = Int(refact_fused!(s, nzval, fp; inv = (inv11, inv_ptr)))
+# the device work of the fused factorization behind a function barrier (the plans are untyped
+# fields); the panel roles write the inverses of their fronts, `invertf` the others
+function _fused_launches!(s, nzval, fp, inv11, inv_ptr, invertf)
+    refact_fused_launches!(s, nzval, fp; inv = (inv11, inv_ptr))
     invertf()
-    return info
+    return nothing
+end
+
+# CUDA-graph replay (`SDSTuning.graph_max_n`, the backend's `capture_graph`): only for n up to
+# the tuning's bound, and only where no vendor dense call is in the captured range (cuSOLVER
+# potrf is not capturable on CUDA.jl 6.5, #174): no host-wide front in the factorization, no
+# front wider than MW (the vendor dense sweeps) in the solve
+_graph_size_ok(F::FusedSolver) = size(F, 1) <= F.tuning.graph_max_n
+_graph_fact_ok(F::FusedSolver) = _graph_size_ok(F) && isempty(F.fp.wides)
+_graph_solve_ok(F::FusedSolver) = _graph_size_ok(F) && maximum(F.inner.symbolic.schedule.width) <= MW
+
+# the captured graph of `f` on the solver's backend, `false` when the backend has none or the
+# capture fails (the phase then launches eagerly, as without the tuning)
+_capture(F::FusedSolver, f) = something(SDS.capture_graph(F.inner.backend, f), false)
+
+function _fused_refactor!(F::FusedSolver)
+    s = F.inner
+    # the first factorization runs eagerly (it compiles the kernels a capture records)
+    if F.stage >= SDS.STAGE_FACTORIZED && _graph_fact_ok(F)
+        if F.gfact === nothing || F.gnz !== F.nzval
+            nz, fp, inv11, inv_ptr, invf = F.nzval, F.fp, F.inv11, F.inv_ptr, F.invert!
+            F.gfact = _capture(F, () -> _fused_launches!(s, nz, fp, inv11, inv_ptr, invf))
+            F.gnz = F.nzval
+        end
+        if F.gfact !== false
+            F.gfact()
+            return Int(SDS._numeric_info!(s.numeric, s.symbolic, true))
+        end
+    end
+    _fused_launches!(s, F.nzval, F.fp, F.inv11, F.inv_ptr, F.invert!)
+    return Int(SDS._numeric_info!(s.numeric, s.symbolic, true))
 end
 
 function _fused_factorize!(F::FusedSolver, p::SDS.Phase)
@@ -2359,7 +2430,7 @@ function _fused_factorize!(F::FusedSolver, p::SDS.Phase)
     p == SDS.PHASE_REFACTORIZATION && F.stage < SDS.STAGE_FACTORIZED &&
         throw(SDS._phase_error(name, "needs a previous \"factorization\""))
     F.nzval = SDS._factor_values(F.inner)
-    F.info = _fused_refactor!(F.inner, F.nzval, F.fp, F.inv11, F.inv_ptr, F.invert!)
+    F.info = _fused_refactor!(F)
     F.stage = SDS.STAGE_FACTORIZED
     return F
 end
@@ -2390,8 +2461,32 @@ function _fused_solve!(F::FusedSolver, X, B)
         throw(SDS.NotSupportedError("FusedSolver: ir_n_steps = $(o.ir_n_steps) (iterative refinement) is not supported"))
     x = _fused_rhs(F, X, "X")
     b = _fused_rhs(F, B, "B")
-    algo2_solve!(x, F.inner, b, F.inv11, F.inv_ptr, F.fz)
+    if _graph_solve_ok(F)
+        _fused_solve_graph!(F, x, b)
+    else
+        algo2_solve!(x, F.inner, b, F.inv11, F.inv_ptr, F.fz)
+    end
     return F
+end
+
+# `algo2_solve!` with the sweeps replayed from a graph (captured at the second solve: the
+# first one runs eagerly and compiles the kernels); the permutations stay outside the graph,
+# so the graph does not depend on the caller's vectors
+function _fused_solve_graph!(F::FusedSolver, x, b)
+    s = F.inner
+    S, N, ws = s.symbolic, s.numeric, s.workspace
+    if F.gsolve === nothing
+        algo2_solve!(x, s, b, F.inv11, F.inv_ptr, F.fz)
+        inv11, inv_ptr, fz = F.inv11, F.inv_ptr, F.fz
+        F.gsolve = _capture(F, () -> algo2_sweeps!(s, inv11, inv_ptr, fz))
+        return nothing
+    end
+    F.gsolve === false && return algo2_solve!(x, s, b, F.inv11, F.inv_ptr, F.fz)
+    bm = SDS.batch_map(N; nrhs = 1)
+    SDS.permute_rhs!(ws.Y, b, S.perm; transposed = false, bm)
+    F.gsolve()
+    SDS.unpermute_solution!(x, ws.Y, S.perm; transposed = false, bm)
+    return nothing
 end
 
 function SDS.execute!(phase::AbstractString, F::FusedSolver, X, B; asynchronous::Bool = true)
