@@ -84,7 +84,9 @@ const NSTRIP = 4  # strip parallelism of the chain kernels
 
 # ---------------------------------------------------------------------------
 # inversion: thread j of the front's workgroup computes column j of inv(L11)
-# (non-unit lower triangular), written col-major at inv_ptr[v]
+# (non-unit lower triangular), written col-major at inv_ptr[v]. The reference the T34
+# gate compares against (bench); the pipeline runs invert_blocked_kernel! and the panel
+# roles of fused_fact_kernel! instead
 @kernel function invert_l11_kernel!(inv11, @Const(factor), @Const(inv_ptr), @Const(list),
                                     @Const(front_ptr), @Const(front_nrows), @Const(front_ncols), ::Val{WGV}) where {WGV}
     li = @index(Local, Linear)
@@ -213,10 +215,118 @@ end
 end
 
 # ---------------------------------------------------------------------------
+# blocked inversion (T34): one workgroup per (front, 32-column block J) computes the block
+# column J of inv(L11) by block forward substitution, X_IJ = -inv(L_II) Σ_{K=J}^{I-1} L_IK X_KJ,
+# with the 32 x 32 diagonal-block inverses formed in local memory (thread c: column c, the
+# arithmetic of invert_l11_kernel!, so a front of width <= 32 gets the same bits). The
+# per-thread serial chain is O(32²) per block instead of O(w²) per column: for the fronts
+# of width 65..256 it replaces invert_l11_kernel!'s latency-bound loops (#155).
+const IB = 32
+const INVWG = 128
+
+@kernel function invert_blocked_kernel!(inv11, @Const(factor), @Const(inv_ptr), @Const(pv), @Const(pj),
+                                        @Const(front_ptr), @Const(front_nrows), @Const(front_ncols),
+                                        ::Val{WGV}) where {WGV}
+    @uniform TT = eltype(inv11)
+    li = @index(Local, Linear)
+    g = @index(Group, Linear)
+    Bs = @localmem TT (IB * IB,)        # inverse of the diagonal block L_II (col-major)
+    Ls = @localmem TT (IB * IB,)        # staged block of L
+    Xs = @localmem TT (IB * IB,)        # staged block X_KJ
+    Ts = @localmem TT (IB * IB,)        # Σ_K L_IK X_KJ
+    @inbounds begin
+        v = Int(pv[g])
+        J = Int(pj[g])                  # 0-based block column
+        f = Int(front_nrows[v])
+        w = Int(front_ncols[v])
+        p0 = Int(front_ptr[v]) - 1
+        ip = Int(inv_ptr[v]) - 1
+        nb = cld(w, IB)
+        c0 = J * IB
+        bj = min(IB, w - c0)
+        if c0 > 0                       # rows above the diagonal block are zero
+            for q in (li - 1):WGV:(c0 * bj - 1)
+                c = q ÷ c0 + 1
+                k = q - (c - 1) * c0 + 1
+                inv11[ip + (c0 + c - 1) * w + k] = zero(TT)
+            end
+        end
+        for I in J:(nb - 1)
+            r0 = I * IB
+            bi = min(IB, w - r0)
+            for q in (li - 1):WGV:(IB * IB - 1)
+                Ts[q + 1] = zero(TT)
+            end
+            for K in J:(I - 1)          # full blocks: K < I <= nb - 1
+                k0 = K * IB
+                @synchronize
+                for q in (li - 1):WGV:(IB * IB - 1)
+                    rr = q % IB + 1
+                    cc = q ÷ IB + 1
+                    Ls[q + 1] = rr <= bi ? factor[p0 + (k0 + cc - 1) * f + r0 + rr] : zero(TT)
+                    Xs[q + 1] = cc <= bj ? inv11[ip + (c0 + cc - 1) * w + k0 + rr] : zero(TT)
+                end
+                @synchronize
+                for q in (li - 1):WGV:(IB * IB - 1)
+                    rr = q % IB + 1
+                    cc = q ÷ IB + 1
+                    a = zero(TT)
+                    for m in 1:IB
+                        a += Ls[rr + (m - 1) * IB] * Xs[m + (cc - 1) * IB]
+                    end
+                    Ts[q + 1] += a
+                end
+            end
+            @synchronize
+            for q in (li - 1):WGV:(IB * IB - 1)
+                rr = q % IB + 1
+                cc = q ÷ IB + 1
+                Ls[q + 1] = (rr <= bi && cc <= rr) ? factor[p0 + (r0 + cc - 1) * f + r0 + rr] : zero(TT)
+            end
+            @synchronize
+            for c in li:WGV:bi
+                cb = (c - 1) * IB
+                for k in 1:(c - 1)
+                    Bs[cb + k] = zero(TT)
+                end
+                for k in c:bi
+                    acc = k == c ? one(TT) : zero(TT)
+                    for m in c:(k - 1)
+                        acc -= Ls[k + (m - 1) * IB] * Bs[cb + m]
+                    end
+                    Bs[cb + k] = acc / Ls[k + (k - 1) * IB]
+                end
+            end
+            @synchronize
+            for q in (li - 1):WGV:(IB * IB - 1)
+                rr = q % IB + 1
+                cc = q ÷ IB + 1
+                if rr <= bi && cc <= bj
+                    x = zero(TT)
+                    if I == J
+                        x = Bs[q + 1]
+                    else
+                        a = zero(TT)
+                        for m in 1:rr
+                            a += Bs[rr + (m - 1) * IB] * Ts[m + (cc - 1) * IB]
+                        end
+                        x = -a
+                    end
+                    inv11[ip + (c0 + cc - 1) * w + r0 + rr] = x
+                end
+            end
+            @synchronize                # X_IJ is read back by the next block row
+        end
+    end
+end
+
+# ---------------------------------------------------------------------------
 # per-front inverses of the L11 blocks (width <= MW) for the partitioned-inverse solve:
 # returns the device buffer, its per-front offsets, a closure that (re)computes the
-# inverses from the current factor, and the buffer size in bytes
-function build_inverse(s)
+# inverses from the current factor, and the buffer size in bytes. `skip[v] = true` leaves
+# front v to another writer (the panel roles of the fused factorization, `inv = ...` of
+# `refact_fused!`); the closure covers the rest with `invert_blocked_kernel!`.
+function build_inverse(s; skip::Union{Nothing, AbstractVector{Bool}} = nothing)
     S = s.symbolic
     sc = S.schedule
     reg = Array(sc.regime)
@@ -237,10 +347,21 @@ function build_inverse(s)
     T = eltype(s.numeric.factor)
     inv11 = KA.zeros(backend, T, p - 1)
     inv_ptr = _dvec(backend, inv_ptr_h)
-    ab = _dvec(backend, Int32.(findall(v -> width[v] <= MW, 1:ns)))
-    invert! = () -> invert_l11_kernel!(backend, WG)(inv11, s.numeric.factor, inv_ptr, ab, S.front_ptr,
-                                                   S.front_nrows, S.front_ncols, Val(WG);
-                                                   ndrange = WG * length(ab))
+    # (front, block column) pairs, the longest block columns first
+    pairs = Tuple{Int32, Int32}[]
+    for v in 1:ns
+        (width[v] <= MW && (skip === nothing || !skip[v])) || continue
+        for J in 0:(cld(width[v], IB) - 1)
+            push!(pairs, (Int32(v), Int32(J)))
+        end
+    end
+    sort!(pairs; by = q -> cld(width[q[1]], IB) - q[2], rev = true)
+    pv = _dvec(backend, first.(pairs))
+    pj = _dvec(backend, last.(pairs))
+    np = length(pairs)
+    invert! = () -> (np > 0 && invert_blocked_kernel!(backend, INVWG)(inv11, s.numeric.factor, inv_ptr, pv, pj,
+                                                                       S.front_ptr, S.front_nrows, S.front_ncols,
+                                                                       Val(INVWG); ndrange = INVWG * np); nothing)
     return inv11, inv_ptr, invert!, sizeof(T) * (p - 1)
 end
 
@@ -993,7 +1114,7 @@ end
                                     @Const(front_ncols), @Const(cb_ptr), @Const(child_ptr),
                                     @Const(child_list), @Const(relind_ptr), @Const(relind), base,
                                     @Const(wbase), wupd, wpdone2, wtrsml, wcbl, scap, eac, epsc, d, @Const(super_ptr),
-                                    ::Val{LDL}, ::Val{WG}) where {LDL, WG}
+                                    inv11, @Const(inv_ptr), ::Val{LDL}, ::Val{WG}, ::Val{INV}) where {LDL, WG, INV}
     @uniform TT = eltype(factor)
     @uniform RT = real(eltype(factor))
     li = @index(Local, Linear)
@@ -1158,6 +1279,27 @@ end
                 @synchronize
                 if li == 1
                     Atomix.@atomic panel_done[v] += Int32(1)
+                end
+            end
+            # the inverse of L11 for the partitioned-inverse solve (#155), from the triangle
+            # still in local memory, after the front has signalled its consumers (off their
+            # critical path). Work item j computes column j, the arithmetic of
+            # invert_l11_kernel! (whose output it replaces for these fronts) on the same values;
+            # LDL: the unit diagonal (sh holds d on it)
+            if INV
+                ip = Int(inv_ptr[v]) - 1
+                for j in li:WG:w
+                    cb = ip + (j - 1) * w
+                    for k in 1:(j - 1)
+                        inv11[cb + k] = zero(TT)
+                    end
+                    for k in j:w
+                        acc = k == j ? one(TT) : zero(TT)
+                        for mm in j:(k - 1)
+                            acc -= sh[SDS._packed(k, mm, 64)] * inv11[cb + mm]
+                        end
+                        inv11[cb + k] = LDL ? acc / one(TT) : acc / sh[SDS._packed(k, k, 64)]
+                    end
                 end
             end
         elseif r == ROLE_TRSM
@@ -1699,6 +1841,7 @@ function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, B
 
     role = Int8[]; ra = Int32[]; rb = Int32[]; rc = Int32[]
     wides = Int[]
+    panel_mask = falses(ns)                      # fronts of a PANEL_B/PANEL_C role (L11 in local memory)
     ea_left = zeros(Int32, ns)
     trsm_left = zeros(Int32, ns)
     tiles_left = zeros(Int32, ns)
@@ -1811,6 +1954,7 @@ function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, B
             for q in a:b
                 v = nodes[q]
                 push!(role, ROLE_PANEL_B); push!(ra, Int32(v)); push!(rb, Int32(0)); push!(rc, Int32(0))
+                panel_mask[v] = true
             end
             for q in a:b
                 emit_split(nodes[q])
@@ -1824,6 +1968,7 @@ function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, B
                 v = nodes[q]
                 if width_h[v] <= 64
                     push!(role, ROLE_PANEL_C); push!(ra, Int32(v)); push!(rb, Int32(0)); push!(rc, Int32(0))
+                    panel_mask[v] = true
                 else
                     push!(gwides, v)
                 end
@@ -1879,7 +2024,7 @@ function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, B
     SDS._log(SDS.LOG_DEBUG, () -> "fused plan: $(length(role)) roles, $(length(segments)) segments, " *
                                   "$(length(wides)) host wide fronts")
     return (; role = _dvec(backend, role), ra = _dvec(backend, ra), rb = _dvec(backend, rb),
-            rc = _dvec(backend, rc), wides, ssub, segments,
+            rc = _dvec(backend, rc), wides, ssub, segments, panel_mask,
             cb2 = _dvec(backend, Int32.(cb2_h)), cb2_h, pcb = KA.zeros(backend, T, off - 1),
             czero = _dvec(backend, czero), wt = _dvec(backend, wt_h),
             nchild = _dvec(backend, nchild),
@@ -1900,7 +2045,9 @@ function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, B
             sptr_h = Array(S.super_ptr))
 end
 
-function refact_fused!(s, nzval, fp)
+# `inv = (inv11, inv_ptr)` (from `build_inverse(s; skip = fp.panel_mask)`): the panel roles
+# also write the inverses of their L11 blocks; the caller runs the closure for the rest
+function refact_fused!(s, nzval, fp; inv = nothing)
     N, S = s.numeric, s.symbolic
     plan = N.plan
     backend = KA.get_backend(N.factor)
@@ -1913,6 +2060,7 @@ function refact_fused!(s, nzval, fp)
     # whichever writer a front goes through.
     # (Before the subtree launches: kernels on this stream would otherwise be clobbered.)
     fill!(view(N.info, 1:SDS.nsupernodes(S)), Int32(0))
+    inv11, inv_ptr = inv === nothing ? (N.factor, fp.cb2) : inv     # placeholders when unused
     copyto!(fp.arrived, fp.arrived_base)
     copyto!(fp.ea, fp.ea_base)
     copyto!(fp.trsm, fp.trsm_base)
@@ -1945,7 +2093,8 @@ function refact_fused!(s, nzval, fp)
                                              S.cb_ptr, S.child_ptr, S.child_list, S.relind_ptr, S.relind,
                                              Int32(base), fp.wbase, fp.wupd, fp.wpd, fp.wtl, fp.wcb,
                                              fp.scap, fp.eac, real(eltype(N.factor))(fp.chol_eps), N.d,
-                                             S.super_ptr, Val(fp.ldl), Val(fp.wgf);
+                                             S.super_ptr, inv11, inv_ptr, Val(fp.ldl), Val(fp.wgf),
+                                             Val(inv !== nothing);
                                              ndrange = fp.wgf * count)
         for v in gwides                              # host-wide fronts at the segment boundary
             if fp.ldl && fp.ldl_potrf
@@ -2179,7 +2328,7 @@ function _fused_symbolic!(F::FusedSolver{T}) where {T}
     inkernel = merged || F.ldl
     fp = build_fused_plan(s; ldl = F.ldl, inkernel_wides = inkernel, merge_segments = merged,
                           wides_potrf = false, wgf = t.workgroup, scap = t.spin_cap)
-    inv11, inv_ptr, invertf, _ = build_inverse(s)
+    inv11, inv_ptr, invertf, _ = build_inverse(s; skip = fp.panel_mask)
     # the solve plan: one merged dependency-counter sweep over the whole tree
     fz1 = build_fused(s; kstart = 1, wcap = 256)
     fz1 === nothing && throw(SDS.NotSupportedError("fused solve: no plan entry with fronts of width <= 256"))
@@ -2192,9 +2341,10 @@ function _fused_symbolic!(F::FusedSolver{T}) where {T}
     return F
 end
 
-# the fused factorization behind a function barrier (the plans are untyped fields)
-function _fused_refactor!(s, nzval, fp, invertf)
-    info = Int(refact_fused!(s, nzval, fp))
+# the fused factorization behind a function barrier (the plans are untyped fields); the panel
+# roles write the inverses of their fronts, `invertf` the others
+function _fused_refactor!(s, nzval, fp, inv11, inv_ptr, invertf)
+    info = Int(refact_fused!(s, nzval, fp; inv = (inv11, inv_ptr)))
     invertf()
     return info
 end
@@ -2205,7 +2355,7 @@ function _fused_factorize!(F::FusedSolver, p::SDS.Phase)
     p == SDS.PHASE_REFACTORIZATION && F.stage < SDS.STAGE_FACTORIZED &&
         throw(SDS._phase_error(name, "needs a previous \"factorization\""))
     F.nzval = SDS._factor_values(F.inner)
-    F.info = _fused_refactor!(F.inner, F.nzval, F.fp, F.invert!)
+    F.info = _fused_refactor!(F.inner, F.nzval, F.fp, F.inv11, F.inv_ptr, F.invert!)
     F.stage = SDS.STAGE_FACTORIZED
     return F
 end
