@@ -83,6 +83,7 @@ const WG = 32
 const MW = 256  # max front width on the inverse path
 const WGF = 128 # default workgroup size; the fused kernel takes it per plan (fp.wgf)
 const CHWG = 1024 # workgroup size of the chain kernels
+const BWR = 8     # work items per column in the gather of bwd2_kernel! (coalesced rows)
 const NSTRIP = 4  # strip parallelism of the chain kernels
 
 # ---------------------------------------------------------------------------
@@ -567,6 +568,8 @@ end
         end
         @synchronize
         i0 = w + 1
+        lane = (li - 1) % BWR + 1                   # row lane of the work item
+        slot = (li - 1) ÷ BWR + 1                   # its column within a batch of WGV ÷ BWR columns
         while i0 <= f                               # chunked coherent gather of ancestor solutions
             ii = i0 + li - 1
             if ii <= f
@@ -574,15 +577,30 @@ end
             end
             @synchronize
             m = min(WGV, f - i0 + 1)
-            for kk in li:WGV:w
-                acc = t[kk]
-                col = p0 + (kk - 1) * f + i0 - 1
-                for c in 1:m
-                    acc += factor[col + c] * xb[c]
+            # t += L21(chunk, :)ᵀ xb: BWR work items share a column and read consecutive rows
+            # (coalesced, T34), their partial sums are reduced through t2 (free until below)
+            kb0 = 0
+            while kb0 < w
+                kk = kb0 + slot
+                acc = zero(TT)
+                if kk <= w
+                    col = p0 + (kk - 1) * f + i0 - 1
+                    for c in lane:BWR:m
+                        acc += factor[col + c] * xb[c]
+                    end
                 end
-                t[kk] = acc
+                t2[li] = acc
+                @synchronize
+                if li <= WGV ÷ BWR && kb0 + li <= w
+                    a = t[kb0 + li]
+                    for r in 1:BWR
+                        a += t2[(li - 1) * BWR + r]
+                    end
+                    t[kb0 + li] = a
+                end
+                @synchronize
+                kb0 += WGV ÷ BWR
             end
-            @synchronize
             i0 += WGV
         end
         for kk in li:WGV:w                          # z = y - L21' x, then x = inv(L11)' z
@@ -780,8 +798,9 @@ end
 
 # the dependency-counter sweeps take a workgroup of 32..512 work items, a multiple of 32
 # (`SDSTuning.solve_workgroup`; 64 is the size they were written for)
-_check_solve_workgroup(wg) = (32 <= wg <= 512 && wg % 32 == 0) ||
-    throw(SDS.InvalidValueError("fused solve: workgroup size $wg; expected a multiple of 32 in 32:512 " *
+# (at most MW: bwd2_kernel! reduces one partial sum per work item through a MW buffer)
+_check_solve_workgroup(wg) = (32 <= wg <= MW && wg % 32 == 0) ||
+    throw(SDS.InvalidValueError("fused solve: workgroup size $wg; expected a multiple of 32 in 32:$MW " *
                                 "(or > 512 for the chain kernel)"))
 
 # one fused segment, forward sweep: `wg > 512` runs the single-workgroup chain kernel,
