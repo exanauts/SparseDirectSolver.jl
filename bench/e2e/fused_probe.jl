@@ -134,7 +134,7 @@ for (name, A) in mats
     t_s = wall(() -> solve!(F, xd, bd))
     # the same objects through the module functions (the pre-T33 extension recipe)
     nz = F.nzval
-    t_pre = wall(() -> (Fused.refact_fused!(s, nz, F.fp; inv = (F.inv11, F.inv_ptr)); F.invert!()))
+    t_pre = wall(() -> (Fused.refact_fused!(s, nz, F.fp); F.invert!()))
     t_pre_s = wall(() -> Fused.algo2_solve!(xd, s, bd, F.inv11, F.inv_ptr, F.fz))
     t_noinv = wall(() -> Fused.refact_fused!(s, nz, F.fp))
     # the stock path on the same analysis (same ordering and amalgamation)
