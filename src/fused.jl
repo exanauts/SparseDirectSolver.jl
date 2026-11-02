@@ -1752,8 +1752,12 @@ function _factor_panel_c_ldl_potrf!(N, S, fp, v, p, backend)
     return nothing
 end
 
-@kernel function panel_zero_kernel!(factor, @Const(list), @Const(front_ptr), @Const(front_nrows),
-                                    @Const(front_ncols), ::Val{WG}) where {WG}
+# the C-group fronts of the fused plan: zero the panel, then scatter A into it, one
+# workgroup per front and one launch for every C group (T34; before: panel_zero_kernel!
+# plus one scatter_A! launch per C group)
+@kernel function czero_scatter_kernel!(factor, @Const(nzval), @Const(amap), @Const(amap_ptr), @Const(amap_src),
+                                       @Const(list), @Const(front_ptr), @Const(front_nrows), @Const(front_ncols),
+                                       ::Val{WG}) where {WG}
     li = @index(Local, Linear)
     G = @index(Group, Linear)
     @inbounds begin
@@ -1764,6 +1768,12 @@ end
         for q in (li - 1):WG:(f * w - 1)
             factor[p0 + q] = zero(eltype(factor))
         end
+    end
+    @synchronize
+    @inbounds begin
+        v2 = Int(list[G])
+        SDS._scatter_front!(factor, nzval, amap, amap_ptr, amap_src, v2, SDS._member_shift(front_ptr, v2, 1, 1),
+                            li, Val(WG))
     end
 end
 
@@ -2074,16 +2084,10 @@ function refact_fused!(s, nzval, fp; inv = nothing)
     for k in eachindex(plan.sub_first)
         launch_subtrees_sorted!(N, S, nzval, fp.ssub[k], plan.sub_local[k], backend, fp.ldl, fp.chol_eps)
     end
-    nodes = S.schedule.group_nodes
     fill!(fp.pcb, zero(eltype(fp.pcb)))
-    isempty(fp.czero) ||
-        panel_zero_kernel!(backend, WGF)(N.factor, fp.czero, S.front_ptr, S.front_nrows, S.front_ncols,
-                                         Val(WGF); ndrange = WGF * length(fp.czero))
-    for k in eachindex(plan.group_first)               # scatter A into every C-group front (panel only)
-        plan.group_width[k] > 0 && continue
-        a, b = plan.group_first[k], plan.group_last[k]
-        SDS.scatter_A!(N, S, nzval, a, b - a + 1)
-    end
+    isempty(fp.czero) ||                               # zero + scatter A into every C-group front (panel only)
+        czero_scatter_kernel!(backend, WGF)(N.factor, nzval, S.amap, S.amap_ptr, S.amap_src, fp.czero, S.front_ptr,
+                                            S.front_nrows, S.front_ncols, Val(WGF); ndrange = WGF * length(fp.czero))
     for (base, count, gwides) in fp.segments
         count > 0 &&
             fused_fact_kernel!(backend, fp.wgf)(N.factor, N.stack, fp.pcb, N.info, nzval, S.amap, S.amap_ptr,
