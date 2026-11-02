@@ -3745,7 +3745,7 @@ PLAN wording. Refs #82; closes #152.
     counter kernel already exist in `src/fused.jl`; what remains of T24–T26 is the `execute!`/`DirectSolver`
     integration and #109's placement, to be re-cut by the owner after T34.
 
-### T34 — Fused pipeline: close the sm_89 gap (issue #156)   `[ ]`
+### T34 — Fused pipeline: close the sm_89 gap (issue #156)   `[!]`
 
 Proposed in the T33 Report and added at the owner's request (2026-10-29) to run
 **before T24**: performance work on the kernels of `src/fused.jl` that
@@ -3798,6 +3798,114 @@ before and after on the 78k and the harness matrices (CUDA, and AMDGPU where
 the runner allows), kept or dropped; the final ratios against cuDSS; the
 `fresh_machine.jl` iterations, objective and linear-solver time; and what
 remains of T24–T26 for the owner to re-cut. Closes #156; refs #154, #155.
+
+### Report
+- Status: [!] (done with deviations: every number is from an **H200, sm_90** (`kkt`, an exclusive Slurm GPU),
+  not the sm_89 RTX 4080 the task names; the sm_89 defaults stay the T33 ones, unmeasured; the strict 1e-8
+  factor gate does not hold on the KKT dumps even at `main`, see below)
+- What was built:
+  * `src/fused.jl`: `invert_blocked_kernel!` (one workgroup per front and 32-column block, block forward
+    substitution, diagonal-block inverses in local memory) computes every L11 inverse of the solve;
+    `invert_l11_kernel!` stays as the gate reference. `czero_scatter_kernel!` zeroes and scatters A into all
+    C-group fronts in one launch (replaces `panel_zero_kernel!` + one `scatter_A!` per C group). The plan carries
+    the counter kernel object and its `Val`s and typed segment/subtree lists (statically dispatched launch).
+    `bwd2_kernel!` gathers L21ᵀx with 8 work items per column (coalesced). `refact_fused!`/`algo2_solve!` are
+    split into `refact_fused_launches!`/`algo2_sweeps!` and the host parts. `SDSTuning` fields
+    `solve_workgroup` (fwd2/bwd2 workgroup, 32:256), `wide_host_min` (per-front wide strategy of a merged
+    Cholesky plan) and `graph_max_n` (CUDA-graph replay of refactorization + inverses and of the solve sweeps);
+    `build_fused_plan(...; host_min)`. `default_tuning`: `solve_workgroup = 128` on 2048-thread NVIDIA parts.
+  * `src/dense/capabilities.jl`: hooks `device_fence(A)` (default `Threads.atomic_fence()`) and
+    `capture_graph(backend, f)` (default `nothing`); `ext/SparseDirectSolverCUDAExt.jl`: `CUDACore.threadfence()`
+    for a `CuDeviceArray`, and `CUDACore.capture` + `instantiate`.
+  * `bench/e2e/fused_probe.jl`: reads bcsstk17/38 from `bench/data/suitesparse` when present (MatrixDepot's index
+    is broken on `kkt`); `bench/ARCH-TUNING.md`: T34 section (measurements, the new knobs, the #174 capture rule).
+- Tests: `SDS_TEST_ONLY=test_fused PTR_NUM_JOBS=2 julia --project=. -e 'using Pkg; Pkg.test()'` (CUDA added to the
+  test environment locally, not committed), CPU + CUDA (H200), all four element types: 309 pass, 0 fail, 0
+  broken. `test/test_fused.jl` unchanged; the allocation budget passes: steps 1+2 had pushed the 18³ Laplacian
+  cycle to 66064 B (> 65536; `main` sits ~16 B under the budget on H200), the statically dispatched launch brings
+  a refactorization from 40.8 KB to 26.7 KB (cycle 54384 → 40288 B measured outside the test env). Full default
+  suite, AMDGPU and oneAPI legs: pending CI (not run locally by owner instruction).
+- Measurements (H200 sm_90; ms; `fused_probe.jl` medians, `FusedSolver` column, base = c38e013 and branch run
+  in separate processes on separate idle GPUs; cuDSS 0.8.0 in its own process):
+
+  | matrix | refact base | refact T34 | cuDSS | ratio base → T34 | solve base | solve T34 | cuDSS | ratio base → T34 |
+  |---|---|---|---|---|---|---|---|---|
+  | 78k condensed KKT (n = 674562) | 20.17 | 18.59 | 11.19 | 1.80 → 1.66 | 3.45 | 2.28 | 1.67 | 2.07 → 1.37 |
+  | lap3d_40 | 33.79 | 27.49 | 14.37 | 2.35 → 1.91 | 16.67 | 6.54 | 1.40 | 11.9 → 4.7 |
+  | lap2d_300 | 6.97 | 5.58 | 3.04 | 2.29 → 1.84 | 1.51 | 1.18 | 0.71 | 2.13 → 1.67 |
+  | bcsstk17 | 5.63 | 4.62 | 1.97 | 2.87 → 2.35 | 0.82 | 0.62 | 0.62 | 1.32 → 1.00 |
+  | bcsstk38 | 5.90 | 4.00 | 1.93 | 3.07 → 2.08 | 0.77 | 0.75 | 0.37 | 2.09 → 2.04 |
+  | case1354 condensed | 1.15 | 1.00 | 0.67 | 1.73 → 1.50 | 0.75 | 0.61 | 0.54 | 1.38 → 1.13 |
+  | case118 condensed | 0.66 | 0.55 | 0.20 | 3.2 → 2.7 | 0.55 | 0.40 | 0.12 | 4.6 → 3.3 |
+
+  The small solves are launch-bound and noisy in the probe (bcsstk38's 0.75 ms reads 0.32 ms in the in-process
+  A/B below; the probe's first block of case118 is taken during the clock ramp, steady-state means 0.600 → 0.505
+  ms refactorization).
+
+  Per step (gate: info 0 in every run, 20 gated refactorizations per configuration, interleaved; refactorization
+  medians of three rounds, one process per tree, rounds base/s1/s2/s3 interleaved; solve knobs three in-process
+  interleaved rounds):
+  1. **L11 inverses — kept, as `invert_blocked_kernel!`; the panel-role variant dropped.** The 2.4 ms launch of
+     the T33 Report was the 65..256-wide fronts (78k: 1.51 of 1.85 ms; lap3d_40 4.8 ms). base → step 1: 78k
+     19.95 → 19.17, lap3d_40 33.53 → 28.09, lap2d_300 7.00 → 5.62, bcsstk17 5.57 → 4.81, bcsstk38 5.85 → 4.48.
+     Writing the inverse from the PANEL_B/PANEL_C roles (the task's proposal; committed first, then removed) was
+     no faster than the blocked kernel over every front (78k 18.42 vs 18.25, case1354 1.06 vs 1.02, lap3d_40
+     27.27 vs 27.26) and put the root front's inverse on the counter kernel's critical path (case118 +22 µs);
+     the separate launch cannot go anyway: the regime-A subtree fronts are factored by the subtree kernels, outside the counter kernel.
+     Δinv vs `invert_l11_kernel!` ≤ 1e-13 on the harness, 3.8e-6 (relative to max|inv|) on the 78k (different
+     summation order on an ill-conditioned L; residuals unchanged).
+  2. **gpu-scope fences — kept.** step 1 → 2: 78k 19.15 → 18.94, bcsstk38 4.52 → 4.41, bcsstk17 4.81 → 4.73,
+     lap3d_40 28.09 → 27.71, lap2d_300 noise (5.72 vs 5.81). 1–2.4% on sm_90 (T33: 3.5–8% on sm_89); never slower.
+  3. **Launches — kept (one C-group zero + scatter launch, statically dispatched counter-kernel launch).** step 2
+     → 3: 78k 18.94 → 18.82, lap3d_40 27.71 → 27.48, bcsstk17 4.73 → 4.65, lap2d_300 5.81 → 5.68: within the 2%
+     noise on the device, kept for the launch count (lap3d_40 37 → 1 scatter launches) and the host allocation
+     (see Tests). `subtree_budgets` 8K/16K and `subtree_parallelism` were not re-swept (no time; 16K stays on
+     2048-thread parts).
+  4. **Fused solve — kept: coalesced `bwd2` gather, `solve_workgroup = 128` default on 2048-thread parts.**
+     78k 3.45 (base) → 2.70 (gather, 64) → 2.23 (128) | 2.95 (256); lap3d_40 16.9 → 11.5 → 6.48 | 4.34;
+     lap2d_300 1.51 → 1.47 → 1.19 | 1.19; bcsstk17 0.81 → 0.56 → 0.34 | 0.26; bcsstk38 0.76 → 0.51 → 0.32 | 0.25.
+     The `chain_*` kernels stay unused (not measured).
+  5. **Per-front wides (`wide_host_min`) — implemented, off by default (dropped on sm_90).** host / merged /
+     merged + host above 128 / above 256: lap3d_40 27.3 / 65.7 / 39.3 / 52.6, 78k 18.4 / 19.4 / 18.1 / 19.3
+     (−1.9%, noise, 3/5 runs above the strict gate), lap2d_300 5.45 / 8.43 / 6.10 / 6.41, bcsstk17 4.60 / 6.33
+     / 5.54 / 6.31. It targets sm_89-class parts (T33: lap3d_40 merged 91.0 vs host 79.3); unmeasured there.
+  6. **CUDA-graph replay (`graph_max_n`) — implemented, off in every default (not a clear win).** Off vs on:
+     solve case118 0.171 → 0.160, case1354 0.544 → 0.420 (noisy), bcsstk17 0.717 → 0.696, bcsstk38 0.694 →
+     0.666, lap2d_300 1.370 → 1.320; refactorization case118 0.514 → 0.588 (worse, noisy), case1354 1.059 →
+     1.004, others equal (host wides: not captured). Captured only without vendor calls in the range (#174).
+  * Gate on the KKT dumps: the base already fails the strict "factor delta ≤ 1e-8 vs stock": `"SPD"` 78k in 9 of
+    20 runs (max 1.8e-8, run-to-run varying: arrival-order sums of the concurrent extend-add); `"S"` case118
+    1.9e-8, case1354 2.9e-8, 78k 1.2e-7 in 20 of 20 (constant: systematic rounding of the fused LDL vs the stock
+    LDL under element growth); the branch gives the same (`"S"` 1.9e-8 / 2.9e-8 / 1.3e-7; `"SPD"` 78k 1–9 of 20
+    above, max 1.5–2.5e-8 per configuration). There the gate was read as "no worse than base"; every other
+    matrix stays ≤ 1e-12 and info = 0 everywhere.
+  * End to end (`bench/e2e/workflow.jl`, `--project=bench/e2e`, 78k ACOPF, H200, warm second solve): branch 100
+    iterations, objective 1.5314931034929376e7, linear solver 4.23 s (192 backsolves); base 101 iterations,
+    1.531493103492935e7, 4.95 s (206 backsolves). Objectives agree to 2e-16 relative; iterations within the
+    100/101 spread.
+- Deviations from PLAN.md / this task:
+  * Measured on sm_90 (H200), not sm_89; `default_tuning` changes only the 2048-thread NVIDIA profile
+    (`solve_workgroup = 128`). The 1536-thread and AMD profiles keep the T33 values (solve workgroup 64); the
+    coalesced gather, the blocked inverse and the fences apply everywhere (architecture-independent code).
+  * Step 1 is a blocked inversion kernel, not the panel roles (measured and dropped, above).
+  * Step 3's subtree-budget/parallelism sweep was not run; step 6 is off by default. No AMDGPU numbers (no
+    hardware here; the `amdgpu` CI leg checks correctness only).
+  * The strict 1e-8 gate is not satisfiable on the KKT dumps at `main`; read as "no worse than base" there.
+- Open issues / follow-ups:
+  * To be opened (draft written): the 1e-8 factor gate of `bench/ARCH-TUNING.md` does not hold on the pglib KKT
+    dumps even at `main` (`"SPD"` arrival order, `"S"` systematic LDL rounding).
+  * sm_89 numbers for every knob (`solve_workgroup`, `wide_host_min` in merged mode, `graph_max_n`) on an RTX
+    4080/L40S; AMDGPU timing on the runner.
+  * The solve gap on 3-D problems (lap3d_40 6.5 vs cuDSS 1.4 ms) is the fronts near the root: the top separator
+    (1600 wide) through the vendor dense sweeps and the wide fronts on one workgroup each; the unused `chain_*`
+    kernels or a multi-workgroup front are the next lever.
+  * What remains of T24–T26: T25's split kernels and T26's segmented counter kernel exist in `src/fused.jl`;
+    what remains is the `execute!`/`DirectSolver` integration (`solve_alg = "algo1"`), graph capture in the
+    stock path (#82; the fused path now has the hook and the #174 rule), and #109's placement.
+- Suggested plan changes:
+  * §2.5: "graph replay captures only ranges without vendor dense calls (cuSOLVER is not capturable on CUDA.jl
+    6.5, #174); the fused pipeline's `SDSTuning.graph_max_n` is the switch."
+  * §2.7: add the `device_fence(A)` hook (gpu-scope fence through the backend extension) to the kernel rules.
 
 ### External — MadNLPGPU integration (in the MadNLP repository)   `[ ]`
 

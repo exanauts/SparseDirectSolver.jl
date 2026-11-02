@@ -36,7 +36,9 @@ champions. Workload throughout: the 78k-bus ACOPF condensed KKT
 | tile size (`tl`) | plan + kernel `Val` | runtime per-plan | syrk tile; shared halves = 2·32·tl · 8B; accumulators = tl²/WGF registers per thread |
 | workgroup size (`SDSTuning.workgroup`) | tuning bundle | runtime (>= 128, multiple of 32: the tile roles' register accumulators) | waves per workgroup; latency hiding on wave64 AMD; occupancy on 1536-thread parts |
 | spin backoff cap (`SDSTuning.spin_cap`) | tuning bundle | runtime | dependency-counter wake-up latency vs polling traffic |
-| CUDA graph replay (`graph`) | run_fused kwarg | runtime | whole refactorization captured once, replayed as one launch |
+| CUDA graph replay (`SDSTuning.graph_max_n`) | tuning bundle | runtime | refactorization + inverses and the solve sweeps captured once, replayed as one launch (only without vendor calls, #174) |
+| fused-solve workgroup (`SDSTuning.solve_workgroup`) | tuning bundle | runtime | work items per front in `fwd2`/`bwd2`: shorter per-front serial work near the root vs idle threads on small fronts |
+| per-front wides (`SDSTuning.wide_host_min`) | tuning bundle | runtime | merged plans: fronts wider than it on the host vendor path at a segment boundary |
 
 ## Procedure for a new architecture
 
@@ -93,6 +95,81 @@ field, `default_tuning(backend)` is the single per-architecture defaults table,
 and `madnlp(m; ..., sds_tuning = SDSTuning(; workgroup = 256))` overrides it.
 The portable kernel takes workgroup size and spin cap per plan — nothing is
 compile-time or environment-dependent in the wrapper path.
+
+## T34: the fused pipeline on an H200 (sm_90), November 2026
+
+Measured on `kkt` (H200, sm_90, an exclusive Slurm GPU), not on the sm_89 part
+the task was written for; the sm_89 defaults are the T33 ones (see below).
+Gate as above (info 0, 20 gated refactorizations, interleaved rounds). The
+strict "factor delta ≤ 1e-8 vs stock" does not hold on the pglib KKT dumps even
+before T34: `"SPD"` 78k 9 of 20 runs above it (max 1.8e-8, arrival-order sums
+of the concurrent extend-add), `"S"` case118/case1354/78k 1.9e-8/2.9e-8/1.2e-7
+in every run (systematic rounding of the fused LDL under element growth); there
+the gate is "no worse than the unmodified pipeline". The well-conditioned
+matrices stay at ≤ 1e-12.
+
+What changed, and the medians of three interleaved rounds (refactorization):
+
+| step | 78k | lap3d_40 | lap2d_300 | bcsstk17 | bcsstk38 |
+|---|---|---|---|---|---|
+| base (c38e013) | 19.95 | 33.53 | 7.00 | 5.57 | 5.85 |
+| 1: `invert_blocked_kernel!` (inverses of L11) | 19.17 | 28.09 | 5.62 | 4.81 | 4.48 |
+| 2: gpu-scope `device_fence` | 18.94 | 27.74 | 5.83 | 4.73 | 4.41 |
+| 3: one zero + scatter launch for the C groups | 18.82 | 27.48 | 5.68 | 4.63 | 4.37 |
+
+- **Inverses of L11** (#155): `invert_l11_kernel!` spent its time in the fronts
+  of width 65..256 (78k: 1.5 of 1.85 ms; lap3d_40: 4.8 ms), where one thread
+  walks a column with an O(w²) dependent chain. `invert_blocked_kernel!` (one
+  workgroup per front and 32-column block, block forward substitution, the
+  diagonal-block inverses in local memory) takes 3 µs on case118 and removes
+  that time. Writing the inverse from the PANEL roles (the task's proposal) was
+  measured too and dropped: no faster than the blocked kernel over every front
+  (78k 18.42 vs 18.25 ms), and the root front's inverse lands on the critical
+  path of the counter kernel (+22 µs on case118).
+- **Fences** (#154): `SDS.device_fence(A)`, `fence.sc.gpu` through the CUDA
+  extension. 1–2% on sm_90 (T33 measured 3.5–8% on sm_89); never slower.
+- **Launches**: `czero_scatter_kernel!` replaces `panel_zero_kernel!` and the
+  per-C-group `scatter_A!` launches (lap3d_40: 37 → 1). Within noise on the
+  device; it and a statically dispatched counter-kernel launch (the plan
+  carries the kernel object and its `Val`s) cut the host allocation of a
+  refactorization of the 18³ Laplacian from 40.8 KB to 26.7 KB.
+- **Subtree budgets / parallelism**: not re-swept (16K stays on 2048-thread
+  parts; the subtree launch is one launch, 6.5 µs on case118).
+
+Fused solve (`SDSTuning.solve_workgroup`, coalesced gather in `bwd2_kernel!`,
+ms; the base row from the per-process A/B above, the others three in-process
+interleaved rounds; the solves of case118/case1354 are launch-bound and noisy):
+
+| | 78k | lap3d_40 | lap2d_300 | bcsstk17 | bcsstk38 | case1354 |
+|---|---|---|---|---|---|---|
+| base (64, strided gather) | 3.45 | 16.9 | 1.51 | 0.81 | 0.76 | 0.46 |
+| coalesced gather, 64 | 2.70 | 11.5 | 1.47 | 0.56 | 0.51 | 0.25 |
+| coalesced gather, 128 | **2.23** | 6.48 | 1.19 | 0.34 | 0.32 | 0.24 |
+| coalesced gather, 256 | 2.95 | **4.34** | 1.19 | **0.26** | **0.25** | 0.24 |
+
+`bwd2_kernel!` read L21 column by column per work item (32 cache lines per
+warp load); 8 work items now share a column. A larger workgroup shortens the
+per-front serial work on the fronts near the root; 128 is the 78k optimum
+and the sm_90 default (`default_tuning`), 256 wins on the 3-D problems.
+
+Per-front wide strategy (`wide_host_min`, merged plans): on sm_90 `:host`
+stays best (lap3d_40: host 27.3, merged 65.7, merged + host above 128 39.3,
+above 256 52.6 ms; 78k: 18.4, 19.4, 18.1, 19.3; lap2d_300: 5.45, 8.43, 6.10,
+6.41). Off by default; it targets sm_89-class parts (T33: lap3d_40 merged
+91.0 vs host 79.3 ms), where it was not measured.
+
+CUDA-graph replay (`graph_max_n`): the solve sweeps gain 3–6% on the small
+matrices (case118 0.171 → 0.160, case1354 0.544 → 0.420 (noisy), bcsstk17 0.717
+→ 0.696, lap2d_300 1.370 → 1.320 ms), the refactorization is mixed (case118
+0.514 vs 0.588, case1354 1.059 vs 1.004 ms; the fronts with host wides are not
+captured). Not a clear win: `graph_max_n = 0` in every default. **Capture
+constraint (#174):** cuSOLVER `potrf` invalidates a stream capture on CUDA.jl
+6.5 / cuSOLVER 12.3.5 (`cusolverDnSetStream` on the capture stream), so the
+pipeline captures only when no vendor call falls in the range: no host-wide
+front in the plan (`isempty(fp.wides)`) for the refactorization, no front
+wider than 256 for the solve; otherwise it launches eagerly. The permutations
+of the solve stay outside the graph, so the graph does not depend on the
+caller's vectors; a new values buffer captures again.
 
 ## Scripts
 
