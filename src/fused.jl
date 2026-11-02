@@ -419,7 +419,7 @@ end
             @synchronize
         end
         if li == 1
-            Threads.atomic_fence()
+            SDS.device_fence(Y)
             pv = Int(snparent[root])
             pv > 0 && (Atomix.@atomic arrived[pv] += Int32(1))
         end
@@ -444,7 +444,7 @@ end
             end
         end
         @synchronize
-        Threads.atomic_fence()
+        SDS.device_fence(Y)
         for kk in li:WGV:w                          # coherent read of the front's columns
             yb[kk] = Atomix.@atomic Y[c0 + kk] += zero(TT)
         end
@@ -469,7 +469,7 @@ end
         end
         @synchronize
         if li == 1
-            Threads.atomic_fence()
+            SDS.device_fence(Y)
             pv = Int(snparent[v])
             pv > 0 && (Atomix.@atomic arrived[pv] += Int32(1))
         end
@@ -507,7 +507,7 @@ end
             end
         end
         @synchronize
-        Threads.atomic_fence()
+        SDS.device_fence(Y)
         for k in cnt:-1:1
             v = Int(subtree_nodes[a0 + k - 1])
             f = Int(front_nrows[v])
@@ -558,7 +558,7 @@ end
             end
         end
         @synchronize
-        Threads.atomic_fence()
+        SDS.device_fence(Y)
         for kk in li:WGV:w
             t[kk] = zero(TT)
         end
@@ -596,7 +596,7 @@ end
         end
         @synchronize
         if li == 1
-            Threads.atomic_fence()
+            SDS.device_fence(Y)
             Atomix.@atomic done[v] += Int32(1)
         end
     end end
@@ -1133,7 +1133,7 @@ end
                 _spin_until_eq!(cb_done, c, Int32(1), fscr, scap)
             end
             @synchronize
-            Threads.atomic_fence()
+            SDS.device_fence(factor)
             cpriv = Int(cb2[c])                  # child CB: private (mega) or stock (subtree root)
             cb = cpriv > 0 ? cpriv : Int(cb_ptr[c])
             mc = Int(front_nrows[c]) - Int(front_ncols[c])
@@ -1160,7 +1160,7 @@ end
                 end
             end
             @synchronize
-            Threads.atomic_fence()      # ALL threads: each wave drains its own stores (gfx9)
+            SDS.device_fence(factor)      # ALL threads: each wave drains its own stores (gfx9)
             @synchronize
             if li == 1
                 Atomix.@atomic ea_left[v] += Int32(-1)
@@ -1175,7 +1175,7 @@ end
                 end
             end
             @synchronize
-            Threads.atomic_fence()
+            SDS.device_fence(factor)
             if r == ROLE_PANEL_B
                 fz = Int(front_nrows[v])
                 wz = Int(front_ncols[v])
@@ -1267,7 +1267,7 @@ end
                                      Val(WG))
                 end
                 @synchronize
-                Threads.atomic_fence()      # ALL threads: each wave drains its own stores (gfx9)
+                SDS.device_fence(factor)      # ALL threads: each wave drains its own stores (gfx9)
                 @synchronize
                 if li == 1
                     Atomix.@atomic cb_done[v] += Int32(1)
@@ -1275,7 +1275,7 @@ end
                     pv > 0 && (Atomix.@atomic arrived[pv] += Int32(1))
                 end
             else
-                Threads.atomic_fence()      # ALL threads (gfx9)
+                SDS.device_fence(factor)      # ALL threads (gfx9)
                 @synchronize
                 if li == 1
                     Atomix.@atomic panel_done[v] += Int32(1)
@@ -1308,7 +1308,7 @@ end
                 _spin_until_eq!(panel_done, v, Int32(1), fscr, scap)
             end
             @synchronize
-            Threads.atomic_fence()
+            SDS.device_fence(factor)
             f = Int(front_nrows[v])
             w = Int(front_ncols[v])
             p0 = Int(front_ptr[v])
@@ -1343,7 +1343,7 @@ end
                 end
             end
             @synchronize
-            Threads.atomic_fence()      # ALL threads: each wave drains its own stores (gfx9)
+            SDS.device_fence(factor)      # ALL threads: each wave drains its own stores (gfx9)
             @synchronize
             if li == 1
                 left = (Atomix.@atomic trsm_left[v] += Int32(-1))
@@ -1364,7 +1364,7 @@ end
                 _spin_until_eq!(trsm_left, v, Int32(0), fscr, scap)
             end
             @synchronize
-            Threads.atomic_fence()
+            SDS.device_fence(factor)
             f = Int(front_nrows[v])
             w = Int(front_ncols[v])
             m = f - w
@@ -1460,7 +1460,7 @@ end
                 end
             end
             @synchronize
-            Threads.atomic_fence()      # ALL threads: each wave drains its own stores (gfx9)
+            SDS.device_fence(factor)      # ALL threads: each wave drains its own stores (gfx9)
             @synchronize
             if li == 1
                 left = (Atomix.@atomic tiles_left[v] += Int32(-1))
@@ -1482,7 +1482,7 @@ end
                 end
             end
             @synchronize
-            Threads.atomic_fence()
+            SDS.device_fence(factor)
             f = Int(front_nrows[v]); w = Int(front_ncols[v])
             c0 = (k - 1) * 64
             kb = min(64, w - c0)
@@ -1552,7 +1552,7 @@ end
             end
             li == 1 && (k == 1 || st[1] != Int32(0)) && (info[v] = st[1])
             @synchronize
-            Threads.atomic_fence()      # ALL threads: each wave drains its own stores (gfx9)
+            SDS.device_fence(factor)      # ALL threads: each wave drains its own stores (gfx9)
             @synchronize
             if li == 1
                 Atomix.@atomic wpdone2[sl] += Int32(1)
@@ -1564,7 +1564,7 @@ end
                 _spin_until_eq!(wpdone2, sl, Int32(1), fscr, scap)
             end
             @synchronize
-            Threads.atomic_fence()
+            SDS.device_fence(factor)
             f = Int(front_nrows[v]); w = Int(front_ncols[v])
             c0 = (k - 1) * 64
             kb = min(64, w - c0)
@@ -1600,7 +1600,7 @@ end
                 end
             end
             @synchronize
-            Threads.atomic_fence()      # ALL threads: each wave drains its own stores (gfx9)
+            SDS.device_fence(factor)      # ALL threads: each wave drains its own stores (gfx9)
             @synchronize
             if li == 1
                 Atomix.@atomic wtrsml[sl] += Int32(-1)
@@ -1613,7 +1613,7 @@ end
                 _spin_until_eq!(wtrsml, sl, Int32(0), fscr, scap)
             end
             @synchronize
-            Threads.atomic_fence()
+            SDS.device_fence(factor)
             f = Int(front_nrows[v]); w = Int(front_ncols[v])
             m = f - w
             c0 = (k - 1) * 64
@@ -1687,7 +1687,7 @@ end
                 end
             end
             @synchronize
-            Threads.atomic_fence()      # ALL threads: each wave drains its own stores (gfx9)
+            SDS.device_fence(factor)      # ALL threads: each wave drains its own stores (gfx9)
             @synchronize
             if li == 1
                 if j0 < w
@@ -1704,7 +1704,7 @@ end
                 _spin_until_eq!(wpdone2, sl, Int32(1), fscr, scap)
                 _spin_until_eq!(wtrsml, sl, Int32(0), fscr, scap)
                 _spin_until_eq!(wcbl, v, Int32(0), fscr, scap)
-                Threads.atomic_fence()
+                SDS.device_fence(factor)
                 Atomix.@atomic cb_done[v] += Int32(1)
                 pv = Int(snparent[v])
                 pv > 0 && (Atomix.@atomic arrived[pv] += Int32(1))
@@ -1770,7 +1770,7 @@ end
 @kernel function signal_kernel!(cb_done, arrived, @Const(snparent), v)
     li = @index(Local, Linear)
     @inbounds if li == 1
-        Threads.atomic_fence()
+        SDS.device_fence(cb_done)
         Atomix.@atomic cb_done[v] += Int32(1)
         pv = Int(snparent[v])
         pv > 0 && (Atomix.@atomic arrived[pv] += Int32(1))

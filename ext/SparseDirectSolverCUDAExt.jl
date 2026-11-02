@@ -39,6 +39,14 @@ SparseDirectSolver.max_local_bytes(::CUDABackend) = 49152
 SparseDirectSolver.max_threads_per_multiprocessor(::CUDABackend) =
     Int(CUDACore.attribute(CUDACore.device(), CUDACore.DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR))
 
+"""
+    device_fence(::CuDeviceArray)
+
+The gpu-scope `threadfence()` (`fence.sc.gpu`) in the fused kernels, instead of the
+system-scope fence `Threads.atomic_fence()` lowers to (#154, T34).
+"""
+@inline SparseDirectSolver.device_fence(::CUDACore.CuDeviceArray) = CUDACore.threadfence()
+
 # ---------------------------------------------------------------------------
 # vendor dense bindings (see `src/dense/vendor.jl` for the contracts)
 
