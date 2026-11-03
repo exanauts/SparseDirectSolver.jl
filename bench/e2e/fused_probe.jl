@@ -55,12 +55,16 @@ if !OPTS["only-dump"]
         M.name in ("kkt_pglib_opf_case118_ieee_condensed_10", "kkt_pglib_opf_case1354_pegase_condensed_10") || continue
         push!(mats, M.name => SparseMatrixCSC{Float64, Int}(M.A))
     end
-    try
-        for M in BenchMatrices.suitesparse_matrices(; names = ["HB/bcsstk17", "Boeing/bcsstk38"])
-            push!(mats, M.name => SparseMatrixCSC{Float64, Int}(M.A))
+    for name in ("HB/bcsstk17", "Boeing/bcsstk38")
+        # a local copy under bench/data/suitesparse/<group>/<name>/<name>.mtx first, else MatrixDepot
+        local_mtx = joinpath(BenchMatrices.DATA_DIR, "suitesparse", name, basename(name) * ".mtx")
+        try
+            A = isfile(local_mtx) ? sparse(BenchMatrices.read_mtx(local_mtx)) :
+                only(BenchMatrices.suitesparse_matrices(; names = [name])).A
+            push!(mats, name => SparseMatrixCSC{Float64, Int}(A))
+        catch err
+            say("$name skipped: ", sprint(showerror, err))
         end
-    catch err
-        say("suitesparse skipped: ", sprint(showerror, err))
     end
     push!(mats, "lap2d_300" => SparseMatrixCSC{Float64, Int}(BenchMatrices.laplacian2d(300, 300)))
     push!(mats, "lap3d_40" => SparseMatrixCSC{Float64, Int}(BenchMatrices.laplacian3d(40, 40, 40)))

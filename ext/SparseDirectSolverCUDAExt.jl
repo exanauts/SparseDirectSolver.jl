@@ -39,6 +39,30 @@ SparseDirectSolver.max_local_bytes(::CUDABackend) = 49152
 SparseDirectSolver.max_threads_per_multiprocessor(::CUDABackend) =
     Int(CUDACore.attribute(CUDACore.device(), CUDACore.DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR))
 
+"""
+    device_fence(::CuDeviceArray)
+
+The gpu-scope `threadfence()` (`fence.sc.gpu`) in the fused kernels, instead of the
+system-scope fence `Threads.atomic_fence()` lowers to (#154, T34).
+"""
+@inline SparseDirectSolver.device_fence(::CUDACore.CuDeviceArray) = CUDACore.threadfence()
+
+"""
+    capture_graph(::CUDABackend, f)
+
+`f()` captured into a CUDA graph (`CUDACore.capture`, on a dedicated stream) and
+instantiated; the returned `CuGraphExec` replays it on the task's stream when called.
+`nothing` when the capture fails (an operation that cannot be captured, e.g. a cuSOLVER
+call on CUDA.jl 6.5 / cuSOLVER 12.3.5, #174).
+"""
+function SparseDirectSolver.capture_graph(::CUDABackend, f)
+    graph = CUDACore.capture(f; throw_error = false)
+    graph === nothing && return nothing
+    exec = CUDACore.instantiate(graph)
+    finalize(graph)
+    return exec
+end
+
 # ---------------------------------------------------------------------------
 # vendor dense bindings (see `src/dense/vendor.jl` for the contracts)
 

@@ -51,7 +51,10 @@ RUN_SHARED &&
     T = Float64
     K = kkt_matrix(T, 150, 60, 0.0)
     b = K * rand(T, size(K, 1))
-    solver = ir_solver(backend, K, "S", INT; params = (("pivot_pairs", "none"),))
+    # deterministic_mode = 1: the default atomic forward sweep sums in a run-dependent order, so two
+    # solves with the same steps differ at rounding level (issue #179: 1.94e-14 on AMDGPU after an
+    # early-exit run under 1e-14); the deterministic sweep makes the repeated solve reproducible
+    solver = ir_solver(backend, K, "S", INT; params = (("pivot_pairs", "none"), ("deterministic_mode", 1)))
     @test getparam(solver, "npivots") > 0
     r0 = relres(K, ir_solve(backend, solver, b; steps = 0), b)
     r1 = relres(K, ir_solve(backend, solver, b; steps = 1), b)
@@ -60,9 +63,12 @@ RUN_SHARED &&
     x = ir_solve(backend, solver, b; steps = 10, tol = 1.0e-14)
     steps = getparam(solver, "ir_n_steps")
     @test 1 < steps < 10
-    @test relres(K, x, b) <= 1.0e-14
-    # the same steps without the early exit reach the same residual level
-    @test relres(K, ir_solve(backend, solver, b; steps, tol = 0.0), b) <= 1.0e-14
+    rx = relres(K, x, b)
+    @test rx <= 1.0e-14
+    # the same steps without the early exit reach the same residual level: compared with the
+    # early-exit residual (a small factor, not the hard-coded 1e-14 again, which the early-exit run
+    # may have met with no margin; issue #179)
+    @test relres(K, ir_solve(backend, solver, b; steps, tol = 0.0), b) <= 2 * max(rx, eps(T))
     @test getparam(solver, "ir_n_steps") == steps
     # setting ir_n_steps reports the requested value until the next solve
     setparam!(solver, "ir_n_steps", 7)

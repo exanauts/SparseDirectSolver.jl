@@ -104,6 +104,30 @@ per-architecture tuning (`Fused.default_tuning`) keys on it.
 """
 max_threads_per_multiprocessor(backend) = 0
 
+"""
+    device_fence(A)
+
+The device-wide memory fence of the dependency-counter kernels of the fused
+pipeline (`src/fused.jl`), called inside a kernel with one of its device array
+arguments `A`, whose type selects the backend's fence. The default is
+`Threads.atomic_fence()` (a sequentially consistent fence without a scope, which
+NVPTX lowers to the system-scope `fence.sc.sys`); the CUDA extension uses the
+gpu-scope `threadfence()` (`fence.sc.gpu`), which is what the counters need since
+no host or peer device reads them while a kernel runs (#154).
+"""
+@inline device_fence(::Any) = Threads.atomic_fence()
+
+"""
+    capture_graph(backend, f) -> callable or nothing
+
+Records the device work `f()` launches on `backend` without running it and returns a
+callable that replays it (a CUDA graph in the CUDA extension), or `nothing` when the
+backend has no graphs (the default) or the capture fails. `f` must not synchronize with
+the host. The fused pipeline replays its refactorization and solve sweeps through it for
+`n <= SDSTuning.graph_max_n` (T34).
+"""
+capture_graph(backend, f) = nothing
+
 # Backend extensions may adjust scheduling options for hard kernel ABI limits.
 _backend_schedule_options(backend, structure::Structure, opts::Options) = opts
 _backend_schedule_options(backend, structure::Structure, opts::Options, nbatch::Integer) =

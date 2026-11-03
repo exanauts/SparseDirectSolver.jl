@@ -21,6 +21,14 @@ Every performance knob of the fused pipeline in one immutable bundle, so a
 platform's tuning is a single value (see bench/ARCH-TUNING.md for how each
 field was measured and the per-architecture champions). All fields are
 runtime parameters — no environment variables, no recompilation.
+
+The T34 fields: `solve_workgroup` is the workgroup size of the fused solve
+sweeps (a multiple of 32 in 32:256); `wide_host_min` puts the wide fronts
+wider than it on the host vendor path in a `:merged` Cholesky plan (the
+per-front wide strategy; `typemax(Int)`, the default, keeps every wide front
+in-kernel; ignored for `"S"`); `graph_max_n` replays the refactorization and
+the solve sweeps from a CUDA graph when `n <= graph_max_n` and no vendor call
+falls in the captured range (`0`, the default, never captures).
 """
 Base.@kwdef struct SDSTuning
     wides::Symbol = :auto                     # :auto | :host | :merged (Cholesky; an LDLᵀ
@@ -37,14 +45,20 @@ Base.@kwdef struct SDSTuning
     # at ~2x the reordering time -- opt in through `sds_tuning` when factor time dominates.
     nd_nseps::Int = 1
     nd_seed::Int = 3
+    # T34 knobs
+    solve_workgroup::Int = 64                 # fused-solve (fwd2/bwd2) workgroup size: 32..256, multiple of 32
+    wide_host_min::Int = typemax(Int)         # :merged Cholesky: fronts wider than this on the host vendor path
+    graph_max_n::Int = 0                      # CUDA-graph replay of refactorization and solve when n <= this
 end
 
 """
     default_tuning(backend) -> SDSTuning
 
 The measured per-architecture defaults — the single place they live.
-2048-threads/SM NVIDIA parts (sm_70/80/90): host wides, 16K budgets.
-1536-thread parts (sm_86/89, Blackwell workstation): merged wides, 8K budgets.
+2048-threads/SM NVIDIA parts (sm_70/80/90): host wides, 16K budgets, fused-solve
+workgroup 128 (T34, measured on an H200; sm_70/80 not re-measured).
+1536-thread parts (sm_86/89, Blackwell workstation): merged wides, 8K budgets,
+solve workgroup 64 (T34 did not measure them).
 AMD (gfx906-measured): merged, 8K, workgroup 256, spin cap 16. A backend
 without a CUDA resident-thread count (`max_threads_per_multiprocessor` returns
 0: AMDGPU, oneAPI, Metal, the CPU backend, anything but CUDA) gets this AMD
@@ -55,7 +69,7 @@ function default_tuning(backend)
     threads = SDS.max_threads_per_multiprocessor(backend)
     if threads > 0
         return threads < 2048 ? SDSTuning(; wides = :merged, subtree_budgets = [8192]) :
-                                SDSTuning(; wides = :host)
+                                SDSTuning(; wides = :host, solve_workgroup = 128)
     end
     return SDSTuning(; wides = :merged, subtree_budgets = [8192], workgroup = 256, spin_cap = 16)
 end
@@ -68,9 +82,8 @@ end
 """
 function resolve_tuning(t::SDSTuning, backend)
     t.wides === :auto || return t
-    return SDSTuning(default_tuning(backend).wides, t.subtree_budgets, t.subtree_parallelism,
-                     t.regime_c_width, t.regime_c_rows, t.amalgamation, t.workgroup, t.spin_cap,
-                     t.nd_nseps, t.nd_seed)
+    w = default_tuning(backend).wides
+    return SDSTuning((f === :wides ? w : getfield(t, f) for f in fieldnames(SDSTuning))...)
 end
 
 # device copy of a host integer vector (empty vectors included)
@@ -80,11 +93,13 @@ const WG = 32
 const MW = 256  # max front width on the inverse path
 const WGF = 128 # default workgroup size; the fused kernel takes it per plan (fp.wgf)
 const CHWG = 1024 # workgroup size of the chain kernels
+const BWR = 8     # work items per column in the gather of bwd2_kernel! (coalesced rows)
 const NSTRIP = 4  # strip parallelism of the chain kernels
 
 # ---------------------------------------------------------------------------
 # inversion: thread j of the front's workgroup computes column j of inv(L11)
-# (non-unit lower triangular), written col-major at inv_ptr[v]
+# (non-unit lower triangular), written col-major at inv_ptr[v]. The reference the T34
+# gate compares against (bench); the pipeline runs invert_blocked_kernel! instead
 @kernel function invert_l11_kernel!(inv11, @Const(factor), @Const(inv_ptr), @Const(list),
                                     @Const(front_ptr), @Const(front_nrows), @Const(front_ncols), ::Val{WGV}) where {WGV}
     li = @index(Local, Linear)
@@ -213,9 +228,115 @@ end
 end
 
 # ---------------------------------------------------------------------------
+# blocked inversion (T34): one workgroup per (front, 32-column block J) computes the block
+# column J of inv(L11) by block forward substitution, X_IJ = -inv(L_II) Σ_{K=J}^{I-1} L_IK X_KJ,
+# with the 32 x 32 diagonal-block inverses formed in local memory (thread c: column c, the
+# arithmetic of invert_l11_kernel!, so a front of width <= 32 gets the same bits). The
+# per-thread serial chain is O(32²) per block instead of O(w²) per column: for the fronts
+# of width 65..256 it replaces invert_l11_kernel!'s latency-bound loops (#155).
+const IB = 32
+const INVWG = 128
+
+@kernel function invert_blocked_kernel!(inv11, @Const(factor), @Const(inv_ptr), @Const(pv), @Const(pj),
+                                        @Const(front_ptr), @Const(front_nrows), @Const(front_ncols),
+                                        ::Val{WGV}) where {WGV}
+    @uniform TT = eltype(inv11)
+    li = @index(Local, Linear)
+    g = @index(Group, Linear)
+    Bs = @localmem TT (IB * IB,)        # inverse of the diagonal block L_II (col-major)
+    Ls = @localmem TT (IB * IB,)        # staged block of L
+    Xs = @localmem TT (IB * IB,)        # staged block X_KJ
+    Ts = @localmem TT (IB * IB,)        # Σ_K L_IK X_KJ
+    @inbounds begin
+        v = Int(pv[g])
+        J = Int(pj[g])                  # 0-based block column
+        f = Int(front_nrows[v])
+        w = Int(front_ncols[v])
+        p0 = Int(front_ptr[v]) - 1
+        ip = Int(inv_ptr[v]) - 1
+        nb = cld(w, IB)
+        c0 = J * IB
+        bj = min(IB, w - c0)
+        if c0 > 0                       # rows above the diagonal block are zero
+            for q in (li - 1):WGV:(c0 * bj - 1)
+                c = q ÷ c0 + 1
+                k = q - (c - 1) * c0 + 1
+                inv11[ip + (c0 + c - 1) * w + k] = zero(TT)
+            end
+        end
+        for I in J:(nb - 1)
+            r0 = I * IB
+            bi = min(IB, w - r0)
+            for q in (li - 1):WGV:(IB * IB - 1)
+                Ts[q + 1] = zero(TT)
+            end
+            for K in J:(I - 1)          # full blocks: K < I <= nb - 1
+                k0 = K * IB
+                @synchronize
+                for q in (li - 1):WGV:(IB * IB - 1)
+                    rr = q % IB + 1
+                    cc = q ÷ IB + 1
+                    Ls[q + 1] = rr <= bi ? factor[p0 + (k0 + cc - 1) * f + r0 + rr] : zero(TT)
+                    Xs[q + 1] = cc <= bj ? inv11[ip + (c0 + cc - 1) * w + k0 + rr] : zero(TT)
+                end
+                @synchronize
+                for q in (li - 1):WGV:(IB * IB - 1)
+                    rr = q % IB + 1
+                    cc = q ÷ IB + 1
+                    a = zero(TT)
+                    for m in 1:IB
+                        a += Ls[rr + (m - 1) * IB] * Xs[m + (cc - 1) * IB]
+                    end
+                    Ts[q + 1] += a
+                end
+            end
+            @synchronize
+            for q in (li - 1):WGV:(IB * IB - 1)
+                rr = q % IB + 1
+                cc = q ÷ IB + 1
+                Ls[q + 1] = (rr <= bi && cc <= rr) ? factor[p0 + (r0 + cc - 1) * f + r0 + rr] : zero(TT)
+            end
+            @synchronize
+            for c in li:WGV:bi
+                cb = (c - 1) * IB
+                for k in 1:(c - 1)
+                    Bs[cb + k] = zero(TT)
+                end
+                for k in c:bi
+                    acc = k == c ? one(TT) : zero(TT)
+                    for m in c:(k - 1)
+                        acc -= Ls[k + (m - 1) * IB] * Bs[cb + m]
+                    end
+                    Bs[cb + k] = acc / Ls[k + (k - 1) * IB]
+                end
+            end
+            @synchronize
+            for q in (li - 1):WGV:(IB * IB - 1)
+                rr = q % IB + 1
+                cc = q ÷ IB + 1
+                if rr <= bi && cc <= bj
+                    x = zero(TT)
+                    if I == J
+                        x = Bs[q + 1]
+                    else
+                        a = zero(TT)
+                        for m in 1:rr
+                            a += Bs[rr + (m - 1) * IB] * Ts[m + (cc - 1) * IB]
+                        end
+                        x = -a
+                    end
+                    inv11[ip + (c0 + cc - 1) * w + r0 + rr] = x
+                end
+            end
+            @synchronize                # X_IJ is read back by the next block row
+        end
+    end
+end
+
+# ---------------------------------------------------------------------------
 # per-front inverses of the L11 blocks (width <= MW) for the partitioned-inverse solve:
 # returns the device buffer, its per-front offsets, a closure that (re)computes the
-# inverses from the current factor, and the buffer size in bytes
+# inverses from the current factor (`invert_blocked_kernel!`), and the buffer size in bytes
 function build_inverse(s)
     S = s.symbolic
     sc = S.schedule
@@ -237,10 +358,21 @@ function build_inverse(s)
     T = eltype(s.numeric.factor)
     inv11 = KA.zeros(backend, T, p - 1)
     inv_ptr = _dvec(backend, inv_ptr_h)
-    ab = _dvec(backend, Int32.(findall(v -> width[v] <= MW, 1:ns)))
-    invert! = () -> invert_l11_kernel!(backend, WG)(inv11, s.numeric.factor, inv_ptr, ab, S.front_ptr,
-                                                   S.front_nrows, S.front_ncols, Val(WG);
-                                                   ndrange = WG * length(ab))
+    # (front, block column) pairs, the longest block columns first
+    pairs = Tuple{Int32, Int32}[]
+    for v in 1:ns
+        width[v] <= MW || continue
+        for J in 0:(cld(width[v], IB) - 1)
+            push!(pairs, (Int32(v), Int32(J)))
+        end
+    end
+    sort!(pairs; by = q -> cld(width[q[1]], IB) - q[2], rev = true)
+    pv = _dvec(backend, first.(pairs))
+    pj = _dvec(backend, last.(pairs))
+    np = length(pairs)
+    invert! = () -> (np > 0 && invert_blocked_kernel!(backend, INVWG)(inv11, s.numeric.factor, inv_ptr, pv, pj,
+                                                                       S.front_ptr, S.front_nrows, S.front_ncols,
+                                                                       Val(INVWG); ndrange = INVWG * np); nothing)
     return inv11, inv_ptr, invert!, sizeof(T) * (p - 1)
 end
 
@@ -298,7 +430,7 @@ end
             @synchronize
         end
         if li == 1
-            Threads.atomic_fence()
+            SDS.device_fence(Y)
             pv = Int(snparent[root])
             pv > 0 && (Atomix.@atomic arrived[pv] += Int32(1))
         end
@@ -323,7 +455,7 @@ end
             end
         end
         @synchronize
-        Threads.atomic_fence()
+        SDS.device_fence(Y)
         for kk in li:WGV:w                          # coherent read of the front's columns
             yb[kk] = Atomix.@atomic Y[c0 + kk] += zero(TT)
         end
@@ -348,7 +480,7 @@ end
         end
         @synchronize
         if li == 1
-            Threads.atomic_fence()
+            SDS.device_fence(Y)
             pv = Int(snparent[v])
             pv > 0 && (Atomix.@atomic arrived[pv] += Int32(1))
         end
@@ -386,7 +518,7 @@ end
             end
         end
         @synchronize
-        Threads.atomic_fence()
+        SDS.device_fence(Y)
         for k in cnt:-1:1
             v = Int(subtree_nodes[a0 + k - 1])
             f = Int(front_nrows[v])
@@ -437,12 +569,14 @@ end
             end
         end
         @synchronize
-        Threads.atomic_fence()
+        SDS.device_fence(Y)
         for kk in li:WGV:w
             t[kk] = zero(TT)
         end
         @synchronize
         i0 = w + 1
+        lane = (li - 1) % BWR + 1                   # row lane of the work item
+        slot = (li - 1) ÷ BWR + 1                   # its column within a batch of WGV ÷ BWR columns
         while i0 <= f                               # chunked coherent gather of ancestor solutions
             ii = i0 + li - 1
             if ii <= f
@@ -450,15 +584,30 @@ end
             end
             @synchronize
             m = min(WGV, f - i0 + 1)
-            for kk in li:WGV:w
-                acc = t[kk]
-                col = p0 + (kk - 1) * f + i0 - 1
-                for c in 1:m
-                    acc += factor[col + c] * xb[c]
+            # t += L21(chunk, :)ᵀ xb: BWR work items share a column and read consecutive rows
+            # (coalesced, T34), their partial sums are reduced through t2 (free until below)
+            kb0 = 0
+            while kb0 < w
+                kk = kb0 + slot
+                acc = zero(TT)
+                if kk <= w
+                    col = p0 + (kk - 1) * f + i0 - 1
+                    for c in lane:BWR:m
+                        acc += factor[col + c] * xb[c]
+                    end
                 end
-                t[kk] = acc
+                t2[li] = acc
+                @synchronize
+                if li <= WGV ÷ BWR && kb0 + li <= w
+                    a = t[kb0 + li]
+                    for r in 1:BWR
+                        a += t2[(li - 1) * BWR + r]
+                    end
+                    t[kb0 + li] = a
+                end
+                @synchronize
+                kb0 += WGV ÷ BWR
             end
-            @synchronize
             i0 += WGV
         end
         for kk in li:WGV:w                          # z = y - L21' x, then x = inv(L11)' z
@@ -475,7 +624,7 @@ end
         end
         @synchronize
         if li == 1
-            Threads.atomic_fence()
+            SDS.device_fence(Y)
             Atomix.@atomic done[v] += Int32(1)
         end
     end end
@@ -654,8 +803,17 @@ function build_fused(s; kstart::Int = 1, wcap::Int = MW, merged::Bool = (kstart 
             nfused = length(flist_h), slist = _dvec(backend, sub_ids), nsub = length(sub_ids))
 end
 
+# the dependency-counter sweeps take a workgroup of 32..512 work items, a multiple of 32
+# (`SDSTuning.solve_workgroup`; 64 is the size they were written for)
+# (at most MW: bwd2_kernel! reduces one partial sum per work item through a MW buffer)
+# the accepted `solve_workgroup` values: a multiple of 32 in 32:MW (32:256), checked for every
+# tuning when a `FusedSolver` is built; the chain kernel (`wg > 512` in `run_fused!`) is bench-only
+# and returns before this check
+_check_solve_workgroup(wg) = (32 <= wg <= MW && wg % 32 == 0) ||
+    throw(SDS.InvalidValueError("fused solve: workgroup size $wg; expected a multiple of 32 in 32:$MW"))
+
 # one fused segment, forward sweep: `wg > 512` runs the single-workgroup chain kernel,
-# `wg == 64` the dependency-counter sweep (the workgroup size the sweep is tuned for)
+# otherwise the dependency-counter sweep with workgroups of `wg` work items
 function run_fused!(fz, wg, Yv, s, inv11, inv_ptr, backend)
     S, N = s.symbolic, s.numeric
     if wg > 512
@@ -664,12 +822,12 @@ function run_fused!(fz, wg, Yv, s, inv11, inv_ptr, backend)
                                          ndrange = CHWG)
         return nothing
     end
-    wg == 64 || throw(SDS.InvalidValueError("fused solve: workgroup size $wg; expected 64 or > 512 (chain)"))
+    _check_solve_workgroup(wg)
     copyto!(fz.arrived, fz.arrived_base)
-    fwd2_kernel!(backend, 64)(Yv, N.factor, inv11, inv_ptr, fz.flist, fz.slist, fz.nsub, S.subtree_ptr,
+    fwd2_kernel!(backend, wg)(Yv, N.factor, inv11, inv_ptr, fz.flist, fz.slist, fz.nsub, S.subtree_ptr,
                               S.subtree_nodes, S.snparent, fz.arrived, fz.nchild,
                               S.super_ptr, S.rowptr, S.rowval, S.front_ptr, S.front_nrows, S.front_ncols,
-                              Val(64); ndrange = 64 * (fz.nfused + fz.nsub))
+                              Val(wg); ndrange = wg * (fz.nfused + fz.nsub))
     return nothing
 end
 
@@ -682,12 +840,12 @@ function run_fused_bwd!(fz, wg, Yv, s, inv11, inv_ptr, backend)
                                          ndrange = CHWG)
         return nothing
     end
-    wg == 64 || throw(SDS.InvalidValueError("fused solve: workgroup size $wg; expected 64 or > 512 (chain)"))
+    _check_solve_workgroup(wg)
     copyto!(fz.done, fz.done_base)
-    bwd2_kernel!(backend, 64)(Yv, N.factor, inv11, inv_ptr, fz.flist, fz.slist, fz.nsub, S.subtree_ptr,
+    bwd2_kernel!(backend, wg)(Yv, N.factor, inv11, inv_ptr, fz.flist, fz.slist, fz.nsub, S.subtree_ptr,
                               S.subtree_nodes, S.snparent, fz.done,
                               S.super_ptr, S.rowptr, S.rowval, S.front_ptr, S.front_nrows, S.front_ncols,
-                              Val(64); ndrange = 64 * (fz.nfused + fz.nsub))
+                              Val(wg); ndrange = wg * (fz.nfused + fz.nsub))
     return nothing
 end
 
@@ -699,6 +857,15 @@ function algo2_solve!(x, s, b, inv11, inv_ptr, fz)
     S, N, ws = s.symbolic, s.numeric, s.workspace
     bm = SDS.batch_map(N; nrhs = 1)
     SDS.permute_rhs!(ws.Y, b, S.perm; transposed = false, bm)
+    algo2_sweeps!(s, inv11, inv_ptr, fz)
+    SDS.unpermute_solution!(x, ws.Y, S.perm; transposed = false, bm)
+    return x
+end
+
+# the sweeps of `algo2_solve!` on the solve workspace `Y` (the permuted right-hand side in,
+# the permuted solution out): the part a CUDA graph replays (T34)
+function algo2_sweeps!(s, inv11, inv_ptr, fz)
+    S, N, ws = s.symbolic, s.numeric, s.workspace
     plan = ws.plan
     nodes = S.schedule.group_nodes
     widths = S.schedule.width
@@ -762,8 +929,7 @@ function algo2_solve!(x, s, b, inv11, inv_ptr, fz)
     while k >= 1
         bwd_entry(k); k -= 1
     end
-    SDS.unpermute_solution!(x, ws.Y, S.perm; transposed = false, bm)
-    return x
+    return nothing
 end
 
 const SYRK_IN = 64
@@ -1012,7 +1178,7 @@ end
                 _spin_until_eq!(cb_done, c, Int32(1), fscr, scap)
             end
             @synchronize
-            Threads.atomic_fence()
+            SDS.device_fence(factor)
             cpriv = Int(cb2[c])                  # child CB: private (mega) or stock (subtree root)
             cb = cpriv > 0 ? cpriv : Int(cb_ptr[c])
             mc = Int(front_nrows[c]) - Int(front_ncols[c])
@@ -1039,7 +1205,7 @@ end
                 end
             end
             @synchronize
-            Threads.atomic_fence()      # ALL threads: each wave drains its own stores (gfx9)
+            SDS.device_fence(factor)      # ALL threads: each wave drains its own stores (gfx9)
             @synchronize
             if li == 1
                 Atomix.@atomic ea_left[v] += Int32(-1)
@@ -1054,7 +1220,7 @@ end
                 end
             end
             @synchronize
-            Threads.atomic_fence()
+            SDS.device_fence(factor)
             if r == ROLE_PANEL_B
                 fz = Int(front_nrows[v])
                 wz = Int(front_ncols[v])
@@ -1146,7 +1312,7 @@ end
                                      Val(WG))
                 end
                 @synchronize
-                Threads.atomic_fence()      # ALL threads: each wave drains its own stores (gfx9)
+                SDS.device_fence(factor)      # ALL threads: each wave drains its own stores (gfx9)
                 @synchronize
                 if li == 1
                     Atomix.@atomic cb_done[v] += Int32(1)
@@ -1154,7 +1320,7 @@ end
                     pv > 0 && (Atomix.@atomic arrived[pv] += Int32(1))
                 end
             else
-                Threads.atomic_fence()      # ALL threads (gfx9)
+                SDS.device_fence(factor)      # ALL threads (gfx9)
                 @synchronize
                 if li == 1
                     Atomix.@atomic panel_done[v] += Int32(1)
@@ -1166,7 +1332,7 @@ end
                 _spin_until_eq!(panel_done, v, Int32(1), fscr, scap)
             end
             @synchronize
-            Threads.atomic_fence()
+            SDS.device_fence(factor)
             f = Int(front_nrows[v])
             w = Int(front_ncols[v])
             p0 = Int(front_ptr[v])
@@ -1201,7 +1367,7 @@ end
                 end
             end
             @synchronize
-            Threads.atomic_fence()      # ALL threads: each wave drains its own stores (gfx9)
+            SDS.device_fence(factor)      # ALL threads: each wave drains its own stores (gfx9)
             @synchronize
             if li == 1
                 left = (Atomix.@atomic trsm_left[v] += Int32(-1))
@@ -1222,7 +1388,7 @@ end
                 _spin_until_eq!(trsm_left, v, Int32(0), fscr, scap)
             end
             @synchronize
-            Threads.atomic_fence()
+            SDS.device_fence(factor)
             f = Int(front_nrows[v])
             w = Int(front_ncols[v])
             m = f - w
@@ -1318,7 +1484,7 @@ end
                 end
             end
             @synchronize
-            Threads.atomic_fence()      # ALL threads: each wave drains its own stores (gfx9)
+            SDS.device_fence(factor)      # ALL threads: each wave drains its own stores (gfx9)
             @synchronize
             if li == 1
                 left = (Atomix.@atomic tiles_left[v] += Int32(-1))
@@ -1340,7 +1506,7 @@ end
                 end
             end
             @synchronize
-            Threads.atomic_fence()
+            SDS.device_fence(factor)
             f = Int(front_nrows[v]); w = Int(front_ncols[v])
             c0 = (k - 1) * 64
             kb = min(64, w - c0)
@@ -1410,7 +1576,7 @@ end
             end
             li == 1 && (k == 1 || st[1] != Int32(0)) && (info[v] = st[1])
             @synchronize
-            Threads.atomic_fence()      # ALL threads: each wave drains its own stores (gfx9)
+            SDS.device_fence(factor)      # ALL threads: each wave drains its own stores (gfx9)
             @synchronize
             if li == 1
                 Atomix.@atomic wpdone2[sl] += Int32(1)
@@ -1422,7 +1588,7 @@ end
                 _spin_until_eq!(wpdone2, sl, Int32(1), fscr, scap)
             end
             @synchronize
-            Threads.atomic_fence()
+            SDS.device_fence(factor)
             f = Int(front_nrows[v]); w = Int(front_ncols[v])
             c0 = (k - 1) * 64
             kb = min(64, w - c0)
@@ -1458,7 +1624,7 @@ end
                 end
             end
             @synchronize
-            Threads.atomic_fence()      # ALL threads: each wave drains its own stores (gfx9)
+            SDS.device_fence(factor)      # ALL threads: each wave drains its own stores (gfx9)
             @synchronize
             if li == 1
                 Atomix.@atomic wtrsml[sl] += Int32(-1)
@@ -1471,7 +1637,7 @@ end
                 _spin_until_eq!(wtrsml, sl, Int32(0), fscr, scap)
             end
             @synchronize
-            Threads.atomic_fence()
+            SDS.device_fence(factor)
             f = Int(front_nrows[v]); w = Int(front_ncols[v])
             m = f - w
             c0 = (k - 1) * 64
@@ -1545,7 +1711,7 @@ end
                 end
             end
             @synchronize
-            Threads.atomic_fence()      # ALL threads: each wave drains its own stores (gfx9)
+            SDS.device_fence(factor)      # ALL threads: each wave drains its own stores (gfx9)
             @synchronize
             if li == 1
                 if j0 < w
@@ -1562,7 +1728,7 @@ end
                 _spin_until_eq!(wpdone2, sl, Int32(1), fscr, scap)
                 _spin_until_eq!(wtrsml, sl, Int32(0), fscr, scap)
                 _spin_until_eq!(wcbl, v, Int32(0), fscr, scap)
-                Threads.atomic_fence()
+                SDS.device_fence(factor)
                 Atomix.@atomic cb_done[v] += Int32(1)
                 pv = Int(snparent[v])
                 pv > 0 && (Atomix.@atomic arrived[pv] += Int32(1))
@@ -1610,8 +1776,12 @@ function _factor_panel_c_ldl_potrf!(N, S, fp, v, p, backend)
     return nothing
 end
 
-@kernel function panel_zero_kernel!(factor, @Const(list), @Const(front_ptr), @Const(front_nrows),
-                                    @Const(front_ncols), ::Val{WG}) where {WG}
+# the C-group fronts of the fused plan: zero the panel, then scatter A into it, one
+# workgroup per front and one launch for every C group (T34; before: panel_zero_kernel!
+# plus one scatter_A! launch per C group)
+@kernel function czero_scatter_kernel!(factor, @Const(nzval), @Const(amap), @Const(amap_ptr), @Const(amap_src),
+                                       @Const(list), @Const(front_ptr), @Const(front_nrows), @Const(front_ncols),
+                                       ::Val{WG}) where {WG}
     li = @index(Local, Linear)
     G = @index(Group, Linear)
     @inbounds begin
@@ -1623,12 +1793,18 @@ end
             factor[p0 + q] = zero(eltype(factor))
         end
     end
+    @synchronize
+    @inbounds begin
+        v2 = Int(list[G])
+        SDS._scatter_front!(factor, nzval, amap, amap_ptr, amap_src, v2, SDS._member_shift(front_ptr, v2, 1, 1),
+                            li, Val(WG))
+    end
 end
 
 @kernel function signal_kernel!(cb_done, arrived, @Const(snparent), v)
     li = @index(Local, Linear)
     @inbounds if li == 1
-        Threads.atomic_fence()
+        SDS.device_fence(cb_done)
         Atomix.@atomic cb_done[v] += Int32(1)
         pv = Int(snparent[v])
         pv > 0 && (Atomix.@atomic arrived[pv] += Int32(1))
@@ -1666,7 +1842,8 @@ end
 # host: the topologically ordered role list + counter bases + stream-2 program
 function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, Bool} = nothing,
                           wides_potrf::Bool = false, merge_segments::Bool = false,
-                          wgf::Int = WGF, scap::Integer = 128, ea_chunk::Integer = 16384)
+                          wgf::Int = WGF, scap::Integer = 128, ea_chunk::Integer = 16384,
+                          host_min::Integer = typemax(Int))
     S = s.symbolic
     plan = s.numeric.plan
     backend = KA.get_backend(s.numeric.factor)
@@ -1679,6 +1856,8 @@ function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, B
     # LDL host-wide fronts exist only as the potrf-derived path (wides_potrf = true);
     # otherwise LDL wides are factored in-kernel
     inkernel_wides = inkernel_wides === nothing ? (ldl && !wides_potrf) : inkernel_wides
+    ldl && host_min < typemax(Int) && !wides_potrf &&
+        throw(SDS.InvalidValueError("fused LDL plan: host-wide fronts (host_min = $host_min) need wides_potrf = true"))
     ldl && !inkernel_wides && !wides_potrf &&
         throw(SDS.InvalidValueError("fused LDL plan: host-wide fronts need wides_potrf = true " *
                                     "(or inkernel_wides = true)"))
@@ -1803,7 +1982,7 @@ function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, B
         return nothing
     end
 
-    segments = NTuple{3, Any}[]                  # (base, count, wides-at-boundary)
+    segments = Tuple{Int, Int, Vector{Int}}[]   # (base, count, wides-at-boundary)
     seg_base = 0
     for k in eachindex(plan.group_first)
         a, b = plan.group_first[k], plan.group_last[k]
@@ -1833,10 +2012,12 @@ function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, B
             end
             if !isempty(gwides)
                 if inkernel_wides
-                    foreach(emit_wide, gwides)
-                    gwides = Int[]
+                    # per-front strategy (T34): a front wider than `host_min` stays on the host
+                    # vendor path at a segment boundary, the others are factored in-kernel
+                    foreach(emit_wide, filter(v -> width_h[v] <= host_min, gwides))
+                    gwides = filter(v -> width_h[v] > host_min, gwides)
                 end
-                if !(inkernel_wides && merge_segments)   # merged: one launch, no split
+                if !(inkernel_wides && merge_segments) || !isempty(gwides)   # merged: one launch, no split
                     push!(segments, (seg_base, length(role) - seg_base, gwides))
                     seg_base = length(role)
                 end
@@ -1869,11 +2050,10 @@ function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, B
     end
 
     stp2 = stp
-    ssub = Vector{Any}()
-    for k in eachindex(plan.sub_first)
+    ssub = map(eachindex(plan.sub_first)) do k    # typed: the launches dispatch statically
         ids = [nodes[q] for q in plan.sub_first[k]:plan.sub_last[k]]
         sort!(ids; by = e -> stp2[e + 1] - stp2[e], rev = true)
-        push!(ssub, _dvec(backend, ids))
+        _dvec(backend, ids)
     end
 
     SDS._log(SDS.LOG_DEBUG, () -> "fused plan: $(length(role)) roles, $(length(segments)) segments, " *
@@ -1893,6 +2073,9 @@ function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, B
             wcb_b = _dvec(backend, wcb_b), wupd = KA.zeros(backend, Int32, max(nwslots, 1)),
             wtl = KA.zeros(backend, Int32, max(nwslots, 1)), wpd = KA.zeros(backend, Int32, max(nwslots, 1)),
             wcb = KA.zeros(backend, Int32, ns), wgf, scap = Int32(scap), eac = Int32(ea_chunk), ldl,
+            # the kernel object and its Val parameters, typed in the plan so that the launch
+            # in refact_fused_launches! is statically dispatched (T34: no boxing of its arguments)
+            kfact = fused_fact_kernel!(backend, wgf), ldlv = Val(ldl), wgv = Val(wgf),
             # captured at plan build: a later setparam!("pivot_epsilon") changes the stock
             # path but not an already-built fused plan (rebuild the plan to change it)
             chol_eps = ldl ? 0.0 : Float64(SDS.resolved_pivot_epsilon(s.options, real(T))),
@@ -1900,7 +2083,16 @@ function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, B
             sptr_h = Array(S.super_ptr))
 end
 
+# the fused factorization of `nzval`; returns the info (one host read after the launches of
+# `refact_fused_launches!`). The inverses of the solve are the caller's (`build_inverse`).
 function refact_fused!(s, nzval, fp)
+    refact_fused_launches!(s, nzval, fp)
+    return SDS._numeric_info!(s.numeric, s.symbolic, true)
+end
+
+# the device work of `refact_fused!`: no host synchronization, the part a CUDA graph
+# replays when no front takes the host vendor path (T34)
+function refact_fused_launches!(s, nzval, fp)
     N, S = s.numeric, s.symbolic
     plan = N.plan
     backend = KA.get_backend(N.factor)
@@ -1926,26 +2118,20 @@ function refact_fused!(s, nzval, fp)
     for k in eachindex(plan.sub_first)
         launch_subtrees_sorted!(N, S, nzval, fp.ssub[k], plan.sub_local[k], backend, fp.ldl, fp.chol_eps)
     end
-    nodes = S.schedule.group_nodes
     fill!(fp.pcb, zero(eltype(fp.pcb)))
-    isempty(fp.czero) ||
-        panel_zero_kernel!(backend, WGF)(N.factor, fp.czero, S.front_ptr, S.front_nrows, S.front_ncols,
-                                         Val(WGF); ndrange = WGF * length(fp.czero))
-    for k in eachindex(plan.group_first)               # scatter A into every C-group front (panel only)
-        plan.group_width[k] > 0 && continue
-        a, b = plan.group_first[k], plan.group_last[k]
-        SDS.scatter_A!(N, S, nzval, a, b - a + 1)
-    end
+    isempty(fp.czero) ||                               # zero + scatter A into every C-group front (panel only)
+        czero_scatter_kernel!(backend, WGF)(N.factor, nzval, S.amap, S.amap_ptr, S.amap_src, fp.czero, S.front_ptr,
+                                            S.front_nrows, S.front_ncols, Val(WGF); ndrange = WGF * length(fp.czero))
     for (base, count, gwides) in fp.segments
         count > 0 &&
-            fused_fact_kernel!(backend, fp.wgf)(N.factor, N.stack, fp.pcb, N.info, nzval, S.amap, S.amap_ptr,
+            fp.kfact(N.factor, N.stack, fp.pcb, N.info, nzval, S.amap, S.amap_ptr,
                                              S.amap_src, fp.cb2, fp.wt, fp.role, fp.ra, fp.rb, fp.rc, fp.nchild,
                                              fp.arrived, fp.ea, fp.pdone, fp.trsm, fp.tiles, fp.tiles_base, fp.cbd,
                                              S.snparent, S.front_ptr, S.front_nrows, S.front_ncols,
                                              S.cb_ptr, S.child_ptr, S.child_list, S.relind_ptr, S.relind,
                                              Int32(base), fp.wbase, fp.wupd, fp.wpd, fp.wtl, fp.wcb,
                                              fp.scap, fp.eac, real(eltype(N.factor))(fp.chol_eps), N.d,
-                                             S.super_ptr, Val(fp.ldl), Val(fp.wgf);
+                                             S.super_ptr, fp.ldlv, fp.wgv;
                                              ndrange = fp.wgf * count)
         for v in gwides                              # host-wide fronts at the segment boundary
             if fp.ldl && fp.ldl_potrf
@@ -1965,7 +2151,7 @@ function refact_fused!(s, nzval, fp)
     # fields are Cholesky-interpretation garbage; inertia comes from the signs of
     # d (the MadNLP extension), never from these stats.
     SDS.cholesky_stats!(N, S)
-    return SDS._numeric_info!(N, S, true)
+    return nothing
 end
 
 # ---------------------------------------------------------------------------
@@ -2076,6 +2262,12 @@ mutable struct FusedSolver{T, INT, S <: SDS.DirectSolver{T, INT}} <: SDS.Abstrac
     fz::Any                  # fused solve segments (`build_fused`)
     info::Int
     stage::Int
+    # CUDA-graph replay (T34, `SDSTuning.graph_max_n`): the captured refactorization and solve
+    # sweeps (`nothing`: not captured yet; `false`: not capturable), and the values the
+    # refactorization graph was captured with (a new `nzval` buffer captures again)
+    gfact::Any
+    gsolve::Any
+    gnz::Any
 end
 
 function FusedSolver(A, structure, view; tuning::Union{Nothing, SDSTuning} = nothing, kwargs...)
@@ -2106,6 +2298,7 @@ function _fused_solver(s::SDS.DirectSolver{T, INT}, tuning::Union{Nothing, SDSTu
     s.nbatch == 1 ||
         throw(SDS.NotSupportedError("FusedSolver: a uniform batch ($(s.nbatch) members) is not supported"))
     t = _resolved_tuning(tuning, backend)
+    _check_solve_workgroup(t.solve_workgroup)
     ldl = st == SDS.STRUCTURE_SYMMETRIC
     if ldl
         SDS.setparam!(s, "pivot_type", 'N')
@@ -2116,7 +2309,7 @@ function _fused_solver(s::SDS.DirectSolver{T, INT}, tuning::Union{Nothing, SDSTu
     end
     _apply_tuning!(s, t)
     return FusedSolver{T, INT, typeof(s)}(s, t, ldl, nothing, nothing, nothing, nothing, nothing, nothing, 0,
-                                          SDS.STAGE_NONE)
+                                          SDS.STAGE_NONE, nothing, nothing, nothing)
 end
 
 Base.size(F::FusedSolver) = size(F.inner)
@@ -2154,6 +2347,7 @@ end
 # drop the plans of an earlier analysis (a new analysis rebuilds them)
 function _clear_plans!(F::FusedSolver)
     F.nzval = F.fp = F.inv11 = F.inv_ptr = F.invert! = F.fz = nothing
+    F.gfact = F.gsolve = F.gnz = nothing
     F.info = 0
     return F
 end
@@ -2177,8 +2371,11 @@ function _fused_symbolic!(F::FusedSolver{T}) where {T}
     # dual rows, so potrf fails on a matrix the no-pivot LDLᵀ factors (#141). `wides =
     # :host` keeps its meaning for Cholesky; for LDL it only keeps the segment split.
     inkernel = merged || F.ldl
+    # `wide_host_min`: the per-front wide strategy of a merged Cholesky plan (LDL keeps every
+    # wide front in-kernel, see above)
+    host_min = merged && !F.ldl ? t.wide_host_min : typemax(Int)
     fp = build_fused_plan(s; ldl = F.ldl, inkernel_wides = inkernel, merge_segments = merged,
-                          wides_potrf = false, wgf = t.workgroup, scap = t.spin_cap)
+                          wides_potrf = false, wgf = t.workgroup, scap = t.spin_cap, host_min)
     inv11, inv_ptr, invertf, _ = build_inverse(s)
     # the solve plan: one merged dependency-counter sweep over the whole tree
     fz1 = build_fused(s; kstart = 1, wcap = 256)
@@ -2186,17 +2383,48 @@ function _fused_symbolic!(F::FusedSolver{T}) where {T}
     F.nzval = SDS._factor_values(s)
     F.fp = fp
     F.inv11, F.inv_ptr, F.invert! = inv11, inv_ptr, invertf
-    F.fz = ([(fz1, 64)], true)
+    F.fz = ([(fz1, t.solve_workgroup)], true)
     F.info = 0
     F.stage = SDS.STAGE_ANALYZED
     return F
 end
 
-# the fused factorization behind a function barrier (the plans are untyped fields)
-function _fused_refactor!(s, nzval, fp, invertf)
-    info = Int(refact_fused!(s, nzval, fp))
+# the device work of the fused factorization and the inverses behind a function barrier (the
+# plans are untyped fields)
+function _fused_launches!(s, nzval, fp, invertf)
+    refact_fused_launches!(s, nzval, fp)
     invertf()
-    return info
+    return nothing
+end
+
+# CUDA-graph replay (`SDSTuning.graph_max_n`, the backend's `capture_graph`): only for n up to
+# the tuning's bound, and only where no vendor dense call is in the captured range (cuSOLVER
+# potrf is not capturable on CUDA.jl 6.5, #174): no host-wide front in the factorization, no
+# front wider than MW (the vendor dense sweeps) in the solve
+_graph_size_ok(F::FusedSolver) = size(F, 1) <= F.tuning.graph_max_n
+_graph_fact_ok(F::FusedSolver) = _graph_size_ok(F) && isempty(F.fp.wides)
+_graph_solve_ok(F::FusedSolver) = _graph_size_ok(F) && maximum(F.inner.symbolic.schedule.width) <= MW
+
+# the captured graph of `f` on the solver's backend, `false` when the backend has none or the
+# capture fails (the phase then launches eagerly, as without the tuning)
+_capture(F::FusedSolver, f) = something(SDS.capture_graph(F.inner.backend, f), false)
+
+function _fused_refactor!(F::FusedSolver)
+    s = F.inner
+    # the first factorization runs eagerly (it compiles the kernels a capture records)
+    if F.stage >= SDS.STAGE_FACTORIZED && _graph_fact_ok(F)
+        if F.gfact === nothing || F.gnz !== F.nzval
+            nz, fp, invf = F.nzval, F.fp, F.invert!
+            F.gfact = _capture(F, () -> _fused_launches!(s, nz, fp, invf))
+            F.gnz = F.nzval
+        end
+        if F.gfact !== false
+            F.gfact()
+            return Int(SDS._numeric_info!(s.numeric, s.symbolic, true))
+        end
+    end
+    _fused_launches!(s, F.nzval, F.fp, F.invert!)
+    return Int(SDS._numeric_info!(s.numeric, s.symbolic, true))
 end
 
 function _fused_factorize!(F::FusedSolver, p::SDS.Phase)
@@ -2205,7 +2433,7 @@ function _fused_factorize!(F::FusedSolver, p::SDS.Phase)
     p == SDS.PHASE_REFACTORIZATION && F.stage < SDS.STAGE_FACTORIZED &&
         throw(SDS._phase_error(name, "needs a previous \"factorization\""))
     F.nzval = SDS._factor_values(F.inner)
-    F.info = _fused_refactor!(F.inner, F.nzval, F.fp, F.invert!)
+    F.info = _fused_refactor!(F)
     F.stage = SDS.STAGE_FACTORIZED
     return F
 end
@@ -2236,8 +2464,32 @@ function _fused_solve!(F::FusedSolver, X, B)
         throw(SDS.NotSupportedError("FusedSolver: ir_n_steps = $(o.ir_n_steps) (iterative refinement) is not supported"))
     x = _fused_rhs(F, X, "X")
     b = _fused_rhs(F, B, "B")
-    algo2_solve!(x, F.inner, b, F.inv11, F.inv_ptr, F.fz)
+    if _graph_solve_ok(F)
+        _fused_solve_graph!(F, x, b)
+    else
+        algo2_solve!(x, F.inner, b, F.inv11, F.inv_ptr, F.fz)
+    end
     return F
+end
+
+# `algo2_solve!` with the sweeps replayed from a graph (captured at the second solve: the
+# first one runs eagerly and compiles the kernels); the permutations stay outside the graph,
+# so the graph does not depend on the caller's vectors
+function _fused_solve_graph!(F::FusedSolver, x, b)
+    s = F.inner
+    S, N, ws = s.symbolic, s.numeric, s.workspace
+    if F.gsolve === nothing
+        algo2_solve!(x, s, b, F.inv11, F.inv_ptr, F.fz)
+        inv11, inv_ptr, fz = F.inv11, F.inv_ptr, F.fz
+        F.gsolve = _capture(F, () -> algo2_sweeps!(s, inv11, inv_ptr, fz))
+        return nothing
+    end
+    F.gsolve === false && return algo2_solve!(x, s, b, F.inv11, F.inv_ptr, F.fz)
+    bm = SDS.batch_map(N; nrhs = 1)
+    SDS.permute_rhs!(ws.Y, b, S.perm; transposed = false, bm)
+    F.gsolve()
+    SDS.unpermute_solution!(x, ws.Y, S.perm; transposed = false, bm)
+    return nothing
 end
 
 function SDS.execute!(phase::AbstractString, F::FusedSolver, X, B; asynchronous::Bool = true)
