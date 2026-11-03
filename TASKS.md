@@ -3892,7 +3892,7 @@ remains of T24–T26 for the owner to re-cut. Closes #156; refs #154, #155.
     hardware here; the `amdgpu` CI leg checks correctness only).
   * The strict 1e-8 gate is not satisfiable on the KKT dumps at `main`; read as "no worse than base" there.
 - Open issues / follow-ups:
-  * To be opened (draft written): the 1e-8 factor gate of `bench/ARCH-TUNING.md` does not hold on the pglib KKT
+  * #177 (found-by-agent): the 1e-8 factor gate of `bench/ARCH-TUNING.md` does not hold on the pglib KKT
     dumps even at `main` (`"SPD"` arrival order, `"S"` systematic LDL rounding).
   * sm_89 numbers for every knob (`solve_workgroup`, `wide_host_min` in merged mode, `graph_max_n`) on an RTX
     4080/L40S; AMDGPU timing on the runner.
