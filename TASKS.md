@@ -3924,6 +3924,149 @@ remains of T24–T26 for the owner to re-cut. Closes #156; refs #154, #155.
     6.5, #174); the fused pipeline's `SDSTuning.graph_max_n` is the switch."
   * §2.7: add the `device_fence(A)` hook (gpu-scope fence through the backend extension) to the kernel rules.
 
+### T35 — Fused pipeline: deterministic extend-add and solve (`deterministic_mode = 1` on `FusedSolver`; issue #180, refs #177, #109, #82)   `[ ]`
+
+Added by the owner (2026-11-03) after T34 and the #177 measurement (H200 sm_90;
+numbers in the #177 comment). Runs on top of T34. The public surface stays as it is: `deterministic_mode`
+is the existing cuDSS parameter string (PLAN §1.3, §3.4). The default stays
+`0` unless the A/B below shows the deterministic path costs nothing measurable.
+
+**Why.** `FusedSolver` raises `NotSupportedError` for `deterministic_mode = 1`
+(`_check_fused_options`, `src/fused.jl`), and its default factorization is not
+reproducible from run to run. #177 measured the run-to-run spread: max|ΔL|/max|L|
+over 10 refactorizations of the same values is 1.6e-8 on the 78k condensed KKT
+(`"SPD"`), 2.7e-8 on the same matrix (`"S"`), 6.0e-9 on case1354 (`"S"`) and
+2.5e-10 on case1354 (`"SPD"`). The stock `DirectSolver` gives exactly 0 on all of
+them. PLAN §3.4 says assembly is deterministic by construction. The fused
+pipeline (T26/T33) broke that promise in three places, all in
+`fused_fact_kernel!`, plus one in the fused solve:
+
+1. **`ROLE_EA`** (C-group parents with more than one contribution-block child):
+   every (child, chunk) workgroup pushes its child's contribution block into
+   the parent with `Atomix.@atomic factor[...] += x` and `Atomix.@atomic
+   pcb[...] += x`. Children finish in arrival order, so each parent entry sums
+   its children in a different order on every run. 78k: 8654 EA roles over
+   7817 child→parent edges, 15.7M atomic CB entries per refactorization,
+   2137 parents. lap3d_40: 14386 roles, 3749 edges, 93.8M entries.
+2. **`ROLE_WTILE`** (in-kernel wide fronts: every `"S"` wide front, and
+   Cholesky wides with `wides = :merged`): the tiles of panel `k` subtract
+   their update into the trailing columns and the CB with `Atomix.@atomic ... -= a`,
+   while tiles of other panels update the same entries. 78k `"S"`: 59 wide
+   fronts, 4978 WTILE roles. lap3d_40 `"S"`: 42 fronts, 100847 roles.
+3. The paths that are already deterministic stay as they are: `ROLE_PANEL_B`
+   (the parent pulls its children in `child_list` order), the write-through
+   tiles (one CB child only), `ROLE_TILE` into the front's own private CB,
+   and the host vendor wide fronts.
+4. **Fused solve**: `fwd2`/the subtree forward kernels scatter `L21·t` into `Y`
+   with `Atomix.@atomic Y[row] += -acc` (rows above `limit`). This is the
+   PLAN §2.5 forward-sweep conflict, but the fused solve has no pull variant.
+
+The contribution blocks are already private. `build_fused_plan` gives every
+non-subtree front with a CB its own packed slot (`pcb`, `cb2`). That is the
+"budget private slots" option of #109 (T26 deliverable 2), so a
+deterministic order costs **no new contribution-block memory**:
+
+| matrix | private CBs (`pcb`) | stock update stack | factor |
+|---|---|---|---|
+| 78k condensed KKT (n = 674562) | 15.97M entries, 122 MiB | 4.13M, 31.5 MiB | 162 MiB |
+| lap3d_40 (n = 64000) | 125.9M entries, 961 MiB | 13.2M, 100.5 MiB | 133 MiB |
+| bcsstk17 | 2.07M, 15.8 MiB | 0.78M, 5.9 MiB | 10.4 MiB |
+
+(Float64, from `length(F.fp.pcb)` and `S.layout` on the T34 branch.) lap3d_40's
+private CBs are 7.2× its factor, and that memory is spent today.
+`memory_estimates` of a `FusedSolver` still forwards the inner solver's numbers and
+leaves `pcb` out, which is what #109 asked to report.
+
+**Deliverables.**
+
+1. **Ordered extend-add** under `deterministic_mode = 1`: the children of a
+   parent add in the fixed `child_list` order, with plain (non-atomic) adds.
+   Two candidates. Implement both behind a plan flag, A/B them, keep one:
+   * *ordered push*: child `k`'s EA chunks wait (spin, as the counter kernel
+     already does) until every chunk of the parent's EA children `1..k-1` has
+     finished (a per-parent count of finished EA chunks, compared against a
+     prefix sum built on the host). The chunks of one child write disjoint
+     parent entries (`relind` is injective), so they need no atomics. Child
+     `1` still overlaps the factorization of its siblings. The wait is on
+     roles that come earlier in the role list (`emit_ea` follows `child_ptr`
+     order), so the in-order dispatch argument of the counter kernel holds
+     and nothing new can deadlock.
+   * *parent pull*: EA roles keyed by (parent, block of parent columns). Each
+     waits for `arrived[v] == nchild[v]` and loops over the children in order.
+     `relind` is sorted, so the child columns that land in a block of parent
+     columns are contiguous, and their bounds per (block, child) are computed
+     on the host. This needs no cross-role ordering but gives up the overlap
+     of child 1 with its siblings.
+2. **Ordered wide-front tiles**: under `deterministic_mode = 1`, WTILE
+   `(k, tii, tjj)` waits for WTILE `(k-1, tii, tjj)` through a per-(front,
+   tile) Int32 "last panel applied" counter. That costs one Int32 per tile of
+   each in-kernel wide front (≤ 100847 on lap3d_40), and then non-atomic
+   `-=`. An alternative to try: a left-looking CB tile that applies all
+   panels in order once the last panel is done (CB columns only).
+3. **Deterministic fused solve**: a pull variant of the forward scatter. Per-front
+   private update buffers of `f_v − w_v` entries (the PLAN §2.5 layout at the
+   gather-list rows, about Σ(f−w) Float64 in total), summed by the parent in
+   child order before its `inv11` apply. Without it, `deterministic_mode = 1`
+   gives a reproducible factor but not a reproducible `x`.
+4. `_check_fused_options` accepts `deterministic_mode = 1`. The plan is built
+   with the deterministic roles when the option is set at analysis, and a
+   change after analysis raises (as `pivot_epsilon` does today) or rebuilds
+   the plan, whichever is simpler; document which. `memory_estimates` of a
+   `FusedSolver` adds the private CB bytes (`pcb`) and the new buffers (#109).
+5. `bench/ARCH-TUNING.md`: the factor gate of #177 restated as (a) bitwise
+   run-to-run equality under `deterministic_mode = 1`, and (b) fused vs stock no
+   larger than the stock path's own response to an eps-level perturbation of
+   A (the #177 table), with the strict 1e-8 kept for the well-conditioned
+   harness matrices.
+
+**Interaction with `"S"`.** The fused no-pivot LDLᵀ always factors its wide
+fronts in the kernel (T33/#141), so WTILE (deliverable 2) matters most for
+`"S"`. Determinism does **not** make the fused `"S"` factor equal to the stock
+one: the fused LDL kernels round differently (constant offset 1.9e-8 / 2.9e-8 /
+1.1e-7 on case118 / case1354 / 78k), and that offset stays. The tests compare
+fused against fused, bitwise, and fused against stock under (b) above. Pivot
+statistics (inertia, `"info"`) must be identical across runs under both modes.
+
+**Time cost and how to measure it.** Per refactorization the atomics touch
+15.7M (78k) and 93.8M (lap3d_40) CB entries. The ordered variants replace them
+with plain adds, which are cheaper per entry, but they serialize the children of
+one parent: 2137 parents with on average 3.7 EA children on the 78k, and mostly
+2 children per separator on lap3d_40. My guess is within ±5% on the 78k and a
+few percent slower on lap3d_40 (where big separator CBs wait on their sibling).
+That is not measured. A/B it with the T34 harness (`ab.jl`-style: one tree, three interleaved rounds, 20
+gated refactorizations per configuration, on an idle exclusive GPU through
+`srun --gres=gpu:1`) and `bench/e2e/fused_probe.jl`. Measure `deterministic_mode
+= 0` (atomic, today) against `1` (ordered push) against `1` (parent pull) on the
+78k (`"SPD"` and `"S"`), lap3d_40, lap2d_300, bcsstk17/38, case1354/118. Also
+measure the solve with and without the pull forward sweep. On the `amdgpu` runner,
+correctness only.
+
+**Default.** Keep `deterministic_mode = 0` (atomic) as the default unless the
+ordered variant is within the 2% noise on every harness matrix on both CUDA and
+AMDGPU. cuDSS also defaults to non-deterministic (`CUDSS_CONFIG_DETERMINISTIC_MODE
+= 0`), and MadNLP does not need bitwise reproducibility: the #177 table shows
+the run-to-run spread sits below the factor's eps-level sensitivity, with the
+same backward error. If the ordered push costs nothing, make it the only path
+and delete the atomic EA roles. That keeps PLAN §3.4 true without a flag.
+
+**Tests.** `test/test_fused.jl`: the existing `deterministic_mode = 1 →
+NotSupportedError` check becomes a positive test. Under `deterministic_mode = 1`,
+on CUDA and AMDGPU, `"SPD"` and `"S"`, `Float64` and `Float32`, on a matrix
+with EA roles and in-kernel wide fronts (the 18³ Laplacian for `"S"`,
+`grid_kkt_matrix` or `kkt_matrix` from `test/matrices.jl` for EA; check that the plan has EA and WTILE roles), 10 refactorizations give bitwise
+equal `numeric.factor`, `numeric.d` and solutions. The fused factor stays
+within `growth_tol(T, Nr)` of the stock factor. Under `deterministic_mode = 0`
+everything passes unchanged. The allocation budget of a refactorization plus a
+solve holds in both modes. The full default suite passes on CPU and CUDA.
+
+**Report:** for each variant, the refactorization and solve medians of the A/B
+on every matrix above (CUDA H200 or RTX 4080, stating which; AMDGPU if the
+runner allows), kept or dropped. The run-to-run deltas in both modes (0 under
+`= 1`). `memory_estimates` before/after on the 78k and lap3d_40. Whether the
+default changed, and why. Refs #177, #109 (private CB slots and their
+reporting; closes the reporting half if not already closed by T26), #82
+(level-merged kernels, whose concurrency this keeps), PLAN §3.4, §2.5.
+
 ### External — MadNLPGPU integration (in the MadNLP repository)   `[ ]`
 
 Add a `SparseDirectSolver`-backed `AbstractLinearSolver` next to

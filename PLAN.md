@@ -410,7 +410,11 @@ GEMV, and one fused dependency-counter kernel per direction over every front
 of width ≤ 256 solves the 78k-bus condensed KKT in 3.5 ms against 3.8 ms for
 cuDSS and 18 ms for the level-batched sweeps, on CUDA and (8 ms) on a Radeon
 VII; the shallow ND ordering (#108) is a precondition. On lap3d_40 and apache2
-the same approach regresses, so T24 picks the strategy per schedule.
+the same approach regresses, so T24 picks the strategy per schedule. Graph replay (§2.7, §3.9) captures only launch ranges without vendor dense
+calls: cuSOLVER's `potrf` is not capturable on CUDA.jl 6.5 (#174), so a
+refactorization with host vendor fronts is replayed in pieces or not at all;
+the fused pipeline's `SDSTuning.graph_max_n` is the switch and its CUDA
+extension follows this rule (T34).
 
 Refinement: plain IR with a KA CSR SpMV residual (gather, no atomics; the
 workspace is allocated by the first refining solve, so the handle layer with
@@ -479,6 +483,7 @@ and an M4 Max.
 | No dynamic parallelism, no graphs in KA; one launch per level is the portable floor. | Subtree fusion and level merging are first-class analysis goals. CUDA/HIP graph capture of refactorize+solve through the extensions. |
 | Metal has no Float64. | `factor_precision = Float32` with Float64 refinement on the CPU or in double-single arithmetic; acceptable for condensed/well-conditioned systems only. |
 | Float32 atomics have codegen regressions on CUDA; atomics cost everywhere. | No atomics in assembly or extend-add (owner-pull, deterministic). Atomics only in the default forward solve, with an atomic-free variant. |
+| KA has no gpu-scope memory fence: `Threads.atomic_fence()` compiles to a system-scope fence on CUDA, which costs 3–8% in the dependency-counter kernels (#154). | Kernels that publish data to other workgroups call the capability `device_fence(A)` (`src/dense/capabilities.jl`): `Threads.atomic_fence()` by default, the gpu-scope `threadfence()` in the CUDA extension (T34). |
 | KernelAbstractions CPU backend: a 2-D ndrange allocates per launch, launches with more than about 32 arguments are not specialized and allocate, `@localmem` is heap-allocated under coverage (issue #53); the 0.10 backend allocates a fixed amount per launch (#145). | Allocation-free phases use 1-D ndranges with the extra dimension folded into the group index and kernels of at most 32 arguments; the CPU allocation tests carry an explicit budget for the backend's own allocations (`ka_cpu_alloc_budget`). |
 | `@localmem` is static shared memory; CUDA rejects more than 48 KiB per kernel, Metal allows 32 KiB. | Regime-A local sizes are a fixed ladder of `Val` instances (8–48 KiB); the per-backend cap is the capability `max_local_bytes(backend)` of each extension (T23/T31, #60). |
 
@@ -583,6 +588,11 @@ keeps the cuDSS pair, `pivot_stats` adds n₀, n_perturbed and n_2×2.
 Assembly (scatter of A and extend-add) is done by the owner workgroup of each
 parent front pulling from its children in a fixed order: no atomics, bitwise
 reproducible by construction. Only the default forward solve uses atomics.
+The fused pipeline (`FusedSolver`, T33) departs from this: its concurrent
+extend-add, its in-kernel wide-front tiles and its forward solve accumulate
+with atomics, and it rejects `deterministic_mode = 1`. T35 (#180) adds the
+ordered variants under that flag; #177 has the measured run-to-run spread, at
+the factor's eps-level sensitivity and with the stock backward error.
 
 ### 3.5 Uniform batch
 
@@ -629,8 +639,9 @@ Everything from analysis is reused: permutation, scaling, etree, supernodes,
 front sizes, extend-add maps, layout, schedule. The numeric phase and the solve
 are pure "values in, factors/solution out" kernel sequences with no allocation
 and no host synchronization, so the CUDA and ROCm extensions can capture the
-refactorize+solve sequence in a graph and replay it per IPM iteration (graph
-capture itself is T26, #82). This holds for the dense implementations `:auto`,
+refactorize+solve sequence in a graph and replay it per IPM iteration (the
+fused pipeline's capture is T34's `graph_max_n`, the stock path's is T26, #82;
+both capture only ranges without vendor dense calls, #174). This holds for the dense implementations `:auto`,
 `:vendor` and `:ka` (the latter still allocates until T32, #146/#53); `:generic`
 (host LinearAlgebra) is the reference path and may allocate. Exceptions by
 design: the `ir_tol > 0` early-exit test and every FGMRES iteration read on the
