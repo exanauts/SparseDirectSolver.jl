@@ -10,16 +10,25 @@ champions. Workload throughout: the 78k-bus ACOPF condensed KKT
 ## Ground rules (these produced every number below)
 
 1. **Gate every configuration.** A trial is valid only with `info == 0`, the
-   residual matching stock, and an elementwise factor delta against the stock
-   factorization at the rounding level of the matrix: ≤ 1e-8 on the
-   well-conditioned harness matrices (bcsstk17/38, lap2d_300, lap3d_40; ~1e-13
-   in practice), and on matrices with element growth (the pglib KKT dumps,
-   κ₁ ≈ 1e16–1e17) no larger than the stock path's own delta under an
-   eps-level perturbation of A or between its CPU and CUDA backends (1e-8 to
-   1e-7 there; the table is in #177). The run-to-run spread of the fused
-   pipeline must stay within the same bound. An `info == 0` check alone is
-   insufficient: one race produced a silently wrong factor (Δ ≈ 1e-5) with
-   clean info.
+   residual matching stock, and the factor gate of #177 as restated in T35:
+   * (a) **reproducibility**: under `deterministic_mode = 1` the factor, `D`
+     and the solution of 20 refactorizations of the same values are bitwise
+     equal (run-to-run delta exactly 0). Under `deterministic_mode = 0` the
+     run-to-run spread of the atomic extend-add must stay within (b);
+   * (b) **accuracy**: the elementwise factor delta of the fused path against
+     the stock factorization on the same analysis is no larger than the stock
+     path's own response to an eps-level perturbation of A (each stored entry
+     times `1 + δ`, |δ| ≤ eps; the #177 table: 5.5e-8 case118 `"S"`, 7.0e-8
+     case1354 `"S"`, 9.8e-8 78k `"S"`, 3.6e-8 78k `"SPD"`, 4.6e-8 case1354
+     `"SPD"`, 4.9e-11 case118 `"SPD"`), with the strict ≤ 1e-8 kept for the
+     well-conditioned harness matrices (bcsstk17/38, lap2d_300, lap3d_40;
+     ~1e-13 in practice). The fused `"S"` factor carries a constant offset
+     against the stock one (its LDLᵀ kernels round differently: 1.9e-8 /
+     2.9e-8 / 1.1e-7 on case118 / case1354 / 78k); determinism does not
+     remove it, (b) bounds it.
+
+   An `info == 0` check alone is insufficient: one race produced a silently
+   wrong factor (Δ ≈ 1e-5) with clean info.
 2. **Interleave with the baseline.** Shared boxes drift by 2× within an hour;
    A/B/A/B in one process is the only defensible comparison. Three pairs
    minimum; treat sub-2% differences as noise.
