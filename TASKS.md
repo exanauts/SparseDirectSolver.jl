@@ -3924,7 +3924,7 @@ remains of T24–T26 for the owner to re-cut. Closes #156; refs #154, #155.
     6.5, #174); the fused pipeline's `SDSTuning.graph_max_n` is the switch."
   * §2.7: add the `device_fence(A)` hook (gpu-scope fence through the backend extension) to the kernel rules.
 
-### T35 — Fused pipeline: deterministic extend-add and solve (`deterministic_mode = 1` on `FusedSolver`; issue #180, refs #177, #109, #82)   `[ ]`
+### T35 — Fused pipeline: deterministic extend-add and solve (`deterministic_mode = 1` on `FusedSolver`; issue #180, refs #177, #109, #82)   `[!]`
 
 Added by the owner (2026-11-03) after T34 and the #177 measurement (H200 sm_90;
 numbers in the #177 comment). Runs on top of T34. The public surface stays as it is: `deterministic_mode`
@@ -4066,6 +4066,150 @@ runner allows), kept or dropped. The run-to-run deltas in both modes (0 under
 default changed, and why. Refs #177, #109 (private CB slots and their
 reporting; closes the reporting half if not already closed by T26), #82
 (level-merged kernels, whose concurrency this keeps), PLAN §3.4, §2.5.
+
+### Report
+- Status: [!] (done with deviations: the ordered extend-add and the ordered wide tiles were faster or equal on
+  every matrix, so they replaced the atomic paths in both modes, as the task allows for a variant that "costs
+  nothing"; `deterministic_mode` then selects only the forward solve and is read at every solve, not at the
+  analysis; measured on an **H200, sm_90**; AMDGPU correctness through CI only)
+- What was built (`src/fused.jl`):
+  * **Extend-add, parent pull — kept, the only path.** `ROLE_EA` is now one role per (C-group parent, block of
+    its columns of about 8K child entries): it loops over the parent's children in `child_list` order (spinning
+    on each child's `cb_done` in turn, so child 1 still overlaps its siblings' factorization) and adds the packed
+    range of each child's CB whose columns land in the block, with plain adds (`relind` is increasing: the range
+    is contiguous; computed on the host into the plan's `pl_c`/`pl_q0`/`pl_q1`, enumerated with `_tri_decode`).
+    The atomic arrival-order push of every child's CB chunks and the *ordered push* candidate (child k's chunks
+    wait on the parent's counter until children 1..k-1 have added, `ea_tgt`) were deleted after the A/B; both
+    stay reproducible at commit cd94954 (`build_fused_plan(...; ea_mode = :atomic | :push | :pull)`).
+  * **Ordered wide-front tiles — the only path.** `ROLE_WTILE` `(k, tii, tjj)` waits (`_wcell_wait!`) until every
+    32 × 32 cell of the front it touches has counted panels `1..k-1` (one Int32 per cell of the lower triangle of
+    each in-kernel wide front, `fp.wcell`/`fp.wcbase`; reset per refactorization), subtracts with plain stores and
+    counts its panel. Below the last panel a tile is exactly one cell (panels are 64 wide); the last panel's
+    tiles (offset by a partial `kb`) may straddle four cells and only wait. The waits are on earlier roles, so the
+    in-order-dispatch argument of the counter kernel holds. The left-looking CB-tile alternative was not tried
+    (the ordered tiles cost nothing measurable).
+  * **Pull forward solve** (`deterministic_mode = 1`): `fwd2_kernel!` (regime-A subtree walks and fronts) and
+    `fwd1_kernel!` (the level-batched entries, which also pull for the fronts wider than 256 before the vendor
+    `SDS._fwd_dense!(...; det = true)`) take `Val(DET)`: every front zeroes its update buffer, pulls its
+    children's buffers in `child_list` order (`_fused_pull!`) into its columns (local memory in `fwd2`) and its own
+    buffer, and writes `-L21 t` into its buffer; the buffers are the existing `ws.U` of the inner solver's solve
+    workspace (PLAN §2.5 layout, `length(rowval)` entries, allocated since T33: no new memory).
+    `algo2_solve!`/`algo2_sweeps!`/`run_fused!` take a `det` argument; the CUDA-graph replay captures one graph
+    per variant (`FusedSolver.gdet`).
+  * `FusedSolver`: `_check_fused_options` no longer rejects `deterministic_mode = 1`; `"deterministic_mode"` is
+    settable (`FUSED_SETTABLE`) and read at every solve, as `DirectSolver` does (no plan depends on it, so a
+    change after the analysis needs neither a rebuild nor an error). `getparam(F, "memory_estimates")` returns
+    the inner solver's estimates plus, after the analysis, slot 13 = the private CBs (`fp.pcb`) and slot 14 =
+    every other device buffer of the fused plans (roles, counters, extend-add lists, wide-tile cells, L11
+    inverses, solve-segment counters), both added to slots 1, 2 and 5 (#109's reporting). Docstring updated.
+  * `bench/ARCH-TUNING.md`: ground rule 1 restated as the task's gate (a) bitwise run-to-run under
+    `deterministic_mode = 1`, (b) fused vs stock ≤ the stock eps-perturbation response of #177, strict 1e-8 on the
+    well-conditioned harness); a T35 section with the A/B below.
+  * `test/test_fused.jl`: the `deterministic_mode = 1 → NotSupportedError` checks are gone; new testset
+    "deterministic_mode = {1, 0}" on laplacian3d 18³ (`"SPD"` with `wides = :merged`, `"S"`) and
+    `grid_kkt_matrix` 40×40 (`"S"`), Float32 and Float64: the plan has `ROLE_EA` and `ROLE_WTILE` roles, 10
+    refactorizations + solves give bitwise equal `numeric.factor` and `numeric.d` (both modes) and solutions
+    (mode 1), inertia unchanged, residual ≤ `tol(T)`, the allocation budget of a refactorization plus a solve,
+    the other mode's solve on the same factor within `tol(T)` and mode 1 again bitwise, the fused factor (and D)
+    within `growth_tol(T, Nr)` of the stock factorization on the same analysis, and the `memory_estimates` slots.
+    The "SDSTuning T34 knobs" testset also solves under `deterministic_mode = 1` (the graph of the pull sweep on
+    CUDA, bitwise equal repeated solves).
+- Tests: `SDS_TEST_ONLY=test_fused,test_options,test_madnlp PTR_NUM_JOBS=3 julia --project=. -e 'using Pkg;
+  Pkg.test()'` (CUDA added to the test environment as `ci.yml` does, not committed), CPU + CUDA (H200), all four
+  element types: 1434 pass, 0 fail, 0 broken (test_fused in its four element-type parts with the new deterministic testsets, test_options, test_madnlp). The intermediate A/B tree (cd94954, both candidates) passed
+  `SDS_TEST_ONLY=test_fused,test_options`: 1087 pass, 0 fail, 0 broken. Full default suite, AMDGPU and oneAPI
+  legs: pending CI (not run locally by owner instruction).
+- Measurements (H200 sm_90, `kkt`, one exclusive Slurm GPU; ms; one process per structure, the plans of all
+  configurations built once on one analysis and swapped, three interleaved rounds, medians; 20 gated
+  refactorizations per configuration, info 0 in every run):
+
+  Refactorization and solve per extend-add variant (the push and pull rows solve with the pull forward sweep,
+  the atomic row with the atomic scatter; wide tiles as in the variant: atomic in the atomic row, ordered in the
+  others):
+
+  | matrix | refact atomic (base) | ordered push | parent pull | solve atomic | solve pull sweep |
+  |---|---|---|---|---|---|
+  | 78k condensed KKT `"SPD"` | 18.18 | 18.88 | **16.54** | 2.23 | 2.42 |
+  | 78k `"S"` | 26.66 | 27.00 | **24.86** | 2.25 | 2.42 |
+  | lap3d_40 `"SPD"` | 27.04 | 27.98 | **24.70** | 6.37 | 6.45 |
+  | lap3d_40 `"S"` | 65.43 | 66.45 | **63.16** | 6.40 | 6.39 |
+  | lap2d_300 | 5.38 | 5.60 | **4.82** | 1.17 | 1.26 |
+  | bcsstk17 | 4.53 | 4.65 | **3.93** | 0.52 | 0.49–0.56 (noise) |
+  | bcsstk38 | 3.93 | 3.90 | **3.28** | 0.45 | 0.46–0.55 (noise) |
+  | case1354 `"SPD"` / `"S"` | 1.01 / 0.93 | 1.04 / 0.95 | 1.00 / 0.92 | launch-bound, noise | noise |
+  | case118 `"SPD"` / `"S"` | 0.60 / 0.59 | 0.60 / 0.58 | 0.50 / 0.59 (noise) | noise | noise |
+
+  Kept: the parent pull (−9% on the 78k `"SPD"`, −7% `"S"`, −9% lap3d_40, −10% lap2d_300, −13%/−16%
+  bcsstk17/38; it enumerates the packed CB triangle where the push walked the full square and skipped half, has
+  2.6× fewer roles on the 78k (3252 vs 8654) and no atomics). Dropped: the ordered push (+1–4% over the atomic
+  base: the serialized children) and the atomic push.
+
+  Ordered wide tiles alone (parent pull with atomic vs ordered tiles; solve atomic): 78k `"S"` 24.88 / 24.84,
+  lap3d_40 `"S"` 63.15 / 63.18; `wides = :merged` `"SPD"`: 78k 17.88 / 17.83, lap3d_40 63.21 / 63.09,
+  lap2d_300 7.90 / 7.90, bcsstk17 5.68 / 5.66 (atomic base there: 19.24, 65.46, 8.39, 6.31). Kept as the only
+  path. The pull forward sweep in the same runs: 78k `"S"` 2.25 → 2.43, `:merged` 78k 2.67 → 2.80, lap2d_300
+  1.37 → 1.46, lap3d_40 6.44 → 6.48, bcsstk17 0.73 → 0.71.
+
+  Final tree, default tuning (mode 0 / mode 1, three interleaved rounds): refactorization 78k `"SPD"` 16.56 /
+  16.52, `"S"` 24.78 / 24.85, lap3d_40 24.72 / 24.75 (`"S"` 63.15 / 63.17), lap2d_300 4.78 / 4.78, bcsstk17 3.87 /
+  3.87, bcsstk38 3.23 / 3.23, case1354 0.91 / 0.90, case118 0.46 / 0.42 (noise); solve 78k `"SPD"` 2.28 / 2.42,
+  `"S"` 2.25 / 2.45, lap3d_40 6.37 / 6.38, lap2d_300 1.04 / 1.12, bcsstk17 0.35 / 0.35, bcsstk38 0.33 / 0.33,
+  case1354 0.24 / 0.28, case118 0.17 / 0.19.
+
+  Run-to-run (max |X − X₁| / max |X₁| over 20 refactorizations + solves of the same values, final tree):
+  factor and D exactly 0 on every matrix in **both** modes (base, atomic: 78k `"SPD"` ΔL 1.3e-8, `"S"` 2.9–4.3e-8 /
+  ΔD 2.2–4.8e-10, case1354 `"SPD"` 2.4e-10, `"S"` 3.8e-9, bcsstk17 7.3e-15, lap2d_300 4.4e-16, lap3d_40 1.8e-16);
+  solution exactly 0 under `deterministic_mode = 1` everywhere; under `= 0` the atomic scatter leaves Δx 4.5e-10
+  (78k `"SPD"`), 3.9e-10 (78k `"S"`), 1.2e-12 / 7.5e-13 (case1354), ≤ 6e-16 on the well-conditioned matrices
+  (base: Δx 2.1e-4 on the 78k, which includes the factor's spread).
+
+  Gate (b), fused vs stock on the same analysis: 78k `"SPD"` 1.4e-8 in 20 of 20 (constant now; base 1.6e-8
+  in 6 of 20, varying) ≤ the stock eps response 3.6e-8; `"S"` case118 1.8e-8, case1354 2.6e-8, 78k 1.1e-7 (the
+  constant fused-LDL offset; base 1.9e-8 / 2.9e-8 / 1.2–1.3e-7) against 5.5e-8 / 7.0e-8 / 9.8e-8: the 78k `"S"`
+  stays 1.1× above the stock eps response, as at `main` (#177: the fused path's own eps response is 1.2e-7;
+  #181). Every well-conditioned matrix ≤ 1.3e-15 (strict 1e-8 holds), case1354 `"SPD"` 6.2e-11, case118 `"SPD"`
+  1.7e-19.
+
+  `memory_estimates` (Float64, MiB; before = the inner solver's estimates, what a `FusedSolver` reported until
+  T35; after = with slots 13 and 14):
+
+  | matrix | slot 1 before → after | slot 2 before → after | slot 13 (`pcb`) | slot 14 (of which inverses / EA lists / tile cells) |
+  |---|---|---|---|---|
+  | 78k `"SPD"` | 238.1 → 421.2 | 269.6 → 452.7 | 121.9 | 61.3 (52.0 / 0.12 / 0) |
+  | 78k `"S"` | 240.7 → 424.7 | 272.1 → 456.2 | 122.7 | 61.4 (52.0 / 0.12 / 0.014) |
+  | lap3d_40 `"SPD"` | 182.8 → 1156.3 | 283.3 → 1256.9 | 960.7 | 12.8 (10.1 / 0.23 / 0) |
+  | lap3d_40 `"S"` | 224.4 → 1199.9 | 324.9 → 1300.5 | 961.2 | 14.3 (10.1 / 0.23 / 0.16) |
+
+  The ordering costs 0.13 MiB (78k) and 0.39 MiB (lap3d_40 `"S"`) of new buffers; the private CBs were already
+  allocated and are now reported. The pull forward sweep uses `ws.U` (already allocated, not in the estimates,
+  which do not count the solve workspace).
+- Deviations from PLAN.md / this task:
+  * The ordered extend-add and wide tiles are the only factorization paths, not variants behind
+    `deterministic_mode = 1`: the kept parent pull is faster than the atomic default on every matrix and the
+    ordered tiles cost nothing (the task's "if the ordered push costs nothing, make it the only path and delete
+    the atomic EA roles", applied to the kept variant). The fused factorization is bitwise reproducible in both
+    modes, so PLAN §3.4's "assembly is deterministic by construction" holds for it again.
+  * Hence `deterministic_mode` only switches the forward solve and is read at every solve (deliverable 4's
+    "raise or rebuild" does not arise: nothing in the plans depends on it); a solve graph is captured per mode.
+  * The default stays `deterministic_mode = 0`: the pull forward sweep costs 4–8% of the solve on the 78k and
+    lap2d_300 (over the 2% noise).
+  * Measured on sm_90 only; AMDGPU timing not measured (no hardware here; the `amdgpu` leg checks correctness).
+    The pull extend-add replaces the atomic one on AMD too, unmeasured there.
+  * The left-looking CB-tile alternative of deliverable 2 was not tried (the ordered tiles cost nothing).
+- Open issues / follow-ups:
+  * #181 (found-by-agent): under the restated gate (b) the 78k `"S"` fused factor stays 1.1× above the stock
+    eps-perturbation response (constant 1.1e-7 vs 9.8e-8; unchanged from `main`), the systematic rounding of the
+    fused LDLᵀ kernels.
+  * AMDGPU timing of the pull extend-add and of the pull sweep on the `amdgpu` runner (gfx906 profile).
+  * The pull forward sweep could zero its buffer in the same pass as the first child's pull (one barrier and one
+    pass less per front) if mode 1 should become the default; not attempted.
+  * #109: the private-slot memory is now reported (slots 13/14); its placement question for a level-merged stock
+    path (T25/T26 integration) stays open, refs #109 (not closed).
+- Suggested plan changes:
+  * §3.4: "The fused pipeline follows this too (T35): its extend-add is a parent pull in `child_list` order and
+    its in-kernel wide-front tiles apply the panels in order; only its default forward solve uses atomics, and
+    `deterministic_mode = 1` (read at every solve) selects the pull sweep."
+  * §1.3 `deterministic_mode` row: the same holds for `FusedSolver`.
 
 ### External — MadNLPGPU integration (in the MadNLP repository)   `[ ]`
 

@@ -195,8 +195,9 @@ end
 end
 
 # deterministic forward (T35): zero the update buffer of front v (rows w+1:f of its gather list at rp),
-# then add the children's buffers in child_list order, into the front's columns of `Y` (or the local copy
-# `yb`, `LOC`) and into its own buffer (the rows of one child are distinct: no conflicts). Ends on a barrier.
+# then add the children's buffers in child_list order, into the front's columns of `Y` (or of its local
+# copy `yb`, when given) and into its own buffer (the rows of one child are distinct: no conflicts). Ends
+# on a barrier.
 @inline function _fused_pull!(Y, U, v, w, f, rp, c0, child_ptr, child_list, rowptr, front_nrows, front_ncols,
                               relind_ptr, relind, li, ::Val{WGV}, yb = nothing) where {WGV}
     @inbounds begin
@@ -817,8 +818,7 @@ end
 
 # fused segment: the maximal run of plan entries from `kstart` in which every
 # front has width <= wcap (regime-A subtree entries break a run)
-# (`det`: the deterministic forward sweep of deterministic_mode = 1, through the update buffers `ws.U`)
-function build_fused(s; kstart::Int = 1, wcap::Int = MW, merged::Bool = (kstart == 1), det::Bool = false)
+function build_fused(s; kstart::Int = 1, wcap::Int = MW, merged::Bool = (kstart == 1))
     S = s.symbolic
     ws = s.workspace
     plan = ws.plan
@@ -879,7 +879,7 @@ function build_fused(s; kstart::Int = 1, wcap::Int = MW, merged::Bool = (kstart 
     return (; i1, i2, flist = _dvec(backend, flist_h), arrived = KA.zeros(backend, Int32, ns),
             arrived_base = _dvec(backend, arrived_base_h), done = KA.zeros(backend, Int32, ns),
             done_base = _dvec(backend, done_base_h), nchild = _dvec(backend, nchild_h),
-            nfused = length(flist_h), slist = _dvec(backend, sub_ids), nsub = length(sub_ids), det)
+            nfused = length(flist_h), slist = _dvec(backend, sub_ids), nsub = length(sub_ids))
 end
 
 # the dependency-counter sweeps take a workgroup of 32..512 work items, a multiple of 32
@@ -892,8 +892,9 @@ _check_solve_workgroup(wg) = (32 <= wg <= MW && wg % 32 == 0) ||
     throw(SDS.InvalidValueError("fused solve: workgroup size $wg; expected a multiple of 32 in 32:$MW"))
 
 # one fused segment, forward sweep: `wg > 512` runs the single-workgroup chain kernel,
-# otherwise the dependency-counter sweep with workgroups of `wg` work items
-function run_fused!(fz, wg, Yv, s, inv11, inv_ptr, backend)
+# otherwise the dependency-counter sweep with workgroups of `wg` work items (`det`: the deterministic
+# variant, update buffers in `ws.U` pulled by the parents, T35)
+function run_fused!(fz, wg, Yv, s, inv11, inv_ptr, backend, det::Bool = false)
     S, N = s.symbolic, s.numeric
     if wg > 512
         chain_fwd_kernel!(backend, CHWG)(Yv, N.factor, inv11, inv_ptr, fz.flist, S.super_ptr, S.rowptr,
@@ -908,7 +909,7 @@ function run_fused!(fz, wg, Yv, s, inv11, inv_ptr, backend)
     args = (Yv, N.factor, inv11, inv_ptr, fz.flist, fz.slist, fz.nsub, S.subtree_ptr, S.subtree_nodes, S.snparent,
             fz.arrived, fz.nchild, S.super_ptr, S.rowptr, S.rowval, S.front_ptr, S.front_nrows, S.front_ncols, Uv,
             S.child_ptr, S.child_list, S.relind_ptr, S.relind)
-    if fz.det
+    if det
         k(args..., Val(wg), Val(true); ndrange = wg * (fz.nfused + fz.nsub))
     else
         k(args..., Val(wg), Val(false); ndrange = wg * (fz.nfused + fz.nsub))
@@ -937,19 +938,20 @@ end
 # the fused solve: `fz = (segments, covered)` with `segments` a vector of
 # `(build_fused(...), wg)` pairs in plan order; plan entries outside the segments
 # run through the level-batched kernels (`fwd1_kernel!`/`bwd1_kernel!`, vendor
-# dense calls for fronts wider than MW)
-function algo2_solve!(x, s, b, inv11, inv_ptr, fz)
+# dense calls for fronts wider than MW). `det`: the deterministic forward sweep of
+# deterministic_mode = 1 (no atomics; the update buffers `ws.U` of PLAN §2.5, pulled by the parents)
+function algo2_solve!(x, s, b, inv11, inv_ptr, fz, det::Bool = false)
     S, N, ws = s.symbolic, s.numeric, s.workspace
     bm = SDS.batch_map(N; nrhs = 1)
     SDS.permute_rhs!(ws.Y, b, S.perm; transposed = false, bm)
-    algo2_sweeps!(s, inv11, inv_ptr, fz)
+    algo2_sweeps!(s, inv11, inv_ptr, fz, det)
     SDS.unpermute_solution!(x, ws.Y, S.perm; transposed = false, bm)
     return x
 end
 
 # the sweeps of `algo2_solve!` on the solve workspace `Y` (the permuted right-hand side in,
 # the permuted solution out): the part a CUDA graph replays (T34)
-function algo2_sweeps!(s, inv11, inv_ptr, fz)
+function algo2_sweeps!(s, inv11, inv_ptr, fz, det::Bool = false)
     S, N, ws = s.symbolic, s.numeric, s.workspace
     plan = ws.plan
     nodes = S.schedule.group_nodes
@@ -959,7 +961,6 @@ function algo2_sweeps!(s, inv11, inv_ptr, fz)
     Yv = vec(ws.Y)
     Uv = vec(ws.U)
     segs, _ = fz
-    det = !isempty(segs) && first(segs)[1].det        # deterministic_mode = 1: the pull forward sweep
     args(first, count) = (Yv, N.factor, inv11, inv_ptr, S.group_nodes, first, count, S.subtree_ptr,
                           S.subtree_nodes, S.super_ptr, S.rowptr, S.rowval, S.front_ptr, S.front_nrows,
                           S.front_ncols)
@@ -999,7 +1000,7 @@ function algo2_sweeps!(s, inv11, inv_ptr, fz)
         while k < fzk.i1
             fwd_entry(k); k += 1
         end
-        run_fused!(fzk, wg, Yv, s, inv11, inv_ptr, backend)
+        run_fused!(fzk, wg, Yv, s, inv11, inv_ptr, backend, det)
         k = fzk.i2 + 1
     end
     while k <= length(plan.kind)
@@ -1221,37 +1222,11 @@ const ROLE_PANEL_B = Int8(1)
 const ROLE_PANEL_C = Int8(2)
 const ROLE_TRSM = Int8(3)
 const ROLE_TILE = Int8(4)
-const ROLE_EA = Int8(5)
+const ROLE_EA = Int8(5)          # extend-add, parent pull: (parent, block of its columns), see build_fused_plan
 const ROLE_WPANEL = Int8(6)       # wide fronts in-kernel: blocked 64-panel Cholesky
 const ROLE_WTRSM = Int8(7)        #   (rb = panel k | rb = chunk, rc = k | rc = k*1024 + tjj)
 const ROLE_WTILE = Int8(8)
 const ROLE_WSIG = Int8(9)
-const ROLE_EAP = Int8(10)         # deterministic_mode = 1, parent pull: (parent, column block) of the extend-add
-
-# the extend-add and wide-tile modes of a fused plan (`build_fused_plan(...; ea_mode)`), the kernel's
-# `Val(DET)`: the atomic arrival-order extend-add and wide-front tiles (`deterministic_mode = 0`), or the
-# ordered variants of `deterministic_mode = 1` (T35): the children of a parent add in `child_list` order
-# with plain adds, by the children's chunks in turn (`:push`) or by roles of the parent that pull every
-# child (`:pull`); the in-kernel wide-front tiles apply the panels in order in both
-const EA_ATOMIC = 0
-const EA_PUSH = 1
-const EA_PULL = 2
-_ea_mode_code(m::Symbol) = m === :atomic ? EA_ATOMIC : m === :push ? EA_PUSH : m === :pull ? EA_PULL :
-    throw(SDS.InvalidValueError("fused plan: ea_mode = :$m; expected :atomic, :push or :pull"))
-
-# spin with backoff on a (decreasing) Int32 counter until it is at most `target`; thread 1 only
-@inline function _spin_until_le!(arr, idx, target, scratch, scap)
-    pause = min(Int32(4), scap)
-    while (Atomix.@atomic arr[idx] += Int32(0)) > target
-        z = Int32(0)
-        for _ in 1:pause
-            z += Int32(1)
-        end
-        z < Int32(0) && (scratch[1] = z)
-        pause = min(pause << 1, scap)
-    end
-    return nothing
-end
 
 # ordered wide tiles: wait until every 32 x 32 cell of front v (cld(f, 32) cells per side, packed lower
 # triangle from wcbase[v] + 1) that the tile with first row i0 + 1 and first column j0 + 1 touches has
@@ -1288,9 +1263,9 @@ end
                                     cb_done, @Const(snparent), @Const(front_ptr), @Const(front_nrows),
                                     @Const(front_ncols), @Const(cb_ptr), @Const(child_ptr),
                                     @Const(child_list), @Const(relind_ptr), @Const(relind), base,
-                                    @Const(wbase), wupd, wpdone2, wtrsml, wcbl, scap, eac, epsc, d, @Const(super_ptr),
-                                    @Const(ea_tgt), @Const(pl_c), @Const(pl_q0), @Const(pl_q1), wcell, @Const(wcbase),
-                                    ::Val{LDL}, ::Val{WG}, ::Val{DET}, ::Val{OT}) where {LDL, WG, DET, OT}
+                                    @Const(wbase), wupd, wpdone2, wtrsml, wcbl, scap, epsc, d, @Const(super_ptr),
+                                    @Const(pl_c), @Const(pl_q0), @Const(pl_q1), wcell, @Const(wcbase),
+                                    ::Val{LDL}, ::Val{WG}) where {LDL, WG}
     @uniform TT = eltype(factor)
     @uniform RT = real(eltype(factor))
     li = @index(Local, Linear)
@@ -1302,58 +1277,10 @@ end
     @inbounds begin
         r = role[G]
         if r == ROLE_EA
-            v = Int(ra[G])                          # parent
-            c = Int(rb[G])                          # child
-            q0 = (Int(rc[G]) - 1) * Int(eac)
-            if li == 1
-                _spin_until_eq!(cb_done, c, Int32(1), fscr, scap)
-                # ordered push: every chunk of the parent's earlier EA children has added
-                DET == EA_PUSH && _spin_until_le!(ea_left, v, ea_tgt[c], fscr, scap)
-            end
-            @synchronize
-            SDS.device_fence(factor)
-            cpriv = Int(cb2[c])                  # child CB: private (mega) or stock (subtree root)
-            cb = cpriv > 0 ? cpriv : Int(cb_ptr[c])
-            mc = Int(front_nrows[c]) - Int(front_ncols[c])
-            fp = Int(front_nrows[v])
-            wp = Int(front_ncols[v])
-            mp = fp - wp
-            pp = Int(front_ptr[v])
-            cp = Int(cb2[v])                     # parent CB is always private
-            r0 = Int(relind_ptr[c]) - 1
-            qe = min(q0 + Int(eac), mc * mc) - 1
-            for q in (q0 + li - 1):WG:qe
-                jj = q ÷ mc + 1
-                ii = q - (jj - 1) * mc + 1
-                if ii >= jj
-                    ri = Int(relind[r0 + ii])
-                    rj = Int(relind[r0 + jj])
-                    x = cpriv > 0 ? pcb[cb + SDS._packed(ii, jj, mc) - 1] :
-                                    stack[cb + SDS._packed(ii, jj, mc) - 1]
-                    if DET == EA_ATOMIC
-                        if rj <= wp
-                            Atomix.@atomic factor[pp + (rj - 1) * fp + ri - 1] += x
-                        else
-                            Atomix.@atomic pcb[cp + SDS._packed(ri - wp, rj - wp, mp) - 1] += x
-                        end
-                    else                         # one child at a time; relind is injective
-                        if rj <= wp
-                            factor[pp + (rj - 1) * fp + ri - 1] += x
-                        else
-                            pcb[cp + SDS._packed(ri - wp, rj - wp, mp) - 1] += x
-                        end
-                    end
-                end
-            end
-            @synchronize
-            SDS.device_fence(factor)      # ALL threads: each wave drains its own stores (gfx9)
-            @synchronize
-            if li == 1
-                Atomix.@atomic ea_left[v] += Int32(-1)
-            end
-        elseif r == ROLE_EAP
-            # parent pull (deterministic_mode = 1): one block of the parent's columns; the children in
-            # child_list order, each over the packed range of its columns that land in the block
+            # extend-add, parent pull (T35): one block of the parent's columns; the children in child_list
+            # order, each over the packed range of its columns that land in the block. Plain adds: the
+            # blocks of one parent are disjoint, the entries of one child too (relind is injective), and the
+            # children follow each other after a barrier, so every entry sums its children in a fixed order
             v = Int(ra[G])
             e0 = Int(rb[G])
             ne = Int(rc[G])
@@ -1824,7 +1751,7 @@ end
             j0 = rb0 + (tjj - 1) * TILE
             if li == 1
                 _spin_until_eq!(wtrsml, sl, Int32(0), fscr, scap)
-                if OT && k > 1
+                if k > 1
                     # ordered panels: every 32 x 32 cell of the front (absolute rows and columns) this
                     # tile touches holds the updates of panels 1..k-1 (the cell's counter). Below the
                     # last panel the tile is one cell; the last panel's tiles may straddle four
@@ -1889,18 +1816,10 @@ end
                     if ii <= f && ii >= jj
                         a = slot == 1 ? acc1 : slot == 2 ? acc2 : slot == 3 ? acc3 : slot == 4 ? acc4 :
                             slot == 5 ? acc5 : slot == 6 ? acc6 : slot == 7 ? acc7 : acc8
-                        if !OT
-                            if jj <= w
-                                Atomix.@atomic factor[p0 + (jj - 1) * f + ii - 1] -= a
-                            elseif c0cb > 0
-                                Atomix.@atomic pcb[c0cb + SDS._packed(ii - w, jj - w, m) - 1] -= a
-                            end
-                        else                     # the panels in order (the cell counter): plain
-                            if jj <= w
-                                factor[p0 + (jj - 1) * f + ii - 1] -= a
-                            elseif c0cb > 0
-                                pcb[c0cb + SDS._packed(ii - w, jj - w, m) - 1] -= a
-                            end
+                        if jj <= w                   # the panels in order (the cell counters): plain
+                            factor[p0 + (jj - 1) * f + ii - 1] -= a
+                        elseif c0cb > 0
+                            pcb[c0cb + SDS._packed(ii - w, jj - w, m) - 1] -= a
                         end
                     end
                 end
@@ -1911,7 +1830,7 @@ end
             if li == 1
                 # ordered panels: this panel is applied to the tile's cell (a tile below the last
                 # panel is exactly one cell; nothing waits on the last panel's)
-                OT && 64 * k < w &&
+                64 * k < w &&
                     (Atomix.@atomic wcell[Int(wcbase[v]) + SDS._packed(i0 ÷ TILE + 1, j0 ÷ TILE + 1, cld(f, TILE))] += Int32(1))
                 if j0 < w
                     Atomix.@atomic wupd[Int(wbase[v]) + j0 ÷ 64 + 1] += Int32(-1)
@@ -2042,10 +1961,8 @@ end
 function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, Bool} = nothing,
                           wides_potrf::Bool = false, merge_segments::Bool = false,
                           wgf::Int = WGF, scap::Integer = 128, ea_chunk::Integer = 16384,
-                          host_min::Integer = typemax(Int), ea_mode::Symbol = :atomic,
-                          ordered_tiles::Bool = ea_mode !== :atomic)
+                          host_min::Integer = typemax(Int))
     S = s.symbolic
-    detc = _ea_mode_code(ea_mode)
     plan = s.numeric.plan
     backend = KA.get_backend(s.numeric.factor)
     T = eltype(s.numeric.factor)
@@ -2112,17 +2029,14 @@ function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, B
     end
     SDS._log(SDS.LOG_DEBUG, () -> "fused plan: write-through $nwt fronts, $(round(ewt / 1e6; digits = 2))M CB entries")
 
-    # deterministic_mode = 1 (T35). Ordered push: the EA chunks of child c wait until the parent's
-    # counter has dropped to ea_tgt[c], i.e. every chunk of the earlier EA children has added (the
-    # chunks of earlier children come earlier in the role list: emit_ea follows child_ptr order).
-    # Parent pull: per parent a ROLE_EAP for each block of its columns (about ea_chunk / 2 child
-    # entries, the lower-triangle work of one push chunk), with the list (child, packed range of the
-    # child's CB) of the children in child_list order: relind is increasing, so the child columns
-    # that land in a block of parent columns are contiguous, and so are their packed entries.
-    ea_pre = zeros(Int32, ns)
+    # the extend-add of a C-group parent (T35: deterministic, the parent pull; it replaced the atomic
+    # push of every child's CB chunks into the parent, which summed in arrival order): per parent a
+    # ROLE_EA for each block of its columns (about ea_chunk / 2 child entries), with the list (child,
+    # packed range of the child's CB) of its children in child_list order. relind is increasing, so the
+    # child columns that land in a block of parent columns are contiguous, and so are their packed entries.
     pl_c = Int32[]; pl_q0 = Int32[]; pl_q1 = Int32[]
-    relp_h = detc == EA_PULL ? Array(S.relind_ptr) : Int[]
-    rel_h = detc == EA_PULL ? Array(S.relind) : Int[]
+    relp_h = Array(S.relind_ptr)
+    rel_h = Array(S.relind)
     emit_pull(v, cs) = begin
         fpv = rows_h[v]
         cost = zeros(Int, fpv)
@@ -2153,12 +2067,12 @@ function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, B
                 q1 = SDS._packed(mc, b, mc)
                 q1 <= typemax(Int32) ||
                     throw(SDS.NotSupportedError("fused plan: a contribution block of $mc rows exceeds the Int32 " *
-                                                "packed range of the parent-pull extend-add"))
+                                                "packed range of the extend-add"))
                 push!(pl_c, Int32(c)); push!(pl_q0, Int32(SDS._packed(a, a, mc) - 1)); push!(pl_q1, Int32(q1))
             end
             ne = length(pl_c) - e0 + 1
             if ne > 0
-                push!(role, ROLE_EAP); push!(ra, Int32(v)); push!(rb, Int32(e0)); push!(rc, Int32(ne))
+                push!(role, ROLE_EA); push!(ra, Int32(v)); push!(rb, Int32(e0)); push!(rc, Int32(ne))
                 ea_left[v] += 1
             end
             Ja = Jb + 1
@@ -2174,16 +2088,7 @@ function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, B
                 ea_left[v] += 1                  # settled by the child's last write-through tile
                 continue
             end
-            if detc == EA_PULL
-                push!(cs, c)
-                continue
-            end
-            ea_pre[c] = ea_left[v]
-            mc = rows_h[c] - width_h[c]
-            for ch in 1:cld(mc * mc, ea_chunk)
-                push!(role, ROLE_EA); push!(ra, Int32(v)); push!(rb, Int32(c)); push!(rc, Int32(ch))
-                ea_left[v] += 1
-            end
+            push!(cs, c)
         end
         isempty(cs) || emit_pull(v, cs)
         return nothing
@@ -2212,18 +2117,17 @@ function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, B
     wupd_b = Int32[]; wtl_b = Int32[]
     wcb_b = zeros(Int32, ns)
     nwslots = 0
-    # ordered wide tiles (deterministic_mode = 1): one Int32 "panels applied" counter per 32 x 32 cell
-    # of the lower triangle of each in-kernel wide front
+    # ordered wide tiles (T35): one Int32 "panels applied" counter per 32 x 32 cell of the lower
+    # triangle of each in-kernel wide front; the tiles of panel k wait for panel k - 1 on their cell
+    # and subtract with plain stores (before: atomic subtractions of every panel in arrival order)
     wcbase_h = zeros(Int32, ns)
     nwcells = 0
     emit_wide(v) = begin
         f = rows_h[v]; w = width_h[v]
         K = cld(w, 64)
         wbase_h[v] = Int32(nwslots)
-        if ordered_tiles
-            wcbase_h[v] = Int32(nwcells)
-            nwcells += cld(f, TILE) * (cld(f, TILE) + 1) ÷ 2
-        end
+        wcbase_h[v] = Int32(nwcells)
+        nwcells += cld(f, TILE) * (cld(f, TILE) + 1) ÷ 2
         append!(wupd_b, zeros(Int32, K)); append!(wtl_b, zeros(Int32, K))
         for k in 1:K
             push!(role, ROLE_WPANEL); push!(ra, Int32(v)); push!(rb, Int32(k)); push!(rc, Int32(0))
@@ -2321,13 +2225,6 @@ function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, B
         arrived_base[v] = Int32(cnt)
     end
 
-    snp_h = S.partition.snparent
-    ea_tgt = zeros(Int32, ns)                    # ordered push: the parent's counter after c's predecessors
-    for c in 1:ns
-        pv = Int(snp_h[c])
-        pv > 0 && (ea_tgt[c] = ea_left[pv] - ea_pre[c])
-    end
-
     stp2 = stp
     ssub = map(eachindex(plan.sub_first)) do k    # typed: the launches dispatch statically
         ids = [nodes[q] for q in plan.sub_first[k]:plan.sub_last[k]]
@@ -2351,13 +2248,12 @@ function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, B
             wbase = _dvec(backend, wbase_h), wupd_b = _dvec(backend, wupd_b), wtl_b = _dvec(backend, wtl_b),
             wcb_b = _dvec(backend, wcb_b), wupd = KA.zeros(backend, Int32, max(nwslots, 1)),
             wtl = KA.zeros(backend, Int32, max(nwslots, 1)), wpd = KA.zeros(backend, Int32, max(nwslots, 1)),
-            wcb = KA.zeros(backend, Int32, ns), wgf, scap = Int32(scap), eac = Int32(ea_chunk), ldl,
+            wcb = KA.zeros(backend, Int32, ns), wgf, scap = Int32(scap), ldl,
             # the kernel object and its Val parameters, typed in the plan so that the launch
             # in refact_fused_launches! is statically dispatched (T34: no boxing of its arguments)
             kfact = fused_fact_kernel!(backend, wgf), ldlv = Val(ldl), wgv = Val(wgf),
-            # deterministic_mode = 1 (T35): the extend-add mode, the kernel's Val(DET) and its buffers
-            ea_mode, ordered_tiles, det = detc != EA_ATOMIC && ordered_tiles, detv = Val(detc), otv = Val(ordered_tiles),
-            ea_tgt = _dvec(backend, ea_tgt), pl_c = _dvec(backend, pl_c), pl_q0 = _dvec(backend, pl_q0),
+            # the extend-add lists and the wide-tile cell counters (T35)
+            pl_c = _dvec(backend, pl_c), pl_q0 = _dvec(backend, pl_q0),
             pl_q1 = _dvec(backend, pl_q1), wcell = KA.zeros(backend, Int32, max(nwcells, 1)),
             wcbase = _dvec(backend, wcbase_h), nwcells,
             # captured at plan build: a later setparam!("pivot_epsilon") changes the stock
@@ -2415,9 +2311,9 @@ function refact_fused_launches!(s, nzval, fp)
                                              S.snparent, S.front_ptr, S.front_nrows, S.front_ncols,
                                              S.cb_ptr, S.child_ptr, S.child_list, S.relind_ptr, S.relind,
                                              Int32(base), fp.wbase, fp.wupd, fp.wpd, fp.wtl, fp.wcb,
-                                             fp.scap, fp.eac, real(eltype(N.factor))(fp.chol_eps), N.d,
-                                             S.super_ptr, fp.ea_tgt, fp.pl_c, fp.pl_q0, fp.pl_q1, fp.wcell,
-                                             fp.wcbase, fp.ldlv, fp.wgv, fp.detv, fp.otv;
+                                             fp.scap, real(eltype(N.factor))(fp.chol_eps), N.d,
+                                             S.super_ptr, fp.pl_c, fp.pl_q0, fp.pl_q1, fp.wcell,
+                                             fp.wcbase, fp.ldlv, fp.wgv;
                                              ndrange = fp.wgf * count)
         for v in gwides                              # host-wide fronts at the segment boundary
             if fp.ldl && fp.ldl_potrf
@@ -2461,13 +2357,10 @@ function _apply_tuning!(s, t::SDSTuning)
     return s
 end
 
-# the parameters `setparam!` accepts on a FusedSolver (read by the next analysis)
+# the parameters `setparam!` accepts on a FusedSolver (read by the next analysis; deterministic_mode by the
+# next solve)
 const FUSED_SETTABLE = ("user_perm", "reordering_alg", "nd_nseps", "nd_seed", "pivot_epsilon", "deterministic_mode")
 
-# the ordered extend-add of deterministic_mode = 1 (T35, the A/B of the TASKS.md T35 Report): `:push`
-# (the children's chunks add in child_list order) or `:pull` (the parent's column blocks pull the
-# children in order); `build_fused_plan(...; ea_mode)` takes either
-const DET_EA_MODE = :push
 # the analysis data parameters `getparam` forwards to the inner DirectSolver
 const FUSED_FORWARDED = ("perm_reorder_row", "perm_reorder_col", "perm_row", "perm_col", "lu_nnz", "flops",
                          "nsuperpanels", "memory_estimates")
@@ -2517,18 +2410,18 @@ Phases (`execute!(phase, F, X, B; asynchronous = true)`):
   an `n × 1` matrix) on the solver's backend; `X === B` is allowed.
 
 `setparam!` accepts `"user_perm"`, `"reordering_alg"`, `"nd_nseps"`,
-`"nd_seed"`, `"pivot_epsilon"` (the Cholesky pivot epsilon; the fused
-LDLᵀ factors with epsilon `0`) and `"deterministic_mode"`, all read by the
-next analysis. `deterministic_mode = 0` (the default) sums the extend-add of
-parents with several children, the trailing updates of the in-kernel wide
-fronts and the forward-solve scatter with atomic adds in arrival order, so
-the factor and the solution vary in the last bits from run to run (#177);
-`deterministic_mode = 1` builds the plans with the ordered variants (the
-children add in `child_list` order, the wide-front panels apply in order, the
-forward sweep pulls the children's update buffers): factor, `D` and solution
-are then bitwise reproducible. A change of `deterministic_mode` after the
-analysis raises [`FactorizationError`](@ref SparseDirectSolver.FactorizationError)
-at the next factorization or solve (run the analysis again). `getparam`
+`"nd_seed"` and `"pivot_epsilon"` (the Cholesky pivot epsilon; the fused
+LDLᵀ factors with epsilon `0`), all read by the next analysis, and
+`"deterministic_mode"`, read at every solve. The factorization is
+deterministic under either mode: the children of a parent add in
+`child_list` order and the panels of an in-kernel wide front apply in order,
+with plain adds, so factor and `D` are bitwise reproducible for the same
+values. `deterministic_mode = 0` (the default) scatters the forward-solve
+updates with atomic adds, so the solution can differ in the last bits from
+run to run; `deterministic_mode = 1` runs the forward sweep without atomics
+(every front writes its update to its own buffer, the parent pulls its
+children's buffers in order), and the solution is bitwise reproducible too.
+`getparam`
 returns `"info"`, `"inertia"` (`(npos, nneg)`; `"SPD"`: the positive pivots and
 `0`; `"S"`: the counts of positive and negative entries of `D`), `"npivots"`
 (`0` for `"S"`: the fused LDLᵀ perturbs no pivot), the analysis data
@@ -2571,6 +2464,7 @@ mutable struct FusedSolver{T, INT, S <: SDS.DirectSolver{T, INT}} <: SDS.Abstrac
     gfact::Any
     gsolve::Any
     gnz::Any
+    gdet::Bool               # the deterministic_mode the solve graph was captured with
 end
 
 function FusedSolver(A, structure, view; tuning::Union{Nothing, SDSTuning} = nothing, kwargs...)
@@ -2612,7 +2506,7 @@ function _fused_solver(s::SDS.DirectSolver{T, INT}, tuning::Union{Nothing, SDSTu
     end
     _apply_tuning!(s, t)
     return FusedSolver{T, INT, typeof(s)}(s, t, ldl, nothing, nothing, nothing, nothing, nothing, nothing, 0,
-                                          SDS.STAGE_NONE, nothing, nothing, nothing)
+                                          SDS.STAGE_NONE, nothing, nothing, nothing, false)
 end
 
 Base.size(F::FusedSolver) = size(F.inner)
@@ -2676,15 +2570,11 @@ function _fused_symbolic!(F::FusedSolver{T}) where {T}
     # `wide_host_min`: the per-front wide strategy of a merged Cholesky plan (LDL keeps every
     # wide front in-kernel, see above)
     host_min = merged && !F.ldl ? t.wide_host_min : typemax(Int)
-    # deterministic_mode = 1 (read here, at the analysis): the ordered extend-add and wide tiles and the
-    # pull forward sweep; a later change raises at the next factorization or solve
-    det = s.options.deterministic_mode == 1
     fp = build_fused_plan(s; ldl = F.ldl, inkernel_wides = inkernel, merge_segments = merged,
-                          wides_potrf = false, wgf = t.workgroup, scap = t.spin_cap, host_min,
-                          ea_mode = det ? DET_EA_MODE : :atomic)
+                          wides_potrf = false, wgf = t.workgroup, scap = t.spin_cap, host_min)
     inv11, inv_ptr, invertf, _ = build_inverse(s)
     # the solve plan: one merged dependency-counter sweep over the whole tree
-    fz1 = build_fused(s; kstart = 1, wcap = 256, det)
+    fz1 = build_fused(s; kstart = 1, wcap = 256)
     fz1 === nothing && throw(SDS.NotSupportedError("fused solve: no plan entry with fronts of width <= 256"))
     F.nzval = SDS._factor_values(s)
     F.fp = fp
@@ -2733,18 +2623,9 @@ function _fused_refactor!(F::FusedSolver)
     return Int(SDS._numeric_info!(s.numeric, s.symbolic, true))
 end
 
-# deterministic_mode is read at the analysis (the plans are built for it): a change after it raises
-function _check_fused_det(F::FusedSolver, name)
-    (F.inner.options.deterministic_mode == 1) == F.fp.det ||
-        throw(SDS._phase_error(name, "deterministic_mode = $(F.inner.options.deterministic_mode) was set after the " *
-                                     "analysis (built with deterministic_mode = $(Int(F.fp.det))); run \"analysis\" again"))
-    return nothing
-end
-
 function _fused_factorize!(F::FusedSolver, p::SDS.Phase)
     name = convert(String, p)
     F.stage >= SDS.STAGE_ANALYZED || throw(SDS._phase_error(name, "needs \"analysis\""))
-    _check_fused_det(F, name)
     p == SDS.PHASE_REFACTORIZATION && F.stage < SDS.STAGE_FACTORIZED &&
         throw(SDS._phase_error(name, "needs a previous \"factorization\""))
     F.nzval = SDS._factor_values(F.inner)
@@ -2772,7 +2653,6 @@ end
 
 function _fused_solve!(F::FusedSolver, X, B)
     F.stage >= SDS.STAGE_FACTORIZED || throw(SDS._phase_error("solve", "needs a \"factorization\""))
-    _check_fused_det(F, "solve")
     o = F.inner.options
     o.solve_mode == 0 ||
         throw(SDS.NotSupportedError("FusedSolver: solve_mode = $(o.solve_mode) (transposed solve) is not supported"))
@@ -2780,10 +2660,11 @@ function _fused_solve!(F::FusedSolver, X, B)
         throw(SDS.NotSupportedError("FusedSolver: ir_n_steps = $(o.ir_n_steps) (iterative refinement) is not supported"))
     x = _fused_rhs(F, X, "X")
     b = _fused_rhs(F, B, "B")
+    det = o.deterministic_mode == 1               # read at every solve, as DirectSolver does
     if _graph_solve_ok(F)
-        _fused_solve_graph!(F, x, b)
+        _fused_solve_graph!(F, x, b, det)
     else
-        algo2_solve!(x, F.inner, b, F.inv11, F.inv_ptr, F.fz)
+        algo2_solve!(x, F.inner, b, F.inv11, F.inv_ptr, F.fz, det)
     end
     return F
 end
@@ -2791,16 +2672,19 @@ end
 # `algo2_solve!` with the sweeps replayed from a graph (captured at the second solve: the
 # first one runs eagerly and compiles the kernels); the permutations stay outside the graph,
 # so the graph does not depend on the caller's vectors
-function _fused_solve_graph!(F::FusedSolver, x, b)
+function _fused_solve_graph!(F::FusedSolver, x, b, det::Bool)
     s = F.inner
     S, N, ws = s.symbolic, s.numeric, s.workspace
+    det == F.gdet || (F.gsolve = nothing)          # a graph is captured for one forward-sweep variant
     if F.gsolve === nothing
-        algo2_solve!(x, s, b, F.inv11, F.inv_ptr, F.fz)
+        algo2_solve!(x, s, b, F.inv11, F.inv_ptr, F.fz, det)
         inv11, inv_ptr, fz = F.inv11, F.inv_ptr, F.fz
-        F.gsolve = _capture(F, () -> algo2_sweeps!(s, inv11, inv_ptr, fz))
+        F.gsolve = det ? _capture(F, () -> algo2_sweeps!(s, inv11, inv_ptr, fz, true)) :
+                         _capture(F, () -> algo2_sweeps!(s, inv11, inv_ptr, fz, false))
+        F.gdet = det
         return nothing
     end
-    F.gsolve === false && return algo2_solve!(x, s, b, F.inv11, F.inv_ptr, F.fz)
+    F.gsolve === false && return algo2_solve!(x, s, b, F.inv11, F.inv_ptr, F.fz, det)
     bm = SDS.batch_map(N; nrhs = 1)
     SDS.permute_rhs!(ws.Y, b, S.perm; transposed = false, bm)
     F.gsolve()
@@ -2890,7 +2774,7 @@ _device_bytes(x) = Int64(0)
 
 # "memory_estimates" of a FusedSolver: the inner solver's, plus (after the analysis) slot 13, the private
 # contribution blocks of the fused factorization (`fp.pcb`, #109), and slot 14, every other device buffer of
-# the fused plans (role list and counters, the buffers of deterministic_mode = 1, the L11 inverses, the
+# the fused plans (role list and counters, the extend-add lists and wide-tile cell counters, the L11 inverses, the
 # solve segments' counters); both are added to the device totals in slots 1, 2 and 5
 function _fused_memory_estimates(F::FusedSolver)
     est = SDS.getparam(F.inner, "memory_estimates")

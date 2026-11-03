@@ -188,6 +188,57 @@ wider than 256 for the solve; otherwise it launches eagerly. The permutations
 of the solve stay outside the graph, so the graph does not depend on the
 caller's vectors; a new values buffer captures again.
 
+## T35: deterministic extend-add, wide tiles and solve (H200, sm_90), November 2026
+
+The fused factorization had three arrival-order (atomic) sums: the extend-add of
+C-group parents with several contribution-block children (`ROLE_EA`, every child's
+CB chunks pushed with `Atomix.@atomic`), the trailing updates of the in-kernel
+wide-front tiles (`ROLE_WTILE`), and the forward-solve scatter. T35 measured two
+ordered extend-adds (commit cd94954 has both behind `build_fused_plan(...; ea_mode)`):
+*ordered push* (child k's chunks wait until the chunks of children 1..k-1 have
+added) and *parent pull* (one role per block of about 8K parent entries, looping
+over the children in `child_list` order over host-computed packed ranges), plus
+ordered wide tiles (tile `(k, I, J)` waits for panel k-1 on a per-cell Int32
+counter) and a pull forward sweep (the PLAN §2.5 update buffers `ws.U`).
+
+One process, all plans built once and swapped, three interleaved rounds, medians
+in ms; 20 gated refactorizations per configuration (info 0 everywhere; the run-to-run
+factor delta of every ordered configuration is exactly 0). Refactorization:
+
+| matrix | atomic EA (base) | ordered push | parent pull |
+|---|---|---|---|
+| 78k `"SPD"` | 18.18 | 18.88 | **16.54** |
+| 78k `"S"` | 26.66 | 27.00 | **24.86** |
+| lap3d_40 `"SPD"` | 27.04 | 27.98 | **24.70** |
+| lap3d_40 `"S"` | 65.43 | 66.45 | **63.16** |
+| lap2d_300 | 5.38 | 5.60 | **4.82** |
+| bcsstk17 | 4.53 | 4.65 | **3.93** |
+| bcsstk38 | 3.93 | 3.90 | **3.28** |
+| case1354 `"SPD"` / `"S"` | 1.01 / 0.93 | 1.04 / 0.95 | 1.00 / 0.92 |
+| case118 `"SPD"` / `"S"` | 0.60 / 0.59 | 0.60 / 0.58 | 0.50 / 0.59 (noise) |
+
+The parent pull is faster than the atomic push everywhere: it enumerates the
+packed triangle of each child CB (the push walked the full square and skipped
+half), has 2.6x fewer roles on the 78k (3252 vs 8654) and no atomics. The ordered
+push is 1-4% slower than the atomic base (the serialized children). Kept: the
+parent pull, as the only extend-add (the atomic and push roles are deleted).
+
+Ordered wide tiles cost nothing measurable (parent pull with atomic vs ordered
+tiles: 78k `"S"` 24.88 / 24.84, lap3d_40 `"S"` 63.15 / 63.18, `wides = :merged`
+`"SPD"`: 78k 17.88 / 17.83, lap3d_40 63.21 / 63.09, lap2d_300 7.90 / 7.90,
+bcsstk17 5.68 / 5.66), so they are the only wide-tile path too: the fused
+factorization is bitwise reproducible under either `deterministic_mode`.
+
+The pull forward sweep (`deterministic_mode = 1`) costs 4-8% of the solve where
+the solve is not launch-bound (78k `"SPD"` 2.23 -> 2.42, `"S"` 2.25 -> 2.42,
+lap2d_300 1.17 -> 1.26, `:merged` 78k 2.67 -> 2.80; lap3d_40 6.37 -> 6.45; the
+small matrices are within noise): over the 2% noise, so `deterministic_mode = 0`
+(the atomic scatter) stays the default. AMDGPU: correctness only (CI).
+
+Gate (b) on the final tree: every matrix passes except the 78k `"S"`, whose
+fused factor (now a constant 1.1e-7 against stock, the fused LDLᵀ rounding)
+stays 1.1× above the stock eps response 9.8e-8, as at `main` (#181).
+
 ## Scripts
 
 The campaign's one-off sweep drivers (`race_repro.jl`, `fact_lib.jl`'s
