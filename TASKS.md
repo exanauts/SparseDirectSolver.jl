@@ -3825,6 +3825,14 @@ remains of T24–T26 for the owner to re-cut. Closes #156; refs #154, #155.
   cycle to 66064 B (> 65536; `main` sits ~16 B under the budget on H200), the statically dispatched launch brings
   a refactorization from 40.8 KB to 26.7 KB (cycle 54384 → 40288 B measured outside the test env). Full default
   suite, AMDGPU and oneAPI legs: pending CI (not run locally by owner instruction).
+  After the review (owner decision): #179 fixed in `test/test_refinement.jl` ("refinement with static pivot
+  perturbation": the solver runs with `deterministic_mode = 1`, and the repeated fixed-step solve is compared
+  with the early-exit residual, `<= 2 * max(rx, eps)`, instead of the hard-coded `1e-14` again); a new
+  `test/test_fused.jl` testset "SDSTuning T34 knobs" (`wides = :merged, wide_host_min = 64, solve_workgroup =
+  256, graph_max_n = typemax(Int)`, laplacian2d 40×40 and laplacian3d 10³, two refactorizations with two solves
+  each, against the stock solver; on CUDA it checks that the graphs are captured where the plan allows them)
+  covers the three T34 knobs. `SDS_TEST_ONLY=test_refinement,test_fused`, CPU + CUDA (H200), all four element
+  types: 1350 pass, 0 fail, 0 broken (the CPU backend alone: 500).
 - Measurements (H200 sm_90; ms; `fused_probe.jl` medians, `FusedSolver` column, base = c38e013 and branch run
   in separate processes on separate idle GPUs; cuDSS 0.8.0 in its own process):
 
@@ -3891,7 +3899,15 @@ remains of T24–T26 for the owner to re-cut. Closes #156; refs #154, #155.
   * Step 3's subtree-budget/parallelism sweep was not run; step 6 is off by default. No AMDGPU numbers (no
     hardware here; the `amdgpu` CI leg checks correctness only).
   * The strict 1e-8 gate is not satisfiable on the KKT dumps at `main`; read as "no worse than base" there.
+  * The end-to-end check ran `bench/e2e/workflow.jl`, not `bench/e2e/fresh_machine.jl`: both run the same
+    MadNLP solve of the 78k ACOPF (iterations, objective, linear-solver time are what the task asks for);
+    `fresh_machine.jl`/`.sh` additionally builds a throwaway environment from scratch, which this machine
+    already had (`bench/e2e`), so `workflow.jl` stood in for it.
+  * Issue #179 (out of scope for T34, found on this PR's `amdgpu` CI leg) was fixed on this PR by owner
+    decision, an explicit exception to the AGENTS.md rule (see Tests).
 - Open issues / follow-ups:
+  * #179 (found-by-agent): `test/test_refinement.jl`'s static-pivot IR testset was flaky on AMDGPU; fixed on
+    this PR by owner decision (see Tests), closed by the merge.
   * #177 (found-by-agent): the 1e-8 factor gate of `bench/ARCH-TUNING.md` does not hold on the pglib KKT
     dumps even at `main` (`"SPD"` arrival order, `"S"` systematic LDL rounding).
   * sm_89 numbers for every knob (`solve_workgroup`, `wide_host_min` in merged mode, `graph_max_n`) on an RTX

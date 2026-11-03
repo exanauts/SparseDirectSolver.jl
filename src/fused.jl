@@ -46,7 +46,7 @@ Base.@kwdef struct SDSTuning
     nd_nseps::Int = 1
     nd_seed::Int = 3
     # T34 knobs
-    solve_workgroup::Int = 64                 # fused-solve (fwd2/bwd2) workgroup size: 32..512, multiple of 32
+    solve_workgroup::Int = 64                 # fused-solve (fwd2/bwd2) workgroup size: 32..256, multiple of 32
     wide_host_min::Int = typemax(Int)         # :merged Cholesky: fronts wider than this on the host vendor path
     graph_max_n::Int = 0                      # CUDA-graph replay of refactorization and solve when n <= this
 end
@@ -806,9 +806,11 @@ end
 # the dependency-counter sweeps take a workgroup of 32..512 work items, a multiple of 32
 # (`SDSTuning.solve_workgroup`; 64 is the size they were written for)
 # (at most MW: bwd2_kernel! reduces one partial sum per work item through a MW buffer)
+# the accepted `solve_workgroup` values: a multiple of 32 in 32:MW (32:256), checked for every
+# tuning when a `FusedSolver` is built; the chain kernel (`wg > 512` in `run_fused!`) is bench-only
+# and returns before this check
 _check_solve_workgroup(wg) = (32 <= wg <= MW && wg % 32 == 0) ||
-    throw(SDS.InvalidValueError("fused solve: workgroup size $wg; expected a multiple of 32 in 32:$MW " *
-                                "(or > 512 for the chain kernel)"))
+    throw(SDS.InvalidValueError("fused solve: workgroup size $wg; expected a multiple of 32 in 32:$MW"))
 
 # one fused segment, forward sweep: `wg > 512` runs the single-workgroup chain kernel,
 # otherwise the dependency-counter sweep with workgroups of `wg` work items

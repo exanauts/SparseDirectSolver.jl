@@ -252,6 +252,54 @@ end
         @test_throws InvalidValueError solve!(F, to_device(backend, zeros(T, n + 1)), to_device(backend, zeros(T, n + 1)))
     end
 
+    # the T34 knobs off their defaults (which never reach these paths): the per-front wide strategy of a
+    # merged Cholesky plan (`wide_host_min`, the segment split), the widest fused-solve workgroup and the
+    # graph replay of refactorization and solve (`graph_max_n`; CUDA only, `capture_graph` returns `nothing`
+    # elsewhere and the phases launch eagerly). Two refactorizations and solves: the first capture, then a
+    # replay with new values in the aliased buffer.
+    @testset "SDSTuning T34 knobs ($label): $T" for T in eltypes_among((Float32, Float64)),
+                                                    (label, gen) in (("laplacian2d 40×40", () -> laplacian2d(T, 40, 40)),
+                                                                     ("laplacian3d 10³", () -> laplacian3d(T, 10, 10, 10)))
+        Random.seed!(666)
+        A = gen()
+        n = size(A, 1)
+        tuning = SDS.Fused.SDSTuning(; wides = :merged, wide_host_min = 64, solve_workgroup = 256,
+                                     graph_max_n = typemax(Int))
+        F, Ad, xd, r = fused_solve(backend, A, "SPD"; tuning)
+        @test F.tuning.solve_workgroup == 256
+        @test getparam(F, "info") == 0
+        @test r <= tol(T)
+        label == "laplacian3d 10³" && @test !isempty(F.fp.wides)     # a front wider than 64 on the host path
+        b = rand(T, n)
+        bd = to_device(backend, b)
+        D = DirectSolver(fused_matrix(backend, A), "SPD", 'L')
+        setparam!(D, "user_perm", getparam(F, "perm_reorder_row"))
+        analyze!(D)
+        factorize!(D)
+        xs = to_host(D \ bd)
+        A2 = T(2) * A + T(n) * I
+        for (k, Ak) in enumerate((A, A2))
+            k == 2 && copyto!(Ad.nzVal, fused_values(A2))
+            refactorize!(F)
+            @test getparam(F, "info") == 0
+            for _ in 1:2
+                solve!(F, xd, bd; asynchronous = false)
+                @test relres(Ak, to_host(xd), b) <= tol(T)
+            end
+            k == 1 && @test norm(to_host(xd) - xs) / norm(xs) <= tol(T)
+        end
+        if backend_name(backend) == "CUDA"
+            # the graphs exist where the plan allows them (no vendor call in the captured range)
+            @test (F.gfact !== nothing && F.gfact !== false) == SDS.Fused._graph_fact_ok(F)
+            @test (F.gsolve !== nothing && F.gsolve !== false) == SDS.Fused._graph_solve_ok(F)
+            @test SDS.Fused._graph_fact_ok(F) || SDS.Fused._graph_solve_ok(F)
+        else
+            @test F.gfact in (nothing, false) && F.gsolve in (nothing, false)
+        end
+        bytes = fused_cycle_allocated(F, xd, bd)
+        @test bytes <= fused_cycle_alloc_budget(backend)
+    end
+
     @testset "refactorization and solve allocate within the launch allowance: $T" for T in eltypes_among((Float32, Float64))
         Random.seed!(666)
         # two sizes: the allowance is per call, not per front
