@@ -29,7 +29,7 @@ getparam(opts, "ir_n_steps"), getparam(opts, "reordering_alg")
 
 | handling | parameters |
 | :--- | :--- |
-| raise [`NotSupportedError`](@ref) | `device_count` other than `1`, `device_indices`, `comm_device`, `comm_host` (when set or read); `solve_alg = "algo1"` (T24–T26, at the solve), `user_nd_partition_tree` (T30) and `schedule = "syncfree"` (at the analysis) |
+| raise [`NotSupportedError`](@ref) | `device_count` other than `1`, `device_indices`, `comm_device`, `comm_host` (when set or read); `solve_alg = "algo1"` (T36, at the solve), `user_nd_partition_tree` (T30) and `schedule = "syncfree"` (at the analysis) |
 | raise [`InvalidValueError`](@ref) | `schedule = "subtree+level"` (when set): `"auto"` is the subtree + level schedule and nothing else implements it (issue #159) |
 | warn once and ignore | a non-default `hybrid_memory_mode`, `hybrid_device_memory_limit` or `hybrid_execute_mode` (T27); a non-default `max_lu_nnz`, `host_nthreads` or `use_cuda_register_memory`, which are stored for cuDSS compatibility (`getparam` returns them) but have no effect in this package (issue #159); `reordering_alg` `"algo1"`/`"algo2"`, which fall back to the symmetric-pattern ordering with in-front pivoting |
 
@@ -52,7 +52,7 @@ docstring. The ones that matter most in practice:
 | `pivot_pairs` | `"default"`, `"all"`, `"none"` | 2×2 pivot pairs chosen at the analysis of `"S"`/`"H"`: rows whose pivot is structurally zero, every candidate, or none; see [Pivot pairs](@ref) |
 | `pivot_pair_tolerance` | real `≥ 0`, default `1e-6` | relative diagonal size below which a row is a 2×2 candidate |
 | `solve_mode` | `0`, `1`, `2` | solve with ``A``, ``A^T`` or ``A^H`` |
-| `solve_alg` | `"default"`, `"algo1"` | level-batched sweeps; `"algo1"` (partitioned-inverse blocks) raises `NotSupportedError` until T24–T26 |
+| `solve_alg` | `"default"`, `"algo1"` | level-batched sweeps; `"algo1"` (partitioned-inverse blocks) raises `NotSupportedError` until T36 |
 | `ir_n_steps`, `ir_tol` | integer, real | iterative refinement steps and early-exit tolerance |
 | `ir_mode` | `"ir"`, `"fgmres"` | plain refinement or FGMRES (needs `using Krylov`) |
 | `deterministic_mode` | `0`, `1` | `1` forbids the atomic forward solve |

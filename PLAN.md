@@ -66,7 +66,7 @@ IPM KKT systems, 2026-10-01). What it changed in this plan:
 * **Benchmark harness and cuDSS baseline measurements** move into M0.
 
 Status: see §5 (M0–M9 done, T22 and the four backend extensions done, M11 in
-progress through T24–T26; the fused pipeline of `src/fused.jl` serves the MadNLP
+progress through T36–T38; the fused pipeline of `src/fused.jl` serves the MadNLP
 extension meanwhile).
 
 ---
@@ -120,11 +120,11 @@ solve phases raise `NotSupportedError` (T20, §3.6).
 | `pivot_type` | port (partial) | `'A'` auto, `'N'` none, `'D'` diagonal, `'L'` local block (treated as Bunch–Kaufman inside the block), `'B'` Bunch–Kaufman 1×1/2×2 (default for `S`/`H`). For `"G"`, `'N'`/`'D'` mean diagonal pivots. `'C'/'R'` global: not planned. |
 | `pivot_threshold` | port (T14, T19) | Threshold for in-front pivot acceptance (LDLᵀ and LU), tested against the whole remaining front column. With `pivot_pairs = "default"` it also bounds the partner acceptance of the 2×2 pivot pairs at analysis time (§2.3 step 2), so a value set after `"analysis"` changes the in-front test but not the pairs. |
 | `pivot_epsilon`, `pivot_epsilon_alg` | port (M4) | Static or scaled perturbation. Defaults match cuDSS: 1e-5 (Float32), 1e-13 (Float64). |
-| `max_lu_nnz` | port | Accepted and validated; the check against `nnz_stored` after the symbolic analysis is not wired in yet (T07/T13 open issue). |
+| `max_lu_nnz` | port | Accepted, validated and stored; the check against `nnz_stored` after the symbolic analysis is not wired in, so a non-default value warns once (#159). |
 | `hybrid_memory_mode`, `hybrid_device_memory_limit` | defer (M12) | Host-resident panels streamed per level. |
-| `use_cuda_register_memory` | reinterpret (M12) | Pinned host memory through the backend extension. |
+| `use_cuda_register_memory` | reinterpret (M12) | Pinned host memory through the backend extension; stored, no effect yet, warns once on a non-default value (#159). |
 | `hybrid_execute_mode` | defer (M12) | Small levels on the KA CPU backend. |
-| `host_nthreads` | reinterpret | Julia threads for the host symbolic phase / CPU backend. |
+| `host_nthreads` | reinterpret | Julia threads for the host symbolic phase / CPU backend; stored, no effect yet (the host phase uses `Threads.nthreads()`), warns once on a non-default value (#159). |
 | `nd_nlevels`, `nd_ubfactor`, `nd_nseps`, `nd_seed` | port (T05, PR #126) | ND is `METIS_NodeND` through CliqueTrees; `nd_ubfactor`, `nd_nseps` and `nd_seed` are passed through, `nd_nlevels` is read as cuDSS documents it, a *minimum* number of dissection levels, which NodeND's full recursion meets (a level-capped ND was 4–13× slower with more fill). It becomes meaningful with the partition-tree export (T30). |
 | `ubatch_size`, `ubatch_index` | port (M6) | Uniform batch. |
 | `use_superpanels` | reinterpret | Supernode amalgamation on/off. |
@@ -190,7 +190,7 @@ MadNLPGPU migrates).
 | `ir_mode` | config | `"ir"` (default) or `"fgmres"`: FGMRES with the factorization as preconditioner (Krylov.jl extension). |
 | `factor_precision` | config | Element type of the factors (`Float32` or `Float64`); refinement runs in the input precision. Accepted and validated; a value other than the input precision raises `NotSupportedError` until T28 (Metal takes `Float32` input only). |
 | `amalgamation` | config | Relaxed-amalgamation parameters `(max_width, zero_fraction, min_width)`; `max_width` caps merging only (§2.3 step 4). |
-| `schedule` | config | `"auto"`, `"subtree+level"` (portable baseline), `"syncfree"` (CUDA/ROCm only, not implemented yet: raises). |
+| `schedule` | config | `"auto"` (the subtree + level schedule, the portable baseline), `"syncfree"` (CUDA/ROCm only, not implemented yet: raises). `"subtree+level"` is rejected as a value (#159: nothing distinguished it from `"auto"`). |
 | `pivot_pairs` | config | `"default"`: for `"S"`/`"H"` the analysis pairs every candidate row whose pivot is structurally zero in the ordering with a partner, so that in-front Bunch–Kaufman can form the 2×2 block (§2.3 step 2); `"all"` pairs every candidate (about 2× nnz(L) on KKT systems); `"none"`. Candidates are decided from the values present at analysis time: an all-zero `nzval` gives no pairs. |
 | `pivot_pair_tolerance` | config | Relative tolerance below which a diagonal counts as a pair candidate (default `1e-6`). |
 | regime thresholds | `Options` keywords only | `regime_c_width`, `regime_c_rows`, `subtree_budgets`, `subtree_parallelism`, `subtree_max_fronts`, `memory_budget` select the three regimes (§2.3 step 5); they are keywords of `Options(...)`, not `setparam!` strings, until there is a reason to expose them. Measured on the 78k-bus condensed KKT (PR #107): the width boundary 64 of regime B is right, `regime_c_rows` matters as much as the width, `subtree_budgets = [16384]` beats the 48 KiB class through occupancy, and `subtree_max_fronts` is neutral there. |
@@ -212,7 +212,7 @@ user API: LinearAlgebra generics  +  handle-style layer (CUDSS.jl strings, C-wra
        │    regime A  fused subtree-per-workgroup kernels          (KA)
        │    regime B  fused per-front size-binned level kernels    (KA; vendor batched optional)
        │    regime C  Cholesky: vendor potrf + trsm + syrk/herk (extensions; KA fallback)
-       │              LDLᵀ: KA blocked in-front pivoting + vendor trsm/gemm; LU: KA kernel (BLAS-3 in T26)
+       │              LDLᵀ: KA blocked in-front pivoting + vendor trsm/gemm; LU: KA kernel (BLAS-3: #75, unscheduled)
        │    + KA kernels for assembly, extend-add, gather/scatter, permutation
        ├─ solve (device): permute/scale → subtree/level fwd → diag → bwd → unpermute → IR/FGMRES
        └─ extensions: CUDA, AMDGPU, oneAPI, Metal (dense + sparse adapters + graph capture
@@ -258,8 +258,8 @@ tree levels, so the numeric phase is organized by front size:
   step. LDLᵀ: the fully-summed block is factored in blocks of 32 columns by a
   KA kernel that reproduces the reference pivot sequence, with one vendor GEMM
   per block for the trailing columns and the contribution block (#89). LU: the
-  fused KA kernel, one workgroup per front; BLAS-3 for `L₂₁`/`U₁₂` is a T26
-  item. Vendor `sytrf`/`getrf` are not used (§3.3).
+  fused KA kernel, one workgroup per front; BLAS-3 for `L₂₁`/`U₁₂` is #75,
+  unscheduled since the T24–T26 re-cut. Vendor `sytrf`/`getrf` are not used (§3.3).
 
 This mirrors cuDSS keeping a distinct algorithm for very sparse factors, and
 CHOLMOD's subtree streaming. The split points are analysis outputs (§2.3), not
@@ -373,7 +373,7 @@ test contract of T15/T19 (the pivot search is cooperative across the workgroup,
 the tie-breaking is the reference's). LDLᵀ root fronts run a blocked KA panel
 factorization (32 columns per block, lazily updated) with one vendor GEMM per
 block for the trailing columns and the contribution block (#89); LU root
-fronts run the fused KA kernel, BLAS-3 pending (T26, #75). On the pglib K2
+fronts run the fused KA kernel, BLAS-3 pending (#75, unscheduled). On the pglib K2
 dumps the device and the reference can still differ by rounding (max|L| up to
 1e16 unscaled), which flips threshold and tie decisions: there the contract is
 equal inertia and `nperturbed` within a tolerance (#86). The whole phase is a
@@ -410,11 +410,12 @@ GEMV, and one fused dependency-counter kernel per direction over every front
 of width ≤ 256 solves the 78k-bus condensed KKT in 3.5 ms against 3.8 ms for
 cuDSS and 18 ms for the level-batched sweeps, on CUDA and (8 ms) on a Radeon
 VII; the shallow ND ordering (#108) is a precondition. On lap3d_40 and apache2
-the same approach regresses, so T24 picks the strategy per schedule. Graph replay (§2.7, §3.9) captures only launch ranges without vendor dense
-calls: cuSOLVER's `potrf` is not capturable on CUDA.jl 6.5 (#174), so a
-refactorization with host vendor fronts is replayed in pieces or not at all;
-the fused pipeline's `SDSTuning.graph_max_n` is the switch and its CUDA
-extension follows this rule (T34).
+the same approach regresses, so T36 picks the strategy per schedule. Graph replay (§2.7, §3.9) may contain vendor dense
+calls: the CUDA extension binds the cuSOLVER/cuBLAS handles to the capture
+stream before capturing (cuSOLVER 12.3.5 invalidates a capture whose stream
+it is bound to during the capture, #174);
+the fused pipeline's `SDSTuning.graph_max_n` is the switch (T34; the stock
+path's capture is T38).
 
 Refinement: plain IR with a KA CSR SpMV residual (gather, no atomics; the
 workspace is allocated by the first refining solve, so the handle layer with
@@ -462,7 +463,7 @@ defect above 128×128 on macOS 27):
 
 Extensions: `…CUDAExt` (weak dependencies `CUDACore`, `cuSPARSE`, `cuBLAS`,
 `cuSOLVER` of CUDA.jl 6.5: dense bindings, sparse adapters; pinned memory,
-graph capture and the sync-free solve are T24/T26), `…AMDGPUExt` (rocBLAS/
+graph capture of the stock path is T38, the sync-free solve is open), `…AMDGPUExt` (rocBLAS/
 rocSOLVER, `ROCSparseMatrixCSR`/`CSC`, T23), `…OneAPIExt` (oneMKL level-3
 BLAS on the vendor path, LAPACK kept on `:ka` because every oneMKL call
 synchronizes and LAPACK allocates a scratchpad, `oneSparseMatrixCSR`/`CSC`,
@@ -506,7 +507,7 @@ bsolver = BatchedDirectSolver([A1, A2, …], "SPD", 'L')    # ≅ CudssBatchedSo
 setparam!(solver, "ir_n_steps", 2)        # ≅ cudss_set, same strings
 getparam(solver, "inertia")               # ≅ cudss_get, returns plain values
 getparam!(buf, solver, "diag")            # non-allocating variant
-update!(solver, A) ; update!(solver, rowPtr, colVal, nzVal)      # ≅ cudss_update
+SparseDirectSolver.update!(solver, A) ; SparseDirectSolver.update!(solver, rowPtr, colVal, nzVal)  # ≅ cudss_update; public, not exported (#144: CUDA.jl 6.5 exports an `update!` too)
 execute!("analysis", solver, x, b; asynchronous=true)            # ≅ cudss(phase, …)
 ```
 
@@ -645,8 +646,9 @@ front sizes, extend-add maps, layout, schedule. The numeric phase and the solve
 are pure "values in, factors/solution out" kernel sequences with no allocation
 and no host synchronization, so the CUDA and ROCm extensions can capture the
 refactorize+solve sequence in a graph and replay it per IPM iteration (the
-fused pipeline's capture is T34's `graph_max_n`, the stock path's is T26, #82;
-both capture only ranges without vendor dense calls, #174). This holds for the dense implementations `:auto`,
+fused pipeline's capture is T34's `graph_max_n`, the stock path's is T38, #82;
+captured ranges may contain vendor dense calls since the handle binding of
+#174). This holds for the dense implementations `:auto`,
 `:vendor` and `:ka` (allocation-free since T32, #146/#53); `:generic` (host
 LinearAlgebra) is the reference path and may allocate. Exceptions by
 design: the `ir_tol > 0` early-exit test and every FGMRES iteration read on the
@@ -695,7 +697,7 @@ src/solver.jl                 DirectSolver, execute!, phases, parameters
 src/generic.jl                LinearAlgebra interface
 src/fused.jl                  module Fused: fused factorization (Cholesky, no-pivot LDLᵀ) with dependency
                               counters, partitioned-inverse solve, SDSTuning per-architecture bundle; the
-                              MadNLP extension's path until T24–T26 move it under execute!
+                              MadNLP extension's path until T36–T38 move it under execute!
 ext/SparseDirectSolverCUDAExt.jl  …AMDGPUExt.jl  …OneAPIExt.jl  …MetalExt.jl  …KrylovExt.jl  …MadNLPExt.jl
 test/                         CPU backend always + every functional GPU package in test/Project.toml;
                               ported CUDSS.jl tests under test/ported; ParallelTestRunner, long files split
@@ -755,7 +757,7 @@ factorization / 3.9× refactorization / 3.5× solve for Cholesky, 5.1× / 7.3× 
 the fused pipeline of `src/fused.jl` reads 2.7× refactorization / 1.9× solve
 on the same harness and runs the 78k-bus ACOPF end to end on seven GPUs
 (`bench/PERFORMANCE-2026-10.md`). The remaining gap on KKT systems is launch-
-and level-bound (#82); T24–T26 move the fused pipeline under `execute!`.
+and level-bound (#82); T36–T38 move the fused pipeline under `execute!`.
 Measurements and the experiment plan are in `PERFORMANCE.md`.
 
 ---

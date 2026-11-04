@@ -59,7 +59,7 @@ chosen by the tuning),
 per-front inverses of the diagonal blocks computed after each factorization,
 and a partitioned-inverse solve in one dependency-counter sweep per direction.
 This is the path that `cholesky_fused` measures on the [Performance](@ref) page;
-tasks T24–T26 of the repository move the same kernels under the `execute!` of
+tasks T36–T38 of the repository move the same kernels under the `execute!` of
 `DirectSolver`. With `:bk` the inner solver is a `DirectSolver` with the same
 tuning.
 

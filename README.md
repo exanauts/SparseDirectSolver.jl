@@ -94,7 +94,7 @@ oneAPI (tested on an Intel Data Center GPU Max 1550):
   measures that path.
 
 Not there yet: the fused pipeline under the `execute!` of `DirectSolver`
-(`solve_alg = "algo1"`, tasks T24–T26, after which it is the Cholesky and LDLᵀ
+(`solve_alg = "algo1"`, tasks T36–T38, after which it is the Cholesky and LDLᵀ
 path of every `DirectSolver`; `FusedSolver` has its own `execute!` today), the
 sm_89 performance work of T34, non-uniform batches, ND partition-tree export, mixed
 precision, hybrid host memory, delayed pivots, and `ComplexF32` on Metal. Unsupported structures, phases and parameters raise
@@ -120,7 +120,7 @@ phase, geometric mean over the benchmark matrices (below 1 is faster), measured
 on an NVIDIA H200 (cuDSS 0.8.0, both solvers on the same GPU, allocated
 exclusively through Slurm). Every row is a feature the package implements,
 through the handle API; `cholesky_fused` is the fused pipeline that the MadNLP
-extension runs, until T24–T26 make it the path of `DirectSolver`'s `execute!`.
+extension runs, until T36–T38 make it the path of `DirectSolver`'s `execute!`.
 The comparison was measured at commit 95ee682 (2026-10-30), after T33 moved the
 construction of the fused plans into the analysis, so the `cholesky_fused`
 factorization column no longer includes building them. It replaces the RTX 4080

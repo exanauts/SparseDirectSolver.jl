@@ -275,6 +275,13 @@ host-wide fronts or the solve fronts wider than 256. Reproducer of #174 (256 ×
 `CUSOLVER_STATUS_INTERNAL_ERROR`; the new `capture_graph` captures, and five
 replays give `info = 0` and a factor bitwise equal to the eager one.
 
+Hazard to keep in mind: the graph bakes in the pointer of the task's cuSOLVER
+workspace, which `with_workspace` reallocates when a wider front than any seen
+so far asks for a larger buffer. The eager pass before the capture sizes it for
+the solver's widest front, so one solver per task is safe; a second, wider
+solver in the same task would reallocate it under a replayed graph. T38 (stock
+path capture) should size the workspace for every live solver first.
+
 Fused Cholesky (`"SPD"`, `FusedSolver`, `default_tuning` on sm_90 = `wides =
 :host`), one NVIDIA H200 idle at the start (`CUDA_VISIBLE_DEVICES=3`, not
 through Slurm), Float64. Eager (`graph_max_n = 0`) vs graph (`typemax(Int)`) on

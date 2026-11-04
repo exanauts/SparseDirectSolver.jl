@@ -63,6 +63,14 @@ the first `cuSOLVER.dense_handle()` in the capture calls `cusolverDnSetStream` o
 stream being captured, which cuSOLVER 12.3.5 (CUDA 13.4) answers by invalidating the
 capture (#174; CUDA.jl 6 captures on a dedicated stream, not on the task's). Afterwards
 both handles are bound back to the task's stream.
+
+A captured vendor `potrf` bakes in the pointer of the task's cuSOLVER workspace
+(`with_workspace` grows that buffer by reallocating it when a larger `bufferSize` comes
+along). The eager factorization that precedes a capture sizes it for the solver's widest
+front, so the graph is consistent for that solver; a wider front factored later in the same
+task by another solver would reallocate the workspace under a still-replayed graph. One
+solver per task (MadNLP's pattern) keeps this theoretical; a capture of the stock path (T38)
+should size the workspace for the widest front of every live solver before capturing.
 """
 function SparseDirectSolver.capture_graph(::CUDABackend, f)
     s = CuStream(; flags = CUDACore.STREAM_NON_BLOCKING)

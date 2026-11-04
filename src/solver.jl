@@ -716,7 +716,7 @@ function _solve!(solver::DirectSolver{T}, p::Phase, X, B) where {T}
     solver.stage >= STAGE_FACTORIZED || throw(_phase_error(name, "needs a \"factorization\""))
     opts = solver.options
     opts.solve_alg == SOLVE_DEFAULT ||
-        throw(NotSupportedError("solve_alg = \"$(convert(String, opts.solve_alg))\" is not implemented yet (T24–T26)"))
+        throw(NotSupportedError("solve_alg = \"$(convert(String, opts.solve_alg))\" is not implemented yet (T36)"))
     Bd, bt = _rhs_data(B)
     Xd, xt = _rhs_data(X)
     xt == bt || throw(InvalidValueError("X and B must have the same layout (transposed or not)"))
