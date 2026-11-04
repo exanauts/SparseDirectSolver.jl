@@ -9,7 +9,7 @@ functions are renamed after Julia conventions.
 | `cudss(phase, solver, x, b)` | [`execute!`](@ref)`(phase, solver, x, b)` |
 | `cudss_set(solver, name, value)` | [`setparam!`](@ref)`(solver, name, value)` |
 | `cudss_get(solver, name)` | [`getparam`](@ref)`(solver, name)` (or [`getparam!`](@ref) into a buffer) |
-| `cudss_update(solver, A)` | [`update!`](@ref)`(solver, A)`; with CUDA.jl ≥ 6.5 both packages export `update!`, so write `using SparseDirectSolver: update!` |
+| `cudss_update(solver, A)` | [`SparseDirectSolver.update!`](@ref)`(solver, A)`; not exported, since CUDA.jl ≥ 6.5 exports an `update!` of its own: write it qualified or `using SparseDirectSolver: update!` |
 | `CudssMatrix` (sparse), `CudssMatrix` (dense), `CudssConfig` | [`CSR`](@ref), [`MatrixDescriptor`](@ref), [`Options`](@ref) |
 | `CudssData` | no public counterpart: the data object lives inside the [`DirectSolver`](@ref) |
 | `cholesky`, `ldlt`, `lu` on `CuSparseMatrixCSR` | the same functions, see [LinearAlgebra interface](@ref) |

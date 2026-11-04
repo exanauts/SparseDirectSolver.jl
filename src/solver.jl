@@ -299,6 +299,10 @@ pattern must be the one of the analysis (only the sizes are checked, as in
 cuDSS); new values are used by the next `"factorization"` or
 `"refactorization"`. Raises [`InvalidValueError`](@ref) for a different size,
 number of stored entries, index base, orientation or array type.
+
+`update!` is not exported (CUDA.jl ≥ 6.5 exports an `update!` of its own, issue
+#144): call it as `SparseDirectSolver.update!(solver, A)`, or bring it into scope
+with `using SparseDirectSolver: update!`.
 """
 function update!(solver::DirectSolver{T, INT, M}, A::CSR) where {T, INT, M}
     old = solver.A

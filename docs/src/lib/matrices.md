@@ -10,4 +10,4 @@ SparseArrays.nnz(::SparseDirectSolver.CSR)
 SparseArrays.SparseMatrixCSC(::SparseDirectSolver.CSR)
 ```
 
-[`update!`](@ref) also replaces the data of a `MatrixDescriptor`.
+[`SparseDirectSolver.update!`](@ref) (not exported) also replaces the data of a `MatrixDescriptor`.

@@ -123,8 +123,10 @@ no host or peer device reads them while a kernel runs (#154).
 Records the device work `f()` launches on `backend` without running it and returns a
 callable that replays it (a CUDA graph in the CUDA extension), or `nothing` when the
 backend has no graphs (the default) or the capture fails. `f` must not synchronize with
-the host. The fused pipeline replays its refactorization and solve sweeps through it for
-`n <= SDSTuning.graph_max_n` (T34).
+the host; it may contain vendor dense calls (the CUDA extension binds the cuSOLVER and
+cuBLAS handles to the capture stream before capturing, #174). The replay runs on the
+task's stream. The fused pipeline replays its refactorization and solve sweeps through it
+for `n <= SDSTuning.graph_max_n` (T34).
 """
 capture_graph(backend, f) = nothing
 

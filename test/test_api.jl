@@ -83,7 +83,7 @@ end
         @test relres(A, api_solve(backend, solver, b), b) <= tol(T)
         # new values of the same pattern, then refactorization
         A2 = A + 2 * I
-        update!(solver, SparseMatrixCSC{T, INT}(triangle_view(A2, view)))
+        SparseDirectSolver.update!(solver, SparseMatrixCSC{T, INT}(triangle_view(A2, view)))  # qualified (#144)
         execute!("refactorization", solver, nothing, nothing)
         @test getparam(solver, "info") == 0
         @test relres(A2, api_solve(backend, solver, b), b) <= tol(T)

@@ -58,7 +58,7 @@ champions. Workload throughout: the 78k-bus ACOPF condensed KKT
 | tile size (`tl`) | plan + kernel `Val` | runtime per-plan | syrk tile; shared halves = 2·32·tl · 8B; accumulators = tl²/WGF registers per thread |
 | workgroup size (`SDSTuning.workgroup`) | tuning bundle | runtime (>= 128, multiple of 32: the tile roles' register accumulators) | waves per workgroup; latency hiding on wave64 AMD; occupancy on 1536-thread parts |
 | spin backoff cap (`SDSTuning.spin_cap`) | tuning bundle | runtime | dependency-counter wake-up latency vs polling traffic |
-| CUDA graph replay (`SDSTuning.graph_max_n`) | tuning bundle | runtime | refactorization + inverses and the solve sweeps captured once, replayed as one launch (only without vendor calls, #174) |
+| CUDA graph replay (`SDSTuning.graph_max_n`) | tuning bundle | runtime | refactorization + inverses and the solve sweeps captured once, replayed as one launch (vendor calls included since the handle binding of #174) |
 | fused-solve workgroup (`SDSTuning.solve_workgroup`) | tuning bundle | runtime | work items per front in `fwd2`/`bwd2`: shorter per-front serial work near the root vs idle threads on small fronts |
 | per-front wides (`SDSTuning.wide_host_min`) | tuning bundle | runtime | merged plans: fronts wider than it on the host vendor path at a segment boundary |
 
@@ -186,13 +186,17 @@ matrices (case118 0.171 → 0.160, case1354 0.544 → 0.420 (noisy), bcsstk17 0.
 → 0.696, lap2d_300 1.370 → 1.320 ms), the refactorization is mixed (case118
 0.514 vs 0.588, case1354 1.059 vs 1.004 ms; the fronts with host wides are not
 captured). Not a clear win: `graph_max_n = 0` in every default. **Capture
-constraint (#174):** cuSOLVER `potrf` invalidates a stream capture on CUDA.jl
-6.5 / cuSOLVER 12.3.5 (`cusolverDnSetStream` on the capture stream), so the
-pipeline captures only when no vendor call falls in the range: no host-wide
-front in the plan (`isempty(fp.wides)`) for the refactorization, no front
-wider than 256 for the solve; otherwise it launches eagerly. The permutations
-of the solve stay outside the graph, so the graph does not depend on the
-caller's vectors; a new values buffer captures again.
+constraint (#174), lifted:** cuSOLVER 12.3.5 (CUDA 13.4) invalidates a stream
+capture when `cusolverDnSetStream` runs on the stream being captured, which
+CUDA.jl 6's pooled capture stream triggers at the first vendor call. The CUDA
+extension's `capture_graph` now captures on a fresh non-blocking stream to
+which the task's cuSOLVER and cuBLAS handles are bound before the capture
+begins (and binds them back afterwards), so the host-wide fronts of the
+refactorization and the vendor solve fronts (wider than 256) are captured too;
+the guards `isempty(fp.wides)` / `width <= 256` are gone. The permutations of
+the solve stay outside the graph, so the graph does not depend on the caller's
+vectors; a new values buffer captures again. Measurements with vendor calls in
+the graph are in the #174 section below.
 
 ## T35: deterministic extend-add, wide tiles and solve (H200, sm_90), November 2026
 
@@ -260,3 +264,44 @@ and `e2e/amd_sweep.jl` (knob sweep). Read the procedure above with those
 substitutions; CUDA-graph replay (step 7's `graph_ab.jl`) retired with the
 consolidation cleanup (no graph kwarg at HEAD). All gates take the
 matrix from `bench/data/` and the tuned permutation from `bench/perm_cand3.bin` (not committed).
+
+## #174: graph replay with vendor calls in the captured range (H200, sm_90), November 2026
+
+`capture_graph` binds the cuSOLVER and cuBLAS handles to the capture stream
+before capturing (CUDA.jl 6.5.0 / CUDACore 6.5.0, CUDA runtime 13.4,
+cuSOLVER 12.3.5), so `_graph_fact_ok`/`_graph_solve_ok` no longer exclude the
+host-wide fronts or the solve fronts wider than 256. Reproducer of #174 (256 ×
+256 SPD, `vendor_potrf_info!`): plain `CUDA.capture` raises
+`CUSOLVER_STATUS_INTERNAL_ERROR`; the new `capture_graph` captures, and five
+replays give `info = 0` and a factor bitwise equal to the eager one.
+
+Fused Cholesky (`"SPD"`, `FusedSolver`, `default_tuning` on sm_90 = `wides =
+:host`), one NVIDIA H200 idle at the start (`CUDA_VISIBLE_DEVICES=3`, not
+through Slurm), Float64. Eager (`graph_max_n = 0`) vs graph (`typemax(Int)`) on
+the same solver, same process: 20 graph refactorizations with `info = 0` and
+the factor bitwise equal to the eager one on every matrix; the solve under
+`deterministic_mode = 1` bitwise equal to the eager solve, and the residuals
+under `deterministic_mode = 0` equal to the eager ones to the atomic-order
+spread. Times: median of 11 after 3 warm-ups per configuration, three
+interleaved rounds; the table gives rounds 2–3 (round 1 still warms the small
+matrices), ms.
+
+| matrix | host wides | widest front | refactorization eager → graph | solve eager → graph |
+|---|---|---|---|---|
+| 78k condensed KKT (n = 674562) | 59 | 182 | 16.75 → 16.11 (−3.8%) | 2.42 → 2.30 |
+| lap3d_40 | 42 | 1600 | 24.83 → 24.23 (−2.4%) | 6.56 → 6.49 |
+| lap2d_300 | 12 | 300 | 4.67 → 4.51 (−3.4%) | 1.02 → 0.97 |
+| bcsstk17 | 13 | 145 | 4.17 → 3.89 (−6.7%) | 0.37 → 0.34–0.49 (noisy) |
+| bcsstk38 | 9 | 183 | 3.50 → 3.30 (−5.5%) | 0.35 → 0.32 |
+| case1354 condensed_10 | 0 | 46 | 1.05 → 1.00 | 0.24 → 0.23 |
+| case118 condensed_10 | 0 | 36 | 0.45–0.68 → 0.58–0.60 (noisy) | 0.166 → 0.156 |
+| laplacian3d 18³ (test) | 3 | 324 | 2.31 → 2.19 (−5%) | 0.43 → 0.41 |
+| laplacian3d 10³ (test) | 1 | 75 | 0.95 → 0.89 | 0.18 → 0.17 |
+| laplacian2d 40² (test) | 0 | 40 | 0.57–0.69 → 0.50–0.63 (noisy) | 0.176 → 0.165 |
+
+Replay now pays a little on every matrix with host-wide fronts (2–7% of the
+refactorization, the ~100 host launches of the vendor fronts) and 3–6% of the
+solve, at the edge of the 2% noise for the large ones. `graph_max_n` stays 0 in
+every default: one GPU, no sm_89/AMD numbers, no MadNLP end-to-end run with
+replay, and the gain is within what the T34 ground rules call a marginal win;
+turning it on for sm_90 is an owner decision.

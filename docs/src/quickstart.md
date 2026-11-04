@@ -27,11 +27,13 @@ The analysis results can be inspected before the numeric phases run:
 getparam(solver, "lu_nnz"), getparam(solver, "nsuperpanels")
 ```
 
-New values with the same pattern reuse the analysis:
+New values with the same pattern reuse the analysis.
+[`SparseDirectSolver.update!`](@ref) is not exported (CUDA.jl ≥ 6.5 exports an
+`update!` of its own): write it qualified, or `using SparseDirectSolver: update!`.
 
 ```@example cpu
 A2 = A + 2I
-update!(solver, tril(A2))
+SparseDirectSolver.update!(solver, tril(A2))
 execute!("refactorization", solver, x, b)
 execute!("solve", solver, x, b)
 norm(A2 * x - b) / norm(b)

@@ -9,7 +9,7 @@ analyze!
 factorize!
 refactorize!
 solve!
-update!
+SparseDirectSolver.update!
 ```
 
 ## Parameters

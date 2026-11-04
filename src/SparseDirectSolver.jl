@@ -22,7 +22,11 @@ import Metis
 export SparseDirectSolverError, NotSupportedError, InvalidValueError, FactorizationError, InterruptedError
 export CONFIG_PARAMETERS, DATA_PARAMETERS, CUDSS08_DATA_PARAMETERS, EXTRA_PARAMETERS
 export Options, setparam!, getparam, default_pivot_epsilon
-export CSR, csr_of_transpose, to_backend, nbatch, MatrixDescriptor, update!
+# `update!` is public but not exported (issue #144): CUDA.jl >= 6.5 exports an `update!`
+# of its own (CuGraph), so `using CUDA, SparseDirectSolver` would leave both unusable.
+# Write `SparseDirectSolver.update!(solver, A)` or `using SparseDirectSolver: update!`.
+export CSR, csr_of_transpose, to_backend, nbatch, MatrixDescriptor
+public update!
 export AbstractDirectSolver, DirectSolver, execute!, analyze!, factorize!, refactorize!, solve!, getparam!
 
 include("errors.jl")

@@ -70,7 +70,7 @@ oneAPI (tested on an Intel Data Center GPU Max 1550):
   matrix (inertia preserved) with 2×2 pivot pairs from the matching;
   `perm_matching`, `scale_row`, `scale_col`;
 * the public API: `DirectSolver`, `execute!` with cuDSS phase strings, named
-  phase wrappers, `update!`, `setparam!`/`getparam`, and the `LinearAlgebra`
+  phase wrappers, `SparseDirectSolver.update!` (not exported), `setparam!`/`getparam`, and the `LinearAlgebra`
   layer (`cholesky`, `cholesky!`, `ldlt`, `ldlt!`, `lu`, `lu!`, `ldiv!`, `\`,
   `logabsdet`, `logdet`, `diag`, `nnz`),
   checked by the test suite of CUDSS.jl ported to this package; phase logging
@@ -146,8 +146,8 @@ Pkg.add(url = "https://github.com/exanauts/SparseDirectSolver.jl")
 The CUDA extension is triggered by CUDA.jl's packages CUDACore, cuBLAS,
 cuSOLVER and cuSPARSE, which `using CUDA` loads (`CuSparseMatrixCSR`/`CuSparseMatrixCSC`
 constructors, cuBLAS/cuSOLVER dense kernels; CUDA.jl 6.5 exports an `update!`
-of its own, so import this package's explicitly with
-`using SparseDirectSolver: update!` when both are loaded); loading AMDGPU.jl
+of its own, so this package does not export its `update!`: write
+`SparseDirectSolver.update!` or `using SparseDirectSolver: update!`); loading AMDGPU.jl
 enables the AMDGPU extension (`ROCSparseMatrixCSR`/`ROCSparseMatrixCSC`
 constructors, rocBLAS/rocSOLVER dense kernels; ROCm must be found by AMDGPU.jl);
 loading oneAPI.jl enables the oneAPI extension
@@ -167,7 +167,7 @@ Phases are run with `execute!`.
 ```julia
 using SparseDirectSolver, SparseArrays, LinearAlgebra
 using CUDA, CUDA.CUSPARSE
-using SparseDirectSolver: update!                     # CUDA.jl 6.5 exports an update! too
+using SparseDirectSolver: update!                     # not exported (CUDA.jl 6.5 exports one too)
 
 n = 1000
 A = sprand(n, n, 0.005); A = A * A' + I               # SPD on the host

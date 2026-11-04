@@ -37,7 +37,8 @@ so the **Report** block at the end of each task must be filled in honestly.
    `test/utils.jl` and `test/matrices.jl` (T01); do not invent new ones per file.
 7. Done = every listed test passes on CPU and on CUDA, the file-level status
    marker is set, and the Report block is filled in. Status markers:
-   `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` done with deviations.
+   `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` done with deviations,
+   `[-]` superseded (the note under the heading names the replacing tasks).
 
 ## Report block template (copy under each task when done)
 
@@ -3106,7 +3107,13 @@ needed to load them on Linux); Metal only by review. Mark both as untested.
   - PLAN §2.3 step 5 / §2.7 hazard row: regime-A ladder 8–64 KiB, capped per backend by `max_local_bytes`.
   - TASKS.md: a task for the oneAPI/Metal remainder of T23 with the #53 owner note.
 
-### T24 — Partitioned-inverse fused solve (`solve_alg = "algo1"`, issue #82 solve half)   `[ ]`
+### T24 — Partitioned-inverse fused solve (`solve_alg = "algo1"`, issue #82 solve half)   `[-]`
+
+**Superseded (2026-11-04, owner re-cut after T33–T35 and T32)** by T36, T37
+and T38 below; the text is kept as history (the prototype numbers, negative
+results and owner notes stay the reference for those tasks). The fused partitioned-inverse solve exists in `src/fused.jl` (T33/T34/T35,
+behind `FusedSolver`); what remains, `solve_alg = "algo1"` on `DirectSolver`,
+is T36.
 
 **Prototype adopted (PR #107)**: `bench/solve_proto_78k.jl`,
 `bench/solve_proto_all.jl`, `bench/final_sweep.jl` (at tag `prototypes-2026-10`), `src/fused.jl` (the adopted prototype)
@@ -3145,7 +3152,13 @@ combinations with `NotSupportedError`. Report: solve table (1 RHS and 6 RHS)
 vs the T04 cuDSS baseline for every harness matrix on CPU and CUDA, with the
 chosen strategy per matrix. Refs #82 (solve half).
 
-### T25 — Split factorization: tiled SYRK, chunked TRSM, split regime-C fronts   `[ ]`
+### T25 — Split factorization: tiled SYRK, chunked TRSM, split regime-C fronts   `[-]`
+
+**Superseded (2026-11-04, owner re-cut after T33–T35 and T32)** by T36, T37
+and T38 below; the text is kept as history (the prototype numbers, negative
+results and owner notes stay the reference for those tasks). The split kernels (tiled SYRK, chunked TRSM, split C-group fronts,
+longest-first subtree launches) exist inside the fused factorization of
+`src/fused.jl`; reaching them from `DirectSolver` is T37.
 
 **Prototype adopted (PR #107)**: `bench/fact_split.jl`. Refactorization of
 the 78k-bus condensed KKT: 167.7 ms (stock) → 138.8 (ND ordering) → 72.7
@@ -3188,7 +3201,15 @@ front classes (fused B, split B, split C) on one matrix. Report:
 refactorization table vs the T04 cuDSS baseline on every harness matrix,
 Cholesky and LDLᵀ, with the per-class time split from `bench/profile_phases.jl`.
 
-### T26 — Segmented fused factorization with dependency counters (issues #82, #109, #110)   `[ ]`
+### T26 — Segmented fused factorization with dependency counters (issues #82, #109, #110)   `[-]`
+
+**Superseded (2026-11-04, owner re-cut after T33–T35 and T32)** by T36, T37
+and T38 below; the text is kept as history (the prototype numbers, negative
+results and owner notes stay the reference for those tasks). The segmented dependency-counter kernel exists in `src/fused.jl`
+(deterministic since T35, its private contribution blocks reported in
+`memory_estimates`, the reporting half of #109); its `DirectSolver`
+integration and #109's placement are T37, graph capture of the stock path
+(#82) and the #110 verification are T38.
 
 **Prototype adopted (PR #107)**: `bench/fact_fused.jl` (at tag `prototypes-2026-10`), `src/fused.jl` (the adopted prototype)
 (factorization part). On top of T25: 40.6 → 33.5 ms (segmented
@@ -4309,6 +4330,227 @@ reporting; closes the reporting half if not already closed by T26), #82
     its in-kernel wide-front tiles apply the panels in order; only its default forward solve uses atomics, and
     `deterministic_mode = 1` (read at every solve) selects the pull sweep."
   * §1.3 `deterministic_mode` row: the same holds for `FusedSolver`.
+
+### T36 — `solve_alg = "algo1"`: the partitioned-inverse fused solve on `DirectSolver` (refs #82 solve half)   `[ ]`
+
+Re-cut by the owner (2026-11-04) from T24 after T33–T35. Runs on top of the
+chores PR that fixed #144/#159/#174.
+
+**Why.** PLAN §1.3 promises `solve_alg = "algo1"` (partitioned-inverse
+diagonal blocks, M11) and §2.5 the prototype numbers (78k condensed KKT:
+level sweeps 18 ms → 3.5 ms, cuDSS 3.8 ms). The kernels exist:
+`build_inverse` (per-front `L₁₁` inverses for fronts of width ≤ `MW = 256`),
+`build_fused` (the fused solve segments), `algo2_solve!` (the
+dependency-counter forward and backward sweeps, the vendor dense sweeps for
+the wider fronts, the pull forward sweep under `deterministic_mode = 1`, T35).
+But they are reached only through `FusedSolver`, i.e. only after the fused
+factorization. `DirectSolver` raises `NotSupportedError("solve_alg = \"algo1\"
+is not implemented yet (T24–T26)")` (`src/solver.jl`). The fused solve reads
+only the factor in the stock layout plus the inverses, so it can follow the
+stock factorization unchanged.
+
+**Deliverables.**
+
+1. `solve_alg = "algo1"` on `DirectSolver`: at the analysis (or the first
+   factorization, whichever the existing workspace allocation makes
+   simpler, documented) build the inverse storage and the solve segments on
+   the solver's backend, sized once and reported in `memory_estimates`; at
+   the end of every `"factorization"`/`"refactorization"` compute the
+   inverses (`invert!`, no host synchronization, no allocation, PLAN §3.9);
+   `"solve"` runs `algo2_solve!` (with `deterministic_mode` read at every
+   solve, as today). The sub-phases (`"solve_fwd_perm"` … `"solve_bwd_perm"`)
+   either run the matching halves of the fused solve or raise
+   `NotSupportedError`; the task decides and documents it.
+2. Scope as the kernels allow, everything else `NotSupportedError` at the
+   analysis or the phase (never a silent fallback to the level sweeps):
+   `"SPD"` and `"S"`/`"H"` only where the factor has no 2×2 or permuted
+   pivots inside a front (`pivot_type = 'N'`; with Bunch–Kaufman pivoting the
+   fused solve would need the local pivot order, PLAN §2.5 — implement it if
+   it is a small change to `fwd2`/`bwd2`, otherwise raise), real `T`
+   (complex: no conjugation in `src/fused.jl`, raise), `nrhs = 1`,
+   `nbatch = 1`, `solve_mode = 0`, no Schur mode, no matching scaling unless
+   the permutation/scaling kernels already wrap it; LU (`"G"`) stays on the
+   level sweeps with a `NotSupportedError` for `"algo1"`. Backends: the
+   counter kernels spin on resident workgroups, so the KA `CPU()` backend
+   raises, and so does any backend without the forward-progress guarantee
+   (PLAN §2.7: Metal, likely Intel) — `FusedSolver` refuses only `CPU()`
+   today ("every GPU backend"); state in the Report which backends were run
+   and whether Metal/oneAPI must be refused too.
+   Iterative refinement (`ir_n_steps > 0`, FGMRES) composes with it: the
+   refinement calls the solve; test it.
+3. `FusedSolver`'s solve becomes this code path (one implementation of the
+   fused solve driver; `FusedSolver` keeps its type, verbs and restrictions,
+   PLAN §3.1/§3.2, and its graph replay of the solve).
+4. `"default"` keeps the level sweeps. A rule that selects `"algo1"`
+   automatically is in scope only if a measured predictor exists: T24's
+   observation was that the fused solve regresses where wide fronts dominate
+   (lap3d_40, apache2); T34 changed that (lap3d_40 fused solve 6.5 ms vs the
+   level sweeps' time in `bench/comparison/comparison.md`). Measure the full
+   SPD and KKT harness, level sweeps vs `"algo1"`, 1 RHS, and either state a
+   rule on schedule statistics (widest front, fraction of flops above `MW`,
+   number of levels) that picks the faster one on every matrix, or keep
+   `"default"` = level sweeps and say why.
+
+**Tests.** `test/test_solve*.jl`/`test_api` (the task picks where): every SPD
+and no-pivot `"S"` generator of `test/matrices.jl` on the GPU backends of
+`BACKENDS` with `solve_alg = "algo1"`: residual within `tol(T)`, solution
+within `tol(T)` of the level sweeps on the same factorization, bitwise equal
+across two solves under `deterministic_mode = 1`; with refinement
+(`ir_n_steps = 2`); a refactorization with new values followed by a solve
+(the inverses follow the values); the allocation budget of a refactorization
+plus a solve (`ka_cpu_alloc_budget` style, as `test_fused.jl` does); every
+unsupported combination above raises `NotSupportedError` (on `CPU()` too).
+`test_options` accepts `"algo1"`. Every existing solve test passes unchanged
+under `"default"`. `test_fused.jl` unchanged.
+
+**Report.** Solve table (1 RHS) level sweeps vs `"algo1"` vs the cuDSS
+baseline (T04) on every harness matrix, CUDA (state the GPU), with the
+residuals; the `"default"` rule and its justification; `memory_estimates`
+with and without `"algo1"` on the 78k and lap3d_40. PLAN §1.3 `solve_alg` row
+and §2.5 wording proposed for the owner. Refs #82 (solve half; not closed).
+
+### T37 — The fused factorization on `DirectSolver`, and #109's placement (refs #82, #109)   `[ ]`
+
+Re-cut by the owner (2026-11-04) from T25/T26 after T33–T35. Runs after T36.
+
+**Why.** The split kernels of T25 and the segmented dependency-counter
+kernel of T26 exist in `src/fused.jl` (`build_fused_plan`,
+`refact_fused_launches!`; Cholesky and no-pivot LDLᵀ; deterministic since
+T35) and are reached only through `FusedSolver` (T33). PLAN §5 says
+"T24–T26 move the fused pipeline under `execute!`". After T36 the solve half
+is there; this task moves the factorization half, so that a `DirectSolver`
+user gets the fast refactorization without a separate type. The fused plan
+already gives every non-subtree front a private contribution-block slot
+(`pcb`), which is the "budget private slots" answer of #109 for a
+level-merged execution; T35 reported those bytes in `FusedSolver`'s
+`memory_estimates`. What #109 still asks is the placement decision for the
+handle-layer path once it executes out of level order.
+
+**Deliverables.**
+
+1. A `factorization_alg` value selects the fused factorization on
+   `DirectSolver` (PLAN §1.3 reinterprets `factorization_alg`; propose the
+   value, e.g. `"algo3"` if the cuDSS enum has it, in the Report, do not edit
+   `PLAN.md`): at the analysis the inner options are adjusted as
+   `FusedSolver` does today from its `SDSTuning` (amalgamation, regime
+   bounds, subtree budgets, ordering knobs) — or, if adjusting the user's
+   options behind their back is wrong for `DirectSolver`, the fused plan is
+   built on the user's options and the Report measures the cost of that
+   choice on the 78k. `"factorization"`/`"refactorization"` run
+   `refact_fused_launches!` (+ the T36 inverses when `solve_alg = "algo1"`);
+   `info`, `inertia` (`"S"`: from the signs of `D`, as `FusedSolver`),
+   `npivots`, `pivot_stats` where defined, and `memory_estimates` (private
+   CBs and plan buffers, T35 slots 13/14) behave as on `FusedSolver`. The
+   same scope and `NotSupportedError` rules as `FusedSolver`
+   (`_check_fused_options`), at the analysis.
+2. `FusedSolver` becomes a thin wrapper over a `DirectSolver` with
+   `factorization_alg` = the fused value and `solve_alg = "algo1"` (its
+   public type, verbs, `SDSTuning` and restrictions stay; the MadNLP
+   extension's `SDSSolver` and `bench/compare.jl` run unchanged). One
+   implementation of each phase.
+3. #109: decide and implement the placement for the out-of-level-order
+   execution: the fused path keeps its private slots (`pcb`) and reports them
+   (state the bytes for the 78k and lap3d_40: T35 measured 122 MiB vs a
+   31.5 MiB reusing stack, 961 MiB vs 100.5 MiB); the level-synchronous stock
+   path keeps the reusing update stack. If lap3d-class matrices make the
+   private slots too expensive (961 MiB is 7.2× the factor), measure
+   interval colouring of the slots over the fused kernel's execution order
+   (the alternative #109 names) on lap3d_40 and the 78k and take it if it
+   saves memory without a timing regression; otherwise document the private
+   slots as the design. Closes #109.
+4. Default: `factorization_alg = "default"` keeps the stock regimes unless
+   the harness shows the fused factorization wins on every matrix where the
+   automatic choice would pick it; state the rule or keep it opt-in.
+
+**Tests.** `test/test_fused.jl` passes unchanged (it now exercises the
+`DirectSolver` path through the wrapper). New tests on the GPU backends: the
+fused `factorization_alg` on every SPD generator and the no-pivot `"S"`
+generators: `info == 0`, residual within `tol(T)`, the factor within
+`growth_tol(T, Nr)` of the stock factor on the same analysis, bitwise equal
+across 10 refactorizations; a matrix with deep contribution-block reuse
+(the #109 failure mode: a deliberately reordered execution must not clobber a
+live block, asserted through the factor equality); `memory_estimates` of the
+fused path ≥ the stock one by the private-slot bytes; the allocation budget
+of a refactorization plus a solve; `NotSupportedError` for every combination
+outside the scope (on `CPU()` too). Every existing numeric suite passes
+unchanged under `"default"`.
+
+**Report.** Refactorization and refactorization+solve tables (stock,
+fused through `DirectSolver`, `FusedSolver`, cuDSS) on the SPD and KKT
+harness, CUDA (state the GPU); launches per refactorization (#82's ≥ 3×
+fewer criterion); the #109 memory table; the PLAN §1.3/§3.1/§3.2/§4 wording
+for the owner. Refs #82; closes #109.
+
+### T38 — Graph capture of the stock refactorization and solve; #110 (closes #82, #110)   `[ ]`
+
+Re-cut by the owner (2026-11-04) from T26 after T33–T35 and the #174 fix.
+Runs after T37.
+
+**Why.** PLAN §3.9: the numeric phase and the solve are allocation- and
+synchronization-free so that the CUDA (and ROCm) extensions can capture the
+refactorize + solve sequence once and replay it per IPM iteration. #82
+measured 54–59 launches per refactorization and 62–85 per solve on the
+pglib KKT matrices through the handle API. The fused pipeline has the hook
+(`SparseDirectSolver.capture_graph(backend, f)`, `SDSTuning.graph_max_n`,
+T34), and since the #174 fix it captures ranges with vendor dense calls
+(cuSOLVER/cuBLAS handles bound to the capture stream before the capture).
+The stock `DirectSolver` phases never capture. A successful capture is also
+the check #110 asks for: any host synchronization (an `info` read, a
+blocking copy) inside the captured range fails the capture.
+
+**Deliverables.**
+
+1. Graph replay of `"refactorization"` and `"solve"` on `DirectSolver`
+   through `capture_graph`, opt-in through a documented switch (an `Options`
+   keyword like `graph_max_n`, not a cuDSS parameter string; propose its
+   name and PLAN §1.7 row in the Report): the first refactorization/solve
+   runs eagerly, the next one captures, later ones replay; a new values
+   buffer (`update!` to another array), a parameter change that the captured
+   range depends on (`deterministic_mode`, `ir_n_steps`, `solve_mode`, the
+   pivot epsilons, `nrhs`) or a new right-hand-side shape recaptures or
+   falls back to eager (document which); the permutations stay outside the
+   solve graph so that it does not depend on the caller's vectors (as the
+   fused path does). `capture_graph` returning `nothing` falls back to the
+   eager launches silently (that is the hook's contract, not a parameter
+   fallback). Both the stock path and the T36/T37 paths when selected.
+2. #110: run the stock refactorization of a matrix with several regime-C
+   fronts (`impl = :vendor`/`:auto`, Cholesky, LDLᵀ and LU) under capture;
+   every host synchronization the capture or a CUDA profile
+   (`bench/profile_phases.jl`) finds in the numeric phase or the solve is
+   removed (an asynchronous vendor `potrf`/`getrf` with the `info` on the
+   device, the workspace sized at analysis) or listed in the Report with the
+   reason it stays (PLAN §3.9 exceptions: `ir_tol > 0`, FGMRES). Closes
+   #110.
+3. Measure eager vs replay (median of 11 after 3 warm-ups, three interleaved
+   rounds, idle GPU, same process) on the SPD and KKT harness and set the
+   default bound from the numbers (0 if replay never wins by more than the
+   2% noise, as T34 found for the fused path).
+
+**Tests.** The phase tests on CUDA with the switch on: the replayed
+refactorization's factor bitwise equal to the eager one (the stock assembly
+is deterministic, PLAN §3.4), `info`/`inertia` equal, the replayed solve's
+solution bitwise equal under `deterministic_mode = 1`; a recapture after
+`update!` to a new buffer; a matrix with regime-C vendor fronts for each of
+Cholesky, LDLᵀ and LU; the allocation budget of a replayed
+refactorization plus solve; on backends without graphs the switch is a no-op
+(eager, same results). Every existing suite passes unchanged with the switch
+off.
+
+**Report.** Launch counts per refactorization and solve before and after
+(#82's criterion), eager vs replay timings per harness matrix (state the
+GPU), the #110 synchronization count before and after, the default chosen and
+why; PLAN §2.5/§3.9 wording for the owner. Closes #82 and #110.
+
+**Why three tasks (owner note on the split).** T36 touches only the solve
+phase and its workspace and can be checked against the level sweeps on the
+same factorization; T37 touches the factorization phase, the analysis-time
+option handling and the memory layout (#109), and its gate is the factor
+against the stock factor; T38 is orthogonal to both (it wraps whichever
+launch sequence the options select) and needs them in place so that one
+capture rule covers every path, which also makes it the natural place to
+close #82 and verify #110. Each is one A/B measurement campaign on the
+harness, the size of T33–T35, and each leaves `main` releasable: the new
+paths are opt-in until their task's numbers justify a default.
 
 ### External — MadNLPGPU integration (in the MadNLP repository)   `[ ]`
 

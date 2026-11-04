@@ -31,7 +31,7 @@ solver = DirectSolver(A, "S", 'L')          # A: CSR on a backend, or a backend 
 setparam!(solver, "pivot_threshold", 0.01)  # configuration before the phase that reads it
 execute!("analysis", solver, X, B)          # once per sparsity pattern
 for k in 1:iterations
-    update!(solver, A_k)                    # new values, same pattern
+    SparseDirectSolver.update!(solver, A_k) # new values, same pattern (not exported)
     execute!(k == 1 ? "factorization" : "refactorization", solver, X, B)
     getparam(solver, "info") == 0 || error("factorization failed")
     execute!("solve", solver, X, B)
