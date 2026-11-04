@@ -130,7 +130,7 @@ solve phases raise `NotSupportedError` (T20, §3.6).
 | `use_superpanels` | reinterpret | Supernode amalgamation on/off. |
 | `device_count`, `device_indices` | not planned | Raise "not supported". |
 | `schur_mode` | port (M8) | |
-| `deterministic_mode` | port | Assembly is deterministic by construction (§3.4); the flag switches the forward solve to its atomic-free variant. Complex `T` always uses that variant (no complex atomics on any backend, issue #36). |
+| `deterministic_mode` | port | Assembly is deterministic by construction (§3.4); the flag switches the forward solve to its atomic-free variant. Complex `T` always uses that variant (no complex atomics on any backend, issue #36). The same holds for `FusedSolver` since T35 (#180). |
 
 ### 1.4 Data parameters (`cudss_get` → `getparam` / `getparam!`)
 
@@ -588,11 +588,14 @@ keeps the cuDSS pair, `pivot_stats` adds n₀, n_perturbed and n_2×2.
 Assembly (scatter of A and extend-add) is done by the owner workgroup of each
 parent front pulling from its children in a fixed order: no atomics, bitwise
 reproducible by construction. Only the default forward solve uses atomics.
-The fused pipeline (`FusedSolver`, T33) departs from this: its concurrent
-extend-add, its in-kernel wide-front tiles and its forward solve accumulate
-with atomics, and it rejects `deterministic_mode = 1`. T35 (#180) adds the
-ordered variants under that flag; #177 has the measured run-to-run spread, at
-the factor's eps-level sensitivity and with the stock backward error.
+The fused pipeline (`FusedSolver`) follows this too since T35 (#180): its
+extend-add is a parent pull in `child_list` order and its in-kernel wide-front
+tiles apply the panels in order, so its factor and `D` are bitwise reproducible
+under either mode; only its default forward solve uses atomics, and
+`deterministic_mode = 1` (read at every solve) selects the pull sweep. #177 has
+the run-to-run spread of the earlier atomic extend-add (T33), at the factor's
+eps-level sensitivity and with the stock backward error, and the fused-vs-stock
+factor gate of `bench/ARCH-TUNING.md` (#181).
 
 ### 3.5 Uniform batch
 
