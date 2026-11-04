@@ -55,9 +55,12 @@ tested_impls(op, backend, T) =
             @test SDS.select_impl(:potrf, X, :vendor) === :vendor
             @test_throws SDS.NotSupportedError SDS.select_impl(:potrf, X, :generic)
         end
+        # `:auto` preference order (T32, #112): `:vendor`, the allocation-free `:ka` (always present),
+        # then the allocating `:generic` reference path, which `:auto` never selects
         for op in keys(SDS.DENSE_OPS)
             impls = SDS.dense_impls(op, backend, T)
-            @test last(impls) === :ka
+            @test :ka in impls
+            @test impls == filter(in(impls), [:vendor, :ka, :generic])
         end
     end
 end
@@ -278,8 +281,9 @@ end
 
 @testset "impl = :auto ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES
     A = to_device(backend, randn(T, 5, 5))
-    for op in (:gemm, :potrf, :laswp, :trsm_strided_batched)
+    for op in keys(SDS.DENSE_OPS)
         @test SDS.select_impl(op, A, :auto) === first(SDS.dense_impls(op, backend, T))
+        @test SDS.select_impl(op, A, :auto) !== :generic
     end
     @test SDS.select_impl(:laswp, A, :auto) === :ka
     C = to_device(backend, zeros(T, 5, 5))
@@ -345,4 +349,94 @@ end
     SDS.ka_potrf!('L', X, info; offset = 2)
     @test to_host(info) == Int32[7, 7, 0, 0]
     @test_throws DimensionMismatch SDS.ka_potrf!('L', X, info; offset = 3)
+end
+
+# T32 (#112): `:auto` takes the allocation-free `:ka` fallbacks before the allocating `:generic`
+# path. A backend without vendor bindings whose generic probes pass (as Metal's `mul!`) is modelled
+# by a host-only fake backend with a fixed capability table; `V`: whether it has a vendor `gemm`.
+struct FakeDenseBackend{V} <: KernelAbstractions.Backend end
+struct FakeDenseMatrix{T, V} <: AbstractMatrix{T}
+    n::Int
+end
+Base.size(A::FakeDenseMatrix) = (A.n, A.n)
+Base.getindex(::FakeDenseMatrix{T}, i::Int, j::Int) where {T} = zero(T)
+KernelAbstractions.get_backend(::FakeDenseMatrix{T, V}) where {T, V} = FakeDenseBackend{V}()
+SDS._probe_capabilities(::FakeDenseBackend{V}, ::Type{T}) where {V, T} =
+    SDS.DenseCapabilities(true, true, true, true, V, false, false, false, false, false, false, false, false, false)
+SDS._allow_generic_dense(op::Symbol, ::FakeDenseBackend, ::Type{T}) where {T} = op !== :getrf
+
+@testset "select_impl order: :ka before :generic ($T)" for T in ELTYPES
+    nv, wv = FakeDenseBackend{false}(), FakeDenseBackend{true}()
+    X, Y = FakeDenseMatrix{T, false}(4), FakeDenseMatrix{T, true}(4)
+    @test SDS.dense_impls(:gemm, nv, T) == [:ka, :generic]
+    @test SDS.dense_impls(:potrf, nv, T) == [:ka, :generic]
+    @test SDS.dense_impls(:getrf, nv, T) == [:ka]                 # generic rejected by the backend
+    @test SDS.dense_impls(:laswp, nv, T) == [:ka]
+    @test SDS.dense_impls(:gemm_strided_batched, nv, T) == [:ka]
+    for op in keys(SDS.DENSE_OPS)
+        @test SDS.select_impl(op, X, :auto) === :ka
+        @test SDS.select_impl(op, X, :ka) === :ka
+    end
+    # `:generic` stays selectable explicitly (the reference path, PLAN §3.9)
+    @test SDS.select_impl(:gemm, X, :generic) === :generic
+    @test SDS.select_impl(:potrf, X, :generic) === :generic
+    @test_throws NotSupportedError SDS.select_impl(:getrf, X, :generic)
+    @test_throws NotSupportedError SDS.select_impl(:gemm, X, :vendor)
+    # a vendor binding still comes first, the other ops take `:ka`
+    @test SDS.dense_impls(:gemm, wv, T) == [:vendor, :ka, :generic]
+    @test SDS.select_impl(:gemm, Y, :auto) === :vendor
+    @test SDS.select_impl(:trsm, Y, :auto) === :ka
+    @test SDS.select_impl(:syrk, Y, :auto) === :ka
+end
+
+# T32 (#53): one call of every `:ka` dense fallback, the flags passed as run-time values, through the
+# public entry points and on panel views as in the numeric and solve phases; 16 launches
+function ka_dense_round!(C, A, B, S, F, P, info, ipiv, C3, A3, F3, X3, flags)
+    T = eltype(C)
+    for (tA, tB) in flags
+        SDS.ka_gemm!(C, A, B, 1, 0; transA = tA, transB = tB)              # 3 launches
+    end
+    SDS.gemm!(C, A, B, -one(T), one(T); transB = 'C', impl = :ka)
+    SDS.syrk!(C, A, 1, 0; uplo = 'U', impl = :ka)
+    SDS.herk!(C, A, -1.0, 1.0; uplo = 'L', impl = :ka)
+    copyto!(F, S)
+    SDS.potrf_info!('L', F, info, 2; impl = :ka)
+    SDS.trsm!('R', 'L', 'C', 'N', one(T), F, P; impl = :ka)
+    SDS.trsm!('R', 'U', 'T', 'U', one(T), F, P; impl = :ka)
+    copyto!(B, A)
+    SDS.ka_getrf!(B, ipiv, info)
+    SDS.ka_laswp!(C, ipiv; reverse = true)
+    SDS.gemm_strided_batched!(C3, A3, A3, one(T), zero(T); transB = 'C', impl = :ka)
+    SDS.trsm_strided_batched!('L', 'L', 'N', 'N', one(T), F3, C3; impl = :ka)
+    SDS.ka_potrf!('L', X3, info; offset = 1)
+    SDS.ka_chol_check_info!(info, 2, F)
+    return nothing
+end
+
+# bytes allocated by `rounds` calls of `ka_dense_round!` (in a function: a loop in the testset's
+# scope would allocate itself)
+ka_dense_rounds_allocated(args, rounds) = @allocated for _ in 1:rounds
+    ka_dense_round!(args...)
+end
+
+TEST_CPU && @testset ":ka dense fallbacks allocation-free (CPU, $T)" for T in ELTYPES
+    Random.seed!(666)
+    n, f = 40, 70
+    A, B, C = randn(T, n, n), randn(T, n, n), zeros(T, n, n)
+    S = dense_hpd(T, n)
+    buf = randn(T, f * n + 3)
+    P = reshape(view(buf, 4:(f * n + 3)), f, n)                       # a panel view, as in a front
+    F = view(P, 1:n, 1:n)
+    Pr = view(P, (n + 1):f, :)
+    info, ipiv = zeros(Int32, 4), zeros(Int32, n)
+    A3, C3 = randn(T, n, n, 2), zeros(T, n, n, 2)
+    F3 = cat(LowerTriangular(S) + n * I, LowerTriangular(S) + n * I; dims = 3)
+    X3 = cat(S, S; dims = 3)
+    flags = [('N', 'N'), ('T', 'C'), ('C', 'T')]
+    args = (C, A, B, S, F, Pr, info, ipiv, C3, A3, F3, X3, flags)
+    ka_dense_round!(args...)                                          # compile
+    rounds = 8
+    bytes = ka_dense_rounds_allocated(args, rounds)
+    launches = 16 * rounds
+    @test bytes <= ka_cpu_alloc_budget(launches, launches * ka_dense_localmem(T))
 end

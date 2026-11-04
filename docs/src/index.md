@@ -46,8 +46,8 @@ oneAPI, Metal and the KernelAbstractions CPU backend.
   elimination tree, level-batched per-front kernels for medium fronts, and dense
   `potrf`/`getrf`/`trsm`/`syrk` calls for large fronts: cuBLAS and cuSOLVER on
   CUDA, rocBLAS and rocSOLVER on AMDGPU, oneMKL level-3 BLAS on oneAPI (the
-  LAPACK steps on the KernelAbstractions kernels), MPS GEMM/SYRK and MPS
-  Cholesky for fronts at least 64 wide on Metal, KernelAbstractions kernels
+  LAPACK steps on the KernelAbstractions kernels), MPS Cholesky for fronts at
+  least 64 wide on Metal, allocation-free KernelAbstractions kernels
   otherwise.
 * **Pivoting**: Bunch–Kaufman 1×1/2×2 pivoting for LDLᵀ/LDLᴴ, threshold partial
   pivoting inside the fully-summed block of each front for LU, static

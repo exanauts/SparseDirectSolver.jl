@@ -46,23 +46,38 @@
     end
 end
 
+# one launch with a static configuration (every flag a `Val`, see `_static_bool`)
+function _ka_trsm_run!(B, A, α, swap::Val, cj::Val, lower::Val, unit::Val, rowline::Val{ROWLINE},
+                       workgroup::Val{WG}) where {ROWLINE, WG}
+    n = ROWLINE ? size(B, 2) : size(B, 1)
+    nlines = ROWLINE ? size(B, 1) : size(B, 2)
+    nb = _nbatch(B)
+    (n == 0 || nlines == 0 || nb == 0) && return B
+    backend = KernelAbstractions.get_backend(B)
+    kernel! = _ka_trsm_kernel!(backend, (WG, 1))
+    kernel!(B, A, eltype(B)(α), swap, cj, lower, unit, rowline, workgroup, n; ndrange = (WG * nlines, nb))
+    return B
+end
+
+# M reads A transposed (SWAP) for side 'L' with op ≠ 'N' and for side 'R' with op = 'N'
+@inline _trsm_swap(::Val{ROWLINE}, ::Val{TR}) where {ROWLINE, TR} = Val(ROWLINE ? TR === 'N' : TR !== 'N')
+@inline _trsm_conj(::Val{TR}) where {TR} = Val(TR === 'C')
+
 function _ka_trsm_launch!(side::Char, uplo::Char, trans::Char, diag::Char, α, A, B, workgroup::Val{WG}) where {WG}
     _ilog2(WG)
     left = side == 'L'
-    n = left ? size(B, 1) : size(B, 2)
-    nlines = left ? size(B, 2) : size(B, 1)
-    nb = _nbatch(B)
-    (n == 0 || nlines == 0 || nb == 0) && return B
-    if left
-        swap, cj, lower = trans != 'N', trans == 'C', (uplo == 'L') == (trans == 'N')
-    else
-        swap, cj, lower = trans == 'N', trans == 'C', (uplo == 'U') == (trans == 'N')
+    # M is lower triangular (forward substitution) when A is lower and not transposed for side 'L', when
+    # A is upper and not transposed for side 'R' (M = op(A)ᵀ), or the transposed counterparts
+    lower = left ? (uplo == 'L') == (trans == 'N') : (uplo == 'U') == (trans == 'N')
+    return _static_bool(!left) do vrow
+        _static_trans(trans) do vtr
+            _static_bool(lower) do vlower
+                _static_bool(diag == 'U') do vunit
+                    _ka_trsm_run!(B, A, α, _trsm_swap(vrow, vtr), _trsm_conj(vtr), vlower, vunit, vrow, workgroup)
+                end
+            end
+        end
     end
-    backend = KernelAbstractions.get_backend(B)
-    kernel! = _ka_trsm_kernel!(backend, (WG, 1))
-    kernel!(B, A, eltype(B)(α), Val(swap), Val(cj), Val(lower), Val(diag == 'U'), Val(!left), workgroup, n;
-            ndrange = (WG * nlines, nb))
-    return B
 end
 
 """
@@ -72,9 +87,10 @@ KernelAbstractions fallback for BLAS `trsm`: `B ← α op(A)⁻¹ B` (`side = 'L
 or `B ← α B op(A)⁻¹` (`side = 'R'`), `A` triangular (`uplo`), unit diagonal if
 `diag = 'U'`, `op` from `trans ∈ ('N', 'T', 'C')`. One 1-D workgroup per
 right-hand side column (row for `side = 'R'`) runs the forward/back
-substitution. Asynchronous.
+substitution. Asynchronous; the launch configuration is static, so a call
+allocates nothing on the host.
 """
-function ka_trsm!(side, uplo, trans, diag, α, A::AbstractMatrix, B::AbstractMatrix; workgroup = Val(KA_WORKGROUP))
+function ka_trsm!(side, uplo, trans, diag, α, A::AbstractMatrix, B::AbstractMatrix; workgroup::Val = Val(KA_WORKGROUP))
     sd, ul, tr, dg = _side_char(side), _uplo_char(uplo), _trans_char(trans), _diag_char(diag)
     _check_trsm_dims(sd, A, B)
     return _ka_trsm_launch!(sd, ul, tr, dg, α, A, B, workgroup)
@@ -87,7 +103,7 @@ Strided batched [`ka_trsm!`](@ref) on 3-D arrays (batch = third dimension, the
 second ndrange dimension of the launch).
 """
 function ka_trsm_strided_batched!(side, uplo, trans, diag, α, A::AbstractArray{<:Any, 3}, B::AbstractArray{<:Any, 3};
-                                  workgroup = Val(KA_WORKGROUP))
+                                  workgroup::Val = Val(KA_WORKGROUP))
     sd, ul, tr, dg = _side_char(side), _uplo_char(uplo), _trans_char(trans), _diag_char(diag)
     _check_trsm_dims(sd, A, B)
     _check_batch(B, A)

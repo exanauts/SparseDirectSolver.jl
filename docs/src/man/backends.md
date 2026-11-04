@@ -33,8 +33,8 @@ types are `Int32` and `Int64`. Metal currently supports `Float32` factors;
 Apple GPUs do not expose Float64 arithmetic.
 
 On Metal, the default SPD schedule uses narrower regime-C thresholds than the
-CUDA/ROCm schedule (`32` columns and `128` rows), Metal.jl's panel GEMM/SYRK,
-and fused level solves for every front. When vendor calls are allowed (not
+CUDA/ROCm schedule (`32` columns and `128` rows), the KernelAbstractions panel
+GEMM/SYRK/TRSM, and fused level solves for every front. When vendor calls are allowed (not
 `factorization_alg = "algo1"`), regime-C Cholesky fronts at least
 64 columns wide use offset-aware MPS decomposition objects built when the
 numeric storage is allocated; the MPS status is folded into `info` (MPS names no
