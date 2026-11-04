@@ -84,11 +84,12 @@ function SparseDirectSolver._offset_potrf_info!(backend::MetalBackend, plan::Met
 end
 
 # Metal.jl's MPS Cholesky and triangular solves work on full MtlMatrix objects,
-# but panel views dispatch to host LAPACK/BLAS. Panel GEMM/SYRK run on MPS through
-# `:generic` (`mul!` on `MtlArray` views), which allocates MPS descriptors per call
-# but is faster than the KA kernels (a deviation from T31's `:auto` prefers `:ka`,
-# recorded in its Report); TRSM stays on KA. POTRF stays on KA through `select_impl`;
-# under `impl = :auto` with vendor calls allowed, single-matrix fronts at least
+# but panel views dispatch to host LAPACK/BLAS. Panel GEMM/SYRK reach MPS through
+# `:generic` (`mul!` on `MtlArray` views), which allocates MPS descriptors per call;
+# since T32 (#112) `impl = :auto` takes the allocation-free KA kernels instead (it
+# never selects `:generic`), and an explicit `impl = :generic` still reaches MPS for
+# these two ops only. TRSM and POTRF stay on KA through `select_impl`; under
+# `impl = :auto` with vendor calls allowed, single-matrix fronts at least
 # `MPS_POTRF_MIN_WIDTH` wide take the cached MPS Cholesky (`_offset_potrf_plan`).
 # Uniform batches use only KA dense kernels.
 function SparseDirectSolver._allow_generic_dense(op::Symbol, ::MetalBackend, ::Type{T}) where {T}

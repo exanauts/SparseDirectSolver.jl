@@ -5,8 +5,9 @@
 #   vendor library (`mul!`, triangular `ldiv!`/`rdiv!`, `cholesky!`, `lu!`);
 # * `:vendor`  — the `vendor_*` bindings of `src/dense/vendor.jl` and `ext/`;
 # * `:ka`      — the KernelAbstractions fallbacks of `src/dense/fallback/`;
-# * `:auto`    — vendor if `capabilities(backend, T)` says so, else generic if
-#   available, else KA.
+# * `:auto`    — vendor if `capabilities(backend, T)` says so, else KA (T32,
+#   #112): the allocation-free KA fallbacks come before the allocating generic
+#   path, which `:auto` never selects (PLAN §3.9: `:generic` is the reference).
 #
 # Flags accept BLAS characters or symbols (`'N'`/`:N`, `'L'`/`:L`, …). Batched
 # ops work on 3-D arrays whose third dimension is the batch, usually
@@ -88,9 +89,11 @@ The implementations of dense op `op` (`:gemm`, `:syrk`, `:herk`, `:trsm`,
 `:potrf`, `:getrf`, `:laswp`, `:gemm_strided_batched`, `:trsm_strided_batched`,
 `:potrf_batched`)
 available for element type `T` on `backend` according to
-[`capabilities`](@ref), in `:auto` preference order (`:vendor`, `:generic`,
-`:ka`). `:ka` is always present. A vendor binding the backend keeps out of
-`:auto` (oneAPI's LAPACK) is not listed; `impl = :vendor` still selects it.
+[`capabilities`](@ref), in `:auto` preference order: `:vendor`, then `:ka`
+(always present, allocation-free), then `:generic` (the allocating
+LinearAlgebra reference path, which `:auto` does not select). A vendor binding
+the backend keeps out of `:auto` (oneAPI's LAPACK) is not listed;
+`impl = :vendor` still selects it.
 """
 function dense_impls(op::Symbol, backend, ::Type{T}) where {T}
     haskey(DENSE_OPS, op) || throw(InvalidValueError("unknown dense op :$op; expected one of $(keys(DENSE_OPS))"))
@@ -98,8 +101,8 @@ function dense_impls(op::Symbol, backend, ::Type{T}) where {T}
     caps = capabilities(backend, T)
     impls = Symbol[]
     spec.vendor === nothing || getfield(caps, spec.vendor) && _auto_vendor_dense(op, backend, T) && push!(impls, :vendor)
-    spec.generic === nothing || getfield(caps, spec.generic) && _allow_generic_dense(op, backend, T) && push!(impls, :generic)
     push!(impls, :ka)
+    spec.generic === nothing || getfield(caps, spec.generic) && _allow_generic_dense(op, backend, T) && push!(impls, :generic)
     return impls
 end
 
@@ -107,9 +110,11 @@ end
     select_impl(op::Symbol, X::AbstractArray, impl::Symbol) -> Symbol
 
 Resolve `impl` for dense op `op` on the backend and element type of `X`:
-`:auto` becomes the first entry of [`dense_impls`](@ref); an explicit `:generic`
-or `:vendor` the capability table does not list raises `NotSupportedError`;
-anything else raises `InvalidValueError`.
+`:auto` becomes the first entry of [`dense_impls`](@ref) (`:vendor` where the
+capability table lists a binding `:auto` may use, else the allocation-free
+`:ka`, never the allocating `:generic`); an explicit `:generic` or `:vendor`
+the capability table does not list raises `NotSupportedError`; anything else
+raises `InvalidValueError`.
 """
 function select_impl(op::Symbol, X::AbstractArray, impl::Symbol)
     impl in DENSE_IMPLS || throw(InvalidValueError("invalid dense impl :$impl; expected one of $DENSE_IMPLS"))
@@ -119,11 +124,10 @@ function select_impl(op::Symbol, X::AbstractArray, impl::Symbol)
     gfield, vfield = _DENSE_OP_FIELDS[op]
     caps = capabilities(KernelAbstractions.get_backend(X), eltype(X))
     vendor = vfield !== :none && getfield(caps, vfield)::Bool
+    impl === :auto &&
+        return vendor && _auto_vendor_dense(op, KernelAbstractions.get_backend(X), eltype(X)) ? :vendor : :ka
     generic = gfield !== :none && getfield(caps, gfield)::Bool &&
               _allow_generic_dense(op, KernelAbstractions.get_backend(X), eltype(X))
-    impl === :auto &&
-        return vendor && _auto_vendor_dense(op, KernelAbstractions.get_backend(X), eltype(X)) ? :vendor :
-               generic ? :generic : :ka
     (impl === :vendor ? vendor : generic) ||
         throw(NotSupportedError("impl = :$impl is not available for $op with $(eltype(X)) on $(KernelAbstractions.get_backend(X))"))
     return impl

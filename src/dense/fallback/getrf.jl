@@ -120,7 +120,7 @@ end
 end
 
 """
-    ka_laswp!(A, ipiv; npiv = size(ipiv, 1), reverse = false, workgroup = 128) -> A
+    ka_laswp!(A, ipiv; npiv = size(ipiv, 1), reverse = false, workgroup = Val(128)) -> A
 
 KernelAbstractions row interchanges: for `i = 1:npiv` (in reverse order if
 `reverse`), swap rows `i` and `ipiv[i]` of `A`, as LAPACK `laswp` with
@@ -129,14 +129,18 @@ computes `P A`; `reverse = true` applies `Pᵀ`. One work item per column; `A` m
 be a 3-D strided batch with `ipiv` a matrix (one column per member).
 """
 function ka_laswp!(A::AbstractArray, ipiv::AbstractVecOrMat{<:Integer}; npiv::Integer = size(ipiv, 1),
-                   reverse::Bool = false, workgroup::Integer = KA_WORKGROUP)
+                   reverse::Bool = false, workgroup::Val{WG} = Val(KA_WORKGROUP)) where {WG}
     nb = _nbatch(A)
     0 <= npiv <= size(ipiv, 1) || throw(DimensionMismatch("npiv = $npiv outside 0:$(size(ipiv, 1)) (rows of ipiv)"))
     npiv <= size(A, 1) || throw(DimensionMismatch("ipiv has $npiv entries but A has $(size(A, 1)) rows"))
     size(ipiv, 2) >= nb || throw(DimensionMismatch("ipiv has $(size(ipiv, 2)) columns < batch count $nb"))
     (size(A, 2) == 0 || nb == 0 || npiv == 0) && return A
     backend = KernelAbstractions.get_backend(A)
-    kernel! = _ka_laswp_kernel!(backend, (min(workgroup, size(A, 2)), 1))
-    kernel!(A, ipiv, Val(reverse), npiv; ndrange = (size(A, 2), nb))
+    # a static workgroup size (a run-time size would build a new kernel type per call); the
+    # work items beyond the last column of a partial workgroup are masked by the launch
+    kernel! = _ka_laswp_kernel!(backend, (WG, 1))
+    _static_bool(reverse) do rev   # static launch configuration, see `_static_bool`
+        kernel!(A, ipiv, rev, npiv; ndrange = (size(A, 2), nb))
+    end
     return A
 end

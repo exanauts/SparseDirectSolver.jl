@@ -198,9 +198,10 @@ end
     S, Sd, Nd, ws = solve_setup(CPU(), A; opts = SOLVE_OPTS)
     b = rand(T, size(A, 1), 5)
     x = similar(b)
-    for deterministic in (false, true)
-        SDS.sweep_solve!(x, ws, Sd, Nd, b; deterministic)
-        @test solve_allocated(x, ws, Sd, Nd, b; deterministic) <= solve_alloc_budget(Sd, ws)
+    # `impl = :ka`: the allocation-free KA dense fallbacks on the regime-C path (T32, #53)
+    for deterministic in (false, true), impl in (:auto, :ka)
+        SDS.sweep_solve!(x, ws, Sd, Nd, b; deterministic, impl)
+        @test solve_allocated(x, ws, Sd, Nd, b; deterministic, impl) <= solve_alloc_budget(Sd, ws; impl)
         @test relres(A, x, b) <= tol(T)
     end
 end

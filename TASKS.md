@@ -3472,7 +3472,7 @@ their numbers and order.
   gemm/trsm yes, sytrf and per-member batched potrf/getrf no; record Metal's 31-buffer argument limit next to
   the 32 KiB local-memory cap in PLAN §2.7.
 
-### T32 — Allocation-free KA dense fallbacks, `:auto` prefers `:ka` (issues #146, #112, #53)   `[ ]`
+### T32 — Allocation-free KA dense fallbacks, `:auto` prefers `:ka` (issues #146, #112, #53)   `[!]`
 
 Part (3) of the original T31, split off by owner decision (PR #136). The
 owner note of #53: the `impl = :ka` dense fallbacks (`ka_potrf!`, `ka_trsm!`,
@@ -3493,6 +3493,101 @@ choice). `:generic` stays the allocating reference path (PLAN §3.9).
 
 Tests: the `:ka` allocation budget and the `select_impl` order on the KA CPU
 backend; on CUDA, AMDGPU, oneAPI and Metal through CI. Closes #112 and #53.
+
+### Report
+- Status: [!] — allocation-free `:ka` fallbacks and the `:auto` order done and tested on the KA CPU backend
+  and CUDA; the Metal/oneAPI measurement the task asks for could not be run (no hardware here), see Deviations.
+- What was built:
+  * Static launch configurations (`src/dense/fallback/common.jl`: `_static_bool`, `_static_trans`,
+    `_static_tile`). Every run-time kernel flag (`'N'/'T'/'C'`, uplo, unit diagonal, side, conjugation,
+    `reverse`, the default GEMM tile) is turned into a compile-time `Val` by one branch per value, so each
+    branch launches with concrete argument types: no dynamic dispatch, hence no boxed arguments, `ndrange`
+    named tuples or `Val`s on the heap (the measured cause, `Profile.Allocs`: the `SubArray` panel views,
+    `α` and the `ndrange` tuple boxed at every launch behind `Val(tA)`/`Val(ul == 'L')`/the `Union` tile).
+    `gemm.jl`: `_ka_gemm_run!` (one static launch), `_ka_gemm_launch!` (9 trans pairs × 2 tiles) and a
+    separate `_ka_syrk_launch!` (uplo × conjugate × tile) so the syrk/herk-only flag combinations are not
+    compiled for gemm; `trsm.jl`: `_ka_trsm_run!` plus `_ka_trsm_launch!` over side × trans × lower × unit
+    (24 branches, `swap`/`conj` derived statically); `potrf.jl`, `getrf.jl` (`ka_laswp!`) likewise.
+    `ka_laswp!` used a run-time workgroup size `min(workgroup, ncols)`, which builds a new kernel type per
+    call: now a static `Val(128)` workgroup (`workgroup::Val` keyword, the launch masks the extra items).
+    `ka_gemm!`/`ka_syrk!`/`ka_gemm_strided_batched!` take `tile::Union{Nothing, Val} = nothing` (default
+    tile chosen in a static branch). Public names and the `impl` keyword API are unchanged.
+  * No workspace was needed: the numeric phase already resolves `impl` once per phase (`_front_impls`,
+    `_solve_impls`, the LDLᵀ `gimpl`) and passes the status vector `N.info`; the only per-call buffer of the
+    dense layer is `_device_info` in the synchronous public `potrf!`/`getrf!`, which return a host `info` and
+    are not used by the numeric phase.
+  * `:auto` order (#112, `src/dense/interface.jl`): `select_impl(op, X, :auto)` is `:vendor` when the
+    capability table has an `:auto`-eligible binding (`_auto_vendor_dense`), else `:ka`; it never selects
+    `:generic`. `dense_impls` lists `[:vendor?, :ka, :generic?]` (`:auto` = first entry still holds).
+    Explicit `impl = :generic` is unchanged (the reference path of PLAN §3.9, `_allow_generic_dense`).
+    Effect per backend: CUDA, ROCm and the CPU backend have vendor bindings for every op with a generic path,
+    so nothing changes there; oneAPI already disabled `:generic`, unchanged; Metal: panel GEMM/SYRK under
+    `:auto` move from Metal.jl's `mul!` (MPS, allocating) to the KA kernels; explicit `:generic` still reaches
+    MPS. Metal extension comment, `docs/src/lib/metal.md`, `docs/src/man/backends.md`, `docs/src/index.md`,
+    README updated (the README no longer lists T32 as missing).
+- Tests (H200 node `kkt`, Julia 1.13.3, all four element types; only the touched files, by owner rule):
+  * New/changed: `test_dense.jl` — "select_impl order: :ka before :generic" (a host-only fake backend with
+    a fixed capability table: generic probes pass, no vendor / vendor gemm only; checks `dense_impls`, `:auto`
+    = `:ka`, explicit `:generic` still selectable, `_allow_generic_dense` rejection), ":ka dense fallbacks
+    allocation-free (CPU, T)" (8 rounds of 16 launches of every `:ka` op, run-time flags, panel views, public
+    entry points with `impl = :ka`, batched ops, against `ka_cpu_alloc_budget`), the capability audit checks
+    the order `[:vendor, :ka, :generic]` instead of `last(impls) === :ka`, and `impl = :auto` checks every op
+    is never `:generic`. `test_numeric_cholesky_c.jl` "dense implementations": the `factorize!` allocation
+    budget for every non-generic impl (so `:ka` too); `test_solve.jl` "no allocations": `impl ∈ (:auto, :ka)`;
+    `test_numeric_ldlt.jl` "determinism and refactorization": factorize and solve budgets for `:auto` and
+    `:ka`. `test/utils.jl`: `ka_dense_localmem(T)` and an `impl` keyword on `numeric_alloc_budget`,
+    `ldlt_alloc_budget`, `solve_alloc_budget`, `numeric_c_allocated` (adds the KA tiles' `@localmem` only under
+    coverage; without coverage every budget is still 1024 B).
+  * CPU: `SDS_TEST_GPU=0 SDS_TEST_ONLY="test_dense,test_numeric_cholesky_c,test_numeric_ldlt,test_solve,test_helpers"`:
+    22,242 pass / 0 fail / 0 broken (`test_dense` 18,959, `test_numeric_cholesky_c` 512, `test_numeric_ldlt`
+    1,876, `test_solve` 524, `test_helpers` 371).
+  * CUDA (H200, CUDA.jl added to the test environment temporarily, `SDS_TEST_CPU=0`, same files):
+    28,611 pass / 0 fail / 0 broken.
+  * AMDGPU, oneAPI (Aurora): CI on the PR. Metal: no CI leg, not run.
+- Measurements (allocation, KA CPU backend, warmed `@allocated`, before → after):
+  * per call: `ka_gemm!`/`ka_syrk!`/`ka_gemm_strided_batched!` 64 → 0 B; `ka_trsm!`/`ka_trsm_strided_batched!`
+    48 → 0 B; batched `ka_potrf!` 32 → 0 B; `ka_laswp!` 112 → 0 B; `ka_potrf!`, `ka_getrf!` 0 → 0 B on plain
+    matrices (but `ka_potrf!` allocated 112 B per call on the numeric phase's panel views).
+  * `factorize!` with `impl = :ka` (regime C only, `factorization_alg = "algo2"`, no subtrees):
+    `laplacian2d(25,25)` (320 fronts) 235,408 → 512 B (`:auto` 512 B, `:generic` 143,424 B);
+    `random_spd(300,0.02)` 13,984 → 512 B (Float64), 16,080 → 512 B (ComplexF32).
+  * `sweep_solve!` with `impl = :ka` (`laplacian2d(40,40)`, test_solve's options, 5 rhs): 4,672 → 0 B
+    (`:generic` 6,416 B); LDLᵀ `factorize!` `random_symindef(300, 0.02)` regime C: 18,512 → 64 B (Float64),
+    15,696 → 64 B (ComplexF32); `:generic` 21,152 B.
+  * CUDA (H200, Float64, `impl` forced, warmed median of 15): host bytes per call are CUDA.jl's own launch
+    cost and unchanged by this task (`ka_gemm!` 864 B before and after; cuBLAS 144 B, `mul!` 704 B); no
+    device allocation for `:ka` or `:auto`, `:generic` allocates on the device (86.5 KB per `factorize!` of
+    `laplacian2d(100,100)`). Times, all fronts regime C: `laplacian2d(100,100)` (3,607 fronts) factorize
+    `:auto` (cuSOLVER/cuBLAS) 119.3 ms, `:ka` 73.1 ms, `:generic` 266.8 ms; solve 110.5 / 73.3 / 169.6 ms.
+    `laplacian3d(20,20,20)` (1,407 fronts) factorize 52.0 / 80.4 / 107.8 ms, solve 42.7 / 33.0 / 64.1 ms.
+    Float32 alike. Dense ops alone (`:vendor` / `:ka` / `:generic`, ms): gemm n = 256 0.018 / 0.034 / 0.041,
+    n = 1024 0.064 / 0.83 / 0.11; trsm n = 256 0.080 / 0.27 / 0.091, n = 1024 0.33 / 13.4 / 0.48; potrf_info
+    n = 256 0.21 / 13.0 / 0.21, n = 1024 0.87 / 913 / 0.73. `:ka` beats both on many small fronts (launch
+    count of the vendor path) and loses badly on wide fronts (the unblocked one-workgroup potrf/trsm), #183.
+- Deviations from PLAN.md / this task:
+  * Metal and oneAPI measurements not run (no hardware on this machine). The `:auto` choice on them follows
+    the task text and PLAN §3.9 (allocation-free before allocating), not a measurement: on Metal, panel
+    GEMM/SYRK under `:auto` now run on the KA kernels instead of MPS through `mul!` — T31 reported MPS GEMM
+    as faster without a recorded number, so Metal regime-C time may regress until measured (CUDA shows the
+    KA GEMM within 2× of cuBLAS up to n = 256, 13× at n = 1024); the MPS potrf route of wide fronts is
+    untouched. On oneAPI nothing changes (`:generic` was already off, LAPACK already `:ka`; level-3 BLAS stays
+    on oneMKL under `:auto`, with its per-call host synchronization, #148): measuring oneMKL BLAS against
+    `:ka` needs the Aurora runner. Both measurements belong to #168 (Metal, Apple hardware) and #148/#183.
+  * "Static launch configurations resolved at analysis": resolved type-stably at the call instead (one
+    branch per flag value, a literal flag at the numeric/solve call sites), which costs nothing per call and
+    needs no new `Numeric` fields or type parameters; no workspace was needed (see above).
+  * Host compile cost: the public `ka_*` entry points now infer every flag branch on first call (gemm 18,
+    syrk 8, trsm 24 small launch wrappers per array type); kernels compile lazily per launched configuration
+    as before. Not measured separately (the CPU `test_dense` parts ran in 43–69 s here; no baseline taken).
+- Open issues / follow-ups: #183 (opened: unblocked `ka_potrf!`/`ka_trsm!` are 100–1000× slower than vendor
+  on wide fronts, now the `:auto` path on oneAPI LAPACK and Metal trsm/gemm). If Metal's MPS GEMM is faster,
+  it should come back as `vendor_gemm!`/`vendor_syrk!` bindings in the Metal extension (`:auto` then takes it
+  through the vendor slot) rather than through `:generic`. #53 item 1 is fixed here; items 2/3 (Julia 1.10,
+  coverage `@localmem`) were already handled by the KA 0.10.3 compat and `ka_cpu_alloc_budget`.
+- Suggested plan changes: PLAN §2.6 item 3 and §3.9: drop "the `:ka` fallbacks still allocate … is T32" and
+  "(the latter still allocates until T32)"; state the `:auto` order as vendor, then `:ka`, `:generic` never
+  under `:auto`. PLAN §2.6 Metal column / extension list: GEMM/SYRK on KA under `:auto` (MPS only through
+  explicit `:generic` or a future vendor binding).
 
 ### T33 — `FusedSolver`: the fused pipeline as an `AbstractDirectSolver` (issue #152)   `[!]`
 

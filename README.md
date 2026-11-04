@@ -37,8 +37,8 @@ oneAPI (tested on an Intel Data Center GPU Max 1550):
   `potrf`/`trsm`/`syrk` through a backend-agnostic dense interface for large
   fronts: cuBLAS and cuSOLVER on CUDA, rocBLAS and rocSOLVER on AMDGPU, oneMKL
   level-3 BLAS on oneAPI (the LAPACK steps on the KernelAbstractions
-  fallbacks), MPS GEMM/SYRK and MPS Cholesky for fronts at least 64 wide on
-  Metal, KernelAbstractions fallbacks otherwise;
+  fallbacks), MPS Cholesky for fronts at least 64 wide on Metal,
+  allocation-free KernelAbstractions fallbacks otherwise;
 * GPU LDLᵀ/LDLᴴ (`"S"`, `"H"`) with in-front Bunch–Kaufman 1×1/2×2 pivoting,
   `pivot_threshold`, static perturbation (`pivot_epsilon`, `pivot_epsilon_alg`)
   with a user-chosen sign per row (`pivot_sign`, which cuDSS cannot do), and
@@ -97,9 +97,7 @@ Not there yet: the fused pipeline under the `execute!` of `DirectSolver`
 (`solve_alg = "algo1"`, tasks T24–T26, after which it is the Cholesky and LDLᵀ
 path of every `DirectSolver`; `FusedSolver` has its own `execute!` today), the
 sm_89 performance work of T34, non-uniform batches, ND partition-tree export, mixed
-precision, hybrid host memory, delayed pivots, allocation-free
-KernelAbstractions dense fallbacks on oneAPI and Metal (T32), and `ComplexF32`
-on Metal. Unsupported structures, phases and parameters raise
+precision, hybrid host memory, delayed pivots, and `ComplexF32` on Metal. Unsupported structures, phases and parameters raise
 `NotSupportedError` rather than falling back silently. The remaining gap to
 cuDSS is performance, not features (see below and
 [`PERFORMANCE.md`](PERFORMANCE.md)); a MadNLP end-to-end run on CUDA and AMD

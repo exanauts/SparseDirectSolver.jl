@@ -315,12 +315,15 @@ end
     @test device_solve(backend, ws, Sd, Nd, b; deterministic = true) ==
           device_solve(backend, ws, Sd, Nd, b; deterministic = true)
     # no allocation in the numeric phase and the solve (CPU backend)
+    # (`impl = :ka`: the allocation-free KA dense fallbacks on the regime-C path, T32 #53)
     if backend isa CPU
-        SDS.factorize!(Nd, Sd, nz; opts)
-        @test (@allocated SDS.factorize!(Nd, Sd, nz; opts)) <= ldlt_alloc_budget(S, Nd)
         x = similar(b)
-        SDS.sweep_solve!(x, ws, Sd, Nd, b)
-        @test (@allocated SDS.sweep_solve!(x, ws, Sd, Nd, b)) <= solve_alloc_budget(S, ws; ldlt = true)
+        for impl in (:auto, :ka)
+            SDS.factorize!(Nd, Sd, nz; opts, impl)
+            @test (@allocated SDS.factorize!(Nd, Sd, nz; opts, impl)) <= ldlt_alloc_budget(S, Nd; impl)
+            SDS.sweep_solve!(x, ws, Sd, Nd, b; impl)
+            @test (@allocated SDS.sweep_solve!(x, ws, Sd, Nd, b; impl)) <= solve_alloc_budget(S, ws; ldlt = true, impl)
+        end
     end
 end
 

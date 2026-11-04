@@ -33,3 +33,13 @@ _nbatch(A::AbstractMatrix) = 1
 _nbatch(A::AbstractArray{<:Any, 3}) = size(A, 3)
 
 _ilog2(n::Int) = (ispow2(n) || throw(InvalidValueError("workgroup size $n is not a power of two")); trailing_zeros(n))
+
+# Static launch configurations (issue #53, T32). A kernel flag known only at run time
+# (`'N'`/`'T'`/`'C'`, a `Bool`, the default tile) becomes a compile-time `Val` through
+# one branch per value, so every branch launches with concrete argument types: no
+# dynamic dispatch, hence no boxed arguments, `ndrange` named tuples or `Val`s on the
+# heap. Call sites with literal flags (the numeric and solve phases) fold to one branch.
+@inline _static_bool(f::F, x::Bool) where {F} = x ? f(Val(true)) : f(Val(false))
+@inline _static_trans(f::F, c::Char) where {F} = c == 'N' ? f(Val('N')) : c == 'T' ? f(Val('T')) : f(Val('C'))
+@inline _static_tile(f::F, ::Nothing, m, n) where {F} = min(m, n) >= 64 ? f(Val(32)) : f(Val(16))
+@inline _static_tile(f::F, tile::Val, m, n) where {F} = f(tile)

@@ -45,9 +45,10 @@
     end
 end
 
-function _ka_gemm_launch!(C, A, B, α, β, tA::Char, tB::Char, uplo::Char, herm::Bool, tile::Val{TILE}) where {TILE}
+# one launch with a static configuration (every flag a `Val`, see `_static_bool`)
+function _ka_gemm_run!(C, A, B, α, β, tA::Val{TA}, tB::Val, uplo::Val, herm::Val, tile::Val{TILE}) where {TA, TILE}
     m, n = size(C, 1), size(C, 2)
-    k = size(A, tA == 'N' ? 2 : 1)
+    k = size(A, TA === 'N' ? 2 : 1)
     nb = _nbatch(C)
     (m == 0 || n == 0 || nb == 0) && return C
     T = eltype(C)
@@ -55,12 +56,32 @@ function _ka_gemm_launch!(C, A, B, α, β, tA::Char, tB::Char, uplo::Char, herm:
     ntiles = ntm * cld(n, TILE)
     backend = KernelAbstractions.get_backend(C)
     kernel! = _ka_gemm_kernel!(backend, (TILE * TILE, 1))
-    kernel!(C, A, B, T(α), T(β), Val(tA), Val(tB), Val(uplo), Val(herm), tile, m, n, k, ntm;
-            ndrange = (TILE * TILE * ntiles, nb))
+    kernel!(C, A, B, T(α), T(β), tA, tB, uplo, herm, tile, m, n, k, ntm; ndrange = (TILE * TILE * ntiles, nb))
     return C
 end
 
-_default_tile(m, n) = min(m, n) >= 64 ? Val(32) : Val(16)
+# `C ← α op(A) op(B) + β C` on the full matrix; `tile = nothing` picks the default tile
+function _ka_gemm_launch!(C, A, B, α, β, tA::Char, tB::Char, tile)
+    return _static_tile(tile, size(C, 1), size(C, 2)) do vt
+        _static_trans(tA) do vA
+            _static_trans(tB) do vB
+                _ka_gemm_run!(C, A, B, α, β, vA, vB, Val('F'), Val(false), vt)
+            end
+        end
+    end
+end
+
+# the `ul` triangle of `C ← α A op(A) + β C`, `op` the transpose or (`conjugate`, herk) the adjoint
+function _ka_syrk_launch!(C, A, α, β, ul::Char, conjugate::Bool, tile)
+    return _static_tile(tile, size(C, 1), size(C, 2)) do vt
+        _static_bool(ul == 'L') do lower
+            _static_bool(conjugate) do herm
+                _ka_gemm_run!(C, A, A, α, β, Val('N'), herm === Val(true) ? Val('C') : Val('T'),
+                              lower === Val(true) ? Val('L') : Val('U'), herm, vt)
+            end
+        end
+    end
+end
 
 """
     ka_gemm!(C, A, B, α, β; transA = 'N', transB = 'N', tile = Val(16) or Val(32)) -> C
@@ -68,13 +89,15 @@ _default_tile(m, n) = min(m, n) >= 64 ? Val(32) : Val(16)
 KernelAbstractions fallback for `C ← α op(A) op(B) + β C` (`op` from `'N'`, `'T'`,
 `'C'`). Tiled, one TILE × TILE tile of `C` per 1-D workgroup of TILE² work
 items; `tile` defaults to `Val(32)` when both dimensions of `C` are at least 64.
-`C` is not read when `β == 0`. Asynchronous: no host synchronization.
+`C` is not read when `β == 0`. Asynchronous: no host synchronization. The
+launch configuration is static (the flags select a compiled `Val` branch), so
+a call allocates nothing on the host.
 """
 function ka_gemm!(C::AbstractMatrix, A::AbstractMatrix, B::AbstractMatrix, α, β;
-                  transA = 'N', transB = 'N', tile = _default_tile(size(C)...))
+                  transA = 'N', transB = 'N', tile::Union{Nothing, Val} = nothing)
     tA, tB = _trans_char(transA), _trans_char(transB)
     _check_gemm_dims(C, A, B, tA, tB)
-    return _ka_gemm_launch!(C, A, B, α, β, tA, tB, 'F', false, tile)
+    return _ka_gemm_launch!(C, A, B, α, β, tA, tB, tile)
 end
 
 """
@@ -82,13 +105,14 @@ end
 
 KernelAbstractions fallback for the `uplo` triangle of `C ← α A Aᵀ + β C`
 (`conjugate = true`: `α A Aᴴ + β C` with real `α`, `β` and a real diagonal, as
-BLAS `herk`). The other triangle is not touched.
+BLAS `herk`). The other triangle is not touched. Allocation-free, as
+[`ka_gemm!`](@ref).
 """
 function ka_syrk!(C::AbstractMatrix, A::AbstractMatrix, α, β; uplo = 'L', conjugate::Bool = false,
-                  tile = _default_tile(size(C)...))
+                  tile::Union{Nothing, Val} = nothing)
     ul = _uplo_char(uplo)
     _check_syrk_dims(C, A)
-    return _ka_gemm_launch!(C, A, A, α, β, 'N', conjugate ? 'C' : 'T', ul, conjugate, tile)
+    return _ka_syrk_launch!(C, A, α, β, ul, conjugate, tile)
 end
 
 """
@@ -99,9 +123,9 @@ Strided batched [`ka_gemm!`](@ref): `A`, `B`, `C` are 3-D arrays (for example
 batch; one launch, the batch index is the second ndrange dimension.
 """
 function ka_gemm_strided_batched!(C::AbstractArray{<:Any, 3}, A::AbstractArray{<:Any, 3}, B::AbstractArray{<:Any, 3},
-                                  α, β; transA = 'N', transB = 'N', tile = _default_tile(size(C, 1), size(C, 2)))
+                                  α, β; transA = 'N', transB = 'N', tile::Union{Nothing, Val} = nothing)
     tA, tB = _trans_char(transA), _trans_char(transB)
     _check_gemm_dims(C, A, B, tA, tB)
     _check_batch(C, A, B)
-    return _ka_gemm_launch!(C, A, B, α, β, tA, tB, 'F', false, tile)
+    return _ka_gemm_launch!(C, A, B, α, β, tA, tB, tile)
 end

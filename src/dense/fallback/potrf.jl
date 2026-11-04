@@ -62,7 +62,8 @@ matrix. `A` is a matrix or a 3-D strided batch; `info` is a device vector of
 `Int32` with one entry per matrix, set to 0 on success or to the first column
 `j` (1-based) whose pivot is not positive, as LAPACK `potrf`; matrix `b` of
 the batch writes `info[offset + b]`. Asynchronous: the caller reads `info` at a
-phase boundary.
+phase boundary. The launch configuration is static, so a call allocates nothing
+on the host.
 """
 function ka_potrf!(uplo, A::AbstractArray, info::AbstractVector{Int32}; workgroup::Val{WG} = Val(KA_WORKGROUP),
                    offset::Integer = 0) where {WG}
@@ -76,7 +77,10 @@ function ka_potrf!(uplo, A::AbstractArray, info::AbstractVector{Int32}; workgrou
     nb == 0 && return info
     backend = KernelAbstractions.get_backend(A)
     kernel! = _ka_potrf_kernel!(backend, (WG, 1))
-    kernel!(A, info, Val(ul == 'L'), workgroup, n, Int(offset); ndrange = (WG, nb))
+    # static launch configuration (`_static_bool`): no dynamic dispatch, no host allocation
+    _static_bool(ul == 'L') do lower
+        kernel!(A, info, lower, workgroup, n, Int(offset); ndrange = (WG, nb))
+    end
     return info
 end
 

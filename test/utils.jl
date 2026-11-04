@@ -329,7 +329,17 @@ and the reference factor `Nr`; compare with [`panel_tol`](@ref).
 panel_error(Nh, Nr) = maximum(abs, Nh.factor - Nr.factor) / maximum(abs, Nr.factor)
 
 """
-    numeric_alloc_budget(S, T) -> Int
+    ka_dense_localmem(T) -> Int
+
+The largest `@localmem` of one launch of the KernelAbstractions dense fallbacks
+(`impl = :ka`, `src/dense/fallback/`) for element type `T`: the two 32×32 tiles
+of the GEMM/SYRK kernel (T32). Only counted under `--code-coverage`, see
+[`ka_cpu_alloc_budget`](@ref).
+"""
+ka_dense_localmem(::Type{T}) where {T} = 2 * 32 * 32 * sizeof(T)
+
+"""
+    numeric_alloc_budget(S, T; impl = :auto) -> Int
 
 [`ka_cpu_alloc_budget`](@ref) for one `factorize!` of the analysis `S` with
 element type `T` and `impl = :auto` on the CPU backend: at most three
@@ -337,13 +347,20 @@ assembly launches per launch group, one `ka_chol_check_info!` and one
 `pack_add!` per front and the statistics launch; `@localmem` of the statistics
 kernel plus, per group, that of the largest fused regime-B kernel (packed
 64×64 triangle, status, pivot) or of the largest regime-A kernel (48 KiB).
+`impl = :ka` (T32) adds the KA dense launches of a regime-C front (diagonal
+clamp, `potrf`, `trsm`, `syrk`/`herk`) with [`ka_dense_localmem`](@ref) each.
 """
-function numeric_alloc_budget(S, ::Type{T}) where {T}
+function numeric_alloc_budget(S, ::Type{T}; impl::Symbol = :auto) where {T}
     ngroups = length(S.schedule.groups)
     launches = 3 * ngroups + 2 * SparseDirectSolver.nsupernodes(S) + 1
     localmem = SparseDirectSolver.STATS_WORKGROUP * sizeof(Int64) +
                ngroups * max(64 * 65 ÷ 2 * sizeof(T) + sizeof(Int32) + sizeof(real(T)),
                              maximum(SparseDirectSolver.SUBTREE_LOCAL_SIZES))
+    if impl === :ka
+        dense = 4 * SparseDirectSolver.nsupernodes(S)
+        launches += dense
+        localmem += dense * ka_dense_localmem(T)
+    end
     return ka_cpu_alloc_budget(launches, localmem)
 end
 
@@ -359,7 +376,7 @@ nregime(S, r) = count(==(r), S.schedule.regime)
 # function per numeric test file (T09 regime C, T10 regime B, T11 regime A)
 numeric_a_allocated(N, S, nz) = @allocated SparseDirectSolver.factorize!(N, S, nz)
 numeric_b_allocated(N, S, nz) = @allocated SparseDirectSolver.factorize!(N, S, nz)
-numeric_c_allocated(N, S, nz) = @allocated SparseDirectSolver.factorize!(N, S, nz)
+numeric_c_allocated(N, S, nz; impl::Symbol = :auto) = @allocated SparseDirectSolver.factorize!(N, S, nz; impl)
 
 """
     pack_lower(C) -> Vector
@@ -423,7 +440,7 @@ function device_solve(backend, ws, Sd, Nd, b::AbstractArray; kwargs...)
 end
 
 """
-    solve_alloc_budget(S, ws; ldlt = false) -> Int
+    solve_alloc_budget(S, ws; ldlt = false, impl = :auto) -> Int
 
 [`ka_cpu_alloc_budget`](@ref) for one `sweep_solve!` with the plan of `ws`
 on the CPU backend: two permutation launches, a forward and a backward launch
@@ -431,16 +448,17 @@ per kernel launch of the plan, and per regime-C-path front up to three dense
 calls or kernels each way plus one pull launch per dense step; `@localmem` of
 the control array (`_SV_CTL` indices) per launch. `ldlt = true` (T15) adds
 the diagonal launch and, per regime-C-path front, the local pivot order kernel
-each way.
+each way. `impl = :ka` (T32) adds [`ka_dense_localmem`](@ref) per launch.
 """
-function solve_alloc_budget(S, ws; ldlt::Bool = false)
+function solve_alloc_budget(S, ws; ldlt::Bool = false, impl::Symbol = :auto)
     plan = ws.plan
     launches = ldlt ? 3 : 2
     per_front = ldlt ? 8 : 6
     for k in eachindex(plan.kind)
         launches += plan.kind[k] == SparseDirectSolver.SOLVE_DENSE ? per_front * (plan.last[k] - plan.first[k] + 1) + 1 : 2
     end
-    return ka_cpu_alloc_budget(launches, launches * SparseDirectSolver._SV_CTL * sizeof(Int64))
+    dense_bytes = impl === :ka ? ka_dense_localmem(eltype(ws.Y)) : 0
+    return ka_cpu_alloc_budget(launches, launches * (SparseDirectSolver._SV_CTL * sizeof(Int64) + dense_bytes))
 end
 
 # --- LDLᵀ/LDLᴴ reference helpers (T14; shared with the 2×2 pivot pair tests of #64) ---
@@ -540,7 +558,7 @@ only on generators without element growth).
 d_error(Nh, Nr) = maximum(abs, Nh.d - Nr.d) / maximum(abs, Nr.d)
 
 """
-    ldlt_alloc_budget(S, N; nb = SparseDirectSolver.LDLT_C_NB, lu = false) -> Int
+    ldlt_alloc_budget(S, N; nb = SparseDirectSolver.LDLT_C_NB, lu = false, impl = :auto) -> Int
 
 [`ka_cpu_alloc_budget`](@ref) for one LDLᵀ/LDLᴴ `factorize!` of the numeric
 storage `N` (its launch plan `N.plan`) on the CPU backend, counting the
@@ -553,9 +571,11 @@ columns, the finish kernel and one contribution-block pack per front; plus the
 instead: every launch group is one fused launch, plus the two Schur assembly
 launches. `@localmem` (heap-allocated only under `--code-coverage`):
 the largest regime-A kernel (48 KiB) per subtree launch and per launch group,
-blocked groups included as before, plus the two reductions (T15).
+blocked groups included as before, plus the two reductions (T15). `impl = :ka`
+(T32) adds [`ka_dense_localmem`](@ref) per launch of a blocked group (its GEMMs).
 """
-function ldlt_alloc_budget(S, N; nb::Integer = SparseDirectSolver.LDLT_C_NB, lu::Bool = false)
+function ldlt_alloc_budget(S, N; nb::Integer = SparseDirectSolver.LDLT_C_NB, lu::Bool = false,
+                           impl::Symbol = :auto)
     plan, sc = N.plan, S.schedule
     members = N.nbatch
     fused = length(plan.sub_first)
@@ -580,6 +600,7 @@ function ldlt_alloc_budget(S, N; nb::Integer = SparseDirectSolver.LDLT_C_NB, lu:
     launches = fused + blocked + 2
     localmem = (fused + nblocked + 2) * maximum(SparseDirectSolver.SUBTREE_LOCAL_SIZES) +
                SparseDirectSolver.STATS_WORKGROUP * SparseDirectSolver.FRONT_STATS_FIELDS * sizeof(Int64)
+    impl === :ka && (localmem += blocked * ka_dense_localmem(eltype(N.factor)))
     return ka_cpu_alloc_budget(launches, localmem)
 end
 

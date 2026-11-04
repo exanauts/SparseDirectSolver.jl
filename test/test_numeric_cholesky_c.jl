@@ -83,6 +83,11 @@ end
         @test relres(A, SDS.ref_solve!(similar(b), S, Nh, b), b) <= tol(T)
         @test SDS.factorize!(Nd, Sd, nz; impl) == 0
         @test SDS.host_numeric(Nd).factor == F1
+        # the allocation-free dense paths (T32, #53): `:ka` like `:auto`; `:generic` is the allocating
+        # reference (PLAN §3.9). The previous call compiled.
+        if backend isa CPU && impl !== :generic
+            @test numeric_c_allocated(Nd, Sd, nz; impl) <= numeric_alloc_budget(S, T; impl)
+        end
     end
 end
 
