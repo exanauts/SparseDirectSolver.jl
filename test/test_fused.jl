@@ -203,7 +203,7 @@ end
         F = FusedSolver(Ad, "SPD", 'L')
         # every parameter outside the five of the analysis
         for (name, value) in (("schur_mode", 1), ("user_schur_indices", [i > n - 3 ? 1 : 0 for i in 1:n]),
-                              ("matching_alg", "algo5"), ("ir_n_steps", 2), ("deterministic_mode", 1),
+                              ("matching_alg", "algo5"), ("ir_n_steps", 2),
                               ("solve_mode", 1), ("pivot_type", 'B'), ("pivot_threshold", 0.1),
                               ("ubatch_size", 2), ("factor_precision", Float32), ("solve_alg", "algo1"),
                               ("info", 0))
@@ -240,7 +240,7 @@ end
         F.inner.options.solve_mode = 1
         @test_throws NotSupportedError solve!(F, x, b)
         F.inner.options.solve_mode = 0
-        for (field, value) in ((:deterministic_mode, 1), (:ir_n_steps, 2), (:schur_mode, 1),
+        for (field, value) in ((:ir_n_steps, 2), (:schur_mode, 1),
                                (:matching_alg, SDS.MATCHING_MAX_DIAG_PRODUCT), (:factor_precision, T == Float64 ? Float32 : Float64))
             G = FusedSolver(Ad, "SPD", 'L')
             setfield!(G.inner.options, field, value)
@@ -296,8 +296,91 @@ end
         else
             @test F.gfact in (nothing, false) && F.gsolve in (nothing, false)
         end
+        # deterministic_mode = 1 (read at the solve): the pull forward sweep, captured as its own graph
+        setparam!(F, "deterministic_mode", 1)
+        solve!(F, xd, bd; asynchronous = false)
+        x1 = to_host(xd)
+        @test relres(A2, x1, b) <= tol(T)
+        solve!(F, xd, bd; asynchronous = false)
+        @test to_host(xd) == x1
+        backend_name(backend) == "CUDA" && SDS.Fused._graph_solve_ok(F) &&
+            @test F.gdet && F.gsolve !== nothing && F.gsolve !== false
         bytes = fused_cycle_allocated(F, xd, bd)
         @test bytes <= fused_cycle_alloc_budget(backend)
+    end
+
+    # T35: the fused factorization is deterministic (the parent-pull extend-add in child_list order, the
+    # in-kernel wide-front tiles applying the panels in order, plain adds), and deterministic_mode = 1 (read
+    # at every solve) makes the forward solve deterministic too (the pull sweep through the update buffers).
+    # On matrices whose plan has extend-add roles (C-group parents with several contribution-block children)
+    # and in-kernel wide-front tiles (every "S" wide front; "SPD" with wides = :merged): factor and D bitwise
+    # equal over 10 refactorizations under both modes, the solution too under deterministic_mode = 1, the
+    # fused factor within growth_tol of the stock factor on the same analysis.
+    @testset "deterministic_mode = $mode, \"$structure\" ($label): $T" for T in eltypes_among((Float32, Float64)),
+                                       mode in (1, 0),
+                                       (structure, label, gen, tuning) in (
+            ("SPD", "laplacian3d 18³, wides = :merged", () -> laplacian3d(T, 18, 18, 18), SDS.Fused.SDSTuning(; wides = :merged)),
+            ("S", "laplacian3d 18³", () -> laplacian3d(T, 18, 18, 18), nothing),
+            ("S", "grid_kkt_matrix 40×40", () -> grid_kkt_matrix(T, 40, 40, 1.0), nothing))
+        Random.seed!(666)
+        A = gen()
+        n = size(A, 1)
+        Ad = fused_matrix(backend, A)
+        F = FusedSolver(Ad, structure, 'L'; tuning)
+        mode == 1 && setparam!(F, "deterministic_mode", 1)
+        @test getparam(F, "deterministic_mode") == mode
+        analyze!(F)
+        roles = Array(F.fp.role)
+        @test count(==(SDS.Fused.ROLE_EA), roles) > 0          # the ordered extend-add is exercised
+        @test count(==(SDS.Fused.ROLE_WTILE), roles) > 0       # and the ordered wide-front tiles
+        factorize!(F)
+        @test getparam(F, "info") == 0
+        b = rand(T, n)
+        bd = to_device(backend, b)
+        xd = similar(bd)
+        solve!(F, xd, bd; asynchronous = false)
+        @test relres(A, to_host(xd), b) <= tol(T)
+        N = F.inner.numeric
+        f1, d1, x1 = to_host(N.factor), to_host(N.d), to_host(xd)
+        inertia = getparam(F, "inertia")
+        same = 0
+        samex = 0
+        for _ in 1:10
+            refactorize!(F)
+            solve!(F, xd, bd; asynchronous = false)
+            same += getparam(F, "info") == 0 && getparam(F, "inertia") == inertia &&
+                    to_host(N.factor) == f1 && to_host(N.d) == d1
+            samex += to_host(xd) == x1
+            @test relres(A, to_host(xd), b) <= tol(T)
+        end
+        @test same == 10                                        # factor and D bitwise, in both modes
+        mode == 1 && @test samex == 10                          # the solution bitwise (deterministic_mode = 1)
+        # the host bytes of a refactorization plus a solve
+        bytes = fused_cycle_allocated(F, xd, bd)
+        @test bytes <= fused_cycle_alloc_budget(backend)
+        # deterministic_mode is read at every solve: the other forward sweep on the same factor
+        setparam!(F, "deterministic_mode", 1 - mode)
+        solve!(F, xd, bd; asynchronous = false)
+        @test norm(to_host(xd) - x1) / norm(x1) <= tol(T)
+        setparam!(F, "deterministic_mode", mode)
+        solve!(F, xd, bd; asynchronous = false)
+        mode == 1 && @test to_host(xd) == x1
+        # the stock factorization on the same analysis (it overwrites the shared factor storage)
+        execute!("refactorization", F.inner, xd, bd; asynchronous = false)
+        @test getparam(F.inner, "info") == 0
+        _, Nr, info_ref, _ = reference_ldlt(SparseMatrixCSC{Float64, Int}(A))
+        @test info_ref == 0
+        fs = to_host(N.factor)
+        @test maximum(abs, f1 - fs) / maximum(abs, fs) <= growth_tol(T, Nr)
+        structure == "S" && @test maximum(abs, d1 - to_host(N.d)) / maximum(abs, to_host(N.d)) <= growth_tol(T, Nr)
+        # memory_estimates: the inner solver's plus the fused plans' buffers (slot 13: the private
+        # contribution blocks, slot 14: the rest), added to the device totals
+        est = getparam(F, "memory_estimates")
+        est0 = getparam(F.inner, "memory_estimates")
+        @test est[13] == length(F.fp.pcb) * sizeof(T) > 0
+        @test est[14] > 0
+        @test est[1] == est0[1] + est[13] + est[14] && est[2] == est0[2] + est[13] + est[14]
+        @test est[5] == est0[5] + est[13] + est[14]
     end
 
     @testset "refactorization and solve allocate within the launch allowance: $T" for T in eltypes_among((Float32, Float64))

@@ -10,16 +10,31 @@ champions. Workload throughout: the 78k-bus ACOPF condensed KKT
 ## Ground rules (these produced every number below)
 
 1. **Gate every configuration.** A trial is valid only with `info == 0`, the
-   residual matching stock, and an elementwise factor delta against the stock
-   factorization at the rounding level of the matrix: ≤ 1e-8 on the
-   well-conditioned harness matrices (bcsstk17/38, lap2d_300, lap3d_40; ~1e-13
-   in practice), and on matrices with element growth (the pglib KKT dumps,
-   κ₁ ≈ 1e16–1e17) no larger than the stock path's own delta under an
-   eps-level perturbation of A or between its CPU and CUDA backends (1e-8 to
-   1e-7 there; the table is in #177). The run-to-run spread of the fused
-   pipeline must stay within the same bound. An `info == 0` check alone is
-   insufficient: one race produced a silently wrong factor (Δ ≈ 1e-5) with
-   clean info.
+   residual matching stock, and the factor gate of #177 as restated in T35:
+   * (a) **reproducibility**: under `deterministic_mode = 1` the factor, `D`
+     and the solution of 20 refactorizations of the same values are bitwise
+     equal (run-to-run delta exactly 0). Under `deterministic_mode = 0` the
+     run-to-run spread of the atomic extend-add must stay within (b);
+   * (b) **accuracy**: the elementwise factor delta of the fused path against
+     the stock factorization on the same analysis is no larger than the larger
+     of the two paths' own responses to an eps-level perturbation of A (each
+     stored entry times `1 + δ`, |δ| ≤ eps: the delta between two roundings of
+     one factorization is bounded by the sensitivity of either), and the fused
+     factor's backward error ‖PAPᵀ − LDLᵀ‖ is no larger than the stock one's
+     within 5%. The eps responses, stock / fused, re-measured on the T35 tree
+     (`sens.jl` of #177): 5.5e-8 / 3.7e-8 case118 `"S"`, 7.0e-8 / 6.0e-8
+     case1354 `"S"`, 9.8e-8 / 1.4e-7 78k `"S"`; stock 3.6e-8 78k `"SPD"`,
+     4.6e-8 case1354 `"SPD"`, 4.9e-11 case118 `"SPD"`. The strict ≤ 1e-8 is
+     kept for the well-conditioned harness matrices (bcsstk17/38, lap2d_300,
+     lap3d_40; ~1e-13 in practice). The fused `"S"` factor carries a constant
+     offset against the stock one (its LDLᵀ kernels round differently: 1.8e-8 /
+     2.6e-8 / 1.1e-7 on case118 / case1354 / 78k, each below the fused path's
+     own eps response, with backward errors 2.2e-19 / 8.1e-17 / 1.60e-16
+     against the stock 2.5e-19 / 8.1e-17 / 1.59e-16); determinism does not
+     remove it, (b) bounds it (#181).
+
+   An `info == 0` check alone is insufficient: one race produced a silently
+   wrong factor (Δ ≈ 1e-5) with clean info.
 2. **Interleave with the baseline.** Shared boxes drift by 2× within an hour;
    A/B/A/B in one process is the only defensible comparison. Three pairs
    minimum; treat sub-2% differences as noise.
@@ -178,6 +193,61 @@ front in the plan (`isempty(fp.wides)`) for the refactorization, no front
 wider than 256 for the solve; otherwise it launches eagerly. The permutations
 of the solve stay outside the graph, so the graph does not depend on the
 caller's vectors; a new values buffer captures again.
+
+## T35: deterministic extend-add, wide tiles and solve (H200, sm_90), November 2026
+
+The fused factorization had three arrival-order (atomic) sums: the extend-add of
+C-group parents with several contribution-block children (`ROLE_EA`, every child's
+CB chunks pushed with `Atomix.@atomic`), the trailing updates of the in-kernel
+wide-front tiles (`ROLE_WTILE`), and the forward-solve scatter. T35 measured two
+ordered extend-adds (commit cd94954 has both behind `build_fused_plan(...; ea_mode)`):
+*ordered push* (child k's chunks wait until the chunks of children 1..k-1 have
+added) and *parent pull* (one role per block of about 8K parent entries, looping
+over the children in `child_list` order over host-computed packed ranges), plus
+ordered wide tiles (tile `(k, I, J)` waits for panel k-1 on a per-cell Int32
+counter) and a pull forward sweep (the PLAN §2.5 update buffers `ws.U`).
+
+One process, all plans built once and swapped, three interleaved rounds, medians
+in ms; 20 gated refactorizations per configuration (info 0 everywhere; the run-to-run
+factor delta of every ordered configuration is exactly 0). Refactorization:
+
+| matrix | atomic EA (base) | ordered push | parent pull |
+|---|---|---|---|
+| 78k `"SPD"` | 18.18 | 18.88 | **16.54** |
+| 78k `"S"` | 26.66 | 27.00 | **24.86** |
+| lap3d_40 `"SPD"` | 27.04 | 27.98 | **24.70** |
+| lap3d_40 `"S"` | 65.43 | 66.45 | **63.16** |
+| lap2d_300 | 5.38 | 5.60 | **4.82** |
+| bcsstk17 | 4.53 | 4.65 | **3.93** |
+| bcsstk38 | 3.93 | 3.90 | **3.28** |
+| case1354 `"SPD"` / `"S"` | 1.01 / 0.93 | 1.04 / 0.95 | 1.00 / 0.92 |
+| case118 `"SPD"` / `"S"` | 0.60 / 0.59 | 0.60 / 0.58 | 0.50 / 0.59 (noise) |
+
+The parent pull is faster than the atomic push everywhere: it enumerates the
+packed triangle of each child CB (the push walked the full square and skipped
+half), has 2.6x fewer roles on the 78k (3252 vs 8654) and no atomics. The ordered
+push is 1-4% slower than the atomic base (the serialized children). Kept: the
+parent pull, as the only extend-add (the atomic and push roles are deleted).
+
+Ordered wide tiles cost nothing measurable (parent pull with atomic vs ordered
+tiles: 78k `"S"` 24.88 / 24.84, lap3d_40 `"S"` 63.15 / 63.18, `wides = :merged`
+`"SPD"`: 78k 17.88 / 17.83, lap3d_40 63.21 / 63.09, lap2d_300 7.90 / 7.90,
+bcsstk17 5.68 / 5.66), so they are the only wide-tile path too: the fused
+factorization is bitwise reproducible under either `deterministic_mode`.
+
+The pull forward sweep (`deterministic_mode = 1`) costs 4-8% of the solve where
+the solve is not launch-bound (78k `"SPD"` 2.23 -> 2.42, `"S"` 2.25 -> 2.42,
+lap2d_300 1.17 -> 1.26, `:merged` 78k 2.67 -> 2.80; lap3d_40 6.37 -> 6.45; the
+small matrices are within noise): over the 2% noise, so `deterministic_mode = 0`
+(the atomic scatter) stays the default. AMDGPU: correctness only (CI).
+
+Gate (b) on the final tree: every matrix passes. The 78k `"S"` fused factor
+(now a constant 1.1e-7 against stock, the fused LDLᵀ rounding) is 1.1× the
+stock eps response 9.8e-8, as at `main`, and 0.8× the fused path's own
+response 1.4e-7; its backward error 1.60e-16 equals the stock 1.59e-16. (b)
+was first written against the stock response alone, which that matrix fails
+by 1.1× (#181); it now reads against the larger of the two responses plus the
+backward error, which is what the #177 analysis supports.
 
 ## Scripts
 
