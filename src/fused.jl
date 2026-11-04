@@ -968,6 +968,8 @@ function algo2_sweeps!(s, inv11, inv_ptr, fz, det::Bool = false)
     fwd1!(a, b_) = det ?
         fwd1_kernel!(backend, WG)(fargs(a, b_ - a + 1)..., Val(false), Val(WG), Val(true); ndrange = WG * (b_ - a + 1)) :
         fwd1_kernel!(backend, WG)(fargs(a, b_ - a + 1)..., Val(false), Val(WG), Val(false); ndrange = WG * (b_ - a + 1))
+    # SOLVE_SUBTREES entries are run by run_fused!/run_fused_bwd!, so the entries launched here never pass
+    # SUB = true to fwd1_kernel!/bwd1_kernel!.
     fwd_entry(k) = begin
         a, b_ = plan.first[k], plan.last[k]
         if plan.kind[k] == SDS.SOLVE_SUBTREES
@@ -991,8 +993,7 @@ function algo2_sweeps!(s, inv11, inv_ptr, fz, det::Bool = false)
             any(widths[nodes[q]] <= MW for q in a:b_) &&
                 bwd1_kernel!(backend, WG)(args(a, b_ - a + 1)..., Val(false), Val(WG); ndrange = WG * (b_ - a + 1))
         else
-            bwd1_kernel!(backend, WG)(args(a, b_ - a + 1)..., Val(plan.kind[k] == SDS.SOLVE_SUBTREES), Val(WG);
-                                      ndrange = WG * (b_ - a + 1))
+            bwd1_kernel!(backend, WG)(args(a, b_ - a + 1)..., Val(false), Val(WG); ndrange = WG * (b_ - a + 1))
         end
     end
     k = 1

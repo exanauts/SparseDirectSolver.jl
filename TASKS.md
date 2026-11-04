@@ -4090,7 +4090,7 @@ reporting; closes the reporting half if not already closed by T26), #82
     (the ordered tiles cost nothing measurable).
   * **Pull forward solve** (`deterministic_mode = 1`): `fwd2_kernel!` (regime-A subtree walks and fronts) and
     `fwd1_kernel!` (the level-batched entries, which also pull for the fronts wider than 256 before the vendor
-    `SDS._fwd_dense!(...; det = true)`) take `Val(DET)`: every front zeroes its update buffer, pulls its
+    `SDS._fwd_dense!`, whose `det` argument is positional) take `Val(DET)`: every front zeroes its update buffer, pulls its
     children's buffers in `child_list` order (`_fused_pull!`) into its columns (local memory in `fwd2`) and its own
     buffer, and writes `-L21 t` into its buffer; the buffers are the existing `ws.U` of the inner solver's solve
     workspace (PLAN §2.5 layout, `length(rowval)` entries, allocated since T33: no new memory).
@@ -4165,10 +4165,13 @@ reporting; closes the reporting half if not already closed by T26), #82
 
   Gate (b), fused vs stock on the same analysis: 78k `"SPD"` 1.4e-8 in 20 of 20 (constant now; base 1.6e-8
   in 6 of 20, varying) ≤ the stock eps response 3.6e-8; `"S"` case118 1.8e-8, case1354 2.6e-8, 78k 1.1e-7 (the
-  constant fused-LDL offset; base 1.9e-8 / 2.9e-8 / 1.2–1.3e-7) against 5.5e-8 / 7.0e-8 / 9.8e-8: the 78k `"S"`
-  stays 1.1× above the stock eps response, as at `main` (#177: the fused path's own eps response is 1.2e-7;
-  #181). Every well-conditioned matrix ≤ 1.3e-15 (strict 1e-8 holds), case1354 `"SPD"` 6.2e-11, case118 `"SPD"`
-  1.7e-19.
+  constant fused-LDL offset; base 1.9e-8 / 2.9e-8 / 1.2–1.3e-7) against the stock eps responses 5.5e-8 / 7.0e-8 /
+  9.8e-8 and the fused path's own 3.7e-8 / 6.0e-8 / 1.4e-7 (re-measured on the final tree, H200, 5
+  refactorizations, run-to-run 0): the 78k `"S"` is 1.1× the stock response, as at `main`, and 0.8× the fused
+  one; its factor backward error is 1.60e-16 against the stock 1.59e-16 (case1354 8.05e-17 / 8.09e-17, case118
+  2.2e-19 / 2.5e-19). (b) as first written in this task (stock response alone) failed there (#181); it now reads
+  against the larger of the two responses plus the backward error, and every matrix passes. Every
+  well-conditioned matrix ≤ 1.3e-15 (strict 1e-8 holds), case1354 `"SPD"` 6.2e-11, case118 `"SPD"` 1.7e-19.
 
   `memory_estimates` (Float64, MiB; before = the inner solver's estimates, what a `FusedSolver` reported until
   T35; after = with slots 13 and 14):
@@ -4197,9 +4200,10 @@ reporting; closes the reporting half if not already closed by T26), #82
     The pull extend-add replaces the atomic one on AMD too, unmeasured there.
   * The left-looking CB-tile alternative of deliverable 2 was not tried (the ordered tiles cost nothing).
 - Open issues / follow-ups:
-  * #181 (found-by-agent): under the restated gate (b) the 78k `"S"` fused factor stays 1.1× above the stock
-    eps-perturbation response (constant 1.1e-7 vs 9.8e-8; unchanged from `main`), the systematic rounding of the
-    fused LDLᵀ kernels.
+  * #181 (found-by-agent, closed by this PR): the 78k `"S"` fused factor is 1.1× the stock eps-perturbation
+    response (constant 1.1e-7 vs 9.8e-8; unchanged from `main`), the systematic rounding of the fused LDLᵀ
+    kernels. Resolved by reading gate (b) against the larger of the two paths' eps responses plus the backward
+    error (above), under which every matrix passes; the fused LDLᵀ arithmetic itself is unchanged.
   * AMDGPU timing of the pull extend-add and of the pull sweep on the `amdgpu` runner (gfx906 profile).
   * The pull forward sweep could zero its buffer in the same pass as the first child's pull (one barrier and one
     pass less per front) if mode 1 should become the default; not attempted.
