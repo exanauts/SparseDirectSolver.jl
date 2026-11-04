@@ -390,7 +390,7 @@ SDS._allow_generic_dense(op::Symbol, ::FakeDenseBackend, ::Type{T}) where {T} = 
 end
 
 # T32 (#53): one call of every `:ka` dense fallback, the flags passed as run-time values, through the
-# public entry points and on panel views as in the numeric and solve phases; 16 launches
+# public entry points and on panel views as in the numeric and solve phases; 15 launches
 function ka_dense_round!(C, A, B, S, F, P, info, ipiv, C3, A3, F3, X3, flags)
     T = eltype(C)
     for (tA, tB) in flags
@@ -437,6 +437,6 @@ TEST_CPU && @testset ":ka dense fallbacks allocation-free (CPU, $T)" for T in EL
     ka_dense_round!(args...)                                          # compile
     rounds = 8
     bytes = ka_dense_rounds_allocated(args, rounds)
-    launches = 16 * rounds
+    launches = 15 * rounds
     @test bytes <= ka_cpu_alloc_budget(launches, launches * ka_dense_localmem(T))
 end

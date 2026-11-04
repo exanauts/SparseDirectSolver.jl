@@ -441,10 +441,11 @@ The dense layer is a small interface (`gemm!`, `syrk!/herk!`, `trsm!`, `potrf!`,
    LinearAlgebra. `laswp!` is KA-only (CUDA.jl has no binding).
 3. **KA fallback kernels** (`:ka`: the regime A/B kernels and tiled
    large-front kernels) for everything a backend lacks, so every feature works
-   everywhere. Batched ops have no `:generic` path. The `:ka` fallbacks still
-   allocate per call (launch configuration built from run-time flags, not
-   buffers); making them allocation-free and preferring `:ka` over `:generic`
-   under `:auto` on oneAPI and Metal is T32 (issues #146, #112, #53).
+   everywhere. Batched ops have no `:generic` path. The `:ka` fallbacks are
+   allocation-free per call (T32, #146/#53: every run-time flag selects a
+   compiled `Val` branch, so the launch configuration is static). `:auto`
+   resolves to `:vendor`, else `:ka`; `:generic` is never chosen under `:auto`
+   (#112) and stays the explicit reference path.
 
 Expected coverage, to be verified by the M0 capability audit (which also checks
 strided `reshape(view(...))` acceptance, float atomics, and the reported MPS LU
@@ -466,7 +467,8 @@ rocSOLVER, `ROCSparseMatrixCSR`/`CSC`, T23), `…OneAPIExt` (oneMKL level-3
 BLAS on the vendor path, LAPACK kept on `:ka` because every oneMKL call
 synchronizes and LAPACK allocates a scratchpad, `oneSparseMatrixCSR`/`CSC`,
 T31), `…MetalExt` (`CSR` of `MtlArray`s, `Float32` only, MPS Cholesky for wide
-fronts, T31), `…KrylovExt` (FGMRES-IR), `…MadNLPExt` (`SDSSolver`, PR #126).
+fronts, T31; panel GEMM/SYRK on `:ka` under `:auto` since T32, MPS GEMM only
+through an explicit `:generic` or a future vendor binding), `…KrylovExt` (FGMRES-IR), `…MadNLPExt` (`SDSSolver`, PR #126).
 Core depends on KernelAbstractions 0.10, GPUArrays 12 (and GPUArraysCore),
 Adapt, Atomix, LinearAlgebra, SparseArrays, CliqueTrees, AMD, Metis. The CUDA
 column of the table above was verified by the T03 capability audit (all yes,
@@ -645,8 +647,8 @@ and no host synchronization, so the CUDA and ROCm extensions can capture the
 refactorize+solve sequence in a graph and replay it per IPM iteration (the
 fused pipeline's capture is T34's `graph_max_n`, the stock path's is T26, #82;
 both capture only ranges without vendor dense calls, #174). This holds for the dense implementations `:auto`,
-`:vendor` and `:ka` (the latter still allocates until T32, #146/#53); `:generic`
-(host LinearAlgebra) is the reference path and may allocate. Exceptions by
+`:vendor` and `:ka` (allocation-free since T32, #146/#53); `:generic` (host
+LinearAlgebra) is the reference path and may allocate. Exceptions by
 design: the `ir_tol > 0` early-exit test and every FGMRES iteration read on the
 host; `getparam` of statistics and `info` are the phase-boundary reads.
 
@@ -745,7 +747,8 @@ regime C (§2.4). The ordering chooser scores the supernodal schedule depth
 oneAPI and Metal (T31, PR #136); CI runs the CPU suite on the self-hosted
 `kkt` machine and the GPU suite on the `cuda`, `amdgpu` and `oneapi` runners,
 every leg required; Metal (`Float32` only) is tested by hand on an M4 Max.
-The allocation-free `:ka` fallbacks are T32 (#146). The M3 target (1.5× cuDSS
+The `:ka` fallbacks are allocation-free and precede `:generic` under `:auto`
+(T32, #146; the unblocked `ka_potrf!`/`ka_trsm!` on wide fronts are #183). The M3 target (1.5× cuDSS
 on condensed pglib systems) is not met through the handle API: 2.4×
 factorization / 3.9× refactorization / 3.5× solve for Cholesky, 5.1× / 7.3× /
 4.3× for LDLᵀ (geometric means, RTX 4080, `bench/comparison/comparison.md`);
