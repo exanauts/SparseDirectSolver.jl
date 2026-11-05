@@ -34,6 +34,9 @@ kernels may use the 64 KiB class there (issue #60).
 SparseDirectSolver.max_local_bytes(::ROCBackend) =
     Int(HIP.attribute(AMDGPU.device(), HIP.hipDeviceAttributeMaxSharedMemoryPerBlock))
 
+# resident workgroups make progress while others spin (the fused solve of solve_alg = "algo1", T36)
+SparseDirectSolver.forward_progress(::ROCBackend) = true
+
 # ---------------------------------------------------------------------------
 # vendor dense bindings (see `src/dense/vendor.jl` for the contracts)
 

@@ -38,5 +38,37 @@ KernelAbstractions CPU backend is refused), real `"SPD"` matrices and real
 `"S"` matrices factored without pivoting, one right-hand side, no uniform
 batch, Schur complement, matching, iterative refinement, deterministic mode or
 mixed precision; each raises `NotSupportedError` (the docstring lists them).
-[`DirectSolver`](@ref) remains the general solver; T36–T38 move the same
-kernels under its `execute!`.
+[`DirectSolver`](@ref) remains the general solver; its `solve_alg = "algo1"`
+(below) runs the same solve after the stock factorization, and T37–T38 move
+the rest of the pipeline under its `execute!`.
+
+## Partitioned-inverse solve (`solve_alg = "algo1"`)
+
+With `setparam!(solver, "solve_alg", "algo1")` before the `"analysis"`, a
+[`DirectSolver`](@ref) solves with the fused solve of the pipeline above after
+its own factorization: the analysis sizes the inverse storage of the diagonal
+blocks `L₁₁` of every front of width ≤ 256 and one dependency-counter solve
+segment over the tree (reported in slot 14 of `"memory_estimates"` and added
+to slots 1, 2 and 5); every `"factorization"`/`"refactorization"` ends with
+one launch that inverts the blocks of the new factor (no host
+synchronization, no allocation); `"solve"` turns each front's triangular solve
+into a matrix-vector product inside one kernel per direction, with the fronts
+wider than 256 on the vendor dense sweeps. `deterministic_mode = 1` (read at
+every solve) selects the pull forward sweep, bitwise reproducible. The
+sub-phases `"solve_fwd_perm"` … `"solve_bwd_perm"` run the matching parts of
+the fused solve (bitwise equal to `"solve"` under `deterministic_mode = 1`),
+iterative refinement (`ir_n_steps`, plain or FGMRES) runs its corrections
+through it, and matching (`matching_alg`) wraps it as it wraps the level
+sweeps.
+
+Its scope is that of the kernels: real `"SPD"` (and real `"HPD"`), real `"S"`
+and `"H"` with `pivot_type = 'N'` (the fused sweeps apply no local pivot order
+and no 2×2 pivots), one right-hand side, `solve_mode = 0`, a single matrix
+(no uniform batch), no Schur complement mode, and a backend whose resident
+workgroups make progress while others spin (CUDA, AMDGPU, oneAPI; not the
+KernelAbstractions CPU backend or Metal). Anything else raises
+`NotSupportedError` at the analysis, the factorization (`pivot_type` changed
+to pivoting) or the solve, never a silent fallback to the level sweeps;
+`"algo1"` set after the analysis, or a factorization run with `"default"`
+before an `"algo1"` solve, raises too. `"default"` stays the level sweeps
+(the T36 Report in `TASKS.md` has the measurements behind that choice).

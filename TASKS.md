@@ -4288,7 +4288,7 @@ reporting; closes the reporting half if not already closed by T26), #82
     `deterministic_mode = 1` (read at every solve) selects the pull sweep."
   * §1.3 `deterministic_mode` row: the same holds for `FusedSolver`.
 
-### T36 — `solve_alg = "algo1"`: the partitioned-inverse fused solve on `DirectSolver` (refs #82 solve half)   `[ ]`
+### T36 — `solve_alg = "algo1"`: the partitioned-inverse fused solve on `DirectSolver` (refs #82 solve half)   `[!]`
 
 Re-cut by the owner (2026-11-04) from T24 after T33–T35. Runs on top of the
 chores PR that fixed #144/#159/#174.
@@ -4365,6 +4365,152 @@ baseline (T04) on every harness matrix, CUDA (state the GPU), with the
 residuals; the `"default"` rule and its justification; `memory_estimates`
 with and without `"algo1"` on the 78k and lap3d_40. PLAN §1.3 `solve_alg` row
 and §2.5 wording proposed for the owner. Refs #82 (solve half; not closed).
+
+### Report
+- Status: [!] (done with deviations: on `DirectSolver` the fused solve runs every run of narrow plan entries as a
+  dependency-counter segment, not only the first (lap3d_40 regressed otherwise, 21.5 vs 11.7 ms); `"algo1"` set
+  after the analysis raises `NotSupportedError` instead of being built late; `FusedSolver` now also refuses
+  backends without forward progress (Metal); measured on an **H200, sm_90** only)
+- What was built:
+  * `src/fused.jl`: `FusedSolve` (mutable: the `L₁₁` inverses, offsets and `invert!` launch of `build_inverse`, the
+    solve segments, their device bytes, the CUDA-graph switch and state `graph`/`gsolve`/`gdet`, and `current`:
+    the inverses belong to the current factor), built by `fused_solve_plan(s; workgroup, graph, all_segments,
+    upper_workgroup)`; `fused_sweeps!` (the sweeps with the graph capture/replay that was `FusedSolver`'s) and
+    `fused_solve!` (permutation and scaling of the solve, sweeps, inverse permutation): **one solve driver** for
+    both solvers. `algo2_sweeps!` is split into `algo2_forward!`, `algo2_diagonal!` (D⁻¹ on the first `n`
+    entries, so a workspace sized for more right-hand sides works) and `algo2_backward!`: the same launches in the
+    same order. `build_inverse` raises `NotSupportedError` for a front wider than 256 in a regime-B plan entry (a
+    raised `regime_c_width`; the `@assert` it replaces also fired on legitimate regime-B bins wider than 64 that
+    take the C path) and returns the bytes of all its buffers. `FusedSolver` holds one `fs::FusedSolve`; the old
+    fields `inv11`, `inv_ptr`, `invert!`, `fz`, `gsolve`, `gdet` are forwarded by `getproperty`, so
+    `bench/e2e/fused_probe.jl` and `test_fused.jl` run unchanged. It solves through `fused_solve!`, sets `fs.graph`
+    from its tuning at every solve (the tests change `F.tuning` between solves), keeps its single segment, and
+    refuses a backend without `forward_progress` (the `CPU()` message is unchanged).
+  * `src/solver.jl`: `DirectSolver` field `fsolve` (`nothing` by default, reset by `"reordering"`). **Built at the
+    analysis** (end of `"symbolic_factorization"`, with `solve_alg = "algo1"`): the numeric storage and the solve
+    workspace with its `SolvePlan` exist there already, so the plan is sized once without a factorization. Every
+    `"factorization"`/`"refactorization"` under `"algo1"` ends with the `invert!` launch (asynchronous, no host
+    sync, no allocation); one under `"default"` marks the inverses stale. `"solve"` and the sub-phases
+    `"solve_fwd_perm"`, `"solve_fwd"`, `"solve_diag"`, `"solve_bwd"`, `"solve_bwd_perm"` **run the matching parts**
+    of the fused solve (bitwise equal to `"solve"` under `deterministic_mode = 1`, tested); `"solve_refinement"`
+    and the refinement of `"solve"` run their corrections through it (plain IR and FGMRES); matching's
+    permutation and scaling wrap it (`solve_io`, as for the level sweeps). `deterministic_mode` is read at every
+    solve. `memory_estimates` slot 14 = the fused solve's buffers, added to slots 1, 2, 5. Docstrings of
+    `execute!` and `memory_estimates` updated.
+  * Scope (`_check_algo1_analysis`, called from `_check_analysis_supported`, so `"reordering"` refuses already):
+    `NotSupportedError` for the KA `CPU()` backend and any backend with `forward_progress(backend) == false`
+    (Metal), complex `T`, `"G"`, `"S"`/`"H"` with `pivot_type ≠ 'N'` (Bunch–Kaufman would need the local pivot
+    order and 2×2 D blocks in `fwd2`/`bwd2`: not a small change, not done), `nbatch > 1`, `schur_mode = 1`; at the
+    factorization a `pivot_type` switched away from `'N'`; at the solve `nrhs > 1`, `solve_mode ≠ 0`, an analysis
+    without `"algo1"` and stale inverses. Accepted: `"SPD"`, real `"HPD"`, real `"S"`/`"H"` with `'N'`. Backends:
+    CUDA run here; AMDGPU and oneAPI allowed (`forward_progress = true`; oneAPI because `test_fused` passes on
+    Aurora's Max 1550, pipeline 73977), both checked by CI only; Metal and `CPU()` refused.
+  * `src/dense/capabilities.jl`: `forward_progress(backend)` (default `false`), `true` in the CUDA, AMDGPU and
+    oneAPI extensions.
+  * `src/solve/refinement.jl`: keyword `fused = nothing` on `refine!`/`fgmres_refine!`, field `fused` on
+    `FactorPreconditioner`; `src/solve/sweeps.jl`: the hook declarations (`_fused_solve_plan`, `_fused_invert!`,
+    `_fused_sweeps!`, …). The level-sweep code path is unchanged when `fused === nothing`.
+  * `test/test_solve_algo1.jl` (new): every SPD generator (laplacian2d 30², laplacian3d 10³/18³/34³ — 34³ has two
+    segments, asserted —, random_spd 300, the 5×5 Schur example) and no-pivot `"S"` generator (random_symindef 400,
+    kkt_matrix 300+150 with SPD and with indefinite H, grid_kkt 20×20) on the GPU backends, Float32/Float64:
+    residual ≤ `tol(T)`, within `tol(T)` of the level sweeps on the same factorization, bitwise-equal repeated
+    solves and sub-phases under `deterministic_mode = 1`, `ir_n_steps = 2`, a refactorization with new values,
+    the `memory_estimates` slots; FGMRES refinement, and matching `"algo5"` on `"SPD"` and `"S"`; no device
+    allocation in a refactorization + solve, host bytes ≤ the level-sweep cycle + `fused_cycle_alloc_budget`;
+    every unsupported combination raises `NotSupportedError` (on `CPU()`: the analysis). `test_api.jl`: one
+    comment (its "`"algo1"` after the analysis raises" assertion holds unchanged). `test_fused.jl` unchanged.
+  * Docs: `man/parameters.md` (`solve_alg` row, the NotSupported row), `man/performance.md` (section
+    "Partitioned-inverse solve"), the `FusedSolver` docstring, README "Not there yet".
+- Tests (H200; CUDA added to the test environment locally and restored, not committed):
+  `SDS_TEST_ONLY=test_solve_algo1,test_fused,test_api,test_refinement,test_fgmres,test_options,test_solve,test_madnlp,test_aqua
+  PTR_NUM_JOBS=4 julia --project=. -e 'using Pkg; Pkg.test()'`, CPU + CUDA, all four element types: 7406 pass,
+  1 fail (the segment-count assertion on a 30³ Laplacian, which has one segment in Float32), 0 broken; with the
+  matrix changed to 34³, `SDS_TEST_ONLY=test_solve_algo1` (CPU + CUDA, all four types): 314 pass, 0 fail, 0
+  broken. So 7407 pass, 0 fail, 0 broken over these files (test_fused 747, test_api 3427, test_refinement 983,
+  test_fgmres 276, test_solve 896, test_madnlp 145, test_options 611, test_aqua 8, test_solve_algo1 314). An
+  earlier 6-worker run had one CPU `test_api[ComplexF32]` failure in "MadNLP-like refactorization loop"
+  (363136 B > 2048 B, a level-sweep path); it passed alone (`SDS_TEST_GPU=0 SDS_TEST_ELTYPES=Float32,ComplexF32
+  SDS_TEST_ONLY=test_api`: 1129 pass) and in the final 4-worker run: read as load noise in `@allocated`
+  (worker-wide), noted in case CI shows it again. Full suite, AMDGPU and oneAPI: CI.
+- Measurements (H200 sm_90, one Slurm GPU, `DirectSolver` with default options; both solves on the same
+  analysis and factor, medians of 21 after a warm-up; cuDSS 0.8 `"SPD"` in its own process; relres =
+  ‖b − Ax‖/‖b‖, b = rand; script kept outside the repository):
+
+  | matrix | n | level sweeps ms (relres) | `"algo1"` ms (relres) | `"algo1"` det = 1 | cuDSS ms (relres) | refact default / `"algo1"` ms |
+  |---|---|---|---|---|---|---|
+  | 78k condensed KKT `"SPD"` | 674562 | 10.14 (1.5e-2) | **2.12** (3.2e-2) | 2.18 | 1.40 (1.8e-2) | 71.7 / 72.6 |
+  | 78k `"S"` (`'N'`) | 674562 | 11.80 (1.2e-2) | **2.11** (2.4e-2) | 2.14 | — | 102.5 / 103.3 |
+  | case118 condensed `"SPD"` | 1088 | 0.346 (9.0e-6) | **0.150** (3.0e-5) | 0.164 | 0.120 (1.4e-5) | 0.71 / 0.76 |
+  | case118 `"S"` | 1088 | 0.400 (7.4e-6) | **0.151** (3.0e-5) | 0.166 | — | 1.32 / 1.36 |
+  | case1354 condensed `"SPD"` | 11192 | 0.886 (1.1e-4) | **0.269** (1.8e-4) | 0.302 | 0.193 (1.3e-4) | 2.66 / 2.70 |
+  | case1354 `"S"` | 11192 | 0.993 (9.2e-5) | **0.276** (1.5e-4) | 0.307 | — | 5.43 / 5.45 |
+  | bcsstk17 | 10974 | 1.930 (5.2e-11) | **0.425** (6.0e-11) | 0.402 | 0.366 (3.9e-11) | 16.8 / 17.0 |
+  | bcsstk38 | 8032 | 1.540 (9.4e-11) | **0.327** (3.3e-9) | 0.317 | 0.353 (2.2e-10) | 16.3 / 16.5 |
+  | lap2d_300 | 90000 | 3.208 (1.8e-12) | **1.595** (2.0e-12) | 1.655 | 0.527 (1.8e-12) | 20.8 / 21.0 |
+  | lap3d_40 | 64000 | 11.72 (7.5e-14) | **6.99** (7.8e-14) | 7.11 | 1.251 (8.3e-14) | 212.3 / 212.6 |
+
+  `"algo1"` is 1.7× (lap3d_40) to 5.6× (78k) faster than the level sweeps; against cuDSS it is 1.5× slower on
+  the 78k, 0.93× (faster) on bcsstk38, 3.0× on lap2d_300 and 5.6× on lap3d_40. The inverse launch adds 0.2–1.3%
+  to a refactorization. The condensed KKT residuals are those of ill-conditioned systems (cuDSS is at the same
+  level); there the fused solve's residual is 1.1–3.3× the level sweeps', on bcsstk38 35× (explicit inverses of
+  ill-conditioned `L₁₁` blocks); refinement removes it. Schedule statistics: widest front 24 (case118) to 1600
+  (lap3d_40), share of solve flops in fronts > 256 zero except lap2d_300 (0.025) and lap3d_40 (0.34), 13–32
+  steps. No SPD harness beyond these matrices was run (apache2 is on disk but was not measured).
+  * Segments: the first run used one segment (as `FusedSolver`) and read lap3d_40 21.5 ms against the level
+    sweeps' 11.7: its stock plan has fronts of width ≤ 256 between the six wider ones, and those entries ran on
+    the level-batched `fwd1`/`bwd1` kernels, 32 work items per front. One segment per narrow run (5 on lap3d_40,
+    2 on lap3d_34, 1 on every other harness matrix) gave 11.7 ms at workgroup 128 and 7.0 ms with 256 on the
+    later segments (probe on a shared GPU: 128/128 11.7, 128/256 9.7, 256/256 9.6 and 7.1, 64/256 7.8; lap3d_30
+    2.9 / 2.5 / 2.3; 78k one segment: 2.3 at 128, 3.0 at 256). Kept: the first segment at
+    `default_tuning(backend).solve_workgroup`, the later ones at 256. The other rows of the first run matched the
+    final run within 5%.
+  * `memory_estimates` (Float64, MiB, `DirectSolver` default options; slot 1 / slot 2 without → with `"algo1"`;
+    slot 14 the fused solve's buffers, almost all of it the inverses): 78k `"SPD"` 235.7 → 289.5 / 267.5 →
+    321.3, slot 14 53.8; 78k `"S"` 238.4 → 292.2 / 270.1 → 323.9, 53.8; lap3d_40 182.7 → 191.8 / 271.3 → 280.5,
+    9.1.
+- `"default"`: **kept as the level sweeps.** On this harness and GPU, "`"algo1"` whenever the scope allows" picks
+  the faster solve on every matrix (no schedule statistic is needed once the plan has one segment per narrow run:
+  the fused solve wins even with 34% of the solve flops above 256 and a 1600-wide root), but (1) its residuals
+  are up to 35× (bcsstk38) and 2× (78k) those of the level sweeps, which a cuDSS-parity default
+  (`ir_n_steps = 0`) would expose; (2) the default `"S"` pivots (Bunch–Kaufman), out of its scope; (3) it was
+  measured on sm_90 only (T33 measured the fused solve about 2× slower on sm_89; AMD and Intel unmeasured); (4)
+  it costs memory (+23% device memory on the 78k) and one launch per factorization. A switch of the default
+  belongs with sm_89/AMD numbers and an accuracy criterion (for example `"algo1"` plus one refinement step).
+- Deviations from PLAN.md / this task:
+  * Multi-segment fused solve on `DirectSolver` (above); `FusedSolver` keeps its one segment, so its numbers do
+    not change (the option would probably help it on lap3d_40; not measured).
+  * `"algo1"` set after the analysis, or a factorization run under `"default"` before an `"algo1"` solve, raises
+    `NotSupportedError` (the plans are built by the analysis, the inverses by the factorization) instead of
+    being built late; `"default"` after an `"algo1"` analysis runs the level sweeps (the plans stay allocated).
+  * `FusedSolver` refuses backends without forward progress (Metal) besides `CPU()`; oneAPI stays allowed on the
+    Aurora CI evidence.
+  * Matching is supported (the permutation and scaling kernels wrap it), as the task allows.
+  * The solve table uses `DirectSolver`'s default options, not `FusedSolver`'s tuning, so the `"algo1"` column
+    is not the T34/T35 `FusedSolver` column (78k 2.12 here vs 2.28 there).
+- Open issues / follow-ups:
+  * The capability probe of complex atomic adds (`_probe_atomic`, caught by design) prints a device exception on
+    the first complex analysis on CUDA and the KA CPU backend: log noise only, already at `main`, left unchanged.
+  * Bunch–Kaufman (`pivot_type = 'B'`) under `"algo1"`: the fused sweeps need the local pivot order and 2×2 D
+    blocks; not attempted.
+  * Graph replay of the `"algo1"` solve on `DirectSolver` stays off (T38); `FusedSolve.graph` is the switch for
+    both solvers.
+  * sm_89 and AMD timing of the multi-segment solve; `FusedSolver` with `all_segments = true` on lap3d_40.
+  * The accuracy of the explicit inverses on ill-conditioned blocks (bcsstk38), if `"algo1"` should become the
+    default.
+- Suggested plan changes:
+  * §1.3 `solve_alg` row: "`"default"` level-batched; `"algo1"` the partitioned-inverse fused solve of
+    `src/fused.jl` after the stock factorization (T36): set before the analysis; real `"SPD"` and no-pivot
+    `"S"`/`"H"` (`pivot_type = 'N'`), one right-hand side, `solve_mode = 0`, backends with inter-workgroup forward
+    progress (CUDA, AMDGPU, oneAPI); everything else `NotSupportedError`. Not chosen automatically: faster on the
+    whole H200 harness, less accurate on ill-conditioned blocks, unmeasured elsewhere."
+  * §2.5: replace "On lap3d_40 and apache2 the same approach regresses, so T36 picks the strategy per schedule."
+    with "On `DirectSolver` (T36) every run of plan entries whose fronts are all of width ≤ 256 is one
+    dependency-counter segment (the later ones, near the root, with 256-wide workgroups) and the wider fronts stay
+    on the vendor dense sweeps; on an H200 this beats the level sweeps on every harness matrix (78k 10.1 → 2.1 ms,
+    cuDSS 1.4; lap3d_40 11.7 → 7.0, cuDSS 1.3), with residuals up to 35× larger on ill-conditioned blocks, so
+    `"default"` stays the level sweeps."
+  * §2.7: add "`forward_progress(backend)` (`src/dense/capabilities.jl`) gates the dependency-counter kernels:
+    `true` on CUDA, AMDGPU, oneAPI; `false` on the CPU backend and Metal."
 
 ### T37 — The fused factorization on `DirectSolver`, and #109's placement (refs #82, #109)   `[ ]`
 

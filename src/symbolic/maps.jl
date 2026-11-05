@@ -324,12 +324,16 @@ element type `T` and device indices `INT` (default: the index type of
 | 10 | device maps (`INT`) |
 | 11 | per-front statistics (6 `Int64` per supernode) and their totals (6 `Int64`), status (`ns + 1` `Int32`), pivot order (`n` `Int32`), pivot kinds and sign requests (`n` `Int8` each), `aux` (one `T`) |
 | 12 | largest regime-A local memory in use (per workgroup, [`subtree_local_bytes`](@ref) of its class) |
-| 13–16 | 0 (reserved) |
+| 13–16 | 0 (reserved; `getparam` fills 13 and 14, see below) |
 
 Slots 1–6 follow cuDSS's `CUDSS_DATA_MEMORY_ESTIMATES`. `getparam(solver, "memory_estimates")`
 adds to slots 1, 2 and 5 the device buffers of the matching when there is one (`matching_alg`): the
 scaled values (`nnz · nbatch` of `T`), the entry weights (`nnz`) and the two scale vectors (`n`
-each) of `real(T)`, and for `"G"` the column permutation (`n` of `INT`).
+each) of `real(T)`, and for `"G"` the column permutation (`n` of `INT`); with `solve_alg = "algo1"` at
+the analysis (T36) slot 14, the device buffers of the partitioned-inverse fused solve (the `L₁₁` inverses
+of the fronts of width ≤ 256, their offsets and block lists, the solve segment's counters), also added to
+slots 1, 2 and 5. A `FusedSolver` reports in slot 13 the private contribution blocks of its fused
+factorization and in slot 14 every other buffer of its plans (T35).
 """
 function memory_estimates(S::Symbolic{INT0}, ::Type{T}, ::Type{INT} = INT0) where {INT0, T, INT}
     est = zeros(Int64, 16)

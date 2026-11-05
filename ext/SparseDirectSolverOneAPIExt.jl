@@ -70,6 +70,9 @@ Center GPU Max): the regime-A kernels may use their largest class, 64 KiB.
 SparseDirectSolver.max_local_bytes(::oneAPIBackend) =
     Int(oneL0.compute_properties(oneAPI.device()).maxSharedLocalMemory)
 
+# resident workgroups make progress while others spin (the fused solve of solve_alg = "algo1", T36)
+SparseDirectSolver.forward_progress(::oneAPIBackend) = true
+
 # ---------------------------------------------------------------------------
 # dense implementation policy (see the header)
 
