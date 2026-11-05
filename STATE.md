@@ -89,13 +89,12 @@ T24–T26 are superseded (`[-]`): their kernels exist in `src/fused.jl`
 
 | Issue | Milestone / labels | State and decision |
 | --- | --- | --- |
-| #24, #25, #26 (T24–T26 task issues) | M11, `task` (#24 `on-hold`) | Stale: the tasks are `[-]` since PR #185. Close as superseded by T36–T38 with a comment; they are not referenced by anything open. |
-| #27, #115, #116, #117 (T27–T30) | M12, M13, M10, M1, `task` | Parked. Their "Depends on" lines still chain #26 → #27 → #115 → #116 → #117; rewrite when one is scheduled (the predecessor is then T38 or whatever the owner picks). Milestones agree with PLAN §5. |
-| #28 (External) | M4, `task`, `external` | "Depends on #27" is stale: the task is independent of the chain. Otherwise agrees with PLAN. |
+| #27, #115, #116, #117 (T27–T30) | M12, M13, M10, M1, `task` | Parked; the issue bodies say so and name no predecessor until the owner schedules one. Milestones agree with PLAN §5. |
+| #28 (External) | M4, `task`, `external` | Independent of the task chain (the issue body says so); agrees with PLAN. |
 | #82 KKT level-bound | M11, triaged, performance | Closed by T38 (T36 takes the solve half, T37 the factorization half). Body is the PR #81 profile; still the right criterion (≥ 3× fewer launches). |
 | #109 update-stack placement under out-of-level-order execution | M11, triaged | Closed by T37 (private slots `pcb` are reported since T35; the placement decision for the `DirectSolver` path remains). |
 | #110 regime-C host synchronization | M11, triaged | Verified and closed by T38 (host-synchronization count per refactorization). |
-| #183 unblocked `ka_potrf!`/`ka_trsm!` 100–1000× slower on wide fronts | no milestone, found-by-agent | The `:auto` path on oneAPI (`potrf`/`getrf`) and Metal (`trsm`, `potrf` below 64) since T32. No task owns it; set M2 and decide between a blocked `:ka` kernel and vendor bindings on those backends. |
+| #183 unblocked `ka_potrf!`/`ka_trsm!` 100–1000× slower on wide fronts | M2, found-by-agent | The `:auto` path on oneAPI (`potrf`/`getrf`) and Metal (`trsm`, `potrf` below 64) since T32. No task owns it; decide between a blocked `:ka` kernel and vendor bindings on those backends. |
 | #163 merge the regime-A/B kernel bodies | design-record, performance | Proposal from the housekeeping pass; unscheduled. Candidate for after T38, or fold into the compile-time work (#91). |
 | #167 in-front Bunch–Kaufman for the fused pipeline | design-record, fused, madnlp | Record of the closed prototypes #135/#139. T36 keeps the fused solve to `pivot_type = 'N'` and raises otherwise; unscheduled. |
 | #142 `_tri_decode` integer isqrt not timed on CUDA/AMDGPU | performance, bench | One A/B on the regime-A/B factorization; T36/T37's measurement campaigns can absorb it. |
@@ -105,10 +104,9 @@ T24–T26 are superseded (`[-]`): their kernels exist in `src/fused.jl`
 
 Agreement with `PLAN.md`: every open issue is consistent with the plan text
 after the housekeeping of PR #185 (§1.3 rows for #159, §3.1 for #144, §2.5/§3.9
-for #174, §2.6/§5 for T32 and #183, §5 status for T36–T38). Two small things:
-the PLAN §5 status paragraph is still headed "2026-10-28" although it was
-updated through 2026-11-04, and M1's definition lists `max_lu_nnz` as done
-while the check is not wired (#159).
+for #174, §2.6/§5 for T32 and #183, §5 status for T36–T38; the M1 row names
+the unwired `max_lu_nnz` check, #159). #24–#26 were closed as superseded and
+the dependency lines of #27, #115–#117 and #28 rewritten on 2026-11-04.
 
 ## 5. Standing deviations from `PLAN.md`
 
