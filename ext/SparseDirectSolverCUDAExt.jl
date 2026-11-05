@@ -31,6 +31,9 @@ therefore stop at the 48 KiB class on CUDA (issue #60).
 """
 SparseDirectSolver.max_local_bytes(::CUDABackend) = 49152
 
+# resident workgroups make progress while others spin (the fused solve of solve_alg = "algo1", T36)
+SparseDirectSolver.forward_progress(::CUDABackend) = true
+
 """
     max_threads_per_multiprocessor(::CUDABackend) -> Int
 

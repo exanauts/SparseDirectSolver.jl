@@ -672,6 +672,22 @@ function _launch_bwd!(ws::SolveWorkspace, S::Symbolic, N::Numeric, first::Int, c
     return nothing
 end
 
+# The partitioned-inverse fused solve of `solve_alg = "algo1"` (T36): `src/fused.jl` adds the methods for its
+# `Fused.FusedSolve`. `_fused_solve_plan(solver)` builds it at the analysis, `_fused_invert!(fs)` computes the
+# L₁₁ inverses of the current factor (asynchronous) and `_fused_stale!(fs)` marks them out of date,
+# `_fused_current(fs)` tells which, `_fused_bytes(fs)` is its device memory; `_fused_sweeps!(fs, ws, S, N, det)`
+# replaces the three sweeps of one right-hand side on `ws.Y`, `_fused_forward!`, `_fused_diagonal!` and
+# `_fused_backward!` are its parts (the solve sub-phases).
+function _fused_solve_plan end
+function _fused_invert! end
+function _fused_stale! end
+function _fused_current end
+function _fused_bytes end
+function _fused_sweeps! end
+function _fused_forward! end
+function _fused_diagonal! end
+function _fused_backward! end
+
 # solve kind of the analysis: Cholesky, LDLᵀ/LDLᴴ with Lᴴ (Hermitian or real), LDLᵀ complex symmetric,
 # LU of A and LU of Aᵀ
 const _SV_CHOLESKY = 0
