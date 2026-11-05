@@ -30,9 +30,6 @@ const PORTED_CONFIG_VALUES = Dict{String, Tuple{Any, Any}}(
     "pivot_type" => ('B', "B"),
     "pivot_threshold" => (0.1, 'x'),
     "pivot_epsilon" => (1.0e-8, "tiny"),
-    "max_lu_nnz" => (10, 10.0),
-    "use_cuda_register_memory" => (0, 0.5),
-    "host_nthreads" => (4, "4"),
     "pivot_epsilon_alg" => ("algo2", 2.0),
     "nd_nlevels" => (5, 5.0),
     "ubatch_size" => (4, "4"),
@@ -48,12 +45,18 @@ const PORTED_CONFIG_VALUES = Dict{String, Tuple{Any, Any}}(
     "ir_mode" => ("fgmres", :fgmres),
     "factor_precision" => (Float32, "Float32"),
     "amalgamation" => ((max_width = 16, zero_fraction = 0.1, min_width = 4), 0.25),
-    "schedule" => ("subtree+level", :auto),
+    "schedule" => ("syncfree", :auto),
     "pivot_pairs" => ("none", :none),
     "pivot_pair_tolerance" => (1.0e-4, "small"),
 )
 
 const DEFERRED_CONFIG = ("hybrid_memory_mode", "hybrid_device_memory_limit", "hybrid_execute_mode")
+# stored for cuDSS compatibility, no effect (issue #159): name => (default, other value, value of the wrong type)
+const NOOP_CONFIG = Dict{String, Tuple{Any, Any, Any}}(
+    "max_lu_nnz" => (-1, 10, 10.0),
+    "use_cuda_register_memory" => (1, 0, 0.5),
+    "host_nthreads" => (0, 4, "4"),
+)
 const NOT_PLANNED = ("device_count", "device_indices", "comm_device", "comm_host")
 const USER_DATA = ("user_perm", "user_schur_indices", "user_nd_partition_tree", "user_host_interrupt",
                    "ubatch_mask", "pivot_sign")
@@ -70,7 +73,7 @@ const USER_DATA = ("user_perm", "user_schur_indices", "user_nd_partition_tree", 
     end
     # the round-trip table covers exactly the port/reinterpret configuration names
     config_like = setdiff([CONFIG_PARAMETERS..., EXTRA_PARAMETERS...],
-                          [DEFERRED_CONFIG..., NOT_PLANNED..., "pivot_stats"])
+                          [DEFERRED_CONFIG..., keys(NOOP_CONFIG)..., NOT_PLANNED..., "pivot_stats"])
     @test Set(keys(PORTED_CONFIG_VALUES)) == Set(config_like)
 end
 
@@ -120,7 +123,7 @@ end
                           ("reordering_alg", "algo6"), ("reordering_alg", 6), ("factorization_alg", "algo3"),
                           ("solve_alg", "algo2"), ("matching_alg", "algo7"), ("pivot_epsilon_alg", "algo3"),
                           ("use_superpanels", 2), ("ubatch_index", -2), ("ubatch_size", -1),
-                          ("nd_ubfactor", -2), ("nd_nseps", -2), ("nd_seed", -2), ("schedule", "fast"), ("ir_mode", "gmres"),
+                          ("nd_ubfactor", -2), ("nd_nseps", -2), ("nd_seed", -2), ("schedule", "fast"), ("schedule", "subtree+level"), ("ir_mode", "gmres"),
                           ("amalgamation", (min_width = 64,)), ("amalgamation", (zero_fraction = -0.1,)),
                           ("amalgamation", (foo = 1,)), ("pivot_sign", [2, 0]),
                           ("user_schur_indices", [0, 2]), ("ubatch_mask", [1, -1]))
@@ -185,6 +188,32 @@ end
                           ("user_host_interrupt", true), ("ubatch_mask", [true, 1.5]))
         @test thrown(() -> setparam!(opts, name, wrong)) isa InvalidValueError
     end
+end
+
+@testset "cuDSS no-op parameters warn once and are stored (#159)" begin
+    for (name, (default, value, wrong)) in NOOP_CONFIG
+        opts = Options()
+        @test getparam(opts, name) == default
+        @test_logs setparam!(opts, name, default)  # the default value is silent
+        # one warning for two non-default settings (maxlog = 1 within a logger)
+        @test_logs (:warn, Regex("\"$name\".*cuDSS compatibility.*no effect")) begin
+            setparam!(opts, name, value)
+            setparam!(opts, name, value)
+        end
+        @test getparam(opts, name) == value
+        @test thrown(() -> setparam!(opts, name, wrong)) isa InvalidValueError
+        @test getparam(opts, name) == value
+        @test_logs (:warn, r"cuDSS compatibility") match_mode = :any Options(; Symbol(name) => value)
+    end
+end
+
+@testset "schedule = \"subtree+level\" is rejected (#159)" begin
+    opts = Options()
+    err = thrown(() -> setparam!(opts, "schedule", "subtree+level"))
+    @test err isa InvalidValueError
+    @test occursin("\"auto\"", err.msg) && occursin("\"syncfree\"", err.msg)
+    @test getparam(opts, "schedule") == "auto"
+    @test thrown(() -> Options(schedule = "subtree+level")) isa InvalidValueError
 end
 
 @testset "deferred parameters warn once and are stored" begin
@@ -268,7 +297,7 @@ const ENUM_VALUES = (
     SDS.MatchingAlg => ("default" => 0, "algo1" => 1, "algo2" => 2, "algo3" => 3, "algo4" => 4,
                         "algo5" => 5, "algo6" => 6),
     SDS.PivotEpsilonAlg => ("default" => 0, "algo1" => 1, "algo2" => 2),
-    SDS.ScheduleKind => ("auto" => 0, "subtree+level" => 1, "syncfree" => 2),
+    SDS.ScheduleKind => ("auto" => 0, "syncfree" => 2),
     SDS.IRMode => ("ir" => 0, "fgmres" => 1),
     SDS.PivotPairsMode => ("default" => 0, "none" => 1, "all" => 2),
 )
@@ -311,4 +340,26 @@ end
     @test occursin("not factorized", sprint(showerror, FactorizationError(0, "not factorized")))
     @test FactorizationError([0, 2, 0]).info == [0, 2, 0]
     @test occursin("user_host_interrupt", sprint(showerror, InterruptedError()))
+end
+
+@testset "update! is public but not exported (#144)" begin
+    # CUDA.jl >= 6.5 exports an update! of its own; exporting ours would make both ambiguous
+    @test !Base.isexported(SparseDirectSolver, :update!)
+    @test Base.ispublic(SparseDirectSolver, :update!)     # declared `public` (in names(SparseDirectSolver))
+    @test isdefined(SparseDirectSolver, :update!)
+    # the qualified call works without the explicit import
+    Random.seed!(666)
+    n = 40
+    A = random_spd(Float64, n, 0.1)
+    b = rand(n)
+    solver = DirectSolver(tril(A), "SPD", 'L')
+    analyze!(solver)
+    factorize!(solver)
+    A2 = A + 2 * I
+    @test SparseDirectSolver.update!(solver, tril(A2)) === solver
+    refactorize!(solver)
+    @test getparam(solver, "info") == 0
+    x = zeros(n)
+    solve!(solver, x, b)
+    @test relres(A2, x, b) <= tol(Float64)
 end

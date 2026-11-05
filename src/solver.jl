@@ -299,6 +299,10 @@ pattern must be the one of the analysis (only the sizes are checked, as in
 cuDSS); new values are used by the next `"factorization"` or
 `"refactorization"`. Raises [`InvalidValueError`](@ref) for a different size,
 number of stored entries, index base, orientation or array type.
+
+`update!` is not exported (CUDA.jl ≥ 6.5 exports an `update!` of its own, issue
+#144): call it as `SparseDirectSolver.update!(solver, A)`, or bring it into scope
+with `using SparseDirectSolver: update!`.
 """
 function update!(solver::DirectSolver{T, INT, M}, A::CSR) where {T, INT, M}
     old = solver.A
@@ -712,7 +716,7 @@ function _solve!(solver::DirectSolver{T}, p::Phase, X, B) where {T}
     solver.stage >= STAGE_FACTORIZED || throw(_phase_error(name, "needs a \"factorization\""))
     opts = solver.options
     opts.solve_alg == SOLVE_DEFAULT ||
-        throw(NotSupportedError("solve_alg = \"$(convert(String, opts.solve_alg))\" is not implemented yet (T24–T26)"))
+        throw(NotSupportedError("solve_alg = \"$(convert(String, opts.solve_alg))\" is not implemented yet (T36)"))
     Bd, bt = _rhs_data(B)
     Xd, xt = _rhs_data(X)
     xt == bt || throw(InvalidValueError("X and B must have the same layout (transposed or not)"))

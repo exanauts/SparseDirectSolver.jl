@@ -17,8 +17,8 @@ using oneAPI
 using Metal
 using Krylov
 using MadNLP
-# CUDA.jl >= 6.5 exports an update! too (CuGraph) and MadNLP a solve!; the explicit imports win
-using SparseDirectSolver: update!, solve!
+# MadNLP exports a solve! too; the explicit import wins (update! is not exported, #144)
+using SparseDirectSolver: solve!
 
 CUDA.functional() || error("the documentation examples need a functional CUDA.jl")
 CUDA.versioninfo()

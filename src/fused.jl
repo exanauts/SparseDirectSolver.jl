@@ -27,8 +27,10 @@ sweeps (a multiple of 32 in 32:256); `wide_host_min` puts the wide fronts
 wider than it on the host vendor path in a `:merged` Cholesky plan (the
 per-front wide strategy; `typemax(Int)`, the default, keeps every wide front
 in-kernel; ignored for `"S"`); `graph_max_n` replays the refactorization and
-the solve sweeps from a CUDA graph when `n <= graph_max_n` and no vendor call
-falls in the captured range (`0`, the default, never captures).
+the solve sweeps from a CUDA graph when `n <= graph_max_n`, vendor dense calls
+in the captured range included (the host-wide fronts, the solve fronts wider
+than 256; #174); `0`, the default, never captures (no measured gain, see
+bench/ARCH-TUNING.md).
 """
 Base.@kwdef struct SDSTuning
     wides::Symbol = :auto                     # :auto | :host | :merged (Cholesky; an LDLᵀ
@@ -2594,13 +2596,14 @@ function _fused_launches!(s, nzval, fp, invertf)
     return nothing
 end
 
-# CUDA-graph replay (`SDSTuning.graph_max_n`, the backend's `capture_graph`): only for n up to
-# the tuning's bound, and only where no vendor dense call is in the captured range (cuSOLVER
-# potrf is not capturable on CUDA.jl 6.5, #174): no host-wide front in the factorization, no
-# front wider than MW (the vendor dense sweeps) in the solve
+# CUDA-graph replay (`SDSTuning.graph_max_n`, the backend's `capture_graph`): for n up to the
+# tuning's bound. The captured ranges may contain vendor dense calls (the host-wide fronts'
+# potrf/trsm/syrk in the factorization, the fronts wider than MW in the solve): the CUDA
+# extension binds the cuSOLVER and cuBLAS handles to the capture stream before the capture
+# begins, which keeps cuSOLVER 12.3.5 from invalidating it (#174)
 _graph_size_ok(F::FusedSolver) = size(F, 1) <= F.tuning.graph_max_n
-_graph_fact_ok(F::FusedSolver) = _graph_size_ok(F) && isempty(F.fp.wides)
-_graph_solve_ok(F::FusedSolver) = _graph_size_ok(F) && maximum(F.inner.symbolic.schedule.width) <= MW
+_graph_fact_ok(F::FusedSolver) = _graph_size_ok(F)
+_graph_solve_ok(F::FusedSolver) = _graph_size_ok(F)
 
 # the captured graph of `f` on the solver's backend, `false` when the backend has none or the
 # capture fails (the phase then launches eagerly, as without the tuning)

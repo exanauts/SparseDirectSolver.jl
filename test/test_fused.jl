@@ -289,10 +289,10 @@ end
             k == 1 && @test norm(to_host(xd) - xs) / norm(xs) <= tol(T)
         end
         if backend_name(backend) == "CUDA"
-            # the graphs exist where the plan allows them (no vendor call in the captured range)
+            # the graphs exist (vendor calls in the captured range included, #174)
             @test (F.gfact !== nothing && F.gfact !== false) == SDS.Fused._graph_fact_ok(F)
             @test (F.gsolve !== nothing && F.gsolve !== false) == SDS.Fused._graph_solve_ok(F)
-            @test SDS.Fused._graph_fact_ok(F) || SDS.Fused._graph_solve_ok(F)
+            @test SDS.Fused._graph_fact_ok(F) && SDS.Fused._graph_solve_ok(F)
         else
             @test F.gfact in (nothing, false) && F.gsolve in (nothing, false)
         end
@@ -307,6 +307,50 @@ end
             @test F.gdet && F.gsolve !== nothing && F.gsolve !== false
         bytes = fused_cycle_allocated(F, xd, bd)
         @test bytes <= fused_cycle_alloc_budget(backend)
+    end
+
+    # #174: graph replay with vendor dense calls in the captured ranges. `wides = :host` puts every wide front
+    # of the factorization on the host vendor path (cuSOLVER potrf, cuBLAS trsm/syrk on CUDA), and the 18³
+    # Laplacian has a front wider than MW, which the solve sweeps through vendor dense calls. The capture binds
+    # the vendor handles to the capture stream first; the replayed factor is bitwise equal to the eager one
+    # (the fused factorization is deterministic, T35), the solution too under deterministic_mode = 1.
+    @testset "graph replay with host-wide fronts and wide solve fronts (#174): $T" for T in eltypes_among((Float32, Float64))
+        Random.seed!(666)
+        A = laplacian3d(T, 18, 18, 18)
+        n = size(A, 1)
+        A2 = T(2) * A + T(n) * I
+        eager = SDS.Fused.SDSTuning(; wides = :host)
+        graph = SDS.Fused.SDSTuning(; wides = :host, graph_max_n = typemax(Int))
+        F, Ad, xd, r = fused_solve(backend, A, "SPD"; tuning = eager)
+        @test r <= tol(T)
+        @test !isempty(F.fp.wides)                                                # host-wide fronts
+        @test maximum(F.inner.symbolic.schedule.width) > SDS.Fused.MW             # vendor fronts in the solve
+        setparam!(F, "deterministic_mode", 1)
+        b = rand(T, n)
+        bd = to_device(backend, b)
+        for (k, Ak) in enumerate((A, A2))
+            k == 2 && copyto!(Ad.nzVal, fused_values(A2))
+            F.tuning = eager
+            refactorize!(F)
+            @test getparam(F, "info") == 0
+            factor = to_host(F.inner.numeric.factor)
+            solve!(F, xd, bd; asynchronous = false)
+            x = to_host(xd)
+            @test relres(Ak, x, b) <= tol(T)
+            F.tuning = graph
+            for _ in 1:3                                    # capture (or eager at the first solve), then replays
+                refactorize!(F)
+                @test getparam(F, "info") == 0
+                @test to_host(F.inner.numeric.factor) == factor
+                solve!(F, xd, bd; asynchronous = false)
+                @test to_host(xd) == x
+            end
+        end
+        if backend_name(backend) == "CUDA"
+            @test !(F.gfact in (nothing, false)) && !(F.gsolve in (nothing, false))
+        else
+            @test F.gfact in (nothing, false) && F.gsolve in (nothing, false)
+        end
     end
 
     # T35: the fused factorization is deterministic (the parent-pull extend-add in child_list order, the

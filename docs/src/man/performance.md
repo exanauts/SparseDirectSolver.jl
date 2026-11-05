@@ -38,5 +38,5 @@ KernelAbstractions CPU backend is refused), real `"SPD"` matrices and real
 `"S"` matrices factored without pivoting, one right-hand side, no uniform
 batch, Schur complement, matching, iterative refinement, deterministic mode or
 mixed precision; each raises `NotSupportedError` (the docstring lists them).
-[`DirectSolver`](@ref) remains the general solver; T24–T26 move the same
+[`DirectSolver`](@ref) remains the general solver; T36–T38 move the same
 kernels under its `execute!`.

@@ -50,13 +50,45 @@ system-scope fence `Threads.atomic_fence()` lowers to (#154, T34).
 """
     capture_graph(::CUDABackend, f)
 
-`f()` captured into a CUDA graph (`CUDACore.capture`, on a dedicated stream) and
-instantiated; the returned `CuGraphExec` replays it on the task's stream when called.
-`nothing` when the capture fails (an operation that cannot be captured, e.g. a cuSOLVER
-call on CUDA.jl 6.5 / cuSOLVER 12.3.5, #174).
+`f()` captured into a CUDA graph (`CUDACore.capture`) and instantiated; the returned
+`CuGraphExec` replays it on the task's stream when called, so it stays ordered with the
+caller's other work on that stream. `nothing` when the capture fails (an operation that
+cannot be captured, or an error raised while capturing: nothing has run then, and the
+caller launches `f` eagerly, where a genuine error raises again).
+
+The capture runs on a fresh non-blocking stream to which the task's cuSOLVER dense and
+cuBLAS handles are bound before the capture begins (`CUDACore.stream!(handle, s)`), so that
+a vendor dense call inside `f` finds its handle already on the capture stream. Otherwise
+the first `cuSOLVER.dense_handle()` in the capture calls `cusolverDnSetStream` on the
+stream being captured, which cuSOLVER 12.3.5 (CUDA 13.4) answers by invalidating the
+capture (#174; CUDA.jl 6 captures on a dedicated stream, not on the task's). Afterwards
+both handles are bound back to the task's stream.
+
+A captured vendor `potrf` bakes in the pointer of the task's cuSOLVER workspace
+(`with_workspace` grows that buffer by reallocating it when a larger `bufferSize` comes
+along). The eager factorization that precedes a capture sizes it for the solver's widest
+front, so the graph is consistent for that solver; a wider front factored later in the same
+task by another solver would reallocate the workspace under a still-replayed graph. One
+solver per task (MadNLP's pattern) keeps this theoretical; a capture of the stock path (T38)
+should size the workspace for the widest front of every live solver before capturing.
 """
 function SparseDirectSolver.capture_graph(::CUDABackend, f)
-    graph = CUDACore.capture(f; throw_error = false)
+    s = CuStream(; flags = CUDACore.STREAM_NON_BLOCKING)
+    graph = try
+        CUDACore.stream!(cuSOLVER.dense_handle, s)
+        CUDACore.stream!(cuBLAS.handle, s)
+        CUDACore.capture(f; stream = s, throw_error = false)
+    catch err
+        # a library error raised inside the capture (e.g. a status a vendor call returns
+        # under capture): nothing ran, the caller launches eagerly, where a genuine error
+        # raises again
+        @debug "capture_graph: the capture failed" exception = (err, catch_backtrace())
+        nothing
+    finally
+        # rebind to the task's stream (each getter calls Set*Stream when its stream changed)
+        cuSOLVER.dense_handle()
+        cuBLAS.handle()
+    end
     graph === nothing && return nothing
     exec = CUDACore.instantiate(graph)
     finalize(graph)

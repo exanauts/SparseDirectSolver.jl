@@ -114,11 +114,11 @@ defaults below. Keyword arguments are applied through [`setparam!`](@ref), so
 | `pivot_threshold` | `0.01` | pivot acceptance threshold; with `pivot_pairs = "default"` also the partner threshold of the 2×2 pairs chosen at analysis (a value set after `"analysis"` changes the in-front test, not the pairs already chosen) |
 | `pivot_epsilon` | `nothing` | [`default_pivot_epsilon`](@ref)`(T)`; LDLᵀ/LDLᴴ/LU static pivot perturbation, and on the Cholesky path (issue #127) the threshold: a pivot in `[0, pivot_epsilon]` is raised to it (negative or NaN still fails the front); `0` disables |
 | `pivot_epsilon_alg` | `PIVOT_EPSILON_DEFAULT` | |
-| `max_lu_nnz` | `-1` | no limit (any negative value) |
+| `max_lu_nnz` | `-1` | no limit (any negative value); stored only, no effect (a non-default value warns once) |
 | `hybrid_memory_mode` | `0` | device memory only |
 | `hybrid_device_memory_limit` | `0` | automatic |
-| `use_cuda_register_memory` | `1` | pinned host memory allowed |
-| `host_nthreads` | `0` | `Threads.nthreads()` |
+| `use_cuda_register_memory` | `1` | pinned host memory allowed; stored only, no effect (a non-default value warns once) |
+| `host_nthreads` | `0` | `Threads.nthreads()`; stored only, no effect (a non-default value warns once) |
 | `hybrid_execute_mode` | `0` | device execution only |
 | `nd_nlevels` | `10` | minimum nested-dissection levels |
 | `ubatch_size` | `0` | deduced from the matrix values (1 for a single matrix) |
@@ -132,7 +132,7 @@ defaults below. Keyword arguments are applied through [`setparam!`](@ref), so
 | `ir_mode` | `IR_PLAIN` | plain iterative refinement |
 | `factor_precision` | `nothing` | factors in the input precision |
 | `amalgamation` | `(max_width = 32, zero_fraction = 0.25, min_width = 8)` | |
-| `schedule` | `SCHEDULE_AUTO` | |
+| `schedule` | `SCHEDULE_AUTO` | the subtree + level schedule (`"syncfree"` raises at the analysis; `"subtree+level"` is rejected) |
 | `pivot_pairs` | `PIVOT_PAIRS_DEFAULT` | 2×2 pivot pairs in the analysis of `"S"`/`"H"` (structurally zero pivots; `"all"`: every candidate; with matching `"algo5"`/`"algo6"`: from the cycles of the matching); decided from the values present at analysis: an all-zero `nzval` gives no pairs, an undefined one arbitrary pairs |
 | `pivot_pair_tolerance` | `1e-6` ([`PIVOT_PAIR_TOLERANCE`](@ref)) | relative diagonal size below which a row is a 2×2 candidate |
 | `regime_c_width` | `64` | fronts wider than this go to regime C (vendor dense calls) |
@@ -253,6 +253,8 @@ resolved_pivot_epsilon(opts::Options, ::Type{T}) where {T} =
 # Disposition of a parameter name (PLAN §1.3/§1.4/§1.7):
 #   :port, :reinterpret  stored in `field`
 #   :deferred            stored in `field`; a non-default value warns once (feature not built yet)
+#   :noop                stored in `field` for cuDSS compatibility, read nowhere; a non-default
+#                        value warns once (issue #159)
 #   :not_planned         NotSupportedError (PLAN "not planned")
 #   :output              computed by a solver, read-only
 #   :solver              data that lives in a solver (`info`, `schur_matrix`)
@@ -274,11 +276,11 @@ const PARAMETER_SPECS = Dict{String, ParameterSpec}(
     "pivot_type" => ParameterSpec(:config, :port, :pivot_type),
     "pivot_threshold" => ParameterSpec(:config, :port, :pivot_threshold),
     "pivot_epsilon" => ParameterSpec(:config, :port, :pivot_epsilon),
-    "max_lu_nnz" => ParameterSpec(:config, :port, :max_lu_nnz),
+    "max_lu_nnz" => ParameterSpec(:config, :noop, :max_lu_nnz),
     "hybrid_memory_mode" => ParameterSpec(:config, :deferred, :hybrid_memory_mode),
     "hybrid_device_memory_limit" => ParameterSpec(:config, :deferred, :hybrid_device_memory_limit),
-    "use_cuda_register_memory" => ParameterSpec(:config, :reinterpret, :use_cuda_register_memory),
-    "host_nthreads" => ParameterSpec(:config, :reinterpret, :host_nthreads),
+    "use_cuda_register_memory" => ParameterSpec(:config, :noop, :use_cuda_register_memory),
+    "host_nthreads" => ParameterSpec(:config, :noop, :host_nthreads),
     "hybrid_execute_mode" => ParameterSpec(:config, :deferred, :hybrid_execute_mode),
     "pivot_epsilon_alg" => ParameterSpec(:config, :port, :pivot_epsilon_alg),
     "nd_nlevels" => ParameterSpec(:config, :port, :nd_nlevels),
@@ -533,6 +535,12 @@ function _warn_deferred(name, value)
     return nothing
 end
 
+function _warn_noop(name, value)
+    @warn "parameter \"$name\" = $(repr(value)) is accepted for cuDSS compatibility and has " *
+          "no effect in SparseDirectSolver.jl" maxlog = 1 _id = Symbol("noop_", name)
+    return nothing
+end
+
 function _set_not_planned(name, value)
     # A single device is what the package always uses, so asking for it is fine.
     name == "device_count" && isequal(value, 1) && return nothing
@@ -556,7 +564,8 @@ Accepted values:
 * integer and flag parameters: an `Integer` in the documented range;
 * `"ir_tol"`, `"pivot_threshold"`, `"pivot_epsilon"`: a finite real `≥ 0`
   (`nothing` resets `"pivot_epsilon"` to [`default_pivot_epsilon`](@ref));
-* `"ir_mode"`: `"ir"` or `"fgmres"`; `"schedule"`: `"auto"`, `"subtree+level"`, `"syncfree"`;
+* `"ir_mode"`: `"ir"` or `"fgmres"`; `"schedule"`: `"auto"` or `"syncfree"` (`"subtree+level"`,
+  which nothing implements apart from `"auto"`, raises [`InvalidValueError`](@ref));
 * `"pivot_pairs"` (beyond cuDSS): `"default"` (for `"S"`/`"H"`, a row with a zero
   or negligible diagonal whose pivot would be structurally zero is ordered
   together with a 2×2 pivot partner, see [`zero_pivot_pairs!`](@ref)), `"all"`
@@ -589,7 +598,10 @@ Unknown names raise `ArgumentError`; values of the wrong type or range raise
 `"comm_device"`, `"comm_host"` and global pivoting raise
 [`NotSupportedError`](@ref). Parameters computed by a solver (`"lu_nnz"`,
 `"inertia"`, …) cannot be set (`ArgumentError`). The hybrid-mode parameters are
-stored but have no effect yet; a non-default value warns once.
+stored but have no effect yet; a non-default value warns once. `"max_lu_nnz"`,
+`"host_nthreads"` and `"use_cuda_register_memory"` are stored for cuDSS
+compatibility (so that `getparam` returns them) but have no effect in this
+package; a non-default value warns once per parameter.
 `reordering_alg = "algo1"`/`"algo2"` (COLAMD-based orderings with global
 pivoting) is accepted and warns once that the symmetric-pattern path is used.
 """
@@ -606,6 +618,8 @@ function setparam!(opts::Options, name::AbstractString, value)
         setfield!(opts, spec.field, x)
         if spec.status === :deferred && !isequal(x, getfield(Options(), spec.field))
             _warn_deferred(name, value)
+        elseif spec.status === :noop && !isequal(x, getfield(Options(), spec.field))
+            _warn_noop(name, value)
         end
         if spec.field === :reordering_alg && (x == REORDERING_BTF_COLAMD || x == REORDERING_COLAMD)
             @warn "reordering_alg = \"$(convert(String, x))\" (COLAMD with global pivoting) is not " *

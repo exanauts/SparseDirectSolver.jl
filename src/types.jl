@@ -168,12 +168,13 @@ end
 """
     ScheduleKind
 
-`schedule` values (PLAN §1.7): `"auto"`, `"subtree+level"` (portable baseline),
-`"syncfree"` (CUDA/ROCm only).
+`schedule` values (PLAN §1.7): `"auto"` (the portable subtree + level schedule),
+`"syncfree"` (CUDA/ROCm only, not implemented yet: raises at the analysis).
+`"subtree+level"` is not accepted (issue #159): nothing distinguished it from
+`"auto"`; the value `1` stays unused so that `SCHEDULE_SYNCFREE` keeps its value.
 """
 @enum ScheduleKind::Int32 begin
     SCHEDULE_AUTO = 0
-    SCHEDULE_SUBTREE_LEVEL = 1
     SCHEDULE_SYNCFREE = 2
 end
 
@@ -285,7 +286,6 @@ enum_spellings(::Type{PivotEpsilonAlg}) = (
 
 enum_spellings(::Type{ScheduleKind}) = (
     "auto" => SCHEDULE_AUTO,
-    "subtree+level" => SCHEDULE_SUBTREE_LEVEL,
     "syncfree" => SCHEDULE_SYNCFREE,
 )
 

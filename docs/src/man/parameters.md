@@ -29,9 +29,12 @@ getparam(opts, "ir_n_steps"), getparam(opts, "reordering_alg")
 
 | handling | parameters |
 | :--- | :--- |
-| raise [`NotSupportedError`](@ref) | `device_count` other than `1`, `device_indices`, `comm_device`, `comm_host` (when set or read); `solve_alg = "algo1"` (T24–T26, at the solve), `user_nd_partition_tree` (T30) and `schedule = "syncfree"` (at the analysis) |
-| warn once and ignore | a non-default `hybrid_memory_mode`, `hybrid_device_memory_limit` or `hybrid_execute_mode` (T27); `reordering_alg` `"algo1"`/`"algo2"`, which fall back to the symmetric-pattern ordering with in-front pivoting |
-| accept and ignore silently | `max_lu_nnz`, `host_nthreads`, `use_cuda_register_memory`; `schedule = "subtree+level"`, which behaves as `"auto"` |
+| raise [`NotSupportedError`](@ref) | `device_count` other than `1`, `device_indices`, `comm_device`, `comm_host` (when set or read); `solve_alg = "algo1"` (T36, at the solve), `user_nd_partition_tree` (T30) and `schedule = "syncfree"` (at the analysis) |
+| raise [`InvalidValueError`](@ref) | `schedule = "subtree+level"` (when set): `"auto"` is the subtree + level schedule and nothing else implements it (issue #159) |
+| warn once and ignore | a non-default `hybrid_memory_mode`, `hybrid_device_memory_limit` or `hybrid_execute_mode` (T27); a non-default `max_lu_nnz`, `host_nthreads` or `use_cuda_register_memory`, which are stored for cuDSS compatibility (`getparam` returns them) but have no effect in this package (issue #159); `reordering_alg` `"algo1"`/`"algo2"`, which fall back to the symmetric-pattern ordering with in-front pivoting |
+
+The warning is printed once per parameter and session (`maxlog = 1`); setting
+the default value never warns.
 
 ## Configuration parameters
 
@@ -49,7 +52,7 @@ docstring. The ones that matter most in practice:
 | `pivot_pairs` | `"default"`, `"all"`, `"none"` | 2×2 pivot pairs chosen at the analysis of `"S"`/`"H"`: rows whose pivot is structurally zero, every candidate, or none; see [Pivot pairs](@ref) |
 | `pivot_pair_tolerance` | real `≥ 0`, default `1e-6` | relative diagonal size below which a row is a 2×2 candidate |
 | `solve_mode` | `0`, `1`, `2` | solve with ``A``, ``A^T`` or ``A^H`` |
-| `solve_alg` | `"default"`, `"algo1"` | level-batched sweeps; `"algo1"` (partitioned-inverse blocks) raises `NotSupportedError` until T24–T26 |
+| `solve_alg` | `"default"`, `"algo1"` | level-batched sweeps; `"algo1"` (partitioned-inverse blocks) raises `NotSupportedError` until T36 |
 | `ir_n_steps`, `ir_tol` | integer, real | iterative refinement steps and early-exit tolerance |
 | `ir_mode` | `"ir"`, `"fgmres"` | plain refinement or FGMRES (needs `using Krylov`) |
 | `deterministic_mode` | `0`, `1` | `1` forbids the atomic forward solve |
@@ -57,7 +60,7 @@ docstring. The ones that matter most in practice:
 | `nd_nlevels`, `nd_ubfactor`, `nd_nseps`, `nd_seed` | integers (`nd_nlevels` default `10`, the others `-1` for the library default) | minimum nested-dissection levels, and METIS's imbalance factor, separators per split and seed |
 | `use_superpanels` | `0`, `1` | supernode amalgamation off or on |
 | `amalgamation` | `NamedTuple` of `max_width`, `zero_fraction`, `min_width` | limits of the relaxed amalgamation |
-| `schedule` | `"auto"`, `"subtree+level"`, `"syncfree"` | factorization schedule (see the table above for the last two) |
+| `schedule` | `"auto"`, `"syncfree"` | factorization schedule: `"auto"` is the subtree + level schedule; `"syncfree"` raises (see the table above) |
 | `factor_precision` | `nothing`, `Float32`, `Float64` | precision of the factors; only the input precision is implemented, another one raises `NotSupportedError` at the analysis |
 | `ubatch_size`, `ubatch_index`, `ubatch_mask` | integers, 0/1 flags | uniform batches: number of members (deduced from the values by default), one member or `-1` for all, a per-member mask |
 
