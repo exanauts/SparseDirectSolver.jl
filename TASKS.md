@@ -2,7 +2,10 @@
 
 Each task is sized for one working session of a capable coding model and ends
 with an explicit list of tests that must pass. Tasks are ordered; do not start
-the next one. After every task the owner re-evaluates `PLAN.md` and this file,
+the next one. The next task is the one whose GitHub issue the owner opened
+(`AGENTS.md`, "GitHub workflow"); the file order is only the fallback, so
+tasks without an issue are parked at the end of the list, numbers unchanged.
+After every task the owner re-evaluates `PLAN.md` and this file,
 so the **Report** block at the end of each task must be filled in honestly.
 
 ## Session protocol
@@ -3285,52 +3288,6 @@ matrix, launches per refactorization (#82's criterion: ≥ 3× fewer), the
 private slots; `ext/SparseDirectSolverMadNLPExt.jl` on the 78k-bus ACOPF as the
 end-to-end check. Closes #82.
 
-### T27 — Hybrid memory / hybrid execute   `[ ]`
-
-Host-resident panels streamed per level with pinned memory;
-`hybrid_device_memory_min`; CPU-backend execution of regime A/B levels;
-test: a factorization under a device memory budget smaller than the factor
-size completes with the same solution.
-
-### T28 — Robustness extras   `[ ]`
-
-A posteriori threshold pivoting with optional delayed pivots (host
-re-analysis), `factor_precision = Float32` with Float64 refinement; tests:
-delayed-pivot case where static perturbation gives `relres > 1e-6` and APTP
-gives `≤ 1e-10`; mixed precision reaches Float64 accuracy with FGMRES-IR.
-
-**Owner note (PR #107)**: on the condensed pglib KKT systems (κ ≈ 1e14) a
-Float32 factor is unusable with or without Jacobi scaling, and FP64's
-single-solve relres of 1.4e-2 is itself the κ·ε floor, consistent with cuDSS's
-documented FP32 failures there. The mixed-precision mode is therefore for
-better-conditioned systems and for Metal; it needs FGMRES-IR against the
-Float32 factor (T18) and a documented failure path, not a precision trick at
-the factorization level.
-
-### T29 — Non-uniform batch (`BatchedDirectSolver`)   `[ ]`
-
-Block-diagonal packing, forest schedule; `test_nonuniform_batch_cudss.jl` ported.
-
-### T30 — ND partition-tree export/import and ordering cache   `[ ]`
-
-`nd_partition_tree`/`user_nd_partition_tree` in the cuDSS binary-tree
-encoding; test: importing the exported tree reproduces the same supernode
-partition and `nnz_L`.
-
-**Owner note (PR #107)**: the ordering study found that SDS's own ND
-(`reordering_alg = "algo4"`) matches the imported cuDSS ordering on the
-78k-bus KKT (schedule depth 29 vs 30), so the tree import is a compatibility
-feature, not a performance one. The ordering cache (analysis under a stored
-permutation ran in 3.6 s against 12 s for a fresh METIS analysis) is the part
-MadNLP benefits from.
-
-**Owner note (PR #120)**: a pipeline run chained after T23 implemented this
-task under its former number before the renumbering reached `main`; the PR
-was closed, but its branch `task/T24-nd-tree-ordering-cache` holds twenty
-minutes of work (`src/symbolic/ndtree.jl` with the tree export/import and a
-canonical supernode postorder, `test/test_ndtree.jl`), unreviewed and without
-CI. Start from it or from scratch; it was not checked against this text.
-
 ### T31 — oneAPI and Metal extensions (issue #118)   `[!]`
 
 The remainder of T23, split off by owner decision when PR #113 delivered the
@@ -4551,6 +4508,57 @@ capture rule covers every path, which also makes it the natural place to
 close #82 and verify #110. Each is one A/B measurement campaign on the
 harness, the size of T33–T35, and each leaves `main` releasable: the new
 paths are opt-in until their task's numbers justify a default.
+
+**Parked tasks (owner, 2026-11-04).** T27–T30 have no GitHub issue yet
+and were moved here, numbers unchanged, behind T36–T38 so that the
+"first open task" rule of `AGENTS.md` picks T36. They become the next
+task only when the owner opens their issue.
+
+### T27 — Hybrid memory / hybrid execute   `[ ]`
+
+Host-resident panels streamed per level with pinned memory;
+`hybrid_device_memory_min`; CPU-backend execution of regime A/B levels;
+test: a factorization under a device memory budget smaller than the factor
+size completes with the same solution.
+
+### T28 — Robustness extras   `[ ]`
+
+A posteriori threshold pivoting with optional delayed pivots (host
+re-analysis), `factor_precision = Float32` with Float64 refinement; tests:
+delayed-pivot case where static perturbation gives `relres > 1e-6` and APTP
+gives `≤ 1e-10`; mixed precision reaches Float64 accuracy with FGMRES-IR.
+
+**Owner note (PR #107)**: on the condensed pglib KKT systems (κ ≈ 1e14) a
+Float32 factor is unusable with or without Jacobi scaling, and FP64's
+single-solve relres of 1.4e-2 is itself the κ·ε floor, consistent with cuDSS's
+documented FP32 failures there. The mixed-precision mode is therefore for
+better-conditioned systems and for Metal; it needs FGMRES-IR against the
+Float32 factor (T18) and a documented failure path, not a precision trick at
+the factorization level.
+
+### T29 — Non-uniform batch (`BatchedDirectSolver`)   `[ ]`
+
+Block-diagonal packing, forest schedule; `test_nonuniform_batch_cudss.jl` ported.
+
+### T30 — ND partition-tree export/import and ordering cache   `[ ]`
+
+`nd_partition_tree`/`user_nd_partition_tree` in the cuDSS binary-tree
+encoding; test: importing the exported tree reproduces the same supernode
+partition and `nnz_L`.
+
+**Owner note (PR #107)**: the ordering study found that SDS's own ND
+(`reordering_alg = "algo4"`) matches the imported cuDSS ordering on the
+78k-bus KKT (schedule depth 29 vs 30), so the tree import is a compatibility
+feature, not a performance one. The ordering cache (analysis under a stored
+permutation ran in 3.6 s against 12 s for a fresh METIS analysis) is the part
+MadNLP benefits from.
+
+**Owner note (PR #120)**: a pipeline run chained after T23 implemented this
+task under its former number before the renumbering reached `main`; the PR
+was closed, but its branch `task/T24-nd-tree-ordering-cache` holds twenty
+minutes of work (`src/symbolic/ndtree.jl` with the tree export/import and a
+canonical supernode postorder, `test/test_ndtree.jl`), unreviewed and without
+CI. Start from it or from scratch; it was not checked against this text.
 
 ### External — MadNLPGPU integration (in the MadNLP repository)   `[ ]`
 
