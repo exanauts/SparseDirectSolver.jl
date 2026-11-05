@@ -13,156 +13,144 @@
 > as the evidence. Validate the numerics on your own matrices before relying on
 > them.
 
-A portable sparse direct solver (LLᵀ/LLᴴ, LDLᵀ/LDLᴴ, LDU) for GPUs, written in
-Julia on KernelAbstractions.jl. It keeps the parameter names
-and phases of [CUDSS.jl](https://github.com/exanauts/CUDSS.jl) so that MadNLP
-and other cuDSS users can switch to it mechanically, and targets CUDA, AMDGPU,
-oneAPI, Metal and the KernelAbstractions CPU backend.
+A portable sparse direct solver for GPUs, written in Julia on
+[KernelAbstractions.jl](https://github.com/JuliaGPU/KernelAbstractions.jl). It
+factors symmetric positive definite (LLᵀ/LLᴴ), symmetric indefinite (LDLᵀ/LDLᴴ
+with 1×1 and 2×2 pivots) and general (LDU) sparse matrices and solves with them
+on the device. It keeps the parameter names and phases of
+[CUDSS.jl](https://github.com/exanauts/CUDSS.jl), the Julia interface of NVIDIA
+cuDSS, so that [MadNLP](https://github.com/MadNLP/MadNLP.jl) and other cuDSS
+users can switch mechanically, and it is not tied to one vendor.
 
-**Status: v0.2, not registered, under construction.** Working today on the
-CPU backend, CUDA, AMDGPU (ROCm), Metal (`Float32`, tested on an M4 Max) and
-oneAPI (tested on an Intel Data Center GPU Max 1550):
+## Status
 
-* host symbolic analysis: AMD or nested dissection (METIS; `nd_nseps` and
-  `nd_seed` are parameters) ordering, chosen per matrix by a cost model that
-  scores the depth of the supernodal schedule next to the flops, elimination
-  tree, supernodes with GPU-tuned amalgamation, static factor layout and
-  assembly maps built on the device; for symmetric
-  indefinite matrices the analysis pairs structurally zero pivots with a
-  partner (`pivot_pairs`, MA57-style compressed-graph ordering) so that the
-  in-front pivoting can form the 2×2 blocks that KKT systems need;
-* GPU multifrontal Cholesky (`"SPD"`, `"HPD"`) in three regimes: fused
-  subtree-per-workgroup kernels for the many small fronts at the bottom of the
-  tree, fused level-batched per-front kernels for medium fronts, and dense
-  `potrf`/`trsm`/`syrk` through a backend-agnostic dense interface for large
-  fronts: cuBLAS and cuSOLVER on CUDA, rocBLAS and rocSOLVER on AMDGPU, oneMKL
-  level-3 BLAS on oneAPI (the LAPACK steps on the KernelAbstractions
-  fallbacks), MPS Cholesky for fronts at least 64 wide on Metal,
-  allocation-free KernelAbstractions fallbacks otherwise;
-* GPU LDLᵀ/LDLᴴ (`"S"`, `"H"`) with in-front Bunch–Kaufman 1×1/2×2 pivoting,
-  `pivot_threshold`, static perturbation (`pivot_epsilon`, `pivot_epsilon_alg`)
-  with a user-chosen sign per row (`pivot_sign`, which cuDSS cannot do), and
-  `inertia`, `npivots` and `pivot_stats` read back from the device; the same
-  pivot sequence as the CPU reference LDLᵀ, which serves as its oracle;
-* GPU LU (`"G"`, `L D U` on the symmetric pattern of `A + Aᵀ`) with row
-  interchanges inside the fully-summed block of each front (threshold partial
-  pivoting, `pivot_threshold`), static perturbation of tiny pivots, `perm_row`
-  and `perm_col`, and solves with `A`, `Aᵀ` and `Aᴴ`; the same pivot sequence
-  as the CPU reference LU;
-* uniform batches for every structure (`ubatch_size`, `ubatch_index`,
-  `ubatch_mask`; values as a long vector, a matrix or a 3-D array; strided
-  and 3-D right-hand sides; per-member `info` and statistics), with
-  strided-batched vendor calls on the root fronts;
-* GPU triangular solves with multiple right-hand sides, forward, diagonal and
-  backward sub-phases, permutations, `solve_mode` (transposed and conjugated
-  systems), and iterative refinement (`ir_n_steps`, `ir_tol`), allocation-free
-  after the analysis, or FGMRES-IR with the factorization as preconditioner
-  (`ir_mode = "fgmres"`, after `using Krylov`); `user_host_interrupt` is
-  polled between launch groups;
-* Schur complement mode (`schur_mode`, `user_schur_indices`) for every
-  structure: the Schur rows and columns are ordered last and their front is
-  assembled but not factored; `schur_shape` (exact symbolic pattern) and
-  `schur_matrix` (dense, or CSR of one triangle or the full matrix), and the
-  `solve_fwd_schur`/`solve_diag`/`solve_bwd_schur` phases of cuDSS;
-* matching and scaling (`matching_alg` `"algo1"`–`"algo6"`, MC64 jobs 1–5 on
-  the host): `"G"` factors the row/column-scaled matrix with the matched
-  entries on the diagonal, the symmetric structures a symmetrically scaled
-  matrix (inertia preserved) with 2×2 pivot pairs from the matching;
-  `perm_matching`, `scale_row`, `scale_col`;
-* the public API: `DirectSolver`, `execute!` with cuDSS phase strings, named
-  phase wrappers, `SparseDirectSolver.update!` (not exported), `setparam!`/`getparam`, and the `LinearAlgebra`
-  layer (`cholesky`, `cholesky!`, `ldlt`, `ldlt!`, `lu`, `lu!`, `ldiv!`, `\`,
-  `logabsdet`, `logdet`, `diag`, `nnz`),
-  checked by the test suite of CUDSS.jl ported to this package; phase logging
-  through `SDS_LOG_LEVEL`;
-* `FusedSolver`: the fused pipeline of `src/fused.jl` (one dependency-counter
-  factorization kernel, a partitioned-inverse solve) behind the same verbs as
-  `DirectSolver`, on every GPU backend (the CPU backend is refused), for real
-  `"SPD"` and no-pivot `"S"` matrices and one right-hand side (everything else
-  raises `NotSupportedError`);
-* a MadNLP linear solver (`using MadNLP` enables the extension): `SDSSolver`,
-  used as `madnlp(model; linear_solver = SDSSolver, kkt_system =
-  MadNLP.SparseCondensedKKTSystem)`, with the options `sds_factorization`
-  (`:cholesky`, or `:ldl` without pivoting, the inertia read from the signs of
-  `D`), `sds_pivoting = :bk` for the in-front Bunch–Kaufman path (with
-  `sds_pivot_threshold`), `sds_reordering`, `sds_user_perm` and `sds_tuning`,
-  a bundle of performance
-  knobs with measured per-architecture defaults (oneAPI and Metal get the AMD
-  profile). It runs the fused pipeline of `src/fused.jl`, one
-  dependency-counter kernel per refactorization and a partitioned-inverse
-  solve, on every GPU backend; the benchmark row `cholesky_fused` below
-  measures that path.
+Version 0.2.0, not registered, under construction. Julia 1.13. Every backend
+below runs the same multifrontal kernels; only the dense operations on the
+large fronts go through a vendor library.
 
-Not there yet: the fused pipeline under the `execute!` of `DirectSolver`
-(`solve_alg = "algo1"`, tasks T36–T38, after which it is the Cholesky and LDLᵀ
-path of every `DirectSolver`; `FusedSolver` has its own `execute!` today), the
-sm_89 performance work of T34, non-uniform batches, ND partition-tree export, mixed
-precision, hybrid host memory, delayed pivots, and `ComplexF32` on Metal. Unsupported structures, phases and parameters raise
-`NotSupportedError` rather than falling back silently. The remaining gap to
-cuDSS is performance, not features (see below and
-[`PERFORMANCE.md`](PERFORMANCE.md)); a MadNLP end-to-end run on CUDA and AMD
-lives in [`bench/e2e/`](bench/e2e/).
+| Backend | Loaded by | Dense layer on large fronts | Tested |
+| --- | --- | --- | --- |
+| CUDA | `using CUDA` (CUDA.jl ≥ 6.5) | cuBLAS, cuSOLVER | CI, self-hosted runner |
+| AMDGPU (ROCm) | `using AMDGPU` (≥ 2.10) | rocBLAS, rocSOLVER | CI, self-hosted runner |
+| oneAPI | `using oneAPI` (≥ 2.10) | oneMKL level-3 BLAS; LAPACK steps on the KernelAbstractions kernels | CI on Aurora (Intel Data Center GPU Max 1550) |
+| Metal | `using Metal` (≥ 1.11) | MPS Cholesky for fronts at least 64 wide; `Float32` only | by hand on an M4 Max, no CI |
+| CPU | nothing (KernelAbstractions `CPU()`) | KernelAbstractions kernels | CI |
 
-* [Documentation](https://exanauts.github.io/SparseDirectSolver.jl/dev/) — user guide and API reference.
-* [`PLAN.md`](PLAN.md) — design, API, milestones.
-* [`TASKS.md`](TASKS.md) — implementation tasks and their reports.
-* [`STATE.md`](STATE.md) — the owner's state review between tasks.
-* [`PERFORMANCE.md`](PERFORMANCE.md) — gap analysis against cuDSS and the experiment plan.
-* [`RESEARCH.md`](RESEARCH.md) — background and state of the art.
-* [`bench/README.md`](bench/README.md) — benchmark harness and cuDSS baselines.
-* [`bench/comparison/comparison.md`](bench/comparison/comparison.md) — per-feature performance comparison with cuDSS.
-* [`bench/PERFORMANCE-2026-10.md`](bench/PERFORMANCE-2026-10.md) — the MadNLP extension on the 78k-bus ACOPF KKT across seven GPUs; [`bench/ARCH-TUNING.md`](bench/ARCH-TUNING.md) — how its per-architecture defaults were measured.
+Element types `Float32`, `Float64`, `ComplexF32`, `ComplexF64` (Metal:
+`Float32`); index types `Int32` and `Int64`. Unsupported structures, phases
+and parameters raise `NotSupportedError`; there is no silent fallback.
+
+## What it does
+
+* **Analysis on the host.** AMD or nested dissection (METIS; `nd_nseps`,
+  `nd_seed`) chosen per matrix by a cost model that scores the depth of the
+  supernodal schedule next to the flops, elimination tree, supernodes with
+  GPU-tuned amalgamation, a static factor layout and the assembly maps built
+  on the device. For symmetric indefinite matrices the analysis pairs
+  structurally zero pivots with a partner (`pivot_pairs`) so that the in-front
+  pivoting can form the 2×2 blocks KKT systems need.
+* **Three numeric regimes.** Fused subtree-per-workgroup kernels for the many
+  small fronts at the bottom of the tree, fused level-batched per-front
+  kernels for medium fronts, and dense `potrf`/`trsm`/`syrk` through a
+  backend-agnostic dense interface for large fronts (vendor library where one
+  exists, allocation-free KernelAbstractions kernels otherwise). No
+  allocation and no host synchronization after the analysis, so a
+  refactorization plus solve can be captured and replayed.
+* **Cholesky** (`"SPD"`, `"HPD"`), **LDLᵀ/LDLᴴ** (`"S"`, `"H"`) with in-front
+  Bunch–Kaufman pivoting, `pivot_threshold`, static perturbation
+  (`pivot_epsilon`, `pivot_epsilon_alg`) with a user-chosen sign per row
+  (`pivot_sign`, which cuDSS cannot do), `inertia`, `npivots` and
+  `pivot_stats` read back from the device, and **LU** (`"G"`) with threshold
+  partial pivoting inside the fully-summed block of each front, `perm_row`,
+  `perm_col` and solves with `A`, `Aᵀ` and `Aᴴ`. The device pivot sequences
+  equal those of the CPU reference factorizations, which serve as oracles.
+* **Solves** with multiple right-hand sides, the forward, diagonal and
+  backward sub-phases, `solve_mode` (transposed and conjugated systems),
+  iterative refinement (`ir_n_steps`, `ir_tol`) or FGMRES-IR with the
+  factorization as preconditioner (`ir_mode = "fgmres"`, after `using
+  Krylov`), and `user_host_interrupt` polled between launch groups.
+* **Uniform batches** for every structure (`ubatch_size`, `ubatch_index`,
+  `ubatch_mask`; values as a long vector, a matrix or a 3-D array; per-member
+  `info` and statistics). **Schur complement mode** (`schur_mode`,
+  `user_schur_indices`, `schur_shape`, `schur_matrix` dense or CSR, the
+  `solve_*_schur` phases). **Matching and scaling** (`matching_alg`
+  `"algo1"`–`"algo6"`, MC64 jobs on the host; `perm_matching`, `scale_row`,
+  `scale_col`), with 2×2 pivot pairs from the matching for the symmetric
+  structures.
+* **The API.** `DirectSolver`, `execute!` with the cuDSS phase strings, the
+  named wrappers `analyze!`, `factorize!`, `refactorize!`, `solve!`,
+  `SparseDirectSolver.update!` (public, not exported), `setparam!`/`getparam`,
+  and the `LinearAlgebra` layer (`cholesky`, `ldlt`, `lu` and their `!`
+  forms, `ldiv!`, `\`, `logabsdet`, `logdet`, `diag`, `nnz`), checked by the
+  test suite of CUDSS.jl ported to this package. `SDS_LOG_LEVEL=1` logs a
+  summary per phase.
+* **`FusedSolver`**, the fused pipeline: one dependency-counter factorization
+  kernel per refactorization (or a few, split at the wide fronts) and a
+  partitioned-inverse solve, behind the same verbs as `DirectSolver`, on
+  every GPU backend. Real `"SPD"` and no-pivot `"S"` matrices, one right-hand
+  side; the factorization is bitwise reproducible, `deterministic_mode = 1`
+  makes the solve so too. Tuned per architecture through `SDSTuning`,
+  including optional CUDA-graph replay of the refactorization and the solve
+  (`graph_max_n`). This is the path the MadNLP extension runs.
+* **MadNLP** (`using MadNLP`): the linear solver `SDSSolver` with the options
+  `sds_factorization` (`:cholesky`, `:ldl`), `sds_pivoting` (`:none` on the
+  fused pipeline, `:bk` on the stock in-front Bunch–Kaufman path, which is
+  also the CPU-backend path), `sds_pivot_threshold`, `sds_reordering`,
+  `sds_user_perm` and `sds_tuning`.
+
+**Not there yet.** `solve_alg = "algo1"` and the fused factorization on
+`DirectSolver` itself, and CUDA-graph capture of the stock refactorization and
+solve (tasks T36–T38 of `TASKS.md`, in progress: today the fused pipeline is
+reached through `FusedSolver`); `schedule = "syncfree"`; non-uniform batches;
+ND partition-tree export and the ordering cache; mixed precision
+(`factor_precision`); hybrid host memory; delayed pivots; `ComplexF32` on
+Metal. The options `max_lu_nnz`, `host_nthreads` and
+`use_cuda_register_memory` are accepted and warn once if set.
 
 ## Performance against cuDSS
 
-Time of SparseDirectSolver.jl divided by the time of cuDSS per feature and
-phase, geometric mean over the benchmark matrices (below 1 is faster), measured
-on an NVIDIA H200 (cuDSS 0.8.0, both solvers on the same GPU, allocated
-exclusively through Slurm). Every row is a feature the package implements,
-through the handle API; `cholesky_fused` is the fused pipeline that the MadNLP
-extension runs, until T36–T38 make it the path of `DirectSolver`'s `execute!`.
-The comparison was measured at commit 95ee682 (2026-10-30), after T33 moved the
-construction of the fused plans into the analysis, so the `cholesky_fused`
-factorization column no longer includes building them. It replaces the RTX 4080
-comparison of commit d750376 (2026-10-28), which is in the git history.
-Per-matrix numbers are in
-[`bench/comparison/comparison.md`](bench/comparison/comparison.md); the plot
-is regenerated by hand with `bench/compare.jl` and `bench/compare_report.jl`
-(see [`bench/README.md`](bench/README.md)). The end-to-end MadNLP run on the
-78k-bus ACOPF system has its per-GPU record in
-[`bench/PERFORMANCE-2026-10.md`](bench/PERFORMANCE-2026-10.md).
+Time of SparseDirectSolver.jl divided by the time of cuDSS 0.8.0 per feature
+and phase, geometric mean over the benchmark matrices (below 1 is faster), on
+an NVIDIA H200 allocated exclusively through Slurm (commit 95ee682,
+2026-10-30). Every row is a feature through the handle API; `cholesky_fused`
+is the fused pipeline the MadNLP extension runs.
 
 ![SparseDirectSolver.jl vs cuDSS time ratio per feature](bench/comparison/comparison.png)
 
-## Installation
+The handle-API gap on KKT systems is launch- and level-bound; the fused
+pipeline closes most of it. After T34 (H200, medians of
+`bench/e2e/fused_probe.jl`) the 78k-bus condensed ACOPF KKT system
+refactorizes in 18.6 ms against 11.2 ms for cuDSS and solves in 2.3 ms against
+1.7 ms. Per-matrix numbers are in
+[`bench/comparison/comparison.md`](bench/comparison/comparison.md), regenerated
+by hand with `bench/compare.jl` and `bench/compare_report.jl` (see
+[`bench/README.md`](bench/README.md)); the MadNLP end-to-end record across
+seven GPUs is in [`bench/PERFORMANCE-2026-10.md`](bench/PERFORMANCE-2026-10.md),
+the tuning methodology in [`bench/ARCH-TUNING.md`](bench/ARCH-TUNING.md) and
+the gap analysis in [`PERFORMANCE.md`](PERFORMANCE.md).
 
-The package is not registered yet. Julia 1.13 or later is required.
+## Installation
 
 ```julia
 using Pkg
 Pkg.add(url = "https://github.com/exanauts/SparseDirectSolver.jl")
 ```
 
-The CUDA extension is triggered by CUDA.jl's packages CUDACore, cuBLAS,
-cuSOLVER and cuSPARSE, which `using CUDA` loads (`CuSparseMatrixCSR`/`CuSparseMatrixCSC`
-constructors, cuBLAS/cuSOLVER dense kernels; CUDA.jl 6.5 exports an `update!`
-of its own, so this package does not export its `update!`: write
-`SparseDirectSolver.update!` or `using SparseDirectSolver: update!`); loading AMDGPU.jl
-enables the AMDGPU extension (`ROCSparseMatrixCSR`/`ROCSparseMatrixCSC`
-constructors, rocBLAS/rocSOLVER dense kernels; ROCm must be found by AMDGPU.jl);
-loading oneAPI.jl enables the oneAPI extension
-(`oneSparseMatrixCSR`/`oneSparseMatrixCSC` constructors, oneMKL BLAS kernels);
-loading Metal.jl enables the Metal extension (`CSR` of `MtlArray`s, `Float32`,
-MPS Cholesky for wide fronts); loading Krylov.jl enables FGMRES refinement;
-loading MadNLP.jl enables the `SDSSolver` linear solver.
+The backend extensions load with the backend package (table above). CUDA.jl's
+split packages CUDACore, cuBLAS, cuSOLVER and cuSPARSE trigger the CUDA
+extension; `using CUDA` loads them all. CUDA.jl 6.5 exports an `update!` of
+its own, so this package does not export its `update!`: write
+`SparseDirectSolver.update!` or `using SparseDirectSolver: update!`.
+`using Krylov` enables FGMRES refinement, `using MadNLP` the `SDSSolver`
+linear solver.
 
 ## Usage
 
 The handle API mirrors CUDSS.jl: a `DirectSolver` is created from a CSR matrix
-living on a KernelAbstractions backend, with a structure string (`"SPD"`,
-`"HPD"`, `"S"`, `"H"`, or `"G"` for LU) and the triangle that is read (`'L'`,
-`'U'` or `'F'`; ignored for `"G"`, which reads the full matrix, as in cuDSS).
-Phases are run with `execute!`.
+on a KernelAbstractions backend, with a structure string (`"SPD"`, `"HPD"`,
+`"S"`, `"H"`, or `"G"` for LU) and the triangle that is read (`'L'`, `'U'` or
+`'F'`; ignored for `"G"`, which reads the full matrix, as in cuDSS). Phases run
+with `execute!`.
 
 ```julia
 using SparseDirectSolver, SparseArrays, LinearAlgebra
@@ -216,11 +204,11 @@ robust choice there.
 General matrices use `"G"` and the same phases; `getparam(solver, "perm_row")`
 and `"perm_col"` give the composed permutations.
 
-The same `DirectSolver` code runs on the CPU backend by wrapping the host CSR
-arrays in a `CSR` (or passing a `SparseMatrixCSC`) instead of a
-`CuSparseMatrixCSR`. The `LinearAlgebra` layer offers the usual shortcuts, with
-two refinement steps per solve by default; on the host it takes `CSR(A)`, since
-`cholesky` of a `SparseMatrixCSC` belongs to CHOLMOD:
+The same code runs on the CPU backend by wrapping the host CSR arrays in a
+`CSR` (or passing a `SparseMatrixCSC`) instead of a `CuSparseMatrixCSR`. The
+`LinearAlgebra` layer offers the usual shortcuts, with two refinement steps per
+solve by default; on the host it takes `CSR(A)`, since `cholesky` of a
+`SparseMatrixCSC` belongs to CHOLMOD:
 
 ```julia
 F = cholesky(A_gpu; view = 'L')        # analysis + factorization
@@ -231,9 +219,26 @@ F = lu(G_gpu)                          # LDU with in-front pivoting
 logabsdet(F)
 ```
 
-The named phase wrappers `analyze!`, `factorize!`, `refactorize!` and `solve!`
-are equivalent to the corresponding `execute!` calls. `SDS_LOG_LEVEL=1` prints
-a summary per phase, `2` adds the residual of every refinement step.
+The fused pipeline has the same verbs. Its values alias the caller's buffer,
+so the interior-point loop is "write new values, refactorize, solve":
+
+```julia
+F = FusedSolver(A_gpu, "SPD", 'L')     # or "S" for a no-pivot LDLᵀ; GPU backends only
+analyze!(F)                            # ordering, symbolic analysis, the fused plans
+factorize!(F)
+x_gpu = F \ b_gpu                      # partitioned-inverse solve
+A_gpu.nzVal .*= 2                      # new values in the same buffer
+refactorize!(F)
+solve!(F, x_gpu, b_gpu)
+```
+
+With MadNLP, on a GPU:
+
+```julia
+using MadNLP, MadNLPGPU, CUDA, SparseDirectSolver
+result = madnlp(model; linear_solver = SDSSolver,
+                kkt_system = MadNLP.SparseCondensedKKTSystem)
+```
 
 ## Running the tests
 
@@ -256,16 +261,26 @@ that change to `test/Project.toml`.
 
 ## Development
 
-The project is developed task by task; `TASKS.md` lists the tasks and the
-report of every finished one. Each task lands through a pull request that CI
-(the CPU suite on the self-hosted `kkt` machine, the GPU suite on the
-self-hosted `cuda` and `amdgpu` runners and on Aurora through ALCF GitLab CI
-for oneAPI, Aqua on GitHub; Metal has no CI leg) and an automated review must
-pass; between tasks the owner reviews the state (`STATE.md`) and refreshes
-`PLAN.md`. Besides the task PRs, out-of-chain housekeeping PRs clean up
-documentation, tests and the repository between tasks; the prototypes they
-removed are kept at the tag `prototypes-2026-10`. `AGENTS.md` describes the
-workflow and the code conventions.
+The project is developed task by task. `TASKS.md` lists the tasks, each with
+the tests that must pass and the report of every finished one; the next task
+is the one whose GitHub issue the owner opened. Each task lands through a pull
+request that CI and an automated review (`claude-review.yml`) must pass, and
+the owner merges by hand. CI runs the CPU suite on the self-hosted `kkt`
+machine, the GPU suite on the self-hosted `cuda` and `amdgpu` runners and on
+Aurora through ALCF GitLab CI for oneAPI, and Aqua on GitHub; Metal has no CI
+leg. Between tasks the owner updates `STATE.md` and `PLAN.md`. `AGENTS.md`
+describes the workflow and the code conventions. Prototypes removed from
+`bench/` are kept at the tag `prototypes-2026-10`.
+
+Project documents:
+
+* [Documentation](https://exanauts.github.io/SparseDirectSolver.jl/dev/) — user guide and API reference.
+* [`PLAN.md`](PLAN.md) — design, API, milestones.
+* [`TASKS.md`](TASKS.md) — implementation tasks and their reports.
+* [`STATE.md`](STATE.md) — the current state: what exists, the numbers, the open tasks and issues.
+* [`PERFORMANCE.md`](PERFORMANCE.md) — gap analysis against cuDSS and the experiment plan.
+* [`RESEARCH.md`](RESEARCH.md) — background and state of the art.
+* [`bench/README.md`](bench/README.md) — benchmark harness and cuDSS baselines.
 
 ## License
 
