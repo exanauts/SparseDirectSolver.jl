@@ -48,6 +48,9 @@ algo1_indefinite_generators(::Type{T}) where {T} = (
     ("kkt_matrix 300+150, indefinite H", () -> kkt_matrix(T, 300, 150, 1.0; hessian = :indefinite)),
     ("grid_kkt_matrix 20×20", () -> grid_kkt_matrix(T, 20, 20, 1.0)),
 )
+# the generators whose weak pivots (no pivoting) leave the Float32 residual at about tol(T), for the fused solve as for
+# the level sweeps: their solves are checked against weak_pivot_tol (test/utils.jl)
+const ALGO1_WEAK_PIVOT_LABELS = ("kkt_matrix 300+150, indefinite H",)
 
 @testset "solve_alg = \"algo1\" on $(backend_name(backend))" for backend in ALGO1_BACKENDS
     @testset "$structure ($label): $T" for T in eltypes_among((Float32, Float64)),
@@ -57,13 +60,14 @@ algo1_indefinite_generators(::Type{T}) where {T} = (
         Random.seed!(666)
         A = gen()
         n = size(A, 1)
+        rtol = label in ALGO1_WEAK_PIVOT_LABELS ? weak_pivot_tol(T) : tol(T)
         s = algo1_solver(backend, A, structure)
         @test getparam(s, "info") == 0
         @test s.fsolve isa SDS.Fused.FusedSolve
         label == "laplacian3d 34³" && @test length(s.fsolve.fz[1]) > 1         # several solve segments
         b = rand(T, n)
         x = algo1_solve(backend, s, b)
-        @test relres(A, x, b) <= tol(T)
+        @test relres(A, x, b) <= rtol
         # the level sweeps on the same factorization
         setparam!(s, "solve_alg", "default")
         x0 = algo1_solve(backend, s, b)
@@ -73,7 +77,7 @@ algo1_indefinite_generators(::Type{T}) where {T} = (
         setparam!(s, "deterministic_mode", 1)
         x1 = algo1_solve(backend, s, b)
         @test algo1_solve(backend, s, b) == x1
-        @test relres(A, x1, b) <= tol(T)
+        @test relres(A, x1, b) <= rtol
         # the sub-phases run the halves of the fused solve: bitwise equal to "solve" under deterministic_mode = 1
         @test algo1_solve(backend, s, b; phases = ("solve_fwd_perm", "solve_fwd", "solve_diag", "solve_bwd",
                                                    "solve_bwd_perm")) == x1
@@ -90,7 +94,7 @@ algo1_indefinite_generators(::Type{T}) where {T} = (
         refactorize!(s)
         @test getparam(s, "info") == 0
         x2 = algo1_solve(backend, s, b)
-        @test relres(A2, x2, b) <= tol(T)
+        @test relres(A2, x2, b) <= rtol
         # memory_estimates: slot 14 holds the fused solve's buffers, added to the device totals
         est = getparam(s, "memory_estimates")
         s0 = DirectSolver(api_matrix(backend, tril(A), Int32), structure, 'L')

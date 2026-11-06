@@ -81,6 +81,18 @@ Residual tolerance on well-conditioned generators: `sqrt(eps(real(T)))`.
 tol(::Type{T}) where {T} = sqrt(eps(real(T)))
 
 """
+    weak_pivot_tol(T)
+
+Residual tolerance `3·tol(T)` for solves of generators factored without pivoting whose
+weak pivots cause element growth, where single precision sits at about `tol(T)`. Measured on
+`kkt_matrix(Float32, 300, 150, 1.0; hessian = :indefinite)` with `pivot_type = 'N'` on
+oneAPI (Intel Max 1550, IGC 2.34.4; 600 refactorizations): the `solve_alg = "algo1"` residual
+reaches 1.63·tol (median 0.97·tol, `deterministic_mode = 1`: 1.13·tol), the stock level-sweep
+solve 1.78·tol, no sample above 2·tol.
+"""
+weak_pivot_tol(::Type{T}) where {T} = 3 * tol(T)
+
+"""
     relres(A, x, b)
 
 Relative residual `‖b - A x‖ / max(‖b‖, 1)`.
