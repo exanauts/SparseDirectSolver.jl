@@ -2,16 +2,14 @@
 # (atomic and deterministic variants), diagonal hook, backward sweep, with
 # regimes A, B and C active, multiple right-hand sides and both RHS layouts.
 
-# small budgets and regime-C thresholds: regimes A, B and C on every T09 matrix
-const SOLVE_OPTS = Options(subtree_budgets = [8192, 16384], regime_c_width = 16, regime_c_rows = 128)
+# the options `SOLVE_OPTS` (regimes A, B and C on every T09 matrix) live in test/utils.jl (shared with
+# test_allocations.jl, #188)
 
 solve_matrices(::Type{T}) where {T} =
     (("laplacian2d(40,40)", laplacian2d(T, 40, 40)), ("random_spd(500,0.01)", random_spd(T, 500, 0.01)),
      ("laplacian3d(10,10,10)", laplacian3d(T, 10, 10, 10)))
 
 solve_rhs(::Type{T}, n, nrhs) where {T} = nrhs == 1 ? rand(T, n) : rand(T, n, nrhs)
-
-solve_allocated(x, ws, S, N, b; kwargs...) = @allocated SDS.sweep_solve!(x, ws, S, N, b; kwargs...)
 
 RUN_SHARED && @testset "solve plan and workspace" begin
     Random.seed!(666)
@@ -192,7 +190,9 @@ end
     end
 end
 
-@testset "no allocations (CPU, $T)" for T in ELTYPES
+# the allocation check of these solves runs in test_allocations.jl (a child process without background tasks,
+# #188); the residuals stay here
+@testset "repeated solves in one workspace (CPU, $T)" for T in ELTYPES
     Random.seed!(666)
     A = laplacian2d(T, 40, 40)
     S, Sd, Nd, ws = solve_setup(CPU(), A; opts = SOLVE_OPTS)
@@ -201,7 +201,7 @@ end
     # `impl = :ka`: the allocation-free KA dense fallbacks on the regime-C path (T32, #53)
     for deterministic in (false, true), impl in (:auto, :ka)
         SDS.sweep_solve!(x, ws, Sd, Nd, b; deterministic, impl)
-        @test solve_allocated(x, ws, Sd, Nd, b; deterministic, impl) <= solve_alloc_budget(Sd, ws; impl)
+        SDS.sweep_solve!(x, ws, Sd, Nd, b; deterministic, impl)
         @test relres(A, x, b) <= tol(T)
     end
 end

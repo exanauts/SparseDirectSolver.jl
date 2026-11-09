@@ -2,10 +2,7 @@
 # workgroup per front), checked against the T08 reference panels and against
 # the regime-C path.
 
-# regime B below the regime-C thresholds, no regime-A subtrees (T11)
-const NUMERIC_B_OPTS = Options(subtree_budgets = Int[])
-# both regimes in one analysis: small thresholds send the larger fronts to regime C
-const NUMERIC_BC_OPTS = Options(subtree_budgets = Int[], regime_c_width = 16, regime_c_rows = 128)
+# the options `NUMERIC_B_OPTS` and `NUMERIC_BC_OPTS` live in test/utils.jl (shared with test_allocations.jl, #188)
 
 numeric_b_matrices(::Type{T}) where {T} =
     (("laplacian2d(40,40)", laplacian2d(T, 40, 40), NUMERIC_B_OPTS),
@@ -182,11 +179,8 @@ end
         @test relres(B, SDS.ref_solve!(similar(b), S2, Nh, b), b) <= tol(T)
         @test SDS.factorize!(Nd, Sd, nz) == 0            # and back
         @test SDS.host_numeric(Nd).factor == F0
-        if backend isa CPU
-            # no allocation in the numeric phase (the first call compiles), see `ka_cpu_alloc_budget`
-            numeric_b_allocated(Nd, Sd, nz)
-            @test numeric_b_allocated(Nd, Sd, nz) <= numeric_alloc_budget(S, T)
-        end
+        # the CPU allocation check of this refactorization runs in test_allocations.jl (a child process
+        # without background tasks, #188)
     end
 end
 

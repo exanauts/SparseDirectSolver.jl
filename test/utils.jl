@@ -294,6 +294,12 @@ allocations of the numeric phase (~62 KB of headroom, 195 launches, for one
 it went with the `[compat] KernelAbstractions = "0.10.3"` bound (#145). (Julia
 ≤ 1.11 also boxed the arguments of every launch behind KA's `__run` inference
 barrier; that allowance went with the Julia 1.10 support.)
+
+`@allocated` counts the allocations of the whole process, and KernelAbstractions ≥ 0.10.6
+`yield`s after every CPU launch of 50 µs or more, so the other tasks of a test worker
+(ParallelTestRunner's communication) are charged to the measured call. The CPU allocation
+checks therefore run in a child process without background tasks, `test_allocations.jl`
+with `allocations_child.jl` (#188).
 """
 function ka_cpu_alloc_budget(launches::Integer, localmem_bytes::Integer)
     b = 1024
@@ -303,12 +309,42 @@ function ka_cpu_alloc_budget(launches::Integer, localmem_bytes::Integer)
     return b
 end
 
+# A trivial kernel: the per-launch allocation of the KA CPU backend itself (#145), measured by
+# `test_allocations.jl` ("KA CPU backend launches allocation-free")
+@kernel function ka_launch_probe_kernel!(y)
+    i = @index(Global, Linear)
+    @inbounds y[i] = i
+end
+
 """
     triangle_view(A, view) -> SparseMatrixCSC
 
 The part of `A` stored for matrix view `view` (`'L'`: `tril(A)`, `'U'`: `triu(A)`, `'F'`: `A`).
 """
 triangle_view(A, view) = view == 'L' ? tril(A) : view == 'U' ? triu(A) : A
+
+# Options of the numeric test files, shared with the allocation checks of `test_allocations.jl` (#188).
+# T11 (test_numeric_cholesky_a): default budgets (16, 32, 48 KiB): regimes A, B and C on the 3-D Laplacian
+# and the random SPD matrix; regime-A subtrees as large as the budgets allow (`subtree_parallelism = 0`; the
+# default split leaves these small matrices few or no subtrees, see "subtree_parallelism" in
+# test_symbolic_schedule.jl)
+const NUMERIC_A_OPTS = Options(subtree_parallelism = 0)
+# small budgets and regime-C thresholds: all three regimes on a 2-D Laplacian
+const NUMERIC_ABC_OPTS = Options(subtree_budgets = [8192, 16384], regime_c_width = 16, regime_c_rows = 128,
+                                 subtree_parallelism = 0)
+# Metal only: subtrees of at most 32 fronts, as in the Metal bring-up (T31, which recorded no measured
+# reason); the other backends keep the fixture of T11
+numeric_abc_opts(backend) =
+    backend_name(backend) == "Metal" ? (o = copy(NUMERIC_ABC_OPTS); o.subtree_max_fronts = 32; o) : NUMERIC_ABC_OPTS
+# T10 (test_numeric_cholesky_b): regime B below the regime-C thresholds, no regime-A subtrees (T11)
+const NUMERIC_B_OPTS = Options(subtree_budgets = Int[])
+# both regimes in one analysis: small thresholds send the larger fronts to regime C
+const NUMERIC_BC_OPTS = Options(subtree_budgets = Int[], regime_c_width = 16, regime_c_rows = 128)
+# T09 (test_numeric_cholesky_c): every front through the level driver: no regime-A subtrees (T11); since T10
+# the regime-C path on every front needs `factorization_alg = "algo2"` (regime B: test_numeric_cholesky_b)
+const NUMERIC_C_OPTS = Options(subtree_budgets = Int[], factorization_alg = "algo2")
+# T12 (test_solve): small budgets and regime-C thresholds: regimes A, B and C on every T09 matrix
+const SOLVE_OPTS = Options(subtree_budgets = [8192, 16384], regime_c_width = 16, regime_c_rows = 128)
 
 """
     numeric_setup(backend, A, INT = Int32; view = 'L', index = 'O', opts) -> (S, Nr, info_ref, Sd, Nd, nz)
@@ -350,6 +386,37 @@ of the GEMM/SYRK kernel (T32). Only counted under `--code-coverage`, see
 """
 ka_dense_localmem(::Type{T}) where {T} = 2 * 32 * 32 * sizeof(T)
 
+# T32 (#53): one call of every `:ka` dense fallback, the flags passed as run-time values, through the
+# public entry points and on panel views as in the numeric and solve phases; 15 launches (the allocation
+# check of `test_allocations.jl`, #188)
+function ka_dense_round!(C, A, B, S, F, P, info, ipiv, C3, A3, F3, X3, flags)
+    T = eltype(C)
+    for (tA, tB) in flags
+        SparseDirectSolver.ka_gemm!(C, A, B, 1, 0; transA = tA, transB = tB)  # 3 launches
+    end
+    SparseDirectSolver.gemm!(C, A, B, -one(T), one(T); transB = 'C', impl = :ka)
+    SparseDirectSolver.syrk!(C, A, 1, 0; uplo = 'U', impl = :ka)
+    SparseDirectSolver.herk!(C, A, -1.0, 1.0; uplo = 'L', impl = :ka)
+    copyto!(F, S)
+    SparseDirectSolver.potrf_info!('L', F, info, 2; impl = :ka)
+    SparseDirectSolver.trsm!('R', 'L', 'C', 'N', one(T), F, P; impl = :ka)
+    SparseDirectSolver.trsm!('R', 'U', 'T', 'U', one(T), F, P; impl = :ka)
+    copyto!(B, A)
+    SparseDirectSolver.ka_getrf!(B, ipiv, info)
+    SparseDirectSolver.ka_laswp!(C, ipiv; reverse = true)
+    SparseDirectSolver.gemm_strided_batched!(C3, A3, A3, one(T), zero(T); transB = 'C', impl = :ka)
+    SparseDirectSolver.trsm_strided_batched!('L', 'L', 'N', 'N', one(T), F3, C3; impl = :ka)
+    SparseDirectSolver.ka_potrf!('L', X3, info; offset = 1)
+    SparseDirectSolver.ka_chol_check_info!(info, 2, F)
+    return nothing
+end
+
+# bytes allocated by `rounds` calls of `ka_dense_round!` (in a function: a loop in the testset's
+# scope would allocate itself)
+ka_dense_rounds_allocated(args, rounds) = @allocated for _ in 1:rounds
+    ka_dense_round!(args...)
+end
+
 """
     numeric_alloc_budget(S, T; impl = :auto) -> Int
 
@@ -384,8 +451,8 @@ Number of supernodes of the analysis `S` that the schedule assigns to regime `r`
 """
 nregime(S, r) = count(==(r), S.schedule.regime)
 
-# bytes allocated by one `factorize!(N, S, nz)`, checked against `numeric_alloc_budget`; one (identical)
-# function per numeric test file (T09 regime C, T10 regime B, T11 regime A)
+# bytes allocated by one `factorize!(N, S, nz)`, checked against `numeric_alloc_budget` by `test_allocations.jl`
+# (#188); one (identical) function per numeric test file it stands for (T09 regime C, T10 regime B, T11 regime A)
 numeric_a_allocated(N, S, nz) = @allocated SparseDirectSolver.factorize!(N, S, nz)
 numeric_b_allocated(N, S, nz) = @allocated SparseDirectSolver.factorize!(N, S, nz)
 numeric_c_allocated(N, S, nz; impl::Symbol = :auto) = @allocated SparseDirectSolver.factorize!(N, S, nz; impl)
@@ -472,6 +539,9 @@ function solve_alloc_budget(S, ws; ldlt::Bool = false, impl::Symbol = :auto)
     dense_bytes = impl === :ka ? ka_dense_localmem(eltype(ws.Y)) : 0
     return ka_cpu_alloc_budget(launches, launches * (SparseDirectSolver._SV_CTL * sizeof(Int64) + dense_bytes))
 end
+
+# bytes allocated by one `sweep_solve!`, checked against `solve_alloc_budget` by `test_allocations.jl` (#188)
+solve_allocated(x, ws, S, N, b; kwargs...) = @allocated SparseDirectSolver.sweep_solve!(x, ws, S, N, b; kwargs...)
 
 # --- LDLᵀ/LDLᴴ reference helpers (T14; shared with the 2×2 pivot pair tests of #64) ---
 

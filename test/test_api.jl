@@ -517,11 +517,11 @@ end
         @test relres(H + σ * I, to_host(xd), b) <= tol(T)
         k > 1 && push!(allocs, a)
     end
-    if any(ismissing, allocs)
+    if backend isa CPU
+        # the CPU budget of this loop is checked in test_allocations.jl (a child process without background
+        # tasks, #188)
+    elseif any(ismissing, allocs)
         @test_skip "no device allocation counter on $(backend_name(backend))"
-    elseif backend isa CPU
-        budget = numeric_alloc_budget(solver.symbolic, T) + solve_alloc_budget(solver.symbolic, solver.workspace)
-        @test maximum(allocs) <= budget
     else
         @test maximum(allocs) == 0
     end
