@@ -33,7 +33,9 @@ end
 # front wider than 256: the vendor dense part of the fused solve; the 34³ one also has fronts of width <= 256
 # between the wider ones near the root, a second dependency-counter segment) and the symmetric indefinite ones that factor
 # without pivoting (diagonally dominant, a KKT matrix with SPD or indefinite Hessian and δ = 1, the grid KKT
-# matrix whose root separators mix primal and dual rows)
+# matrix whose root separators mix primal and dual rows, and a KKT matrix with a denser Hessian whose root front is
+# wider than 256: the vendor dense sweeps of the fused solve on a factor of the stock regime-C LDLᵀ kernels, which
+# rely on its unit diagonal and on pivot_type = 'N' applying no local pivot order)
 algo1_spd_generators(::Type{T}) where {T} = (
     ("laplacian2d 30×30", () -> laplacian2d(T, 30, 30)),
     ("laplacian3d 10³", () -> laplacian3d(T, 10, 10, 10)),
@@ -47,6 +49,7 @@ algo1_indefinite_generators(::Type{T}) where {T} = (
     ("kkt_matrix 300+150", () -> kkt_matrix(T, 300, 150, 1.0)),
     ("kkt_matrix 300+150, indefinite H", () -> kkt_matrix(T, 300, 150, 1.0; hessian = :indefinite)),
     ("grid_kkt_matrix 20×20", () -> grid_kkt_matrix(T, 20, 20, 1.0)),
+    ("kkt_matrix 1000+500, denser H", () -> kkt_matrix(T, 1000, 500, 1.0; density_h = 0.01)),
 )
 # the generators whose weak pivots (no pivoting) leave the Float32 residual at about tol(T), for the fused solve as for
 # the level sweeps: their solves are checked against weak_pivot_tol (test/utils.jl)
@@ -65,6 +68,7 @@ const ALGO1_WEAK_PIVOT_LABELS = ("kkt_matrix 300+150, indefinite H",)
         @test getparam(s, "info") == 0
         @test s.fsolve isa SDS.Fused.FusedSolve
         label == "laplacian3d 34³" && @test length(s.fsolve.fz[1]) > 1         # several solve segments
+        label == "kkt_matrix 1000+500, denser H" && @test maximum(s.symbolic.schedule.width) > 256   # vendor dense part
         b = rand(T, n)
         x = algo1_solve(backend, s, b)
         @test relres(A, x, b) <= rtol

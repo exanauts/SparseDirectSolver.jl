@@ -4427,7 +4427,14 @@ and §2.5 wording proposed for the owner. Refs #82 (solve half; not closed).
   1 fail (the segment-count assertion on a 30³ Laplacian, which has one segment in Float32), 0 broken; with the
   matrix changed to 34³, `SDS_TEST_ONLY=test_solve_algo1` (CPU + CUDA, all four types): 314 pass, 0 fail, 0
   broken. So 7407 pass, 0 fail, 0 broken over these files (test_fused 747, test_api 3427, test_refinement 983,
-  test_fgmres 276, test_solve 896, test_madnlp 145, test_options 611, test_aqua 8, test_solve_algo1 314). An
+  test_fgmres 276, test_solve 896, test_madnlp 145, test_options 611, test_aqua 8, test_solve_algo1 314).
+  After the review (the wide-front `"S"` generator `kkt_matrix 1000+500, denser H`, `density_h = 0.01`, n = 1500,
+  widest front 434 in Float64 / 433 in Float32, asserted > 256: the vendor dense sweeps on the stock regime-C
+  LDLᵀ factor, with the whole battery of the file including `deterministic_mode = 1`, the sub-phases, refinement
+  and a refactorization; 0.07 s per analysis + factorization + solve warm on CUDA):
+  `CUDA_VISIBLE_DEVICES=1 SDS_TEST_ONLY=test_solve_algo1 PTR_NUM_JOBS=4 julia --project=. -e 'using Pkg;
+  Pkg.test()'`, CPU + CUDA (H200), all four element types: 342 pass, 0 fail, 0 broken (314 + 14 assertions × 2
+  element types); no other file changed. An
   earlier 6-worker run had one CPU `test_api[ComplexF32]` failure in "MadNLP-like refactorization loop"
   (363136 B > 2048 B, a level-sweep path); it passed alone (`SDS_TEST_GPU=0 SDS_TEST_ELTYPES=Float32,ComplexF32
   SDS_TEST_ONLY=test_api`: 1129 pass) and in the final 4-worker run: read as load noise in `@allocated`
@@ -4448,14 +4455,19 @@ and §2.5 wording proposed for the owner. Refs #82 (solve half; not closed).
   | bcsstk38 | 8032 | 1.540 (9.4e-11) | **0.327** (3.3e-9) | 0.317 | 0.353 (2.2e-10) | 16.3 / 16.5 |
   | lap2d_300 | 90000 | 3.208 (1.8e-12) | **1.595** (2.0e-12) | 1.655 | 0.527 (1.8e-12) | 20.8 / 21.0 |
   | lap3d_40 | 64000 | 11.72 (7.5e-14) | **6.99** (7.8e-14) | 7.11 | 1.251 (8.3e-14) | 212.3 / 212.6 |
+  | apache2 (GHS_psdef) | 715176 | 70.53 (1.6e-10) | **47.88** (1.7e-10) | 48.48 | 3.286 (1.8e-10) | 512.6 / 513.9 |
 
-  `"algo1"` is 1.7× (lap3d_40) to 5.6× (78k) faster than the level sweeps; against cuDSS it is 1.5× slower on
-  the 78k, 0.93× (faster) on bcsstk38, 3.0× on lap2d_300 and 5.6× on lap3d_40. The inverse launch adds 0.2–1.3%
+  `"algo1"` is 1.5× (apache2) and 1.7× (lap3d_40) to 5.6× (78k) faster than the level sweeps; against cuDSS it
+  is 1.5× slower on the 78k, 0.93× (faster) on bcsstk38, 3.0× on lap2d_300, 5.6× on lap3d_40 and 14.6× on apache2. The inverse launch adds 0.2–1.3%
   to a refactorization. The condensed KKT residuals are those of ill-conditioned systems (cuDSS is at the same
   level); there the fused solve's residual is 1.1–3.3× the level sweeps', on bcsstk38 35× (explicit inverses of
-  ill-conditioned `L₁₁` blocks); refinement removes it. Schedule statistics: widest front 24 (case118) to 1600
-  (lap3d_40), share of solve flops in fronts > 256 zero except lap2d_300 (0.025) and lap3d_40 (0.34), 13–32
-  steps. No SPD harness beyond these matrices was run (apache2 is on disk but was not measured).
+  ill-conditioned `L₁₁` blocks); refinement removes it. Schedule statistics: widest front 24 (case118) to 2378
+  (apache2), share of solve flops in fronts > 256 zero except lap2d_300 (0.025), lap3d_40 (0.34) and apache2
+  (0.375, 49 fronts wider than 256), 13–32 steps. The apache2 row was measured after the review (same script and
+  protocol restricted to apache2, `bench/data/suitesparse/GHS_psdef/apache2`, one `srun --gres=gpu:1` job per
+  solver); it is the matrix where the vendor dense sweeps dominate both solves: the fused solve still wins over
+  the level sweeps (the level-batched narrow part is what it replaces), but cuDSS is an order of magnitude ahead,
+  so the vendor dense sweeps of the wide fronts are where apache2/lap3d-class solve time goes.
   * Segments: the first run used one segment (as `FusedSolver`) and read lap3d_40 21.5 ms against the level
     sweeps' 11.7: its stock plan has fronts of width ≤ 256 between the six wider ones, and those entries ran on
     the level-batched `fwd1`/`bwd1` kernels, 32 work items per front. One segment per narrow run (5 on lap3d_40,
@@ -4467,7 +4479,7 @@ and §2.5 wording proposed for the owner. Refs #82 (solve half; not closed).
   * `memory_estimates` (Float64, MiB, `DirectSolver` default options; slot 1 / slot 2 without → with `"algo1"`;
     slot 14 the fused solve's buffers, almost all of it the inverses): 78k `"SPD"` 235.7 → 289.5 / 267.5 →
     321.3, slot 14 53.8; 78k `"S"` 238.4 → 292.2 / 270.1 → 323.9, 53.8; lap3d_40 182.7 → 191.8 / 271.3 → 280.5,
-    9.1.
+    9.1; apache2 1361.8 → 1472.0 / 1744.9 → 1855.0, 110.2.
 - `"default"`: **kept as the level sweeps.** On this harness and GPU, "`"algo1"` whenever the scope allows" picks
   the faster solve on every matrix (no schedule statistic is needed once the plan has one segment per narrow run:
   the fused solve wins even with 34% of the solve flops above 256 and a 1600-wide root), but (1) its residuals
@@ -4487,16 +4499,26 @@ and §2.5 wording proposed for the owner. Refs #82 (solve half; not closed).
   * Matching is supported (the permutation and scaling kernels wrap it), as the task allows.
   * The solve table uses `DirectSolver`'s default options, not `FusedSolver`'s tuning, so the `"algo1"` column
     is not the T34/T35 `FusedSolver` column (78k 2.12 here vs 2.28 there).
-- Open issues / follow-ups:
-  * The capability probe of complex atomic adds (`_probe_atomic`, caught by design) prints a device exception on
-    the first complex analysis on CUDA and the KA CPU backend: log noise only, already at `main`, left unchanged.
+- Open issues / follow-ups (recorded here, no new issues, per the owner's rule for small findings):
+  * The capability probe of complex atomic adds (`_probe_atomic`, `src/dense/capabilities.jl`, already on `main`)
+    prints "exception ... during kernel execution" on the first complex analysis on CUDA and on the KA CPU
+    (POCL) backend; the probe still returns `false`, as designed. Left unchanged: the text is printed by the
+    device runtimes (CUDA's device-side exception report, POCL's), not by Julia code, so `_probe`'s `try` cannot
+    silence it; avoiding it means deciding complex atomics without the launch (a static per-backend rule), which
+    could change what the probe decides on the backends not run here (AMDGPU, oneAPI). Atomix/UnsafeAtomics have no
+    complex atomic add today; if the probe ever needs to stay quiet, the fix is two real atomics on the
+    reinterpreted array in the kernels that use `atomic_add`, not a quieter probe.
   * Bunch–Kaufman (`pivot_type = 'B'`) under `"algo1"`: the fused sweeps need the local pivot order and 2×2 D
-    blocks; not attempted.
+    blocks; not attempted, raises `NotSupportedError`. Belongs to the design record #167.
   * Graph replay of the `"algo1"` solve on `DirectSolver` stays off (T38); `FusedSolve.graph` is the switch for
     both solvers.
-  * sm_89 and AMD timing of the multi-segment solve; `FusedSolver` with `all_segments = true` on lap3d_40.
-  * The accuracy of the explicit inverses on ill-conditioned blocks (bcsstk38), if `"algo1"` should become the
-    default.
+  * sm_89 and AMD timing of the multi-segment solve: decided by the same solve table on the RTX 4080 and an MI-class
+    GPU; if `"algo1"` loses to the level sweeps on any harness matrix there, the per-segment workgroup (and the
+    `"default"` rule) needs a per-architecture choice. `FusedSolver` with `all_segments = true` on lap3d_40: not
+    measured.
+  * The accuracy of the explicit inverses on ill-conditioned blocks (bcsstk38 35× the level-sweep residual):
+    decided by measuring `"algo1"` plus one refinement step against the level sweeps without refinement, residual
+    and time, on the harness; only if that is at parity can `"algo1"` become the default.
 - Suggested plan changes:
   * §1.3 `solve_alg` row: "`"default"` level-batched; `"algo1"` the partitioned-inverse fused solve of
     `src/fused.jl` after the stock factorization (T36): set before the analysis; real `"SPD"` and no-pivot
@@ -4507,7 +4529,7 @@ and §2.5 wording proposed for the owner. Refs #82 (solve half; not closed).
     with "On `DirectSolver` (T36) every run of plan entries whose fronts are all of width ≤ 256 is one
     dependency-counter segment (the later ones, near the root, with 256-wide workgroups) and the wider fronts stay
     on the vendor dense sweeps; on an H200 this beats the level sweeps on every harness matrix (78k 10.1 → 2.1 ms,
-    cuDSS 1.4; lap3d_40 11.7 → 7.0, cuDSS 1.3), with residuals up to 35× larger on ill-conditioned blocks, so
+    cuDSS 1.4; lap3d_40 11.7 → 7.0, cuDSS 1.3; apache2 70.5 → 47.9, cuDSS 3.3), with residuals up to 35× larger on ill-conditioned blocks, so
     `"default"` stays the level sweeps."
   * §2.7: add "`forward_progress(backend)` (`src/dense/capabilities.jl`) gates the dependency-counter kernels:
     `true` on CUDA, AMDGPU, oneAPI; `false` on the CPU backend and Metal."
