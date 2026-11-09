@@ -66,8 +66,8 @@ IPM KKT systems, 2026-10-01). What it changed in this plan:
 * **Benchmark harness and cuDSS baseline measurements** move into M0.
 
 Status: see §5 (M0–M9 done, T22 and the four backend extensions done, M11 in
-progress through T36–T38; the fused pipeline of `src/fused.jl` serves the MadNLP
-extension meanwhile).
+progress: T33–T36 done, T37–T38 open; the fused pipeline of `src/fused.jl`
+serves the MadNLP extension meanwhile, its solve is on `DirectSolver` since T36).
 
 ---
 
@@ -113,7 +113,7 @@ solve phases raise `NotSupportedError` (T20, §3.6).
 | --- | --- | --- |
 | `reordering_alg` | reinterpret | `"default"`: automatic choice between ND (METIS through CliqueTrees; Metis.jl is a dependency) and AMD by the cost model of §2.3 (flops + 1e8 × supernodal schedule depth, T22); `"algo3"` AMD, `"algo4"` ND, `"algo5"` natural. `"algo1"/"algo2"` (BTF_COLAMD/COLAMD with global pivoting): accepted, falls back to symmetric-pattern LU with a one-time warning (§3.3). |
 | `factorization_alg` | reinterpret | `"default"` auto; `"algo1"` runs the fronts above the regime-B bins on the KA tiled kernels (no vendor calls); `"algo2"` sends every front outside regime A to the regime-C path. Mirrors cuDSS keeping a separate algorithm for very sparse factors (T07, T10). |
-| `solve_alg` | reinterpret | `"default"` level-batched; `"algo1"` partitioned-inverse diagonal blocks (M11); sync-free variant selected automatically on CUDA/ROCm when available. |
+| `solve_alg` | reinterpret | `"default"` level-batched; `"algo1"` the partitioned-inverse fused solve of `src/fused.jl` after the stock factorization (T36): set before the analysis; real `"SPD"` and no-pivot `"S"`/`"H"` (`pivot_type = 'N'`), one right-hand side, `solve_mode = 0`, backends with inter-workgroup forward progress (CUDA, AMDGPU, oneAPI); everything else `NotSupportedError`. Not chosen automatically: faster on the whole H200 harness, less accurate on ill-conditioned blocks, unmeasured elsewhere. |
 | `matching_alg` | port (T21) | `"default"` off; algo1..5 = MC64 jobs 1..5; algo6 auto → job 5. Host MC64 at reordering, from the first batch member, reused by refactorizations. `"G"` factors `(Dr A Dc)[:, q]`; the symmetric structures are scaled only (`D A D`, inertia of `A`) and take the 2×2 pivot pairs from the matching cycles for jobs 5/6. Not combined with Schur mode. |
 | `solve_mode` | port (M5) | 0 = A, 1 = Aᵀ, 2 = Aᴴ. |
 | `ir_n_steps`, `ir_tol` | port (T16) | `ir_tol` honored (cuDSS ignores it); the early-exit test costs one host synchronization per step and runs only when `ir_tol > 0`. Default `ir_n_steps = 0` in the handle layer (cuDSS parity; MadNLP runs its own refinement loop); the LinearAlgebra layer sets `ir_n_steps = 2` and keeps `ir_tol = 0` (§3.1). With `ir_mode = "fgmres"`, `ir_n_steps` is the maximum number of FGMRES iterations (T18). |
@@ -409,8 +409,14 @@ guarantees forward progress (M11). Both were prototyped in PR #107
 GEMV, and one fused dependency-counter kernel per direction over every front
 of width ≤ 256 solves the 78k-bus condensed KKT in 3.5 ms against 3.8 ms for
 cuDSS and 18 ms for the level-batched sweeps, on CUDA and (8 ms) on a Radeon
-VII; the shallow ND ordering (#108) is a precondition. On lap3d_40 and apache2
-the same approach regresses, so T36 picks the strategy per schedule. Graph replay (§2.7, §3.9) may contain vendor dense
+VII; the shallow ND ordering (#108) is a precondition. On `DirectSolver` (T36)
+every run of plan entries whose fronts are all of width ≤ 256 is one
+dependency-counter segment (the later ones, near the root, with 256-wide
+workgroups) and the wider fronts stay on the vendor dense sweeps; on an H200
+this beats the level sweeps on every harness matrix (78k 10.1 → 2.1 ms, cuDSS
+1.4; lap3d_40 11.7 → 7.0, cuDSS 1.3; apache2 70.5 → 47.9, cuDSS 3.3), with
+residuals up to 35× larger on ill-conditioned blocks, so `"default"` stays the
+level sweeps. Graph replay (§2.7, §3.9) may contain vendor dense
 calls: the CUDA extension binds the cuSOLVER/cuBLAS handles to the capture
 stream before capturing (cuSOLVER 12.3.5 invalidates a capture whose stream
 it is bound to during the capture, #174);
@@ -482,12 +488,12 @@ and an M4 Max.
 | Constraint | Consequence |
 | --- | --- |
 | KA has no stable portable shuffle/ballot/subgroup reduction (KernelInterface 0.4 and KA 0.10 still moving; KernelIntrinsics.jl is a proof of concept tested on CUDA/ROCm only). | Portable kernels use 1-D workgroups and shared-memory reductions. Warp-level variants only behind backend extensions, later. |
-| Metal (and likely Intel) guarantee no inter-workgroup forward progress or launch order. | Sync-free SpTRSV and persistent DAG schedulers are CUDA/ROCm-only, selected by a capability check. Subtree + level scheduling is the portable baseline. |
+| Metal (and likely Intel) guarantee no inter-workgroup forward progress or launch order. | Sync-free SpTRSV and persistent DAG schedulers are selected by a capability check: `forward_progress(backend)` (`src/dense/capabilities.jl`) gates the dependency-counter kernels, `true` on CUDA, AMDGPU and oneAPI (the fused tests pass on Aurora's Max 1550), `false` on the CPU backend and Metal (T36). Subtree + level scheduling is the portable baseline. |
 | No dynamic parallelism, no graphs in KA; one launch per level is the portable floor. | Subtree fusion and level merging are first-class analysis goals. CUDA/HIP graph capture of refactorize+solve through the extensions. |
 | Metal has no Float64. | `factor_precision = Float32` with Float64 refinement on the CPU or in double-single arithmetic; acceptable for condensed/well-conditioned systems only. |
 | Float32 atomics have codegen regressions on CUDA; atomics cost everywhere. | No atomics in assembly or extend-add (owner-pull, deterministic). Atomics only in the default forward solve, with an atomic-free variant. |
 | KA has no gpu-scope memory fence: `Threads.atomic_fence()` compiles to a system-scope fence on CUDA, which costs 3–8% in the dependency-counter kernels (#154). | Kernels that publish data to other workgroups call the capability `device_fence(A)` (`src/dense/capabilities.jl`): `Threads.atomic_fence()` by default, the gpu-scope `threadfence()` in the CUDA extension (T34). |
-| KernelAbstractions CPU backend: a 2-D ndrange allocates per launch, launches with more than about 32 arguments are not specialized and allocate, `@localmem` is heap-allocated under coverage (issue #53); the 0.10 backend allocates a fixed amount per launch (#145). | Allocation-free phases use 1-D ndranges with the extra dimension folded into the group index and kernels of at most 32 arguments; the CPU allocation tests carry an explicit budget for the backend's own allocations (`ka_cpu_alloc_budget`). |
+| KernelAbstractions CPU backend: a 2-D ndrange allocates per launch, launches with more than about 32 arguments are not specialized and allocate, `@localmem` is heap-allocated under coverage (issue #53); KA ≥ 0.10.3 launches allocation-free (#145) and KA ≥ 0.10.6 `yield`s after a CPU launch of ≥ 50 µs, so a process-wide `@allocated` sees other tasks' allocations (#188). | Allocation-free phases use 1-D ndranges with the extra dimension folded into the group index and kernels of at most 32 arguments; the CPU allocation tests carry no per-launch allowance (`ka_cpu_alloc_budget`) and measure in a child process without background tasks (`test/test_allocations.jl`). |
 | `@localmem` is static shared memory; CUDA rejects more than 48 KiB per kernel, Metal allows 32 KiB. | Regime-A local sizes are a fixed ladder of `Val` instances (8–48 KiB); the per-backend cap is the capability `max_local_bytes(backend)` of each extension (T23/T31, #60). |
 
 ---
@@ -697,7 +703,8 @@ src/solver.jl                 DirectSolver, execute!, phases, parameters
 src/generic.jl                LinearAlgebra interface
 src/fused.jl                  module Fused: fused factorization (Cholesky, no-pivot LDLᵀ) with dependency
                               counters, partitioned-inverse solve, SDSTuning per-architecture bundle; the
-                              MadNLP extension's path until T36–T38 move it under execute!
+                              MadNLP extension's path; its solve is DirectSolver's solve_alg = "algo1"
+                              (T36), the factorization moves under execute! in T37, graph capture in T38
 ext/SparseDirectSolverCUDAExt.jl  …AMDGPUExt.jl  …OneAPIExt.jl  …MetalExt.jl  …KrylovExt.jl  …MadNLPExt.jl
 test/                         CPU backend always + every functional GPU package in test/Project.toml;
                               ported CUDSS.jl tests under test/ported; ParallelTestRunner, long files split
@@ -739,7 +746,7 @@ Not planned: multi-GPU (MG, MGMN), global pivoting, double-double, distributed
 input. The assembly tree keeps per-subtree ownership so MG can be added later
 by splitting the ND top level.
 
-**Status (2026-11-04)**: M0–M3 and M5–M9 are done; M4 is done except the
+**Status (2026-11-09)**: M0–M3 and M5–M9 are done; M4 is done except the
 MadNLPGPU integration (External task), for which the MadNLP extension
 (`SDSSolver`, PR #126, `sds_pivoting = :bk` PR #134) is the in-repository
 stand-in; M2 and M4 differ from the definitions above in that vendor batched
@@ -757,7 +764,9 @@ factorization / 3.9× refactorization / 3.5× solve for Cholesky, 5.1× / 7.3× 
 the fused pipeline of `src/fused.jl` reads 2.7× refactorization / 1.9× solve
 on the same harness and runs the 78k-bus ACOPF end to end on seven GPUs
 (`bench/PERFORMANCE-2026-10.md`). The remaining gap on KKT systems is launch-
-and level-bound (#82); T36–T38 move the fused pipeline under `execute!`.
+and level-bound (#82); T36 moved the fused solve under `execute!`
+(`solve_alg = "algo1"`, H200: 78k solve 10.1 → 2.1 ms against cuDSS 1.4),
+T37–T38 move the fused factorization and add graph capture.
 Measurements and the experiment plan are in `PERFORMANCE.md`.
 
 ---
