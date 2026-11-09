@@ -389,54 +389,5 @@ SDS._allow_generic_dense(op::Symbol, ::FakeDenseBackend, ::Type{T}) where {T} = 
     @test SDS.select_impl(:syrk, Y, :auto) === :ka
 end
 
-# T32 (#53): one call of every `:ka` dense fallback, the flags passed as run-time values, through the
-# public entry points and on panel views as in the numeric and solve phases; 15 launches
-function ka_dense_round!(C, A, B, S, F, P, info, ipiv, C3, A3, F3, X3, flags)
-    T = eltype(C)
-    for (tA, tB) in flags
-        SDS.ka_gemm!(C, A, B, 1, 0; transA = tA, transB = tB)              # 3 launches
-    end
-    SDS.gemm!(C, A, B, -one(T), one(T); transB = 'C', impl = :ka)
-    SDS.syrk!(C, A, 1, 0; uplo = 'U', impl = :ka)
-    SDS.herk!(C, A, -1.0, 1.0; uplo = 'L', impl = :ka)
-    copyto!(F, S)
-    SDS.potrf_info!('L', F, info, 2; impl = :ka)
-    SDS.trsm!('R', 'L', 'C', 'N', one(T), F, P; impl = :ka)
-    SDS.trsm!('R', 'U', 'T', 'U', one(T), F, P; impl = :ka)
-    copyto!(B, A)
-    SDS.ka_getrf!(B, ipiv, info)
-    SDS.ka_laswp!(C, ipiv; reverse = true)
-    SDS.gemm_strided_batched!(C3, A3, A3, one(T), zero(T); transB = 'C', impl = :ka)
-    SDS.trsm_strided_batched!('L', 'L', 'N', 'N', one(T), F3, C3; impl = :ka)
-    SDS.ka_potrf!('L', X3, info; offset = 1)
-    SDS.ka_chol_check_info!(info, 2, F)
-    return nothing
-end
-
-# bytes allocated by `rounds` calls of `ka_dense_round!` (in a function: a loop in the testset's
-# scope would allocate itself)
-ka_dense_rounds_allocated(args, rounds) = @allocated for _ in 1:rounds
-    ka_dense_round!(args...)
-end
-
-TEST_CPU && @testset ":ka dense fallbacks allocation-free (CPU, $T)" for T in ELTYPES
-    Random.seed!(666)
-    n, f = 40, 70
-    A, B, C = randn(T, n, n), randn(T, n, n), zeros(T, n, n)
-    S = dense_hpd(T, n)
-    buf = randn(T, f * n + 3)
-    P = reshape(view(buf, 4:(f * n + 3)), f, n)                       # a panel view, as in a front
-    F = view(P, 1:n, 1:n)
-    Pr = view(P, (n + 1):f, :)
-    info, ipiv = zeros(Int32, 4), zeros(Int32, n)
-    A3, C3 = randn(T, n, n, 2), zeros(T, n, n, 2)
-    F3 = cat(LowerTriangular(S) + n * I, LowerTriangular(S) + n * I; dims = 3)
-    X3 = cat(S, S; dims = 3)
-    flags = [('N', 'N'), ('T', 'C'), ('C', 'T')]
-    args = (C, A, B, S, F, Pr, info, ipiv, C3, A3, F3, X3, flags)
-    ka_dense_round!(args...)                                          # compile
-    rounds = 8
-    bytes = ka_dense_rounds_allocated(args, rounds)
-    launches = 15 * rounds
-    @test bytes <= ka_cpu_alloc_budget(launches, launches * ka_dense_localmem(T))
-end
+# the CPU allocation check of the `:ka` dense fallbacks (`ka_dense_round!`, test/utils.jl) runs in
+# test_allocations.jl (a child process without background tasks, #188)

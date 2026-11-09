@@ -2,9 +2,8 @@
 # front through the regime-C path (dense interface), checked against the T08
 # reference panels.
 
-# every front through the level driver: no regime-A subtrees (T11); since T10 the
-# regime-C path on every front needs `factorization_alg = "algo2"` (regime B: test_numeric_cholesky_b)
-const NUMERIC_C_OPTS = Options(subtree_budgets = Int[], factorization_alg = "algo2")
+# the options `NUMERIC_C_OPTS` (every front through the regime-C path) live in test/utils.jl (shared with
+# test_allocations.jl, #188)
 
 numeric_c_matrices(::Type{T}) where {T} =
     (("laplacian2d(40,40)", laplacian2d(T, 40, 40)), ("random_spd(500,0.01)", random_spd(T, 500, 0.01)),
@@ -83,11 +82,8 @@ end
         @test relres(A, SDS.ref_solve!(similar(b), S, Nh, b), b) <= tol(T)
         @test SDS.factorize!(Nd, Sd, nz; impl) == 0
         @test SDS.host_numeric(Nd).factor == F1
-        # the allocation-free dense paths (T32, #53): `:ka` like `:auto`; `:generic` is the allocating
-        # reference (PLAN §3.9). The previous call compiled.
-        if backend isa CPU && impl !== :generic
-            @test numeric_c_allocated(Nd, Sd, nz; impl) <= numeric_alloc_budget(S, T; impl)
-        end
+        # the CPU allocation checks of the allocation-free dense paths (T32, #53) run in test_allocations.jl
+        # (a child process without background tasks, #188)
     end
 end
 
@@ -117,12 +113,8 @@ end
     @test relres(B, SDS.ref_solve!(similar(b), S2, Nh, b), b) <= tol(T)
     @test SDS.factorize!(Nd, Sd, nz) == 0                # and back
     @test SDS.host_numeric(Nd).factor == F0
-    if backend isa CPU
-        # no allocation in the numeric phase (the first call compiles) beyond what the KA CPU backend
-        # itself allocates per launch under coverage (`ka_cpu_alloc_budget`)
-        numeric_c_allocated(Nd, Sd, nz)
-        @test numeric_c_allocated(Nd, Sd, nz) <= numeric_alloc_budget(S, T)
-    end
+    # the CPU allocation check of this refactorization runs in test_allocations.jl (a child process without
+    # background tasks, #188)
 end
 
 @testset "info: first non-positive pivot ($(backend_name(backend)), $T)" for backend in BACKENDS, T in ELTYPES

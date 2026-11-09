@@ -2,17 +2,8 @@
 # workgroup per leaf subtree, fronts and contribution blocks in local memory),
 # together with regimes B and C, checked against the T08 reference panels.
 
-# default budgets (16, 32, 48 KiB): regimes A, B and C on the 3-D Laplacian and the random SPD matrix; regime-A
-# subtrees as large as the budgets allow (`subtree_parallelism = 0`; the default split leaves these small
-# matrices few or no subtrees, see "subtree_parallelism" in test_symbolic_schedule.jl)
-const NUMERIC_A_OPTS = Options(subtree_parallelism = 0)
-# small budgets and regime-C thresholds: all three regimes on a 2-D Laplacian
-const NUMERIC_ABC_OPTS = Options(subtree_budgets = [8192, 16384], regime_c_width = 16, regime_c_rows = 128,
-                                 subtree_parallelism = 0)
-# Metal only: subtrees of at most 32 fronts, as in the Metal bring-up (T31, which recorded no measured
-# reason); the other backends keep the fixture of T11
-numeric_abc_opts(backend) =
-    backend_name(backend) == "Metal" ? (o = copy(NUMERIC_ABC_OPTS); o.subtree_max_fronts = 32; o) : NUMERIC_ABC_OPTS
+# the options `NUMERIC_A_OPTS`, `NUMERIC_ABC_OPTS` and `numeric_abc_opts` live in test/utils.jl (shared with
+# test_allocations.jl, #188)
 
 numeric_a_matrices(::Type{T}, backend = CPU()) where {T} =
     (("laplacian2d(40,40) A+B+C", laplacian2d(T, 40, 40), numeric_abc_opts(backend)),
@@ -183,11 +174,8 @@ end
         @test relres(B, SDS.ref_solve!(similar(b), S2, Nh, b), b) <= tol(T)
         @test SDS.factorize!(Nd, Sd, nz) == 0            # and back
         @test SDS.host_numeric(Nd).factor == F0
-        if backend isa CPU
-            # no allocation in the numeric phase (the first call compiles), see `ka_cpu_alloc_budget`
-            numeric_a_allocated(Nd, Sd, nz)
-            @test numeric_a_allocated(Nd, Sd, nz) <= numeric_alloc_budget(S, T)
-        end
+        # the CPU allocation check of this refactorization runs in test_allocations.jl (a child process
+        # without background tasks, #188)
     end
 end
 

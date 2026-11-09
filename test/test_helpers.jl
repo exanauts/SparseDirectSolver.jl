@@ -161,23 +161,8 @@ end
     end
 end
 
-# A trivial kernel: the per-launch allocation of the KA CPU backend itself (#145).
-@kernel function ka_launch_probe_kernel!(y)
-    i = @index(Global, Linear)
-    @inbounds y[i] = i
-end
-
-# The CPU allocation budgets (`ka_cpu_alloc_budget`) grant nothing per launch: a KA
-# release that allocates per launch again would fail the numeric and solve budgets
-# all over the suite, so this guard names the cause (#145).
-TEST_CPU && @testset "KA CPU backend launches allocation-free" begin
-    y = zeros(Int, 256)
-    launch!() = (ka_launch_probe_kernel!(CPU(), 64)(y; ndrange = length(y)); KernelAbstractions.synchronize(CPU()))
-    launch!(); launch!(); launch!()                       # compile and warm up
-    bytes = @allocated launch!()
-    @test y == 1:256
-    @test bytes <= (Base.JLOptions().code_coverage != 0 ? 64 : 0)
-end
+# the guard "KA CPU backend launches allocation-free" (#145) runs in test_allocations.jl (a child process
+# without background tasks, #188)
 
 @testset "tolerances and residuals" begin
     @test tol(Float32) == sqrt(eps(Float32))

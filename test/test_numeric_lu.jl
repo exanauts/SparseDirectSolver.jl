@@ -207,16 +207,8 @@ end
         @test device_solve(backend, ws, Sd, Nd, b; deterministic = true, transpose) ==
               device_solve(backend, ws, Sd, Nd, b; deterministic = true, transpose)
     end
-    # no allocation in the numeric phase and the solve (CPU backend)
-    if backend isa CPU
-        SDS.factorize!(Nd, Sd, nz; opts)
-        @test (@allocated SDS.factorize!(Nd, Sd, nz; opts)) <= ldlt_alloc_budget(S, Nd; lu = true)
-        x = similar(b)
-        for transpose in (false, true)
-            SDS.sweep_solve!(x, ws, Sd, Nd, b; transpose)
-            @test (@allocated SDS.sweep_solve!(x, ws, Sd, Nd, b; transpose)) <= solve_alloc_budget(S, ws; ldlt = true)
-        end
-    end
+    # the CPU allocation checks of the numeric phase and the solves run in test_allocations.jl (a child
+    # process without background tasks, #188)
 end
 
 @testset "solve sweeps: one at a time and dense path ($(backend_name(backend)), $T)" for backend in BACKENDS,

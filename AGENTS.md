@@ -47,7 +47,10 @@ Three documents define the work. Read them in this order before touching code:
   AMDGPU.jl >= 2.10, Metal.jl >= 1.11 and oneAPI.jl >= 2.10; KA >= 0.10.3
   launches allocation-free on the CPU backend, so the test allocation budgets
   carry no per-launch allowance outside coverage runs -- see
-  `ka_cpu_alloc_budget` and #145).
+  `ka_cpu_alloc_budget` and #145). `@allocated` around a KA CPU launch is only
+  meaningful in a process whose other tasks do not allocate (KA >= 0.10.6
+  yields after launches of 50 µs or more), so the CPU allocation checks live in
+  `test/test_allocations.jl`, which measures in a child process (#188).
 * The repository is `github.com/exanauts/SparseDirectSolver.jl` (remote
   `origin`, branch `main`). Commit at the end of the task with a message
   starting with the task id, e.g. `T05: symbolic pattern, ordering, etree,
