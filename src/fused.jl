@@ -388,22 +388,33 @@ end
 # ---------------------------------------------------------------------------
 # per-front inverses of the L11 blocks (width <= MW) for the partitioned-inverse solve:
 # returns the device buffer, its per-front offsets, a closure that (re)computes the
-# inverses from the current factor (`invert_blocked_kernel!`), and the buffer size in bytes
+# inverses from the current factor (`invert_blocked_kernel!`), and the device bytes of every
+# buffer it allocates (inverses, offsets, the (front, block column) lists). Every front wider
+# than MW must be solved by the dense calls of a SOLVE_DENSE plan entry (the regime-C path):
+# `fwd1_kernel!`/`bwd1_kernel!` skip such fronts, so a wider front in a regime-B entry (a raised
+# `regime_c_width`) raises NotSupportedError
 function build_inverse(s)
     S = s.symbolic
     sc = S.schedule
-    reg = Array(sc.regime)
     width = sc.width
-    ns = length(reg)
+    ns = length(width)
+    plan = s.workspace.plan
+    nodes = sc.group_nodes
+    for k in eachindex(plan.kind)
+        plan.kind[k] == SDS.SOLVE_FRONTS || continue
+        for q in plan.first[k]:plan.last[k]
+            v = nodes[q]
+            width[v] <= MW ||
+                throw(SDS.NotSupportedError("fused solve: front $v of width $(width[v]) > $MW is not on the regime-C " *
+                                            "path (regime_c_width = $(sc.regime_c_width)); the partitioned-inverse " *
+                                            "solve needs every front wider than $MW in regime C"))
+        end
+    end
     inv_ptr_h = zeros(Int64, ns + 1)
     p = 1
     for v in 1:ns
         inv_ptr_h[v] = p
-        if width[v] <= MW
-            p += width[v]^2
-        else
-            @assert reg[v] == SDS.REGIME_C "front $v: width $(width[v]) > $MW but not regime C"
-        end
+        width[v] <= MW && (p += width[v]^2)
     end
     inv_ptr_h[ns + 1] = p
     backend = KA.get_backend(s.numeric.factor)
@@ -425,7 +436,8 @@ function build_inverse(s)
     invert! = () -> (np > 0 && invert_blocked_kernel!(backend, INVWG)(inv11, s.numeric.factor, inv_ptr, pv, pj,
                                                                        S.front_ptr, S.front_nrows, S.front_ncols,
                                                                        Val(INVWG); ndrange = INVWG * np); nothing)
-    return inv11, inv_ptr, invert!, sizeof(T) * (p - 1)
+    bytes = Int64(sizeof(T)) * (p - 1) + Int64(sizeof(Int64)) * (ns + 1) + Int64(2 * sizeof(Int32)) * np
+    return inv11, inv_ptr, invert!, bytes
 end
 
 # ---------------------------------------------------------------------------
@@ -952,8 +964,18 @@ function algo2_solve!(x, s, b, inv11, inv_ptr, fz, det::Bool = false)
 end
 
 # the sweeps of `algo2_solve!` on the solve workspace `Y` (the permuted right-hand side in,
-# the permuted solution out): the part a CUDA graph replays (T34)
+# the permuted solution out): the part a CUDA graph replays (T34). The three parts are the
+# solve sub-phases of `solve_alg = "algo1"` ("solve_fwd", "solve_diag", "solve_bwd", T36)
 function algo2_sweeps!(s, inv11, inv_ptr, fz, det::Bool = false)
+    algo2_forward!(s, inv11, inv_ptr, fz, det)
+    algo2_diagonal!(s)
+    algo2_backward!(s, inv11, inv_ptr, fz)
+    return nothing
+end
+
+# the forward sweep of the fused solve: the segments by the dependency-counter kernel, the
+# plan entries outside them by `fwd1_kernel!` and the vendor dense calls (fronts wider than MW)
+function algo2_forward!(s, inv11, inv_ptr, fz, det::Bool = false)
     S, N, ws = s.symbolic, s.numeric, s.workspace
     plan = ws.plan
     nodes = S.schedule.group_nodes
@@ -985,6 +1007,49 @@ function algo2_sweeps!(s, inv11, inv_ptr, fz, det::Bool = false)
             fwd1!(a, b_)
         end
     end
+    k = 1
+    for (fzk, wg) in segs
+        while k < fzk.i1
+            fwd_entry(k); k += 1
+        end
+        run_fused!(fzk, wg, Yv, s, inv11, inv_ptr, backend, det)
+        k = fzk.i2 + 1
+    end
+    while k <= length(plan.kind)
+        fwd_entry(k); k += 1
+    end
+    return nothing
+end
+
+# the diagonal step between the unit-triangular sweeps of LDLᵀ (1×1 pivots only: D⁻¹ on the first
+# column of `Y`); nothing for Cholesky
+function algo2_diagonal!(s)
+    S, N, ws = s.symbolic, s.numeric, s.workspace
+    if SDS._is_ldlt_structure(S.structure)
+        n = S.n
+        Yv = vec(ws.Y)
+        if length(Yv) == n
+            Yv ./= view(N.d, 1:n)
+        else                                     # a workspace sized for more right-hand sides
+            view(Yv, 1:n) ./= view(N.d, 1:n)
+        end
+    end
+    return nothing
+end
+
+# the backward sweep of the fused solve (the forward plan in reverse)
+function algo2_backward!(s, inv11, inv_ptr, fz)
+    S, N, ws = s.symbolic, s.numeric, s.workspace
+    plan = ws.plan
+    nodes = S.schedule.group_nodes
+    widths = S.schedule.width
+    p = SDS._solve_impls(N, S, :auto)
+    backend = KA.get_backend(ws.Y)
+    Yv = vec(ws.Y)
+    segs, _ = fz
+    args(first, count) = (Yv, N.factor, inv11, inv_ptr, S.group_nodes, first, count, S.subtree_ptr,
+                          S.subtree_nodes, S.super_ptr, S.rowptr, S.rowval, S.front_ptr, S.front_nrows,
+                          S.front_ncols)
     bwd_entry(k) = begin
         a, b_ = plan.first[k], plan.last[k]
         if plan.kind[k] == SDS.SOLVE_SUBTREES
@@ -997,20 +1062,6 @@ function algo2_sweeps!(s, inv11, inv_ptr, fz, det::Bool = false)
         else
             bwd1_kernel!(backend, WG)(args(a, b_ - a + 1)..., Val(false), Val(WG); ndrange = WG * (b_ - a + 1))
         end
-    end
-    k = 1
-    for (fzk, wg) in segs
-        while k < fzk.i1
-            fwd_entry(k); k += 1
-        end
-        run_fused!(fzk, wg, Yv, s, inv11, inv_ptr, backend, det)
-        k = fzk.i2 + 1
-    end
-    while k <= length(plan.kind)
-        fwd_entry(k); k += 1
-    end
-    if SDS._is_ldlt_structure(S.structure)      # LDL: apply D between the unit-triangular sweeps
-        Yv ./= view(N.d, 1:length(Yv))
     end
     k = length(plan.kind)
     for (fzk, wg) in Iterators.reverse(segs)
@@ -1025,6 +1076,109 @@ function algo2_sweeps!(s, inv11, inv_ptr, fz, det::Bool = false)
     end
     return nothing
 end
+
+# ---------------------------------------------------------------------------
+# The partitioned-inverse fused solve as one object (T36): the L11 inverses of an analysis
+# (`build_inverse`), its dependency-counter solve segment (`build_fused`) and the optional
+# CUDA-graph replay of the sweeps. The one solve driver of the fused solve, shared by
+# `DirectSolver` (`solve_alg = "algo1"`, after the stock factorization: the factor in the stock
+# layout is all the solve reads) and `FusedSolver` (after the fused factorization).
+mutable struct FusedSolve{VT, VI, IF, FZ}
+    inv11::VT                # per-front L11 inverses (`build_inverse`)
+    inv_ptr::VI
+    invert!::IF              # recomputes them from the current factor (one launch)
+    fz::FZ                   # `([(segment, workgroup)], true)`, the segments of `algo2_solve!`
+    bytes::Int64             # device bytes: inverses, offsets, block lists, segment counters
+    graph::Bool              # replay the sweeps from a captured graph (FusedSolver, `graph_max_n`)
+    gsolve::Any              # the captured sweeps (`nothing`: not yet; `false`: not capturable)
+    gdet::Bool               # the deterministic_mode the graph was captured with
+    current::Bool            # the inverses are those of the current factor (DirectSolver's bookkeeping)
+end
+
+# the fused solve of the analysis of `s` (a DirectSolver, or anything with its `symbolic`,
+# `numeric` and `workspace`): inverse storage and the dependency-counter segments: the merged one
+# from the first plan entry (workgroups of `workgroup` work items) and, with `all_segments`, one
+# more per later run of plan entries whose fronts are all of width <= MW (between the fronts wider
+# than MW near the root, which stay on the vendor dense sweeps; workgroups of `upper_workgroup`:
+# these runs hold few, wide fronts). Without `all_segments` (FusedSolver) the entries after the
+# first segment run on the level-batched inverse kernels. Raises NotSupportedError when no plan
+# entry has fronts of width <= MW, or a front wider than MW is not on the regime-C path
+function fused_solve_plan(s; workgroup::Int, graph::Bool = false, all_segments::Bool = false,
+                          upper_workgroup::Int = MW)
+    _check_solve_workgroup(workgroup)
+    _check_solve_workgroup(upper_workgroup)
+    inv11, inv_ptr, invertf, bytes = build_inverse(s)
+    fz1 = build_fused(s; kstart = 1, wcap = MW)
+    fz1 === nothing && throw(SDS.NotSupportedError("fused solve: no plan entry with fronts of width <= $MW"))
+    segs = [(fz1, workgroup)]
+    while all_segments
+        fzk = build_fused(s; kstart = last(segs)[1].i2 + 1, wcap = MW, merged = false)
+        fzk === nothing && break
+        push!(segs, (fzk, upper_workgroup))
+    end
+    for (fzk, _) in segs
+        bytes += sum(k -> _device_bytes(fzk[k]), keys(fzk))
+    end
+    return FusedSolve(inv11, inv_ptr, invertf, (segs, true), bytes, graph, nothing, false, false)
+end
+
+# the three sweeps on the permuted right-hand side in `s.workspace.Y`; with `fs.graph` the first
+# call per `det` runs eagerly (it compiles the kernels) and captures the graph, later calls replay it
+function fused_sweeps!(fs::FusedSolve, s, det::Bool)
+    if fs.graph
+        det == fs.gdet || (fs.gsolve = nothing)    # a graph is captured for one forward-sweep variant
+        if fs.gsolve === nothing
+            algo2_sweeps!(s, fs.inv11, fs.inv_ptr, fs.fz, det)
+            inv11, inv_ptr, fz = fs.inv11, fs.inv_ptr, fs.fz
+            backend = KA.get_backend(s.workspace.Y)
+            g = det ? SDS.capture_graph(backend, () -> algo2_sweeps!(s, inv11, inv_ptr, fz, true)) :
+                      SDS.capture_graph(backend, () -> algo2_sweeps!(s, inv11, inv_ptr, fz, false))
+            fs.gsolve = something(g, false)
+            fs.gdet = det
+            return nothing
+        end
+        if fs.gsolve !== false
+            fs.gsolve()
+            return nothing
+        end
+    end
+    algo2_sweeps!(s, fs.inv11, fs.inv_ptr, fs.fz, det)
+    return nothing
+end
+
+"""
+    fused_solve!(fs, s, X, B, det; transposed = false, pin, scale_in, pout, scale_out) -> X
+
+The partitioned-inverse fused solve `X = A⁻¹ B` for one right-hand side with the factor of `s`
+(a `DirectSolver`): permute `B` into the solve workspace (`pin`, `scale_in`: the permutation and
+scaling of the solve phases, `solve_io`; default the analysis permutation without scaling), the
+fused sweeps of `fs` (`det`: the pull forward sweep of `deterministic_mode = 1`), and the inverse
+permutation into `X`. Asynchronous; the solve driver of both `DirectSolver` with
+`solve_alg = "algo1"` and `FusedSolver`.
+"""
+function fused_solve!(fs::FusedSolve, s, X, B, det::Bool; transposed::Bool = false, pin = s.symbolic.perm,
+                      scale_in = nothing, pout = s.symbolic.perm, scale_out = nothing)
+    ws = s.workspace
+    bm = SDS.batch_map(s.numeric; nrhs = 1)
+    SDS.permute_rhs!(ws.Y, B, pin; transposed, bm, scale = scale_in)
+    fused_sweeps!(fs, s, det)
+    SDS.unpermute_solution!(X, ws.Y, pout; transposed, bm, scale = scale_out)
+    return X
+end
+
+# the hooks of the handle layer (src/solver.jl, src/solve/refinement.jl): the fused solve of an
+# analysis with solve_alg = "algo1", its inverses, its sweeps on (ws, S, N) and the sub-phases
+SDS._fused_invert!(fs::FusedSolve) = (fs.invert!(); fs.current = true; nothing)
+SDS._fused_stale!(fs::FusedSolve) = (fs.current = false; nothing)
+SDS._fused_current(fs::FusedSolve) = fs.current
+SDS._fused_bytes(fs::FusedSolve) = fs.bytes
+_sv(ws, S, N) = (; symbolic = S, numeric = N, workspace = ws)
+SDS._fused_sweeps!(fs::FusedSolve, ws, S, N, det::Bool) = fused_sweeps!(fs, _sv(ws, S, N), det)
+SDS._fused_forward!(fs::FusedSolve, ws, S, N, det::Bool) = algo2_forward!(_sv(ws, S, N), fs.inv11, fs.inv_ptr, fs.fz, det)
+SDS._fused_diagonal!(fs::FusedSolve, ws, S, N) = algo2_diagonal!(_sv(ws, S, N))
+SDS._fused_backward!(fs::FusedSolve, ws, S, N) = algo2_backward!(_sv(ws, S, N), fs.inv11, fs.inv_ptr, fs.fz)
+SDS._fused_solve_plan(s::SDS.DirectSolver) =
+    fused_solve_plan(s; workgroup = default_tuning(s.backend).solve_workgroup, all_segments = true)
 
 const SYRK_IN = 64
 const TILE = 32
@@ -2410,7 +2564,8 @@ Phases (`execute!(phase, F, X, B; asynchronous = true)`):
   on every part: a front with more than `1023 · 32` rows below a panel raises
   `NotSupportedError` at analysis.
 * `"solve"`: `X = A⁻¹ B` with the partitioned-inverse solve, for a vector (or
-  an `n × 1` matrix) on the solver's backend; `X === B` is allowed.
+  an `n × 1` matrix) on the solver's backend; `X === B` is allowed. The solve
+  is the one of `DirectSolver`'s `solve_alg = "algo1"` (one driver, T36).
 
 `setparam!` accepts `"user_perm"`, `"reordering_alg"`, `"nd_nseps"`,
 `"nd_seed"` and `"pivot_epsilon"` (the Cholesky pivot epsilon; the fused
@@ -2438,7 +2593,8 @@ factorization, slot 14 every other buffer of the plans, both added to slots
 Everything the pipeline does not do raises [`NotSupportedError`](@ref SparseDirectSolver.NotSupportedError), at
 construction or in the phase, never a silent switch to the stock path: the
 KernelAbstractions `CPU()` backend (the dependency-counter kernels spin on
-resident workgroups, which the CPU backend runs one after another), complex
+resident workgroups, which the CPU backend runs one after another) and any
+other backend without inter-workgroup forward progress (Metal), complex
 element types, the structures `"HPD"`, `"H"` and `"G"`, a uniform batch
 (`nbatch > 1`), `nrhs > 1`, a transposed solve (`solve_mode ≠ 0`), the solve
 sub-phases (`"solve_fwd_perm"` … `"solve_refinement"`, the Schur phases),
@@ -2455,20 +2611,31 @@ mutable struct FusedSolver{T, INT, S <: SDS.DirectSolver{T, INT}} <: SDS.Abstrac
     ldl::Bool                # "S": no-pivot LDLᵀ
     nzval::Any               # the values the fused factorization reads (`_factor_values(inner)`)
     fp::Any                  # factorization plan (`build_fused_plan`)
-    inv11::Any               # per-front L11 inverses (`build_inverse`)
-    inv_ptr::Any
-    invert!::Any
-    fz::Any                  # fused solve segments (`build_fused`)
+    fs::Any                  # the fused solve (`FusedSolve`: inverses, segments, solve graph), shared
+                             # with DirectSolver's solve_alg = "algo1" (T36)
     info::Int
     stage::Int
-    # CUDA-graph replay (T34, `SDSTuning.graph_max_n`): the captured refactorization and solve
-    # sweeps (`nothing`: not captured yet; `false`: not capturable), and the values the
-    # refactorization graph was captured with (a new `nzval` buffer captures again)
+    # CUDA-graph replay (T34, `SDSTuning.graph_max_n`): the captured refactorization
+    # (`nothing`: not captured yet; `false`: not capturable), and the values it was captured with
+    # (a new `nzval` buffer captures again); the solve graph lives in `fs`
     gfact::Any
-    gsolve::Any
     gnz::Any
-    gdet::Bool               # the deterministic_mode the solve graph was captured with
 end
+
+# the fields of the fused solve before T36 (`F.inv11`, `F.inv_ptr`, `F.invert!`, `F.fz`, `F.gsolve`,
+# `F.gdet`; bench/e2e/fused_probe.jl and the tests read them) now live in `F.fs`
+const _FS_FIELDS = (:inv11, :inv_ptr, :invert!, :fz, :gsolve, :gdet)
+
+function Base.getproperty(F::FusedSolver, name::Symbol)
+    if name in _FS_FIELDS
+        fs = getfield(F, :fs)
+        fs === nothing && return name === :gdet ? false : nothing
+        return getfield(fs, name)
+    end
+    return getfield(F, name)
+end
+
+Base.propertynames(F::FusedSolver, private::Bool = false) = (fieldnames(FusedSolver)..., _FS_FIELDS...)
 
 function FusedSolver(A, structure, view; tuning::Union{Nothing, SDSTuning} = nothing, kwargs...)
     return _fused_solver(SDS.DirectSolver(A, structure, view; kwargs...), tuning)
@@ -2488,6 +2655,9 @@ function _fused_solver(s::SDS.DirectSolver{T, INT}, tuning::Union{Nothing, SDSTu
     backend isa KA.CPU &&
         throw(SDS.NotSupportedError("FusedSolver: the KernelAbstractions CPU backend is not supported (the " *
                                     "dependency-counter kernels spin on resident workgroups); use DirectSolver"))
+    SDS.forward_progress(backend) ||
+        throw(SDS.NotSupportedError("FusedSolver: the backend $(nameof(typeof(backend))) guarantees no " *
+                                    "inter-workgroup forward progress (PLAN §2.7); use DirectSolver"))
     T <: Real ||
         throw(SDS.NotSupportedError("FusedSolver: complex element type $T is not supported (the fused kernels " *
                                     "have no conjugation); use DirectSolver"))
@@ -2508,8 +2678,7 @@ function _fused_solver(s::SDS.DirectSolver{T, INT}, tuning::Union{Nothing, SDSTu
         SDS.setparam!(s, "pivot_pairs", "none")
     end
     _apply_tuning!(s, t)
-    return FusedSolver{T, INT, typeof(s)}(s, t, ldl, nothing, nothing, nothing, nothing, nothing, nothing, 0,
-                                          SDS.STAGE_NONE, nothing, nothing, nothing, false)
+    return FusedSolver{T, INT, typeof(s)}(s, t, ldl, nothing, nothing, nothing, 0, SDS.STAGE_NONE, nothing, nothing)
 end
 
 Base.size(F::FusedSolver) = size(F.inner)
@@ -2545,8 +2714,8 @@ end
 
 # drop the plans of an earlier analysis (a new analysis rebuilds them)
 function _clear_plans!(F::FusedSolver)
-    F.nzval = F.fp = F.inv11 = F.inv_ptr = F.invert! = F.fz = nothing
-    F.gfact = F.gsolve = F.gnz = nothing
+    F.nzval = F.fp = F.fs = nothing
+    F.gfact = F.gnz = nothing
     F.info = 0
     return F
 end
@@ -2575,14 +2744,12 @@ function _fused_symbolic!(F::FusedSolver{T}) where {T}
     host_min = merged && !F.ldl ? t.wide_host_min : typemax(Int)
     fp = build_fused_plan(s; ldl = F.ldl, inkernel_wides = inkernel, merge_segments = merged,
                           wides_potrf = false, wgf = t.workgroup, scap = t.spin_cap, host_min)
-    inv11, inv_ptr, invertf, _ = build_inverse(s)
-    # the solve plan: one merged dependency-counter sweep over the whole tree
-    fz1 = build_fused(s; kstart = 1, wcap = 256)
-    fz1 === nothing && throw(SDS.NotSupportedError("fused solve: no plan entry with fronts of width <= 256"))
+    # the solve plan (the one of solve_alg = "algo1"): the inverses and one merged dependency-counter
+    # sweep over the whole tree
+    fs = fused_solve_plan(s; workgroup = t.solve_workgroup, graph = _graph_solve_ok(F))
     F.nzval = SDS._factor_values(s)
     F.fp = fp
-    F.inv11, F.inv_ptr, F.invert! = inv11, inv_ptr, invertf
-    F.fz = ([(fz1, t.solve_workgroup)], true)
+    F.fs = fs
     F.info = 0
     F.stage = SDS.STAGE_ANALYZED
     return F
@@ -2614,7 +2781,7 @@ function _fused_refactor!(F::FusedSolver)
     # the first factorization runs eagerly (it compiles the kernels a capture records)
     if F.stage >= SDS.STAGE_FACTORIZED && _graph_fact_ok(F)
         if F.gfact === nothing || F.gnz !== F.nzval
-            nz, fp, invf = F.nzval, F.fp, F.invert!
+            nz, fp, invf = F.nzval, F.fp, F.fs.invert!
             F.gfact = _capture(F, () -> _fused_launches!(s, nz, fp, invf))
             F.gnz = F.nzval
         end
@@ -2623,7 +2790,7 @@ function _fused_refactor!(F::FusedSolver)
             return Int(SDS._numeric_info!(s.numeric, s.symbolic, true))
         end
     end
-    _fused_launches!(s, F.nzval, F.fp, F.invert!)
+    _fused_launches!(s, F.nzval, F.fp, F.fs.invert!)
     return Int(SDS._numeric_info!(s.numeric, s.symbolic, true))
 end
 
@@ -2665,35 +2832,9 @@ function _fused_solve!(F::FusedSolver, X, B)
     x = _fused_rhs(F, X, "X")
     b = _fused_rhs(F, B, "B")
     det = o.deterministic_mode == 1               # read at every solve, as DirectSolver does
-    if _graph_solve_ok(F)
-        _fused_solve_graph!(F, x, b, det)
-    else
-        algo2_solve!(x, F.inner, b, F.inv11, F.inv_ptr, F.fz, det)
-    end
+    F.fs.graph = _graph_solve_ok(F)               # the tuning may change between solves
+    fused_solve!(F.fs, F.inner, x, b, det)        # the solve driver of solve_alg = "algo1" (T36)
     return F
-end
-
-# `algo2_solve!` with the sweeps replayed from a graph (captured at the second solve: the
-# first one runs eagerly and compiles the kernels); the permutations stay outside the graph,
-# so the graph does not depend on the caller's vectors
-function _fused_solve_graph!(F::FusedSolver, x, b, det::Bool)
-    s = F.inner
-    S, N, ws = s.symbolic, s.numeric, s.workspace
-    det == F.gdet || (F.gsolve = nothing)          # a graph is captured for one forward-sweep variant
-    if F.gsolve === nothing
-        algo2_solve!(x, s, b, F.inv11, F.inv_ptr, F.fz, det)
-        inv11, inv_ptr, fz = F.inv11, F.inv_ptr, F.fz
-        F.gsolve = det ? _capture(F, () -> algo2_sweeps!(s, inv11, inv_ptr, fz, true)) :
-                         _capture(F, () -> algo2_sweeps!(s, inv11, inv_ptr, fz, false))
-        F.gdet = det
-        return nothing
-    end
-    F.gsolve === false && return algo2_solve!(x, s, b, F.inv11, F.inv_ptr, F.fz, det)
-    bm = SDS.batch_map(N; nrhs = 1)
-    SDS.permute_rhs!(ws.Y, b, S.perm; transposed = false, bm)
-    F.gsolve()
-    SDS.unpermute_solution!(x, ws.Y, S.perm; transposed = false, bm)
-    return nothing
 end
 
 function SDS.execute!(phase::AbstractString, F::FusedSolver, X, B; asynchronous::Bool = true)
@@ -2785,11 +2926,7 @@ function _fused_memory_estimates(F::FusedSolver)
     F.fp === nothing && return est
     fp = F.fp
     pcb = _device_bytes(fp.pcb)
-    rest = sum(k -> k === :pcb ? Int64(0) : _device_bytes(fp[k]), keys(fp)) + _device_bytes(F.inv11) +
-           _device_bytes(F.inv_ptr)
-    for (fzk, _) in F.fz[1]
-        rest += sum(k -> _device_bytes(fzk[k]), keys(fzk))
-    end
+    rest = sum(k -> k === :pcb ? Int64(0) : _device_bytes(fp[k]), keys(fp)) + F.fs.bytes
     est[13] = pcb
     est[14] = rest
     for k in (1, 2, 5)

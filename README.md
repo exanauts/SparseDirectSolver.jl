@@ -98,10 +98,10 @@ and parameters raise `NotSupportedError`; there is no silent fallback.
   also the CPU-backend path), `sds_pivot_threshold`, `sds_reordering`,
   `sds_user_perm` and `sds_tuning`.
 
-**Not there yet.** `solve_alg = "algo1"` and the fused factorization on
-`DirectSolver` itself, and CUDA-graph capture of the stock refactorization and
-solve (tasks T36–T38 of `TASKS.md`, in progress: today the fused pipeline is
-reached through `FusedSolver`); `schedule = "syncfree"`; non-uniform batches;
+**Not there yet.** The fused factorization on `DirectSolver` itself, and
+CUDA-graph capture of the stock refactorization and solve (tasks T37–T38 of
+`TASKS.md`; the fused solve is on `DirectSolver` as `solve_alg = "algo1"`
+since T36, the fused factorization is reached through `FusedSolver`); `schedule = "syncfree"`; non-uniform batches;
 ND partition-tree export and the ordering cache; mixed precision
 (`factor_precision`); hybrid host memory; delayed pivots; `ComplexF32` on
 Metal. The options `max_lu_nnz`, `host_nthreads` and

@@ -105,6 +105,19 @@ per-architecture tuning (`Fused.default_tuning`) keys on it.
 max_threads_per_multiprocessor(backend) = 0
 
 """
+    forward_progress(backend) -> Bool
+
+Whether the device `backend` runs on keeps every launched workgroup that is
+resident making progress while other workgroups spin on dependency counters
+(PLAN §2.7): the fused solve of `solve_alg = "algo1"` and the fused pipeline
+(`src/fused.jl`) need it. `false` by default (the KernelAbstractions CPU backend
+runs the workgroups one after another; Metal guarantees no inter-workgroup
+progress); the CUDA, AMDGPU and oneAPI extensions return `true` (oneAPI: the
+fused kernels pass the test suite on the Intel Data Center GPU Max, T36).
+"""
+forward_progress(backend) = false
+
+"""
     device_fence(A)
 
 The device-wide memory fence of the dependency-counter kernels of the fused

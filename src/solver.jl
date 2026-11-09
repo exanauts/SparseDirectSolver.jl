@@ -209,6 +209,7 @@ mutable struct DirectSolver{T, INT, M <: CSR{T, INT}, B <: KernelAbstractions.Ba
     analysis_colval::Vector{INT}
     host_pattern::Union{Nothing, SymmetricPattern}
     matching::Union{Nothing, MS}
+    fsolve::Any              # the partitioned-inverse fused solve of solve_alg = "algo1" (T36), or nothing
     # explicit parameters only: the default outer constructor would leave SY, NU, WS, RF, MS unbound
     # (they occur only in `Union{Nothing, …}` fields; Aqua on Julia 1.10)
     function DirectSolver{T, INT, M, B, SY, NU, WS, RF, MS}(A, structure, view, options, backend, nbatch,
@@ -216,12 +217,13 @@ mutable struct DirectSolver{T, INT, M <: CSR{T, INT}, B <: KernelAbstractions.Ba
                                                             host_colval, ordering, host_symbolic, symbolic,
                                                             numeric, workspace, refinement, ir_steps, schur,
                                                             host_matching, analysis_colval, host_pattern,
-                                                            matching) where {T, INT, M, B, SY, NU, WS, RF, MS}
+                                                            matching, fsolve = nothing) where {T, INT, M, B, SY, NU,
+                                                                                               WS, RF, MS}
         return new{T, INT, M, B, SY, NU, WS, RF, MS}(A, structure, view, options, backend, nbatch,
                                                      fresh_factorization, info, stage, host_rowptr, host_colval,
                                                      ordering, host_symbolic, symbolic, numeric, workspace,
                                                      refinement, ir_steps, schur, host_matching, analysis_colval,
-                                                     host_pattern, matching)
+                                                     host_pattern, matching, fsolve)
     end
 end
 
@@ -358,7 +360,8 @@ Execute `phase` on `solver` (≅ `cudss(phase, solver, x, b)`), PLAN §1.2:
 * `"refactorization"`: the same with the analysis and storage reused, `"info"`
   reset first (needs a previous `"factorization"`);
 * `"solve"`: `X = op(A)⁻¹ B` (`solve_mode` 0: `A`, 1: `Aᵀ`, 2: `Aᴴ`), followed by
-  `ir_n_steps` steps of iterative refinement; the sub-phases `"solve_fwd_perm"`
+  `ir_n_steps` steps of iterative refinement (`solve_alg = "algo1"`: the
+  partitioned-inverse fused solve instead of the level sweeps, see below); the sub-phases `"solve_fwd_perm"`
   (permute `B` into the workspace), `"solve_fwd"` (forward sweep),
   `"solve_diag"` (`D⁻¹` of LDLᵀ/LDLᴴ, the identity for Cholesky), `"solve_bwd"`
   (backward sweep), `"solve_bwd_perm"` (inverse permutation into `X`) and
@@ -415,6 +418,25 @@ phases raise [`NotSupportedError`](@ref) in Schur mode, and the Schur phases
 without it [`FactorizationError`](@ref). Unknown phase strings raise
 `ArgumentError`. Executing a phase before the phases it depends on raises
 [`FactorizationError`](@ref).
+`solve_alg = "algo1"` (T36; set before the analysis, PLAN §1.3, §2.5): the analysis
+builds the inverse storage of the diagonal blocks `L₁₁` of the fronts of width
+≤ 256 and the dependency-counter solve segment of the fused pipeline
+(`src/fused.jl`; slot 14 of `"memory_estimates"`), every factorization ends
+with one launch computing the inverses of the new factor, and the solve phases
+run the fused solve (one dependency-counter kernel per direction, the fronts
+wider than 256 on the vendor dense sweeps; `deterministic_mode = 1`, read at
+every solve, selects the pull forward sweep): `"solve"` and the sub-phases
+`"solve_fwd_perm"` … `"solve_bwd_perm"` (the parts of the fused solve, bitwise
+equal to `"solve"` under `deterministic_mode = 1`), with refinement (plain or
+FGMRES) and matching as for the level sweeps. Scope: real `T`, `"SPD"`/`"HPD"`
+and `"S"`/`"H"` with `pivot_type = 'N'`, a single matrix, no Schur mode, a
+backend with inter-workgroup forward progress (CUDA, AMDGPU, oneAPI; not the
+KernelAbstractions CPU backend or Metal) at the analysis; `pivot_type = 'N'` at
+the factorization; one right-hand side and `solve_mode = 0` at the solve.
+Everything else raises [`NotSupportedError`](@ref), never a fallback to the
+level sweeps, as does an `"algo1"` solve after an analysis or a factorization
+run with `solve_alg = "default"`.
+
 With `asynchronous = false` the backend is synchronized before returning
 (`KernelAbstractions.synchronize`). Phase summaries are logged (see
 [`SparseDirectSolver.set_log_level!`](@ref)).
@@ -456,7 +478,57 @@ function _check_analysis_supported(solver::DirectSolver{T}) where {T}
     opts.schedule == SCHEDULE_SYNCFREE && throw(NotSupportedError("schedule = \"syncfree\" is not implemented yet"))
     opts.factor_precision === nothing || opts.factor_precision === real(T) ||
         throw(NotSupportedError("factor_precision = $(opts.factor_precision) for $T input is not implemented yet"))
+    opts.solve_alg == SOLVE_PARTITIONED_INVERSE && _check_algo1_analysis(solver)
     return nothing
+end
+
+# solve_alg = "algo1" (T36): the scope of the partitioned-inverse fused solve, checked at the analysis (never a
+# silent fallback to the level sweeps)
+_algo1_unsupported(what) =
+    throw(NotSupportedError("solve_alg = \"algo1\": $what is not supported; use solve_alg = \"default\""))
+
+function _check_algo1_analysis(solver::DirectSolver{T}) where {T}
+    be = solver.backend
+    be isa KernelAbstractions.CPU &&
+        _algo1_unsupported("the KernelAbstractions CPU backend (the dependency-counter kernels spin on resident " *
+                           "workgroups, which the CPU backend runs one after another)")
+    forward_progress(be) ||
+        _algo1_unsupported("the backend $(nameof(typeof(be))) (no inter-workgroup forward progress, PLAN §2.7)")
+    T <: Real || _algo1_unsupported("complex element type $T (the fused kernels have no conjugation)")
+    solver.structure == STRUCTURE_GENERAL && _algo1_unsupported("structure \"G\" (LU)")
+    _check_algo1_pivoting(solver)
+    solver.nbatch == 1 || _algo1_unsupported("a uniform batch ($(solver.nbatch) members)")
+    solver.options.schur_mode == 0 || _algo1_unsupported("schur_mode = 1")
+    return nothing
+end
+
+# LDLᵀ: the fused solve has no local pivot order and no 2×2 pivots, so only pivot_type = 'N'
+function _check_algo1_pivoting(solver::DirectSolver)
+    p = solver.options.pivot_type
+    _is_ldlt_structure(solver.structure) && p != PIVOT_NONE &&
+        _algo1_unsupported("structure \"$(convert(String, solver.structure))\" with pivot_type = " *
+                           "'$(convert(Char, p))' (the fused solve applies no local pivot order; set pivot_type = 'N')")
+    return nothing
+end
+
+_check_algo1_factorization(solver::DirectSolver, name) = _check_algo1_pivoting(solver)
+
+# the fused solve of a solve phase with solve_alg = "algo1", after the checks of the phase
+function _algo1_solve_state(solver::DirectSolver, p::Phase, nu::Int)
+    fs = solver.fsolve
+    name = convert(String, p)
+    # solve_alg is read at the analysis (the inverse storage and the solve segment) and by the factorization (the
+    # inverses): set later, it is refused here, never run on the level sweeps
+    fs === nothing &&
+        _algo1_unsupported("phase \"$name\" after an \"analysis\" with solve_alg = \"default\" (set it before " *
+                           "the analysis)")
+    _fused_current(fs) ||
+        _algo1_unsupported("phase \"$name\" after a factorization with solve_alg = \"default\" (the L₁₁ " *
+                           "inverses are those of an earlier factor; refactorize with \"algo1\")")
+    nu == 1 || _algo1_unsupported("$nu right-hand sides (the fused solve takes one)")
+    o = solver.options.solve_mode
+    o == 0 || _algo1_unsupported("solve_mode = $o (transposed solve)")
+    return fs
 end
 
 # the backend when the symbolic maps may be built on it (device.jl), else nothing
@@ -501,7 +573,7 @@ function _reorder!(solver::DirectSolver{T}) where {T}
         solver.schur = nothing
     end
     solver.host_symbolic = solver.symbolic = solver.numeric = solver.workspace = solver.refinement = nothing
-    solver.matching = nothing
+    solver.matching = solver.fsolve = nothing
     solver.stage = STAGE_REORDERED
     _log(LOG_INFO, () -> "reordering: n = $(A.nrows), nnz = $(nnz(A)), $(_elapsed(tic))")
     return solver
@@ -570,6 +642,9 @@ function _symbolic!(solver::DirectSolver{T, INT}) where {T, INT}
     solver.workspace = allocate_solve(Sd, T, solver.backend, nrhs)
     solver.matching = solver.host_matching === nothing ? nothing : _matching_state(solver, Sh, Sd)
     solver.refinement = nothing
+    solver.fsolve = nothing
+    # the inverse storage and the solve segment of the fused solve, sized once per analysis (T36)
+    opts.solve_alg == SOLVE_PARTITIONED_INVERSE && (solver.fsolve = _fused_solve_plan(solver))
     solver.stage = STAGE_ANALYZED
     solver.fresh_factorization = true
     fill!(solver.info, 0)
@@ -590,6 +665,9 @@ function _factorize!(solver::DirectSolver, p::Phase)
             solver.info[N.plan.members_host[j]] = 0
         end
     end
+    fs = solver.fsolve
+    algo1 = fs !== nothing && solver.options.solve_alg == SOLVE_PARTITIONED_INVERSE
+    algo1 && _check_algo1_factorization(solver, name)
     tic = time_ns()
     try
         _numeric_phase!(solver)
@@ -603,6 +681,9 @@ function _factorize!(solver::DirectSolver, p::Phase)
         end
         rethrow()
     end
+    # solve_alg = "algo1": the L₁₁ inverses of the new factor (one launch, asynchronous); a factorization
+    # under another solve_alg leaves them stale, and an "algo1" solve then raises
+    fs === nothing || (algo1 ? _fused_invert!(fs) : _fused_stale!(fs))
     member_info!(solver.info, N, S)
     solver.stage = STAGE_FACTORIZED
     p == PHASE_FACTORIZATION && (solver.fresh_factorization = false)
@@ -715,8 +796,6 @@ function _solve!(solver::DirectSolver{T}, p::Phase, X, B) where {T}
     name = convert(String, p)
     solver.stage >= STAGE_FACTORIZED || throw(_phase_error(name, "needs a \"factorization\""))
     opts = solver.options
-    opts.solve_alg == SOLVE_DEFAULT ||
-        throw(NotSupportedError("solve_alg = \"$(convert(String, opts.solve_alg))\" is not implemented yet (T36)"))
     Bd, bt = _rhs_data(B)
     Xd, xt = _rhs_data(X)
     xt == bt || throw(InvalidValueError("X and B must have the same layout (transposed or not)"))
@@ -751,6 +830,8 @@ function _solve_phase!(solver::DirectSolver, p::Phase, X::AbstractVecOrMat, B::A
     (p == PHASE_SOLVE_FWD_SCHUR || p == PHASE_SOLVE_BWD_SCHUR) &&
         throw(_phase_error(convert(String, p), "needs an analysis with schur_mode = 1"))
     pin, sin, pout, sout = solve_io(S, _solve_scaling(solver), tm)
+    # solve_alg = "algo1": the partitioned-inverse fused solve of the analysis (`nothing`: the level sweeps)
+    fs = opts.solve_alg == SOLVE_PARTITIONED_INVERSE ? _algo1_solve_state(solver, p, nu) : nothing
     refine = opts.ir_n_steps > 0 && (p == PHASE_SOLVE || p == PHASE_SOLVE_REFINEMENT)
     if p == PHASE_SOLVE_REFINEMENT && refine && Base.mightalias(X, B)
         throw(InvalidValueError("\"solve_refinement\" needs the original right-hand side: X and B must not alias"))
@@ -763,23 +844,28 @@ function _solve_phase!(solver::DirectSolver, p::Phase, X::AbstractVecOrMat, B::A
             Bs, bt = W.Bc, false
         end
         permute_rhs!(ws.Y, B, pin; transposed, conjugate = cj, bm, scale = sin)
-        forward_sweep!(ws, S, N; nrhs, deterministic = det, transpose = tm)
-        diagonal_sweep!(ws, S, N; nrhs)
-        backward_sweep!(ws, S, N; nrhs, transpose = tm)
+        if fs === nothing
+            forward_sweep!(ws, S, N; nrhs, deterministic = det, transpose = tm)
+            diagonal_sweep!(ws, S, N; nrhs)
+            backward_sweep!(ws, S, N; nrhs, transpose = tm)
+        else
+            _fused_sweeps!(fs, ws, S, N, det)
+        end
         unpermute_solution!(X, ws.Y, pout; transposed, conjugate = cj, bm, scale = sout)
-        refine ? _refine_phase!(solver, W, ws, X, Bs, transposed, bt, cj, det, tm) : (solver.ir_steps = 0)
+        refine ? _refine_phase!(solver, W, ws, X, Bs, transposed, bt, cj, det, tm, fs) : (solver.ir_steps = 0)
     elseif p == PHASE_SOLVE_FWD_PERM
         permute_rhs!(ws.Y, B, pin; transposed, conjugate = cj, bm, scale = sin)
     elseif p == PHASE_SOLVE_FWD
-        forward_sweep!(ws, S, N; nrhs, deterministic = det, transpose = tm)
+        fs === nothing ? forward_sweep!(ws, S, N; nrhs, deterministic = det, transpose = tm) :
+                         _fused_forward!(fs, ws, S, N, det)
     elseif p == PHASE_SOLVE_DIAG
-        diagonal_sweep!(ws, S, N; nrhs)
+        fs === nothing ? diagonal_sweep!(ws, S, N; nrhs) : _fused_diagonal!(fs, ws, S, N)
     elseif p == PHASE_SOLVE_BWD
-        backward_sweep!(ws, S, N; nrhs, transpose = tm)
+        fs === nothing ? backward_sweep!(ws, S, N; nrhs, transpose = tm) : _fused_backward!(fs, ws, S, N)
     elseif p == PHASE_SOLVE_BWD_PERM
         unpermute_solution!(X, ws.Y, pout; transposed, conjugate = cj, bm, scale = sout)
     else  # PHASE_SOLVE_REFINEMENT
-        refine ? _refine_phase!(solver, W, ws, X, B, transposed, transposed, cj, det, tm) : (solver.ir_steps = 0)
+        refine ? _refine_phase!(solver, W, ws, X, B, transposed, transposed, cj, det, tm, fs) : (solver.ir_steps = 0)
     end
     return nothing
 end
@@ -814,15 +900,22 @@ function _schur_solve_phase!(solver::DirectSolver, p::Phase, X, B, transposed::B
 end
 
 function _refine_phase!(solver::DirectSolver, W::RefinementWorkspace, ws::SolveWorkspace, X, B, xt::Bool, bt::Bool,
-                        cj::Bool, det::Bool, tm::Bool)
+                        cj::Bool, det::Bool, tm::Bool, fs = nothing)
     opts = solver.options
     done = Ref(0)   # the corrections applied, also when the refinement is interrupted
     try
         driver = opts.ir_mode == IR_FGMRES ? fgmres_refine! : refine!
-        driver(X, B, W, ws, solver.symbolic, solver.numeric, vec(solver.A.nzval); nsteps = opts.ir_n_steps,
-               tol = opts.ir_tol, transposed = xt, b_transposed = bt, conjugate = cj, deterministic = det,
-               interrupt = opts.user_host_interrupt, progress = done, transpose_matrix = tm,
-               scaling = _solve_scaling(solver))
+        if fs === nothing
+            driver(X, B, W, ws, solver.symbolic, solver.numeric, vec(solver.A.nzval); nsteps = opts.ir_n_steps,
+                   tol = opts.ir_tol, transposed = xt, b_transposed = bt, conjugate = cj, deterministic = det,
+                   interrupt = opts.user_host_interrupt, progress = done, transpose_matrix = tm,
+                   scaling = _solve_scaling(solver))
+        else            # solve_alg = "algo1": the corrections through the fused solve
+            driver(X, B, W, ws, solver.symbolic, solver.numeric, vec(solver.A.nzval); nsteps = opts.ir_n_steps,
+                   tol = opts.ir_tol, transposed = xt, b_transposed = bt, conjugate = cj, deterministic = det,
+                   interrupt = opts.user_host_interrupt, progress = done, transpose_matrix = tm,
+                   scaling = _solve_scaling(solver), fused = fs)
+        end
     finally
         solver.ir_steps = done[]
     end
@@ -1051,6 +1144,13 @@ end
 # entry weights, the two scale vectors and, for "G", the column permutation
 function _memory_estimates(solver::DirectSolver{T, INT}) where {T, INT}
     est = memory_estimates(solver.host_symbolic, T, INT)
+    fs = solver.fsolve
+    if fs !== nothing           # solve_alg = "algo1": slot 14, the buffers of the fused solve
+        est[14] = _fused_bytes(fs)
+        for k in (1, 2, 5)
+            est[k] += est[14]
+        end
+    end
     m = solver.host_matching
     m === nothing && return est
     n = solver.A.nrows

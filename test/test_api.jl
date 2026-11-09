@@ -212,7 +212,7 @@ end
     s2 = DirectSolver(api_matrix(backend, tril(A)), spd_structure(T), 'L')
     setparam!(s2, "ubatch_size", 2)
     @test thrown(() -> execute!("analysis", s2, x, b)) isa InvalidValueError
-    setparam!(solver, "solve_alg", "algo1")
+    setparam!(solver, "solve_alg", "algo1")     # after the analysis: refused (T36), never the level sweeps
     @test thrown(() -> execute!("solve", solver, x, b)) isa NotSupportedError
     setparam!(solver, "solve_alg", "default")
     s3 = DirectSolver(api_matrix(backend, A), "G", 'L')            # "G" ignores the view (cuDSS, #84)
