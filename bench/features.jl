@@ -27,7 +27,10 @@ partitioned-inverse solve, the inner solver of the MadNLP extension's
 `SDSSolver`; cuDSS runs it as a plain `:single` system). `matrices(M)` decides
 whether harness matrix `M` belongs to the feature. `params` are set on both
 solvers (the names mirror cuDSS), `cudss_params` and `sds_params` on one side
-only. `task` is the TASKS.md task id (`"T13"`) or the pull request (`"#126"`)
+only (they override `params`). Every entry states the cuDSS matching
+explicitly in `cudss_params` (`CUDSS_NO_MATCHING` unless the feature is about
+matching): cuDSS 1.0 turns matching and scaling on by default for `"S"`, `"H"`
+and `"G"`, SparseDirectSolver.jl only when `matching_alg` is set. `task` is the TASKS.md task id (`"T13"`) or the pull request (`"#126"`)
 that implemented the feature.
 """
 Base.@kwdef struct Feature
@@ -52,22 +55,43 @@ spd(M) = "SPD" in M.structures
 sym(M) = "S" in M.structures
 unsym(M) = "G" in M.structures
 
+# cuDSS 1.0 defaults to `matching_alg = "algo6"` (automatic matching and scaling)
+# for S/H/G; the SDS side runs without matching unless the feature sets it, so the
+# cuDSS side turns it off explicitly (CUDSS.jl >= 1.0 accepts "none").
+const CUDSS_NO_MATCHING = Dict{String, Any}("matching_alg" => "none")
+nomatch() = copy(CUDSS_NO_MATCHING)
+# T36: the partitioned-inverse fused solve on DirectSolver, set before the analysis
+# (configure! runs before every phase); cuDSS has no counterpart and runs its default solve.
+algo1() = Dict{String, Any}("solve_alg" => "algo1")
+
 const COMPARE_FEATURES = Feature[
-    Feature(id = "cholesky_f64", title = "Cholesky, Float64", task = "T13", structure = "SPD", matrices = spd),
+    Feature(id = "cholesky_f64", title = "Cholesky, Float64", task = "T13", structure = "SPD", matrices = spd,
+            cudss_params = nomatch()),
     Feature(id = "cholesky_nrhs16", title = "Cholesky, 16 right-hand sides", task = "T12", structure = "SPD",
-            matrices = spd, nrhs = 16),
-    Feature(id = "ldlt", title = "LDLᵀ, static pivoting", task = "T15", structure = "S", matrices = sym),
+            matrices = spd, nrhs = 16, cudss_params = nomatch()),
+    Feature(id = "ldlt", title = "LDLᵀ, static pivoting", task = "T15", structure = "S", matrices = sym,
+            cudss_params = nomatch()),
     Feature(id = "ldlt_ir2", title = "LDLᵀ + 2 refinement steps, K2 dumps", task = "T16", structure = "S",
-            matrices = is_k2, params = Dict{String, Any}("ir_n_steps" => 2)),
+            matrices = is_k2, params = Dict{String, Any}("ir_n_steps" => 2), cudss_params = nomatch()),
     Feature(id = "ubatch8", title = "Uniform batch of 8, Cholesky", task = "T17", structure = "SPD",
-            matrices = is_condensed, nbatch = 8, kind = :ubatch),
-    Feature(id = "lu", title = "LU, unsymmetric", task = "T19", structure = "G", matrices = unsym),
+            matrices = is_condensed, nbatch = 8, kind = :ubatch, cudss_params = nomatch()),
+    Feature(id = "lu", title = "LU, unsymmetric", task = "T19", structure = "G", matrices = unsym,
+            cudss_params = nomatch()),
     Feature(id = "schur", title = "Schur complement, Cholesky", task = "T20", structure = "SPD",
-            matrices = is_condensed, kind = :schur, params = Dict{String, Any}("schur_mode" => 1)),
+            matrices = is_condensed, kind = :schur, params = Dict{String, Any}("schur_mode" => 1),
+            cudss_params = nomatch()),
     Feature(id = "ldlt_matching", title = "LDLᵀ + matching (algo5), K2 dumps", task = "T21", structure = "S",
-            matrices = is_k2, params = Dict{String, Any}("matching_alg" => "algo5")),
+            matrices = is_k2, params = Dict{String, Any}("matching_alg" => "algo5"),
+            cudss_params = Dict{String, Any}("matching_alg" => "algo5")),
     Feature(id = "cholesky_fused", title = "Cholesky, fused pipeline (the `SDSSolver` path)", task = "#126",
-            structure = "SPD", matrices = spd, kind = :fused),
+            structure = "SPD", matrices = spd, kind = :fused, cudss_params = nomatch()),
+    Feature(id = "cholesky_algo1", title = "Cholesky, `solve_alg = \"algo1\"`", task = "T36", structure = "SPD",
+            matrices = spd, cudss_params = nomatch(), sds_params = algo1()),
+    # pivot_type = 'N' is in the scope of "algo1" for S; the K2 dumps need pivoting,
+    # so this row runs on the condensed dumps (SPD, LDLᵀ without pivoting) on both sides
+    Feature(id = "ldlt_algo1", title = "LDLᵀ without pivoting, `solve_alg = \"algo1\"`, condensed dumps",
+            task = "T36", structure = "S", matrices = is_condensed,
+            params = Dict{String, Any}("pivot_type" => 'N'), cudss_params = nomatch(), sds_params = algo1()),
 ]
 
 """

@@ -48,24 +48,13 @@ if parse_args(ARGS)["solver"] == "cudss"
     using CUDA, CUDA.cuSPARSE, CUDSS
 end
 
-# CUDSS.jl has no getter for CUDSS_DATA_FLOPS; read it through the C API. The
-# header does not document its type; cuDSS 0.8.0 writes an int64 (checked on an
-# RTX 4080: lap2d_300 SPD gives 3.18e8 with lu_nnz = 2.43e6, consistent with
-# Σ colcount² = 5.18e8 of CHOLMOD's 4.12e6-entry factor; read as a double the
-# same bits are a denormal). `missing` if this cuDSS does not provide it or the
-# value is not positive; the raw bits are printed once in that case.
-const FLOPS_WARNED = Ref(false)
+# CUDSS_DATA_FLOPS through CUDSS.jl >= 1.0 (data parameter "flops", an Int64;
+# cuDSS 0.8.0 already wrote an int64 there, read through the C API before
+# CUDSS.jl had the getter). `missing` if the value is not positive.
 function cudss_flops(solver)
     try
-        ref = Ref{Int64}(0)
-        nw = Ref{Csize_t}(0)
-        CUDSS.cudssDataGet(solver.data.handle, solver.data, CUDSS.CUDSS_DATA_FLOPS, ref, 8, nw)
-        nw[] == 8 && ref[] > 0 && return ref[]
-        if !FLOPS_WARNED[]
-            FLOPS_WARNED[] = true
-            @warn "CUDSS_DATA_FLOPS is not a positive Int64; recording missing" written = Int(nw[]) as_int64 = ref[] as_float64 = reinterpret(Float64, ref[])
-        end
-        return missing
+        f = CUDSS.cudss_get(solver, "flops")
+        return f > 0 ? Int64(f) : missing
     catch
         return missing
     end
@@ -79,6 +68,9 @@ function cudss_solver(structure)
         bd = CUDA.CuVector(b)
         xd = similar(bd)
         solver = CUDSS.CudssSolver(Ad, structure, view)
+        # cuDSS 1.0 matches and scales S/G by default; the baseline keeps the
+        # cuDSS 0.8 behavior (no matching), which the SDS side also defaults to
+        structure == "SPD" || CUDSS.cudss_set(solver, "matching_alg", "none")
         check() = (info = CUDSS.cudss_get(solver, "info"); info == 0 || error("cuDSS info = $info"))
         return (analysis = () -> CUDSS.cudss("analysis", solver, xd, bd),
                 factorization = () -> CUDSS.cudss("factorization", solver, xd, bd),
