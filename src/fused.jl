@@ -1187,8 +1187,10 @@ const NL64 = 2080                 # packed 64x64 lower triangle
 # no-pivot LDLᵀ mode of the fused kernel (real element types): the factor stores
 # the UNIT lower panels and D goes to `d` (global factor-column indexing), the
 # stock LDL layout, so the stock solve and the fused solve (one extra D pass
-# between the sweeps) both work on it. A zero pivot sets info[v] to the local
-# column and the front's consumers skip, exactly the Cholesky failure path;
+# between the sweeps) both work on it. A pivot with |d| < pivot_epsilon is replaced
+# by ±pivot_epsilon (`_ldl_static_pivot`, #194); a pivot that stays zero (epsilon 0)
+# or is not finite sets info[v] to the local column and the front's consumers skip,
+# exactly the Cholesky failure path;
 # NEGATIVE pivots factor through (inertia for MadNLP). The mode is a compile-time
 # `Val{LDL}` kernel parameter: the Cholesky instantiation is unchanged machine code.
 #
@@ -1210,20 +1212,35 @@ const NL64 = 2080                 # packed 64x64 lower triangle
 const _SP_C0 = SDS._ST_CTL + 1
 const _SP_CTL = _SP_C0
 
-@inline function _subtree_ldl_update!(buf, ctl, pv, j, li, d, piv, pivot_kind, ::Val{WG}) where {WG}
+# the static pivot of the fused LDLᵀ (#194), the rule of the stock kernel (`_lt_select!`) with
+# `pivot_type = 'N'`: a pivot with |d| < eps, or d == 0, is replaced by sign·eps, where sign is the
+# requested `psg[g]` (`pivot_sign` in factor-column order) when nonzero, else the sign of d (+ for 0).
+# Returns (pivot, replaced). A pure function of (d, eps, psg[g]): the factorization stays bitwise
+# deterministic. eps = 0 returns a zero pivot as ±0 (the caller fails the front, as before #194);
+# NaN and Inf are not "tiny" and come back unchanged, so the caller's finiteness test fails them
+# (the stock kernel replaces a NaN pivot and accepts an Inf one).
+@inline function _ldl_static_pivot(dk::R, eps::R, psg, g) where {R}
+    if abs(dk) < eps || iszero(dk)
+        s = @inbounds psg[g]
+        return (s != 0 ? R(s) : (dk < zero(R) ? -one(R) : one(R))) * eps, true
+    end
+    return dk, false
+end
+
+@inline function _subtree_ldl_update!(buf, ctl, pv, j, li, d, piv, pivot_kind, eps, psg, ::Val{WG}) where {WG}
     @inbounds begin
         T = eltype(buf)
         IT = eltype(ctl)
         f = ctl[SDS._ST_F]
         lf = ctl[SDS._ST_LF] - 1
         if ctl[SDS._ST_STATUS] == 0
-            dk = real(buf[lf + SDS._packed(j, j, f)])
+            g = Int(ctl[_SP_C0]) + j - 1
+            dk, rep = _ldl_static_pivot(real(buf[lf + SDS._packed(j, j, f)]), eps, psg, g)
             if isfinite(dk) && !iszero(dk)   # NaN/Inf must fail like potrf, not "factor"
                 if li == 1
-                    g = Int(ctl[_SP_C0]) + j - 1
                     d[g] = dk
                     piv[g] = Int32(g)
-                    pivot_kind[g] = SDS.PIVOT_KIND_1X1
+                    pivot_kind[g] = rep ? SDS.PIVOT_KIND_PERTURBED : SDS.PIVOT_KIND_1X1
                     pv[1] = dk
                 end
                 rd = inv(dk)
@@ -1263,7 +1280,7 @@ end
                                      @Const(subtree_nodes), @Const(super_ptr), @Const(front_ptr),
                                      @Const(front_nrows), @Const(front_ncols), @Const(cb_ptr),
                                      @Const(local_front), @Const(local_cb), @Const(child_ptr),
-                                     @Const(child_list), @Const(relind_ptr), @Const(relind),
+                                     @Const(child_list), @Const(relind_ptr), @Const(relind), eps, @Const(psg),
                                      ::Val{NE}, ::Val{WG}) where {NE, WG}
     @uniform TT = eltype(factor)
     @uniform IT = eltype(subtree_nodes)
@@ -1294,7 +1311,7 @@ end
         for j in 1:ctl[SDS._ST_W]
             _subtree_ldl_update!(buf, ctl, pv, j, li, SDS._mview(d, SDS._bm_gmember(bm, G), bm.nbatch),
                                  SDS._mview(piv, SDS._bm_gmember(bm, G), bm.nbatch),
-                                 SDS._mview(pivot_kind, SDS._bm_gmember(bm, G), bm.nbatch), Val(WG))
+                                 SDS._mview(pivot_kind, SDS._bm_gmember(bm, G), bm.nbatch), eps, psg, Val(WG))
             @synchronize
             _subtree_ldl_scale!(buf, ctl, pv, j, li, Val(WG))
             @synchronize
@@ -1310,14 +1327,19 @@ end
     end
 end
 
-@inline function _front_ldl_update!(sh, st, pv, j, v, li, front_ncols, d, g0, ::Val{WG}) where {WG}
+# the pivot of column j (replaced by `_ldl_static_pivot`) goes to d, pivot_kind and pv[1]; every thread
+# derives it from the sh diagonal itself, and `_front_ldl_scale!` writes a replaced pivot back into the
+# diagonal slot (read by the in-panel TRSM and the SYRK) after the barrier, when no thread reads it here
+@inline function _front_ldl_update!(sh, st, pv, j, v, li, front_ncols, d, g0, eps, psg, pivot_kind,
+                                    ::Val{WG}) where {WG}
     @inbounds begin
         w = Int(front_ncols[v])
         if j <= w && st[1] == Int32(0)
-            dk = real(sh[SDS._packed(j, j, 64)])
+            dk, rep = _ldl_static_pivot(real(sh[SDS._packed(j, j, 64)]), eps, psg, g0 + j)
             if isfinite(dk) && !iszero(dk)   # NaN/Inf must fail like potrf, not "factor"
                 if li == 1
                     d[g0 + j] = dk
+                    pivot_kind[g0 + j] = rep ? SDS.PIVOT_KIND_PERTURBED : SDS.PIVOT_KIND_1X1
                     pv[1] = dk
                 end
                 rd = inv(dk)
@@ -1337,6 +1359,7 @@ end
         w = Int(front_ncols[v])
         if j <= w && st[1] == Int32(0)
             dk = pv[1]
+            li == 1 && (sh[SDS._packed(j, j, 64)] = dk)   # the (replaced) pivot; the loop below reads i, k > j only
             r = w - j
             for q in (li - 1):WG:(r * (r + 1) ÷ 2 - 1)
                 a, b = SDS._tri_decode(q, r)
@@ -1421,7 +1444,7 @@ end
                                     @Const(child_list), @Const(relind_ptr), @Const(relind), base,
                                     @Const(wbase), wupd, wpdone2, wtrsml, wcbl, scap, epsc, d, @Const(super_ptr),
                                     @Const(pl_c), @Const(pl_q0), @Const(pl_q1), wcell, @Const(wcbase),
-                                    ::Val{LDL}, ::Val{WG}) where {LDL, WG}
+                                    @Const(psg), pivot_kind, ::Val{LDL}, ::Val{WG}) where {LDL, WG}
     @uniform TT = eltype(factor)
     @uniform RT = real(eltype(factor))
     li = @index(Local, Linear)
@@ -1531,7 +1554,7 @@ end
             g0 = Int(super_ptr[v]) - 1
             for j in 1:w
                 if LDL
-                    _front_ldl_update!(sh, st, piv, j, v, li, front_ncols, d, g0, Val(WG))
+                    _front_ldl_update!(sh, st, piv, j, v, li, front_ncols, d, g0, epsc, psg, pivot_kind, Val(WG))
                 else
                     SDS._front_chol_update!(sh, st, j, v, li, front_ncols, epsc, Val(64), Val(WG))
                 end
@@ -1787,9 +1810,13 @@ end
                 if li == 1
                     dj = real(sh[SDS._packed(j, j, 64)])
                     if LDL
+                        gj = Int(super_ptr[v]) - 1 + c0 + j
+                        dj, rep = _ldl_static_pivot(dj, epsc, psg, gj)
                         if st[1] == Int32(0) && isfinite(dj) && !iszero(dj)
                             piv[1] = dj                      # d stays on the diagonal
-                            d[Int(super_ptr[v]) - 1 + c0 + j] = dj
+                            sh[SDS._packed(j, j, 64)] = dj
+                            d[gj] = dj
+                            pivot_kind[gj] = rep ? SDS.PIVOT_KIND_PERTURBED : SDS.PIVOT_KIND_1X1
                         elseif st[1] == Int32(0)
                             st[1] = Int32(c0 + j)
                             piv[1] = one(RT)
@@ -2086,13 +2113,14 @@ end
 end
 
 # subtree launcher with a custom (sorted) list, local memory sized by eltype
-function launch_subtrees_sorted!(N, S, nzval, list, lb, backend, ldl::Bool = false, epsc::Real = 0.0)
+# (`psg`: the LDL plan's `pivot_sign` in factor-column order, `epsc` the LDL pivot epsilon; see `build_fused_plan`)
+function launch_subtrees_sorted!(N, S, nzval, list, lb, backend, ldl::Bool = false, epsc::Real = 0.0, psg = nothing)
     SDS._with_local_bytes(Int(lb)) do LBv
-        _sorted_subtree_launch(N, S, nzval, list, Val(ldl), LBv, Val(SDS.SUBTREE_WORKGROUP), backend, epsc)
+        _sorted_subtree_launch(N, S, nzval, list, Val(ldl), LBv, Val(SDS.SUBTREE_WORKGROUP), backend, epsc, psg)
     end
 end
 function _sorted_subtree_launch(N::SDS.Numeric{T}, S, nzval, list, ::Val{LDL}, ::Val{LB}, ::Val{WG},
-                                backend, epsc::Real = 0.0) where {T, LDL, LB, WG}
+                                backend, epsc::Real = 0.0, psg = nothing) where {T, LDL, LB, WG}
     bm = SDS.batch_map(N; first = 1)
     if LDL
         # the schedule sized the "S" budget classes with the LDLT reserve: match it
@@ -2100,7 +2128,7 @@ function _sorted_subtree_launch(N::SDS.Numeric{T}, S, nzval, list, ::Val{LDL}, :
         k!(N.factor, N.stack, N.info, N.d, N.piv, N.pivot_kind, nzval, S.amap, S.amap_ptr, S.amap_src,
            list, bm, S.subtree_ptr, S.subtree_nodes, S.super_ptr, S.front_ptr, S.front_nrows, S.front_ncols,
            S.cb_ptr, S.local_front, S.local_cb, S.child_ptr, S.child_list, S.relind_ptr, S.relind,
-           Val((LB - SDS.SUBTREE_LOCAL_RESERVE_LDLT) ÷ sizeof(T)), Val(WG);
+           real(T)(epsc), psg, Val((LB - SDS.SUBTREE_LOCAL_RESERVE_LDLT) ÷ sizeof(T)), Val(WG);
            ndrange = WG * length(list) * bm.nact)
     else
         k! = SDS.subtree_cholesky_kernel!(backend, WG)
@@ -2135,6 +2163,19 @@ function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, B
     ldl && !inkernel_wides && !wides_potrf &&
         throw(SDS.InvalidValueError("fused LDL plan: host-wide fronts need wides_potrf = true " *
                                     "(or inkernel_wides = true)"))
+    # the pivot epsilon (Cholesky: the narrow kernels'; LDL: static pivot replacement, #194) and, for LDL,
+    # `pivot_sign` in factor-column order (the stock kernel reads psign[perm[g]] under static pivoting)
+    pivot_eps = Float64(SDS.resolved_pivot_epsilon(s.options, real(T)))
+    ldl && wides_potrf && pivot_eps > 0 &&
+        throw(SDS.NotSupportedError("fused LDL plan: wides_potrf cannot replace pivots; set pivot_epsilon = 0"))
+    ps = s.options.pivot_sign
+    if ldl && ps !== nothing
+        length(ps) == S.n ||
+            throw(SDS.InvalidValueError("pivot_sign has $(length(ps)) entries, the matrix has $(S.n) rows"))
+        psg = _dvec(backend, Int8.(ps[Array(S.perm)]))
+    else
+        psg = KA.zeros(backend, Int8, ldl ? max(S.n, 1) : 1)   # Cholesky: never read
+    end
     nodes = S.schedule.group_nodes
     rows_h = S.schedule.rows
     width_h = S.schedule.width
@@ -2412,9 +2453,10 @@ function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, B
             pl_c = _dvec(backend, pl_c), pl_q0 = _dvec(backend, pl_q0),
             pl_q1 = _dvec(backend, pl_q1), wcell = KA.zeros(backend, Int32, max(nwcells, 1)),
             wcbase = _dvec(backend, wcbase_h), nwcells,
-            # captured at plan build: a later setparam!("pivot_epsilon") changes the stock
-            # path but not an already-built fused plan (rebuild the plan to change it)
-            chol_eps = ldl ? 0.0 : Float64(SDS.resolved_pivot_epsilon(s.options, real(T))),
+            # captured at plan build: a later setparam!("pivot_epsilon") or ("pivot_sign") changes the
+            # stock path but not an already-built fused plan (rebuild the plan to change it). Cholesky:
+            # the pivot epsilon of the narrow kernels; LDL: the static-pivot epsilon (#194)
+            pivot_eps, psg,
             ldl_potrf = ldl && wides_potrf,
             sptr_h = Array(S.super_ptr))
 end
@@ -2453,7 +2495,7 @@ function refact_fused_launches!(s, nzval, fp)
     copyto!(fp.wcb, fp.wcb_b)
     fp.nwcells > 0 && fill!(fp.wcell, Int32(0))
     for k in eachindex(plan.sub_first)
-        launch_subtrees_sorted!(N, S, nzval, fp.ssub[k], plan.sub_local[k], backend, fp.ldl, fp.chol_eps)
+        launch_subtrees_sorted!(N, S, nzval, fp.ssub[k], plan.sub_local[k], backend, fp.ldl, fp.pivot_eps, fp.psg)
     end
     fill!(fp.pcb, zero(eltype(fp.pcb)))
     isempty(fp.czero) ||                               # zero + scatter A into every C-group front (panel only)
@@ -2467,16 +2509,16 @@ function refact_fused_launches!(s, nzval, fp)
                                              S.snparent, S.front_ptr, S.front_nrows, S.front_ncols,
                                              S.cb_ptr, S.child_ptr, S.child_list, S.relind_ptr, S.relind,
                                              Int32(base), fp.wbase, fp.wupd, fp.wpd, fp.wtl, fp.wcb,
-                                             fp.scap, real(eltype(N.factor))(fp.chol_eps), N.d,
+                                             fp.scap, real(eltype(N.factor))(fp.pivot_eps), N.d,
                                              S.super_ptr, fp.pl_c, fp.pl_q0, fp.pl_q1, fp.wcell,
-                                             fp.wcbase, fp.ldlv, fp.wgv;
+                                             fp.wcbase, fp.psg, N.pivot_kind, fp.ldlv, fp.wgv;
                                              ndrange = fp.wgf * count)
         for v in gwides                              # host-wide fronts at the segment boundary
             if fp.ldl && fp.ldl_potrf
                 _factor_panel_c_ldl_potrf!(N, S, fp, v, p, backend)
             else
                 SDS._factor_panel_c!(N.factor, fp.pcb, N.work, N.info, v, S.layout.panel_ptr[v],
-                                     S.schedule.rows[v], S.schedule.width[v], fp.cb2_h[v], p, fp.chol_eps)
+                                     S.schedule.rows[v], S.schedule.width[v], fp.cb2_h[v], p, fp.pivot_eps)
             end
             signal_kernel!(backend, 32)(fp.cbd, fp.arrived, S.snparent, v; ndrange = 32)
         end
@@ -2515,7 +2557,8 @@ end
 
 # the parameters `setparam!` accepts on a FusedSolver (read by the next analysis; deterministic_mode by the
 # next solve)
-const FUSED_SETTABLE = ("user_perm", "reordering_alg", "nd_nseps", "nd_seed", "pivot_epsilon", "deterministic_mode")
+const FUSED_SETTABLE = ("user_perm", "reordering_alg", "nd_nseps", "nd_seed", "pivot_epsilon", "pivot_sign",
+                        "deterministic_mode")
 
 # the analysis data parameters `getparam` forwards to the inner DirectSolver
 const FUSED_FORWARDED = ("perm_reorder_row", "perm_reorder_col", "perm_row", "perm_col", "lu_nnz", "flops",
@@ -2707,6 +2750,8 @@ function _check_fused_options(F::FusedSolver{T}) where {T}
     o.solve_alg == SDS.SOLVE_DEFAULT || unsupported("solve_alg = \"$(convert(String, o.solve_alg))\"")
     F.ldl && o.pivot_type != SDS.PIVOT_NONE &&
         unsupported("structure \"S\" with pivot_type = '$(convert(Char, o.pivot_type))'")
+    F.ldl && o.pivot_epsilon_alg != SDS.PIVOT_EPSILON_DEFAULT &&
+        unsupported("structure \"S\" with pivot_epsilon_alg = \"$(convert(String, o.pivot_epsilon_alg))\"")
     o.user_schur_indices === nothing || unsupported("user_schur_indices")
     return nothing
 end
@@ -2888,6 +2933,8 @@ function SDS.setparam!(F::FusedSolver, name::AbstractString, value)
     name in FUSED_SETTABLE ||
         throw(SDS.NotSupportedError("FusedSolver: parameter \"$name\" cannot be set; the fused pipeline takes " *
                                     join(("\"$p\"" for p in FUSED_SETTABLE), ", ") * " (use DirectSolver)"))
+    name == "pivot_sign" && !F.ldl &&
+        throw(SDS.NotSupportedError("FusedSolver: \"pivot_sign\" applies to the LDLᵀ of structure \"S\" only"))
     SDS.setparam!(F.inner, name, value)
     return nothing
 end
@@ -2899,7 +2946,9 @@ function SDS.getparam(F::FusedSolver{T, INT}, name::AbstractString) where {T, IN
         F.stage >= SDS.STAGE_FACTORIZED ||
             throw(SDS.FactorizationError(0, "the data parameter \"$name\" needs the \"factorization\" phase"))
         F.ldl || return SDS.getparam(F.inner, name)   # Cholesky: the stats of the fused factorization
-        name == "npivots" && return zero(INT)          # the fused LDLᵀ perturbs no pivot
+        # the replaced static pivots (#194), counted on the device at the phase boundary like the inertia
+        name == "npivots" &&
+            return INT(count(==(SDS.PIVOT_KIND_PERTURBED), view(F.inner.numeric.pivot_kind, 1:size(F, 1))))
         d = view(F.inner.numeric.d, 1:size(F, 1))
         return (INT(count(>(zero(T)), d)), INT(count(<(zero(T)), d)))
     end
