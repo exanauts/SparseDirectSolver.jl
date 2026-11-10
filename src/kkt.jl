@@ -18,9 +18,11 @@ CSR or CSC matrix such as `CuSparseMatrixCSC`, `ROCSparseMatrixCSC` or
 CSC matrix, `SparseMatrixCSC` included, is read without a copy, as the CSR of
 its transpose. The backend is the one of the arrays.
 
-The constructor chooses the pipeline, runs the analysis and factorizes the
-values `A` holds. The values alias the caller's `nzval`: write the new values
-into it and call [`factorize!`](@ref), then [`solve!`](@ref) and
+The constructor chooses the pipeline, sets the parameters, runs the analysis
+and factorizes the values `A` holds; with `deferred_analysis = true` it stops
+after the parameters, and the first [`factorize!`](@ref) runs the analysis on
+the values present then. The values alias the caller's `nzval`: write the new
+values into it and call [`factorize!`](@ref), then [`solve!`](@ref) and
 [`inertia`](@ref SparseDirectSolver.inertia).
 
 ```julia
@@ -40,19 +42,28 @@ Keywords:
 * `pivoting::Symbol = :none`: `:ldl` only. `:none` factors in the pivot order
   of the analysis; `:bk` uses Bunch–Kaufman pivoting inside the fronts, which
   the stock pipeline provides.
+* `matching::AbstractString = "none"`: `:ldl` only, the `"matching_alg"` of the
+  analysis (`"none"` or `"default"` off, `"algo1"`–`"algo6"`; `"algo5"` and
+  `"algo6"` also choose the 2×2 pivot pairs of the ordering from the cycles of
+  the matching, with either `pivoting`). Matching runs on the stock pipeline
+  only. It reads the values present at the analysis, so pass
+  `deferred_analysis = true` when the matrix holds no real values yet.
 * `fused::Union{Nothing, Bool} = nothing`: `true` runs the fused pipeline (a
   [`FusedSolver`](@ref)), `false` the stock one (a [`DirectSolver`](@ref)).
-  `nothing` selects the fused pipeline where it runs: `pivoting = :none` on a
-  backend with forward progress between workgroups (CUDA, AMDGPU, oneAPI); the
+  `nothing` selects the fused pipeline where it runs and no option needs the
+  stock one: `pivoting = :none` on a backend with forward progress between
+  workgroups (CUDA, AMDGPU, oneAPI), no matching and, for `:ldl`, neither
+  `pivot_epsilon` nor `pivot_sign` (the fused `L D Lᵀ` replaces no pivot). The
   CPU backend and Metal get the stock pipeline.
 * `pivot_threshold = nothing`: `:bk` only, the `"pivot_threshold"` of the
   acceptance test.
 * `pivot_epsilon = nothing`: the `"pivot_epsilon"` below which a pivot is
-  replaced. The fused `L D Lᵀ` replaces no pivot.
+  replaced. For `:ldl` it selects the stock pipeline (the fused `L D Lᵀ`
+  replaces no pivot); the fused Cholesky reads it.
 * `pivot_sign = nothing`: `:ldl` only, a vector of `n` entries in `(-1, 0, 1)`,
   the `"pivot_sign"` a replaced pivot takes (an interior-point method passes
-  `1` for the primal and `-1` for the dual rows). The fused `L D Lᵀ` replaces
-  no pivot, so it does not read it.
+  `1` for the primal and `-1` for the dual rows). It selects the stock
+  pipeline.
 * `reordering::String = "algo4"`: the `"reordering_alg"` of the analysis
   (`"algo4"` nested dissection, `"algo3"` AMD, `"default"` the choice of the
   cost model).
@@ -63,22 +74,33 @@ Keywords:
   takes [`default_tuning`](@ref SparseDirectSolver.Fused.default_tuning) of the
   backend for `nothing`; the stock pipeline keeps the defaults of
   [`DirectSolver`](@ref) for `nothing`.
+* `deferred_analysis::Bool = false`: `true` leaves the analysis and the first
+  factorization to the first [`factorize!`](@ref), for a matrix whose values
+  are not assembled yet when the solver is built (the matching and the 2×2
+  pivot pairs are decided from the values of the analysis). Until then
+  `getparam(K, "info")` is `0`, and [`solve!`](@ref) and
+  [`inertia`](@ref SparseDirectSolver.inertia) raise
+  [`FactorizationError`](@ref).
 
 `nothing` keeps the default of the parameter. The inner solver is the field
 `inner`; [`getparam`](@ref) is forwarded to it, and
 [`pipeline`](@ref SparseDirectSolver.pipeline) tells which one runs.
 
-Raises [`InvalidValueError`](@ref) for an unknown `factorization` or
-`pivoting`, for `:bk` without `:ldl` or with `fused = true`, for
-`pivot_threshold` without `:bk` and for `pivot_sign` without `:ldl`;
-[`NotSupportedError`](@ref) for a complex element type, a uniform batch, and
-`fused = true` on a backend that cannot run the fused pipeline.
+Raises [`InvalidValueError`](@ref) for an unknown `factorization`, `pivoting`
+or `matching`, for `:bk` without `:ldl` or with `fused = true`, for matching
+without `:ldl`, for `pivot_threshold` without `:bk` and for `pivot_sign`
+without `:ldl`; [`NotSupportedError`](@ref) for a complex element type, a
+uniform batch, `fused = true` on a backend that cannot run the fused pipeline,
+and `fused = true` with matching or with `:ldl` and `pivot_epsilon` or
+`pivot_sign`. Every option is checked by the constructor, also with
+`deferred_analysis = true`.
 """
 mutable struct KKTSolver{T, INT, S <: AbstractDirectSolver{T, INT}, V <: AbstractVector{T}}
     inner::S
     x::V
     b::V
     info::Int
+    factorized::Bool          # false until the first factorization (deferred_analysis = true)
     factorization::Symbol
     pivoting::Symbol
 end
@@ -100,9 +122,10 @@ function KKTSolver(rowptr::AbstractVector{<:Integer}, colval::AbstractVector{<:I
 end
 
 function _kkt_solver(make; factorization::Symbol = :cholesky, pivoting::Symbol = :none,
-                     fused::Union{Nothing, Bool} = nothing, pivot_threshold = nothing, pivot_epsilon = nothing,
-                     pivot_sign = nothing, reordering::AbstractString = "algo4", user_perm = nothing,
-                     tuning::Union{Nothing, Fused.SDSTuning} = nothing)
+                     matching::AbstractString = "none", fused::Union{Nothing, Bool} = nothing,
+                     pivot_threshold = nothing, pivot_epsilon = nothing, pivot_sign = nothing,
+                     reordering::AbstractString = "algo4", user_perm = nothing,
+                     tuning::Union{Nothing, Fused.SDSTuning} = nothing, deferred_analysis::Bool = false)
     factorization in (:cholesky, :ldl) ||
         throw(InvalidValueError("factorization must be :cholesky or :ldl, got $(repr(factorization))"))
     pivoting in (:none, :bk) || throw(InvalidValueError("pivoting must be :none or :bk, got $(repr(pivoting))"))
@@ -119,8 +142,27 @@ function _kkt_solver(make; factorization::Symbol = :cholesky, pivoting::Symbol =
     T <: Real || throw(NotSupportedError("KKTSolver: complex element type $T is not supported; use DirectSolver"))
     d.nbatch == 1 ||
         throw(NotSupportedError("KKTSolver: a uniform batch ($(d.nbatch) members) is not supported; use DirectSolver"))
+    # the parsed option decides whether matching is on ("none" and "default" are off); bad strings raise here
+    setparam!(d, "matching_alg", matching)
+    matched = d.options.matching_alg != MATCHING_NONE
+    matched && !ldl &&
+        throw(InvalidValueError("matching = $(repr(matching)) needs factorization = :ldl"))
+    # the fused LDLᵀ replaces no pivot and has no matching: these ask for the stock pipeline, never a silent drop
+    if fused === true
+        matched && throw(NotSupportedError("KKTSolver: fused = true does not support matching = $(repr(matching)) " *
+                                           "(the fused pipeline has no matching); use fused = false or nothing"))
+        if ldl
+            for (name, value) in (("pivot_epsilon", pivot_epsilon), ("pivot_sign", pivot_sign))
+                value === nothing ||
+                    throw(NotSupportedError("KKTSolver: fused = true with factorization = :ldl does not support " *
+                                            "$name (the fused L D Lᵀ replaces no pivot); use fused = false or " *
+                                            "nothing"))
+            end
+        end
+    end
+    replacement = ldl && (pivot_epsilon !== nothing || pivot_sign !== nothing)
     backend = d.backend
-    use_fused = something(fused, !bk && forward_progress(backend))
+    use_fused = something(fused, !bk && !matched && !replacement && forward_progress(backend))
     inner = if use_fused
         Fused._fused_solver(d, tuning)
     else
@@ -129,7 +171,8 @@ function _kkt_solver(make; factorization::Symbol = :cholesky, pivoting::Symbol =
             pivot_threshold === nothing || setparam!(d, "pivot_threshold", pivot_threshold)
         elseif ldl
             setparam!(d, "pivot_type", 'N')
-            setparam!(d, "pivot_pairs", "none")
+            # no-pivot LDLᵀ consumes no 2×2 pair, but with matching the pairs of its cycles shape the ordering
+            matched || setparam!(d, "pivot_pairs", "none")
         end
         ldl && pivot_sign !== nothing && setparam!(d, "pivot_sign", pivot_sign)
         d
@@ -143,20 +186,32 @@ function _kkt_solver(make; factorization::Symbol = :cholesky, pivoting::Symbol =
     n = size(d, 1)
     x = similar(d.A.nzval, n)
     b = similar(d.A.nzval, n)
-    analyze!(inner, x, b; asynchronous = false)
-    # a refactorization needs a first factorization, here of the values of the analysis
-    factorize!(inner, x, b; asynchronous = false)
     INT = eltype(d.A.rowptr)
-    return KKTSolver{T, INT, typeof(inner), typeof(x)}(inner, x, b, Int(getparam(inner, "info")), factorization,
-                                                       pivoting)
+    K = KKTSolver{T, INT, typeof(inner), typeof(x)}(inner, x, b, 0, false, factorization, pivoting)
+    deferred_analysis || _first_factorization!(K)
+    return K
 end
+
+# the analysis and the first factorization (a refactorization needs one), on the values the matrix holds now
+function _first_factorization!(K::KKTSolver)
+    analyze!(K.inner, K.x, K.b; asynchronous = false)
+    factorize!(K.inner, K.x, K.b; asynchronous = false)
+    K.factorized = true
+    K.info = Int(getparam(K.inner, "info"))
+    return K
+end
+
+_check_factorized(K::KKTSolver, what) =
+    K.factorized || throw(FactorizationError(0, "KKTSolver: $what needs a factorization; with " *
+                                                "deferred_analysis = true call factorize!(K) first"))
 
 Base.size(K::KKTSolver) = size(K.inner)
 Base.size(K::KKTSolver, d::Integer) = size(K.inner, d)
 
 function Base.show(io::IO, K::KKTSolver{T, INT}) where {T, INT}
     print(io, "KKTSolver{", T, ", ", INT, "}(n = ", size(K, 1), ", factorization = :", K.factorization,
-          ", pivoting = :", K.pivoting, ", pipeline = :", pipeline(K), ", info = ", K.info, ")")
+          ", pivoting = :", K.pivoting, ", pipeline = :", pipeline(K))
+    K.factorized ? print(io, ", info = ", K.info, ")") : print(io, ", not factorized)")
     return nothing
 end
 
@@ -173,11 +228,15 @@ pipeline(K::KKTSolver) = K.inner isa Fused.FusedSolver ? :fused : :stock
     factorize!(K::KKTSolver) -> K
 
 Factorize the values the matrix of `K` holds now, with the analysis of the
-constructor. The call returns when the factorization is complete. A failed
-factorization does not throw: `getparam(K, "info")` is then the column of the
-first failed pivot, and `0` otherwise.
+constructor. With `deferred_analysis = true` the first call runs the analysis
+(ordering, matching, 2×2 pivot pairs) on these values and then the first
+factorization; the later calls refactorize with that analysis. The call returns
+when the factorization is complete. A failed factorization does not throw:
+`getparam(K, "info")` is then the column of the first failed pivot, and `0`
+otherwise.
 """
 function factorize!(K::KKTSolver)
+    K.factorized || return _first_factorization!(K)
     refactorize!(K.inner, K.x, K.b; asynchronous = false)
     K.info = Int(getparam(K.inner, "info"))
     return K
@@ -189,9 +248,11 @@ end
 
 Solve `A x = b` with the last factorization; with one vector, `xb` holds `b` on
 entry and `x` on return. The vectors are on the backend of `K`. The call
-returns when the solution is complete.
+returns when the solution is complete. Before the first factorization
+(`deferred_analysis = true`) it raises [`FactorizationError`](@ref).
 """
 function solve!(K::KKTSolver, x::AbstractVector, b::AbstractVector)
+    _check_factorized(K, "solve!")
     copyto!(K.b, b)
     solve!(K.inner, K.x, K.b)
     copyto!(x, K.x)
@@ -209,9 +270,11 @@ factorized last, which sum to `n`: for `factorization = :ldl` from the signs of
 `D` (2×2 blocks included), for `:cholesky` the number of positive pivots and
 `0` negative ones. It is the inertia of the factorized matrix, so a replaced
 pivot counts with the sign it was given. Valid when `getparam(K, "info")` is
-`0`.
+`0`; before the first factorization (`deferred_analysis = true`) it raises
+[`FactorizationError`](@ref).
 """
 function inertia(K::KKTSolver)
+    _check_factorized(K, "inertia")
     n = size(K, 1)
     npos, nneg = getparam(K.inner, "inertia")
     return (Int(npos), n - Int(npos) - Int(nneg), Int(nneg))
