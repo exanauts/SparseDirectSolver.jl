@@ -23,6 +23,12 @@
 # partitioned-inverse solve, the inner solver of the MadNLP extension's
 # `SDSSolver`: ND ordering, per-architecture tuning, the fused plans built by the
 # analysis) through the same calls as every other solver; it needs a GPU backend.
+# So do the `solve_alg = "algo1"` features (T36), which set the parameter on the
+# SDS side before the analysis.
+#
+# The cuDSS matching is set explicitly per feature (`cudss_params` in
+# features.jl): cuDSS 1.0 turns matching and scaling on by default for S/H/G,
+# the SDS side runs without matching unless the feature asks for it.
 #
 # Each phase is timed on a fresh solver: the `setup` of the benchmark creates the
 # solver and runs the phases it depends on, the timed expression runs the phase
@@ -95,12 +101,8 @@ end
 
 # --- the two solvers behind one set of names (the parameter strings mirror cuDSS) ---
 
-# CUDSS.jl has no getter for CUDSS_DATA_FLOPS (an Int64 in cuDSS 0.8, see cudss_baseline.jl)
-function cudss_flops(s)
-    ref, nw = Ref{Int64}(0), Ref{Csize_t}(0)
-    CUDSS.cudssDataGet(s.data.handle, s.data, CUDSS.CUDSS_DATA_FLOPS, ref, 8, nw)
-    return nw[] == 8 && ref[] > 0 ? ref[] : missing
-end
+# CUDSS.jl >= 1.0 reads CUDSS_DATA_FLOPS (an Int64) as the data parameter "flops"
+cudss_flops(s) = (f = CUDSS.cudss_get(s, "flops"); f > 0 ? Int64(f) : missing)
 
 const API = if SOLVER == "cudss"
     (solver = CUDSS.CudssSolver, batched = CUDSS.CudssBatchedSolver, set = CUDSS.cudss_set,
@@ -325,8 +327,8 @@ function main()
     end
     rows = Vector{Vector{String}}()
     for f in features
-        if f.kind == :fused && SOLVER == "sds" && !ON_GPU
-            println(rpad(f.id, 18), "fused pipeline needs a GPU backend, skipped")
+        if (f.kind == :fused || get(f.sds_params, "solve_alg", "") == "algo1") && SOLVER == "sds" && !ON_GPU
+            println(rpad(f.id, 18), "fused kernels need a GPU backend, skipped")
             continue
         end
         selected = filter(M -> f.structure in M.structures && f.matrices(M), mats)

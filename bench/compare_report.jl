@@ -1,7 +1,8 @@
 # Renders the cuDSS vs SparseDirectSolver.jl comparison from the CSVs written by
 # `compare.jl`: `bench/comparison/comparison.md` (overview of every feature,
-# then one table per feature) and `bench/comparison/comparison.png`
-# (geometric-mean time ratio SDS/cuDSS per feature and phase). Nothing in them
+# and the same restricted to the KKT dumps, then one table per feature) and
+# `bench/comparison/comparison.png` (geometric-mean time ratio SDS/cuDSS per
+# feature and phase, all matrices and KKT dumps only). Nothing in them
 # is quoted from elsewhere: every number comes from the two CSVs.
 #
 #   julia --project=bench/report bench/compare_report.jl [--no-plot]
@@ -14,7 +15,7 @@ using Printf
 include(joinpath(@__DIR__, "features.jl"))
 using .BenchFeatures
 
-export read_rows, ratio_summary, render_markdown, PHASES
+export read_rows, ratio_summary, render_markdown, PHASES, is_kkt
 
 const PHASES = ("analysis", "factorization", "refactorization", "solve")
 const DIR = joinpath(@__DIR__, "comparison")
@@ -43,13 +44,22 @@ matrices_of(f, cudss_rows, sds_rows) =
     unique!([r["matrix"] for r in vcat(cudss_rows, sds_rows) if r["feature"] == f.id])
 
 """
-    ratio_summary(f, cudss_rows, sds_rows) -> (ratios, count)
+    is_kkt(name)
+
+Whether the matrix `name` is a MadNLP KKT dump (`kkt_<case>_<kind>_<iter>`).
+"""
+is_kkt(name) = startswith(name, "kkt_")
+
+"""
+    ratio_summary(f, cudss_rows, sds_rows; select = Returns(true)) -> (ratios, count)
 
 Geometric mean of the SDS/cuDSS time ratio per phase over the matrices where
-both rows are `ok` (`nothing` per phase when there is none), and their number.
+both rows are `ok` and `select(matrix_name)` holds (`nothing` per phase when
+there is none), and their number.
 """
-function ratio_summary(f, cudss_rows, sds_rows)
-    pairs = [(find_row(cudss_rows, f, m), find_row(sds_rows, f, m)) for m in matrices_of(f, cudss_rows, sds_rows)]
+function ratio_summary(f, cudss_rows, sds_rows; select = Returns(true))
+    pairs = [(find_row(cudss_rows, f, m), find_row(sds_rows, f, m))
+             for m in matrices_of(f, cudss_rows, sds_rows) if select(m)]
     filter!(((c, s),) -> ok(c) && ok(s), pairs)
     isempty(pairs) && return Dict{String, Union{Nothing, Float64}}(p => nothing for p in PHASES), 0
     gm(p) = exp(sum(log(seconds(s, p) / seconds(c, p)) for (c, s) in pairs) / length(pairs))
@@ -63,10 +73,26 @@ fmt_field(r, k) = ok(r) && !isempty(r[k]) ? @sprintf("%.3g", parse(Float64, r[k]
 
 state(f, implemented) = implemented ? "done" : "pending"
 
+function overview(io, heading, text, cudss_rows, sds_rows, features, implemented, select)
+    println(io, "## ", heading, "\n")
+    println(io, text, "\n")
+    println(io, "| feature | task | status | matrices | analysis | factorization | refactorization | solve |")
+    println(io, "| --- | --- | --- | --- | --- | --- | --- | --- |")
+    for f in features
+        ratios, count = ratio_summary(f, cudss_rows, sds_rows; select)
+        println(io, "| ", f.title, " | ", f.task, " | ", state(f, implemented(f)), " | ", count == 0 ? "" : count,
+                " | ", join((fmt_ratio(ratios[p]) for p in PHASES), " | "), " |")
+    end
+    println(io)
+end
+
+param_text(d) = join(("`$k = $(repr(v))`" for (k, v) in sort!(collect(d); by = first)), ", ")
+
 """
     render_markdown(io, cudss_rows, sds_rows; features = COMPARE_FEATURES, implemented = feature_implemented)
 
-Writes the comparison as Markdown: an overview with one line per feature, then
+Writes the comparison as Markdown: an overview with one line per feature (all
+matrices, then the KKT dumps only), then
 per feature a table with cuDSS ms, SDS ms and the ratio for each phase, nnz(L)
 and the relative residual of both solvers. Cells without a row stay blank, a
 failed row shows `fail` and its message below the table.
@@ -78,16 +104,11 @@ function render_markdown(io::IO, cudss_rows, sds_rows; features = COMPARE_FEATUR
             "(`bench/compare.jl`). Times are BenchmarkTools medians per phase on a fresh solver; ",
             "the ratio is SDS time / cuDSS time, so below 1 means SparseDirectSolver.jl is faster.\n")
     plot && println(io, "![SDS/cuDSS time ratio per feature](comparison.png)\n")
-    println(io, "## Overview\n")
-    println(io, "Geometric mean of the SDS/cuDSS ratio over the matrices both solvers ran.\n")
-    println(io, "| feature | task | status | matrices | analysis | factorization | refactorization | solve |")
-    println(io, "| --- | --- | --- | --- | --- | --- | --- | --- |")
-    for f in features
-        ratios, count = ratio_summary(f, cudss_rows, sds_rows)
-        println(io, "| ", f.title, " | ", f.task, " | ", state(f, implemented(f)), " | ", count == 0 ? "" : count,
-                " | ", join((fmt_ratio(ratios[p]) for p in PHASES), " | "), " |")
-    end
-    println(io)
+    overview(io, "Overview", "Geometric mean of the SDS/cuDSS ratio over the matrices both solvers ran.",
+             cudss_rows, sds_rows, features, implemented, Returns(true))
+    overview(io, "Overview, KKT dumps only",
+             "The same over the MadNLP KKT dumps (matrices `kkt_*`) only, the interior-point workload; " *
+             "features without KKT dumps stay blank.", cudss_rows, sds_rows, features, implemented, is_kkt)
     for f in features
         println(io, "## ", f.title, "\n")
         println(io, "`", f.id, "`, ", f.task, " (", state(f, implemented(f)), "), structure `", f.structure, "`, ",
@@ -95,6 +116,9 @@ function render_markdown(io::IO, cudss_rows, sds_rows; features = COMPARE_FEATUR
                 f.kind == :fused ? ", SDS through a `FusedSolver` (the fused factorization and partitioned-inverse " *
                                    "solve the MadNLP extension runs; its analysis phase includes a stock " *
                                    "factorization and building the fused plans), cuDSS through its one path" : "",
+                isempty(f.params) ? "" : "; both solvers: " * param_text(f.params),
+                isempty(f.cudss_params) ? "" : "; cuDSS: " * param_text(f.cudss_params),
+                isempty(f.sds_params) ? "" : "; SDS: " * param_text(f.sds_params),
                 ".\n")
         names = matrices_of(f, cudss_rows, sds_rows)
         if isempty(names)
@@ -151,32 +175,42 @@ devices(rows) = join(unique(r["device"] for r in rows), ", ")
     write_plot(path, cudss_rows, sds_rows)
 
 Grouped bars of the geometric-mean SDS/cuDSS ratio per feature and phase, log
-scale, bars drawn from 1; a feature without results keeps an empty slot.
+scale, bars drawn from 1, in two panels (all matrices, KKT dumps only) labelled
+with the feature titles; a feature without results keeps an empty slot.
 """
 function write_plot(path, cudss_rows, sds_rows)
     F = BenchCompareReport.BenchFeatures
     feats = F.COMPARE_FEATURES
-    xs, ys, groups = Int[], Float64[], Int[]
-    for (i, f) in enumerate(feats), (j, p) in enumerate(PHASES)
-        r = first(ratio_summary(f, cudss_rows, sds_rows))[p]
-        r === nothing || (push!(xs, i); push!(ys, r); push!(groups, j))
-    end
-    labels = ["$(f.id) ($(f.task))" for f in feats]
-    fig = Figure(size = (1200, 560), fontsize = 14)
+    # readable x labels: the feature titles of the overview, wrapped at about 26 characters
+    wrap(t) = (words = split(replace(t, "`" => "")); lines = [""];
+               foreach(w -> (length(lines[end]) + length(w) > 26 && !isempty(lines[end]) ? push!(lines, w) :
+                             (lines[end] = isempty(lines[end]) ? String(w) : lines[end] * " " * w)), words);
+               join(lines, "\n"))
+    labels = [wrap(f.title) for f in feats]
+    fig = Figure(size = (1400, 1100), fontsize = 14)
     ticks = [0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100]
     tickfmt = vs -> ["$(round(v; sigdigits = 2))×" for v in vs]
     sha = isempty(sds_rows) ? "" : ", SDS $(first(sds_rows)["git_sha"])"
-    ax = Axis(fig[1, 1]; yscale = log10, xticks = (1:length(feats), labels), xticklabelrotation = π / 4,
-              ylabel = "SDS time / cuDSS time (geometric mean)", yticks = ticks, ytickformat = tickfmt,
-              title = "SparseDirectSolver.jl vs cuDSS per feature, $(devices(cudss_rows))$sha: below 1 is faster",
-              xgridvisible = false, ygridcolor = (:black, 0.08))
-    isempty(xs) || barplot!(ax, xs, ys; dodge = groups, n_dodge = length(PHASES), width = 0.8, gap = 0.02,
-                            color = PHASE_COLORS[groups], fillto = 1.0, strokecolor = :white, strokewidth = 1)
-    hlines!(ax, [1.0]; color = :black, linestyle = :dash)
-    xlims!(ax, 0.5, length(feats) + 0.5)
-    lo, hi = isempty(ys) ? (1.0, 1.0) : extrema(ys)
-    ylims!(ax, min(lo, 1.0) / 1.5, max(hi, 1.0) * 1.5)
-    Legend(fig[1, 2], [PolyElement(color = c) for c in PHASE_COLORS], collect(PHASES), "phase"; framevisible = false)
+    panels = (("all matrices", Returns(true)), ("KKT dumps only", BenchCompareReport.is_kkt))
+    for (row, (what, select)) in enumerate(panels)
+        xs, ys, groups = Int[], Float64[], Int[]
+        for (i, f) in enumerate(feats), (j, p) in enumerate(PHASES)
+            r = first(ratio_summary(f, cudss_rows, sds_rows; select))[p]
+            r === nothing || (push!(xs, i); push!(ys, r); push!(groups, j))
+        end
+        title = row == 1 ? "SparseDirectSolver.jl vs cuDSS per feature, $(devices(cudss_rows))$sha: below 1 is faster\n$what" : what
+        ax = Axis(fig[row, 1]; yscale = log10, xticks = (1:length(feats), labels),
+                  xticklabelsvisible = row == length(panels), xticklabelrotation = π / 4,
+                  ylabel = "SDS time / cuDSS time (geometric mean)", yticks = ticks, ytickformat = tickfmt,
+                  title, xgridvisible = false, ygridcolor = (:black, 0.08))
+        isempty(xs) || barplot!(ax, xs, ys; dodge = groups, n_dodge = length(PHASES), width = 0.8, gap = 0.02,
+                                color = PHASE_COLORS[groups], fillto = 1.0, strokecolor = :white, strokewidth = 1)
+        hlines!(ax, [1.0]; color = :black, linestyle = :dash)
+        xlims!(ax, 0.5, length(feats) + 0.5)
+        lo, hi = isempty(ys) ? (1.0, 1.0) : extrema(ys)
+        ylims!(ax, min(lo, 1.0) / 1.5, max(hi, 1.0) * 1.5)
+    end
+    Legend(fig[1:2, 2], [PolyElement(color = c) for c in PHASE_COLORS], collect(PHASES), "phase"; framevisible = false)
     save(path, fig)
     return path
 end

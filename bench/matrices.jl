@@ -259,15 +259,32 @@ function _load_jld2(path)
 end
 
 """
+    EXPECTED_DUMPS
+
+Dumps the comparison expects in `bench/data/` besides the pglib case14/118/1354
+ones: `kkt_pglib_opf_case78484_epigrids_condensed_10` (the 78k-bus ACOPF
+condensed KKT system, n = 674 562, 148 MB, the matrix the fused pipeline and
+`solve_alg = "algo1"` were tuned on). Not in the repository: dumped with
+`dump_madnlp_kkt.jl` (or copied from a machine that has it); a missing one is
+skipped with a warning.
+"""
+const EXPECTED_DUMPS = ("kkt_pglib_opf_case78484_epigrids_condensed_10",)
+
+"""
     dump_matrices(dir = bench/data) -> Vector{BenchMatrix}
 
 Loads every file in `dir` that follows the naming convention of
 [`parse_dump_name`](@ref), sorted by name. `.mtx` files are read with
 [`read_mtx`](@ref); `.jld2` files need JLD2.jl and must hold the matrix under
 the key `"A"`. A stored triangle is expanded to the full symmetric matrix.
+Warns for each of [`EXPECTED_DUMPS`](@ref) that is not there.
 """
 function dump_matrices(dir::AbstractString = DATA_DIR)
     isdir(dir) || return BenchMatrix[]
+    for name in EXPECTED_DUMPS
+        any(ext -> isfile(joinpath(dir, name * ext)), (".mtx", ".jld2")) ||
+            @warn "$name not found in $dir; skipping it (see BenchMatrices.EXPECTED_DUMPS)"
+    end
     out = BenchMatrix[]
     for file in sort(readdir(dir))
         meta = parse_dump_name(file)

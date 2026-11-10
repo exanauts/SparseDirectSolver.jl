@@ -283,6 +283,47 @@ The loop arithmetic closes (193 factorizations × ~36 ms + 202 solves × ~4 ms +
 
 **Revised priority.** The ordering comes first: it is a third of the remaining solve gap, a precondition for the fused solve, and the fix (#108: score the supernodal schedule depth, or prefer ND on GPU backends) is host code. Then experiment 6 in `src/`, then experiment 5 with #109 solved by placement, then the factorization buckets above. `TASKS.md` splits them into T22 (ordering), T24 (solve), T25 (split factorization) and T26 (segmented fused factorization, #109, #110).
 
+## 2026-11 comparison against cuDSS 1.0 (H200)
+
+`bench/comparison/comparison.{md,png}` regenerated on 2026-11-09 at commit 352271c (code of `main` at ffdafa8, after T32, T34, T35 and T36) against cuDSS 1.0.0 through CUDSS.jl 1.0, one exclusive H200 per solver through Slurm (cuDSS job 11854, 57 min; SDS job 11907, 1 h 50 min, a rerun of job 11855 whose rows agree within 5% per feature and phase). SDS/cuDSS geometric means over all matrices:
+
+| feature | task | status | matrices | analysis | factorization | refactorization | solve |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Cholesky, Float64 | T13 | done | 15 | 0.58× | 3.13× | 3.84× | 3.84× |
+| Cholesky, 16 right-hand sides | T12 | done | 15 | 0.58× | 3.16× | 3.83× | 3.20× |
+| LDLᵀ, static pivoting | T15 | done | 24 | 1.07× | 5.64× | 6.87× | 4.66× |
+| LDLᵀ + 2 refinement steps, K2 dumps | T16 | done | 9 | 2.64× | 4.20× | 5.46× | 10.24× |
+| Uniform batch of 8, Cholesky | T17 | done | 10 | 0.40× | 1.15× | 1.76× | 2.60× |
+| LU, unsymmetric | T19 | done | 2 | 1.17× | 13.82× | 15.19× | 5.46× |
+| Schur complement, Cholesky | T20 | done | 10 | 0.43× | 2.01× | 2.54× | 4.25× |
+| LDLᵀ + matching (algo5), K2 dumps | T21 | done | 9 | 0.74× | 3.57× | 4.21× | 4.21× |
+| Cholesky, fused pipeline (the `SDSSolver` path) | #126 | done | 15 | 0.74× | 1.38× | 1.62× | 1.92× |
+| Cholesky, `solve_alg = "algo1"` | T36 | done | 15 | 0.62× | 3.41× | 4.01× | 1.83× |
+| LDLᵀ without pivoting, `solve_alg = "algo1"`, condensed dumps | T36 | done | 10 | 0.46× | 4.23× | 5.24× | 1.39× |
+
+and over the MadNLP KKT dumps only (`kkt_*`; the new second overview of the report and lower panel of the plot):
+
+| feature | task | status | matrices | analysis | factorization | refactorization | solve |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Cholesky, Float64 | T13 | done | 10 | 0.40× | 1.88× | 2.44× | 2.83× |
+| Cholesky, 16 right-hand sides | T12 | done | 10 | 0.40× | 1.92× | 2.44× | 2.75× |
+| LDLᵀ, static pivoting | T15 | done | 19 | 1.01× | 4.73× | 6.00× | 4.20× |
+| LDLᵀ + 2 refinement steps, K2 dumps | T16 | done | 9 | 2.64× | 4.20× | 5.46× | 10.24× |
+| Uniform batch of 8, Cholesky | T17 | done | 10 | 0.40× | 1.15× | 1.76× | 2.60× |
+| LU, unsymmetric | T19 | done |  |  |  |  |  |
+| Schur complement, Cholesky | T20 | done | 10 | 0.43× | 2.01× | 2.54× | 4.25× |
+| LDLᵀ + matching (algo5), K2 dumps | T21 | done | 9 | 0.74× | 3.57× | 4.21× | 4.21× |
+| Cholesky, fused pipeline (the `SDSSolver` path) | #126 | done | 10 | 0.50× | 1.21× | 1.48× | 1.62× |
+| Cholesky, `solve_alg = "algo1"` | T36 | done | 10 | 0.43× | 2.10× | 2.60× | 1.41× |
+| LDLᵀ without pivoting, `solve_alg = "algo1"`, condensed dumps | T36 | done | 10 | 0.46× | 4.23× | 5.24× | 1.39× |
+
+What changed since the October record (cuDSS 0.8.0, commit 95ee682):
+
+- **Library.** cuDSS 1.0 turns matching and scaling on by default for `S`/`H`/`G`. Every feature now sets the cuDSS matching explicitly (`"none"`, `"algo5"` for `ldlt_matching` on both sides), so the rows stay like-for-like with the SDS defaults. Feature by feature (geometric mean of cuDSS 1.0 / 0.8.0 over the October matrices), factorization and refactorization moved within ±12%, except the static-pivoting LDLᵀ factorization (0.71×, mostly one October outlier, 56 ms on case118 condensed_10) and the `ldlt_matching` refactorization (1.21×); the solve is faster on the Schur (0.69×), `ldlt_matching` (0.60×) and `ldlt_ir2` (0.77×) rows, and the `ldlt_matching` analysis takes 0.58×. With `"algo5"` the case1354 K2 residuals improved (2e-2 → 5e-6 and 7e-3 → 1e-4). The LU residuals without matching stay as large as in October (rajat21 3.8e8, TSOPF 5.3e30 for cuDSS; 3.5e3 and 1.6e16 for SDS). The uniform-batch rows run with one right-hand side, outside the cuDSS 0.8 multi-RHS batch bug, and agree with October.
+- **Code.** On the handle-API features SDS factorization and refactorization moved within ±4% of October and the solve within +15% (`ldlt_matching`); the fused pipeline is 17% faster (refactorization 0.83×, solve 0.84× of its October time, T33–T35).
+- **New rows.** `cholesky_algo1` and `ldlt_algo1` (T36, `solve_alg = "algo1"` on `DirectSolver`): the solve ratio falls from 3.84× (level sweeps) to 1.83× over the 15 SPD matrices and to 1.41× over the 10 condensed dumps; `ldlt_algo1` runs without pivoting on the condensed dumps, the K2 dumps needing pivoting. The 78k-bus condensed KKT system (n = 674 562) joins every feature on condensed or SPD matrices: fused refactorization 16.6 ms against 10.4 ms for cuDSS (1.60×), fused solve 2.34 ms against 1.63 ms (1.44×), `"algo1"` solve 2.33 ms against 10.3 ms for the level sweeps; the stock Cholesky refactorization there is 71.9 ms (6.9×) and the static-pivoting LDLᵀ 354 ms (22×).
+- **By matrix class.** The overview mixes two populations: on the KKT dumps the fused pipeline is at 1.48× (refactorization) and 1.62× (solve), on the SuiteSparse/Laplacian set at 1.94× and 2.67×, and the stock Cholesky refactorization at 2.44× against 9.52×.
+
 ## Recommendations: Prioritized Experiment Plan
 
 | # | Experiment | Payoff | Effort | Key measurement | Success criterion |

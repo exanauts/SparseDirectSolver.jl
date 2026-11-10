@@ -13,10 +13,10 @@ Baselines every later milestone is measured against (PLAN.md §5 M0, §7). The
 | `regimes.jl` | `factorize!` time on the generated matrices with regimes A+B+C (default), B+C (`subtree_budgets = []`) and C only (`factorization_alg = "algo2"`), with fronts per regime and launch counts; package environment: `julia --project=. bench/regimes.jl [--backend=cuda] [--T=Float64] [--only=lap2d_300,lap3d_40]` |
 | `report.jl` | prints the CSV files as Markdown tables |
 | `dump_madnlp_kkt.jl` | dumps MadNLP K2 and condensed KKT matrices of pglib-opf cases |
-| `features.jl` | module `BenchFeatures`: the comparison features, one per implemented capability in TASKS.md order (`cholesky_f64` … `cholesky_fused`), with structure, element type, matrix selector and parameters; `task_status` reads the task's marker in TASKS.md, a safety check that no listed feature is pending |
+| `features.jl` | module `BenchFeatures`: the comparison features, one per implemented capability in TASKS.md order (`cholesky_f64` … `ldlt_algo1`), with structure, element type, matrix selector and parameters (the cuDSS matching stated per feature); `task_status` reads the task's marker in TASKS.md, a safety check that no listed feature is pending |
 | `compare.jl` | cuDSS vs SparseDirectSolver.jl per feature × matrix with BenchmarkTools; one solver per run (`--solver=cudss` or `--solver=sds`), results merged into `bench/comparison/<solver>.csv` |
 | `profile_phases.jl` | where SDS spends refactorization and solve time on CUDA (PERFORMANCE.md, experiment 0): schedule per matrix (regime-A subtrees, B/C fronts, launch groups) and a CUPTI trace of one warm refactorization and solve (kernels, copies, busy time, longest kernel and its grid); writes `bench/profile/phase_split.{md,csv}`: `julia --project=bench bench/profile_phases.jl [--only=m1,m2] [--structures=SPD,S]` |
-| `compare_report.jl` | renders `bench/comparison/comparison.md` (overview + one table per feature) and `comparison.png` (SDS/cuDSS ratio per feature and phase); environment `bench/report/` (CairoMakie) |
+| `compare_report.jl` | renders `bench/comparison/comparison.md` (overview over all matrices and over the KKT dumps only, then one table per feature) and `comparison.png` (SDS/cuDSS ratio per feature and phase, one panel per overview); environment `bench/report/` (CairoMakie) |
 | `fact_split.jl` | PR #107, experiment 5: split factorization (tiled SYRK, chunked TRSM, routing by `regime_c_rows`); reproduces its table in one run given the KKT dump. The other PR #107 prototypes (partitioned-inverse solve, segmented fused factorization, ordering study, ROCm and Metal ports) were removed and are at `https://github.com/exanauts/SparseDirectSolver.jl/tree/prototypes-2026-10/bench/` |
 | `ordering_chooser.jl` | T22 (issue #108): AMD vs ND per harness matrix and dump (schedule depth, fundamental and column-etree depth, nnz(L), flops) and the choice of the T22 and T05 cost models; host only, no GPU: `julia --project=bench bench/ordering_chooser.jl` (`SDS_BENCH_SUITESPARSE=0` skips MatrixDepot) |
 | `refinement.jl` | T16: relative residual of iterative refinement (`--mode=ir`) or FGMRES-IR (`--mode=fgmres`, T18) after `--steps=0,2,5` steps on the K2 dumps; package environment: `julia --project=. bench/refinement.jl [--only=...] [--steps=0,2,5] [--backend=cpu\|cuda] [--mode=ir\|fgmres]` |
@@ -72,6 +72,20 @@ julia --project=bench bench/compare.jl --solver=sds --features=ldlt
   run checks that every listed task is marked done (`[x]`/`[!]`) in TASKS.md
   and stops otherwise: the marker is the gate, not an error, because some
   parameters are accepted and ignored before their task.
+* **cuDSS version and matching.** The comparison runs CUDSS.jl 1.0 (cuDSS
+  1.0; the October 2026 record used cuDSS 0.8.0). cuDSS 1.0 enables matching
+  with scaling by default (`matching_alg = "algo6"`, automatic) for `S`, `H`
+  and `G` matrices, SparseDirectSolver.jl only when `matching_alg` is set. To
+  stay like-for-like, every feature sets the cuDSS matching explicitly in its
+  `cudss_params`: `"none"` for the Cholesky, static-pivoting LDLᵀ, LU, Schur,
+  batch, fused and `"algo1"` features, `"algo5"` on both sides for
+  `ldlt_matching`. `cudss_baseline.jl` also turns matching off for `S`/`G`.
+* **The partitioned-inverse solve.** `cholesky_algo1` and `ldlt_algo1` (T36)
+  set `solve_alg = "algo1"` on the SDS side before the analysis (a plain
+  `DirectSolver`); cuDSS runs its default solve on the same system. Its scope
+  being `pivot_type = 'N'` for `S`, `ldlt_algo1` runs without pivoting on both
+  sides and therefore only on the condensed dumps (SPD), not the K2 dumps,
+  which need pivoting. Both need a GPU backend.
 * **The fused pipeline.** `cholesky_fused` measures the fused factorization
   and partitioned-inverse solve of `SparseDirectSolver.Fused`, set up as the
   MadNLP extension's `SDSSolver` sets them up (native ND ordering, the
@@ -104,8 +118,14 @@ julia --project=bench bench/compare.jl --solver=sds --features=ldlt
   solve (no residual). The SDS calls for uniform batches pass `(n, nbatch)`
   right-hand sides.
 * **Adding a feature.** One `Feature(...)` entry in `features.jl` (task id or
-  pull request, structure, matrix selector, parameters); `compare.jl` handles
-  the kinds `:single`, `:ubatch`, `:schur` and `:fused`.
+  pull request, structure, matrix selector, parameters, the cuDSS matching);
+  `compare.jl` handles the kinds `:single`, `:ubatch`, `:schur` and `:fused`.
+* **The 78k-bus dump.** `kkt_pglib_opf_case78484_epigrids_condensed_10`
+  (n = 674 562, the condensed KKT system the fused pipeline and `"algo1"` were
+  tuned on) is not in the repository; copy it into `bench/data/` to include it
+  (`BenchMatrices.EXPECTED_DUMPS`; skipped with a warning otherwise). Like the
+  other condensed dumps it joins every feature on condensed or SPD matrices,
+  not the K2 features.
 
 ## What is measured
 
@@ -113,8 +133,8 @@ For each matrix and structure, after one warm-up run, five runs each of
 analysis, factorization, refactorization (same values) and solve (`nrhs = 1`,
 `b = rand(n)` with seed 666). A fresh solver is created per run (not timed);
 GPU phases are bracketed by `CUDA.synchronize()`. The CSV holds the medians in
-seconds, `lu_nnz`, `flops` (cuDSS `CUDSS_DATA_FLOPS`, an `Int64` read through the C API
-since CUDSS.jl has no getter) and `nsuperpanels`, the relative residual of the
+seconds, `lu_nnz`, `flops` (cuDSS `CUDSS_DATA_FLOPS`, an `Int64`, through
+`cudss_get(solver, "flops")` of CUDSS.jl 1.0) and `nsuperpanels`, the relative residual of the
 last solve and a status (`ok` or the error message; a failing matrix does not
 stop the run). Symmetric structures pass the lower triangle (view `'L'`).
 

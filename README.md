@@ -69,6 +69,10 @@ and parameters raise `NotSupportedError`; there is no silent fallback.
   iterative refinement (`ir_n_steps`, `ir_tol`) or FGMRES-IR with the
   factorization as preconditioner (`ir_mode = "fgmres"`, after `using
   Krylov`), and `user_host_interrupt` polled between launch groups.
+  `solve_alg = "algo1"` (set before the analysis; real `"SPD"`, no-pivot
+  `"S"`/`"H"`, one right-hand side, CUDA/AMDGPU/oneAPI) solves with the
+  partitioned-inverse sweeps of the fused pipeline after the stock
+  factorization; the default stays the level-batched sweeps.
 * **Uniform batches** for every structure (`ubatch_size`, `ubatch_index`,
   `ubatch_mask`; values as a long vector, a matrix or a 3-D array; per-member
   `info` and statistics). **Schur complement mode** (`schur_mode`,
@@ -109,19 +113,27 @@ Metal. The options `max_lu_nnz`, `host_nthreads` and
 
 ## Performance against cuDSS
 
-Time of SparseDirectSolver.jl divided by the time of cuDSS 0.8.0 per feature
-and phase, geometric mean over the benchmark matrices (below 1 is faster), on
-an NVIDIA H200 allocated exclusively through Slurm (commit 95ee682,
-2026-10-30). Every row is a feature through the handle API; `cholesky_fused`
-is the fused pipeline the MadNLP extension runs.
+Time of SparseDirectSolver.jl divided by the time of cuDSS 1.0.0 (CUDSS.jl
+1.0) per feature and phase, geometric mean over the benchmark matrices (below
+1 is faster), on an NVIDIA H200 allocated exclusively through Slurm (commit
+352271c, 2026-11-09). Every row is a feature through the handle API;
+`cholesky_fused` is the fused pipeline the MadNLP extension runs,
+`cholesky_algo1` and `ldlt_algo1` the `solve_alg = "algo1"` solve on
+`DirectSolver`. The cuDSS matching is off except in `ldlt_matching` (cuDSS 1.0
+turns it on by default for `S`/`G`), as on the SDS side. The lower panel
+keeps the MadNLP KKT dumps only.
 
 ![SparseDirectSolver.jl vs cuDSS time ratio per feature](bench/comparison/comparison.png)
 
-The handle-API gap on KKT systems is launch- and level-bound; the fused
-pipeline closes most of it. After T34 (H200, medians of
-`bench/e2e/fused_probe.jl`) the 78k-bus condensed ACOPF KKT system
-refactorizes in 18.6 ms against 11.2 ms for cuDSS and solves in 2.3 ms against
-1.7 ms. Per-matrix numbers are in
+The gap depends on the matrix class. On the condensed KKT systems the fused
+pipeline refactorizes at 1.48× and solves at 1.62× the cuDSS time
+(geometric mean over 10 dumps), on the SuiteSparse/Laplacian set at 1.94× and
+2.67×; the stock handle-API Cholesky reads 2.44× (KKT) and
+9.52× (SuiteSparse/Laplacian) for the refactorization. On the 78k-bus
+condensed ACOPF KKT system (n = 674 562) the fused pipeline refactorizes in
+16.6 ms against 10.4 ms for cuDSS and solves in 2.34 ms against
+1.63 ms; `solve_alg = "algo1"` brings the `DirectSolver` solve there from
+10.3 ms to 2.33 ms. Per-matrix numbers are in
 [`bench/comparison/comparison.md`](bench/comparison/comparison.md), regenerated
 by hand with `bench/compare.jl` and `bench/compare_report.jl` (see
 [`bench/README.md`](bench/README.md)); the MadNLP end-to-end record across
