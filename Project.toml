@@ -1,6 +1,6 @@
 name = "SparseDirectSolver"
 uuid = "dc8e0fd9-41f1-440b-9624-22817132f700"
-version = "0.2.0"
+version = "0.3.0"
 authors = ["Michel Schanen <Michel.Schanen@gmail.com>"]
 
 [deps]

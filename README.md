@@ -24,9 +24,15 @@ users can switch mechanically, and it is not tied to one vendor.
 
 ## Status
 
-Version 0.2.0, not registered, under construction. Julia 1.13. Every backend
-below runs the same multifrontal kernels; only the dense operations on the
-large fronts go through a vendor library.
+Version 0.3.0, the first release registered in the Julia General registry.
+Julia 1.13 or later. Every backend below runs the same multifrontal kernels;
+only the dense operations on the large fronts go through a vendor library.
+It is young: complete enough for the MadNLP workload and checked against CPU
+reference factorizations and the ported CUDSS.jl tests, but slower than cuDSS
+on most matrices and with features still missing; the
+[What to expect](https://exanauts.github.io/SparseDirectSolver.jl/dev/man/expectations/)
+page of the documentation says what the release covers, how far it is from
+cuDSS and what is not there. The changes are in [`CHANGELOG.md`](CHANGELOG.md).
 
 | Backend | Loaded by | Dense layer on large fronts | Tested |
 | --- | --- | --- | --- |
@@ -145,6 +151,13 @@ the gap analysis in [`PERFORMANCE.md`](PERFORMANCE.md).
 
 ```julia
 using Pkg
+Pkg.add("SparseDirectSolver")
+```
+
+Until the registration pull request in General is merged, install from the
+repository:
+
+```julia
 Pkg.add(url = "https://github.com/exanauts/SparseDirectSolver.jl")
 ```
 
@@ -287,6 +300,7 @@ describes the workflow and the code conventions. Prototypes removed from
 Project documents:
 
 * [Documentation](https://exanauts.github.io/SparseDirectSolver.jl/dev/) — user guide and API reference.
+* [`CHANGELOG.md`](CHANGELOG.md) — changes per release.
 * [`PLAN.md`](PLAN.md) — design, API, milestones.
 * [`TASKS.md`](TASKS.md) — implementation tasks and their reports.
 * [`STATE.md`](STATE.md) — the current state: what exists, the numbers, the open tasks and issues.

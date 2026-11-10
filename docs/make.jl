@@ -67,6 +67,7 @@ makedocs(
             "Backends" => "man/backends.md",
             "MadNLP" => "man/madnlp.md",
             "Performance" => "man/performance.md",
+            "What to expect" => "man/expectations.md",
         ],
         "Library" => [
             "Solver" => "lib/solver.md",
