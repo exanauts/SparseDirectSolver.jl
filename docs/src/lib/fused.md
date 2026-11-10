@@ -5,8 +5,10 @@ factorization and partitioned-inverse solve of `SparseDirectSolver.Fused`
 (`src/fused.jl`) behind the verbs of [`DirectSolver`](@ref): the same
 [`execute!`](@ref) phases, [`setparam!`](@ref), [`getparam`](@ref) and
 [`SparseDirectSolver.update!`](@ref), for one right-hand side, on a GPU backend, for `"SPD"` and
-no-pivot `"S"` real matrices. It is the inner solver of the MadNLP extension's
-`SDSSolver` ([MadNLP](@ref)); [Performance](@ref) says when to use it.
+no-pivot `"S"` real matrices. It is the inner solver that [`KKTSolver`](@ref)
+selects on GPU backends with forward progress ([KKT solver](kkt.md)), and so
+the default path of MadNLP's binding ([MadNLP](@ref)); [Performance](@ref) says
+when to use it.
 
 ```julia
 using SparseDirectSolver, CUDA, CUDA.CUSPARSE

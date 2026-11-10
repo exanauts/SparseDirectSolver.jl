@@ -45,7 +45,7 @@ docstring. The ones that matter most in practice:
 | :--- | :--- | :--- |
 | `reordering_alg` | `"default"`, `"algo1"`–`"algo5"` | automatic (AMD or ND, whichever has the lower flops + 1e8 × supernodal schedule depth), AMD (`"algo3"`), nested dissection (`"algo4"`), natural (`"algo5"`); see [`SparseDirectSolver.ReorderingAlg`](@ref) |
 | `factorization_alg` | `"default"`, `"algo1"`, `"algo2"` | automatic, small-front kernels only, vendor dense calls for large fronts |
-| `matching_alg` | `"default"` (none), `"algo1"`–`"algo6"` | MC64 jobs 1–5 (`"algo6"`: automatic) before the ordering |
+| `matching_alg` | `"default"` (none), `"none"`, `"algo1"`–`"algo6"` | no matching (`"none"`, the cuDSS 1.0 spelling, is the same as `"default"` here and reads back as `"default"`; in cuDSS 1.0 `"default"` is automatic matching), MC64 jobs 1–5 (`"algo6"`: automatic) before the ordering |
 | `pivot_type` | `'A'`, `'N'`, `'D'`, `'L'`, `'B'` | automatic, none, diagonal (1×1 only), local block, Bunch–Kaufman; `'A'`, `'B'` and `'L'` all select Bunch–Kaufman for LDLᵀ/LDLᴴ and threshold row pivoting inside the fully-summed block for LU; global pivoting (`'C'`, `'R'`) raises `NotSupportedError` |
 | `pivot_threshold` | `0.0`–`1.0`, default `0.01` | acceptance threshold of a pivot |
 | `pivot_epsilon` | default `1e-13` (`Float64`), `1e-5` (`Float32`) | tiny pivots of LDLᵀ/LDLᴴ/LU are perturbed to this size; it is also the Cholesky threshold: a non-negative pivot up to `pivot_epsilon` is raised to it (issue #127), a negative or NaN one still fails |

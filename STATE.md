@@ -7,7 +7,11 @@ cuDSS 1.0 comparison) and the release PR #191 (version 0.3.0, `CHANGELOG.md`,
 the docs page "What to expect"). Registration in General is the owner's next
 step: `JuliaRegistrator register` on the merge commit of #191 with the
 CHANGELOG section as release notes; General waits 3 days for a new package;
-TagBot then tags `v0.3.0` and `Documentation.yml` deploys `stable`. It replaces the snapshot
+TagBot then tags `v0.3.0` and `Documentation.yml` deploys `stable`. Version 0.4.0
+is prepared on branch `maint/kkt-solver-0.4.0`: `KKTSolver` (`src/kkt.jl`), the
+public front end for interior-point KKT systems, replaces the MadNLP extension,
+whose binding moves to MadNLP 0.12 (`MadCoreGPU.SDSSolver`); it is merged and
+registered after General PR 175567 (0.3.0) merges (`CHANGELOG.md` [0.4.0]). It replaces the snapshot
 of 2026-11-04; the history is in git (`git log -- STATE.md`). Sources: the Report blocks of `TASKS.md`, the open and
 closed issues, `PLAN.md` §5, `bench/comparison/comparison.md`,
 `bench/ARCH-TUNING.md`, `PERFORMANCE.md` and `bench/PERFORMANCE-2026-10.md`.
@@ -221,6 +225,8 @@ assume:
   `prototypes-2026-10`.
 - Releases: `CHANGELOG.md` (Keep a Changelog; TagBot cannot read it, so the
   register comment carries the section as `Release notes:`). Version 0.3.0 is
-  the first release; 0.2.0 and earlier were internal, never tagged.
+  the first release; 0.2.0 and earlier were internal, never tagged. 0.4.0
+  (`KKTSolver`, MadNLP binding moved to MadNLP) waits on branch
+  `maint/kkt-solver-0.4.0` for General PR 175567 (0.3.0) to merge.
 - Documentation: `https://exanauts.github.io/SparseDirectSolver.jl/dev/`,
   built on the `cuda` runner for every push to `main`.

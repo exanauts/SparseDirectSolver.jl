@@ -23,7 +23,7 @@ plot keeps the MadNLP KKT dumps only. SDS/cuDSS ratios (geometric means):
 | LU, unsymmetric | 2 | 13.82× | 15.19× | 5.46× | – | – |
 | Schur complement, Cholesky | 10 | 2.01× | 2.54× | 4.25× | 2.54× | 4.25× |
 | LDLᵀ + matching (algo5), K2 dumps | 9 | 3.57× | 4.21× | 4.21× | 4.21× | 4.21× |
-| Cholesky, fused pipeline (the `SDSSolver` path) | 15 | 1.38× | 1.62× | 1.92× | 1.48× | 1.62× |
+| Cholesky, fused pipeline (the `KKTSolver` and MadNLP `SDSSolver` path) | 15 | 1.38× | 1.62× | 1.92× | 1.48× | 1.62× |
 | Cholesky, `solve_alg = "algo1"` | 15 | 3.41× | 4.01× | 1.83× | 2.60× | 1.41× |
 | LDLᵀ without pivoting, `solve_alg = "algo1"`, condensed dumps | 10 | 4.23× | 5.24× | 1.39× | 5.24× | 1.39× |
 

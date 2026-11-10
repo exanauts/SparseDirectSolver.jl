@@ -14,11 +14,8 @@ jobs:
         with:
           version: '1'
       - name: Aqua.jl
-        # MadNLP is loaded so the SparseDirectSolverMadNLPExt extension assigns the
-        # exported SDSSolver/SDSSolverOptions globals: the undefined-exports check
-        # then validates them for real instead of flagging the declared-only state.
         # persistent_tasks is skipped for the same two upstream reasons as in
         # test/test_aqua.jl: KernelAbstractions 0.10's CPU backend keeps worker tasks
         # alive at exit, and Aqua's fresh temporary project fails to precompile
         # pocl_standalone_jll ("Cannot load SLEEF_jll").
-        run: julia --color=yes -e 'using Pkg; Pkg.add(["Aqua", "MadNLP"]); Pkg.develop(path="."); using Aqua, MadNLP, SparseDirectSolver; Aqua.test_all(SparseDirectSolver, ambiguities=false, persistent_tasks=false)'
+        run: julia --color=yes -e 'using Pkg; Pkg.add("Aqua"); Pkg.develop(path="."); using Aqua, SparseDirectSolver; Aqua.test_all(SparseDirectSolver, ambiguities=false, persistent_tasks=false)'

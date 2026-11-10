@@ -106,7 +106,7 @@ defaults below. Keyword arguments are applied through [`setparam!`](@ref), so
 | `reordering_alg` | `REORDERING_DEFAULT` | automatic AMD/ND choice: flops + 1e8 × supernodal schedule depth, every backend |
 | `factorization_alg` | `FACTORIZATION_DEFAULT` | automatic regime choice |
 | `solve_alg` | `SOLVE_DEFAULT` | level-batched sweeps |
-| `matching_alg` | `MATCHING_NONE` | no matching |
+| `matching_alg` | `MATCHING_NONE` | no matching (`"default"`, or `"none"` as in cuDSS 1.0) |
 | `solve_mode` | `0` | solve with `A` (1: `Aᵀ`, 2: `Aᴴ`) |
 | `ir_n_steps` | `0` | no refinement (cuDSS parity) |
 | `ir_tol` | `0.0` | no early exit |
@@ -558,6 +558,8 @@ Accepted values:
 
 * algorithms (`"reordering_alg"`, `"factorization_alg"`, `"solve_alg"`,
   `"matching_alg"`, `"pivot_epsilon_alg"`): `"default"`, `"algoN"` or the integer `N`;
+  `"matching_alg"` also accepts `"none"` (the cuDSS 1.0 spelling of matching off), the
+  same as `"default"` here, which `getparam` returns;
 * `"pivot_type"`: `'A'`, `'N'`, `'D'`, `'L'`, `'B'` (`'C'`/`'R'` raise `NotSupportedError`);
   LDLᵀ/LDLᴴ: `'A'`, `'B'`, `'L'` Bunch–Kaufman, `'D'` 1×1 only, `'N'` none; LU (`"G"`, [`lu_pivoting`](@ref)):
   `'A'`, `'B'`, `'L'` in-block threshold row pivoting, `'N'`, `'D'` diagonal pivots;

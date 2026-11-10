@@ -1,8 +1,9 @@
 # What to expect
 
-Version 0.3.0 is the first registered release. This page says what it covers,
-how fast and how accurate it is next to cuDSS, and what it does not do yet. The
-other pages of the manual have the details.
+This page is about version 0.4.0, which follows 0.3.0, the first registered
+release. It says what the release covers, how fast and how accurate it is next
+to cuDSS, and what it does not do yet. The other pages of the manual have the
+details.
 
 ## What the release covers
 
@@ -27,9 +28,11 @@ other pages of the manual have the details.
   analysis; real `"SPD"`/`"HPD"`, `"S"`/`"H"` with `pivot_type = 'N'`, one
   right-hand side, CUDA/AMDGPU/oneAPI). The default stays the level-batched
   sweeps.
-* **The MadNLP extension** (`using MadNLP`): the linear solver `SDSSolver`,
-  which runs the fused pipeline by default and the stock Bunch–Kaufman path with
-  `sds_pivoting = :bk` ([MadNLP](@ref)).
+* **[`KKTSolver`](@ref)**: the front end for interior-point KKT systems
+  (refactorization, one right-hand side, inertia), which runs the fused
+  pipeline where the backend allows it and the stock pipeline otherwise or
+  with Bunch–Kaufman pivoting ([KKT solver](../lib/kkt.md)). MadNLP 0.12
+  binds it as `SDSSolver` in its own packages ([MadNLP](@ref)).
 
 KernelAbstractions 0.10 (≥ 0.10.3) is required, hence CUDA.jl ≥ 6.5, AMDGPU.jl ≥
 2.10, oneAPI.jl ≥ 2.10 and Metal.jl ≥ 1.11, on Julia 1.13 or later.
@@ -64,8 +67,9 @@ timed less.
   `matching_alg = "algo5"` ([Symmetric indefinite systems](@ref)).
 * **No pivoting.** The fused pipeline and `solve_alg = "algo1"` factor `"S"`
   matrices in the identity pivot order (`pivot_type = 'N'`), which relies on
-  the regularization of the interior-point method; MadNLP's `SDSSolver`
-  reports the true inertia from the signs of ``D``.
+  the regularization of the interior-point method; [`KKTSolver`](@ref) (and
+  through it MadNLP's `SDSSolver`) reports the true inertia from the signs of
+  ``D``.
 * **`"algo1"` residuals.** The partitioned-inverse solve multiplies by explicit
   inverses of the diagonal blocks of each front. On ill-conditioned blocks its
   residual is larger than that of the level sweeps: 1.1–3.3× on the condensed

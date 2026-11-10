@@ -140,8 +140,9 @@ end
 """
     MatchingAlg
 
-`matching_alg` values (cuDSS `cudssMatchingAlg_t`): `"default"` no matching,
-`"algo1"`–`"algo5"` MC64 jobs 1–5, `"algo6"` automatic (job 5).
+`matching_alg` values (cuDSS `cudssMatchingAlg_t`): `"default"` no matching
+(`"none"` is accepted as the cuDSS 1.0 spelling of the same and read back as
+`"default"`), `"algo1"`–`"algo5"` MC64 jobs 1–5, `"algo6"` automatic (job 5).
 """
 @enum MatchingAlg::Int32 begin
     MATCHING_NONE = 0
@@ -278,6 +279,19 @@ enum_spellings(::Type{MatchingAlg}) = (
     "algo6" => MATCHING_AUTO,
 )
 
+"""
+    enum_aliases(E) -> Tuple{Vararg{Pair}}
+
+Additional input spellings of the enum type `E`, as `spelling => instance` pairs:
+accepted by `convert(E, spelling)` but never returned by `convert(String, x)`,
+which keeps the spelling of `enum_spellings`. The only alias is
+`"none"` for `MatchingAlg` (`MATCHING_NONE`, spelled `"default"`): cuDSS 1.0
+spells matching off `"none"` (its `"default"` is automatic matching), and
+MadNLP's cuDSS binding sets it explicitly.
+"""
+enum_aliases(::Type) = ()
+enum_aliases(::Type{MatchingAlg}) = ("none" => MATCHING_NONE,)
+
 enum_spellings(::Type{PivotEpsilonAlg}) = (
     "default" => PIVOT_EPSILON_DEFAULT,
     "algo1" => PIVOT_EPSILON_SCALED,
@@ -334,12 +348,15 @@ enum_description(::Type{IRMode}) = "refinement mode"
 enum_description(::Type{PivotPairsMode}) = "pivot pairs mode"
 
 function _unknown_spelling(::Type{E}, x) where {E}
-    expected = join((repr(first(p)) for p in enum_spellings(E)), ", ")
+    expected = join((repr(first(p)) for p in (enum_spellings(E)..., enum_aliases(E)...)), ", ")
     return InvalidValueError("unknown $(enum_description(E)) $(repr(x)); expected one of $expected")
 end
 
 function _parse_spelling(::Type{E}, x) where {E}
     for (spelling, instance) in enum_spellings(E)
+        spelling == x && return instance
+    end
+    for (spelling, instance) in enum_aliases(E)
         spelling == x && return instance
     end
     throw(_unknown_spelling(E, x))
