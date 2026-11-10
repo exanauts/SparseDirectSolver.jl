@@ -5,9 +5,12 @@
 # `compare_report.jl` renders the side-by-side table and plot.
 #
 #   julia --project=bench bench/compare.jl --solver=cudss [options]
-#   julia --project=bench bench/compare.jl --solver=sds [--backend=cuda|cpu] [options]
+#   julia --project=bench bench/compare.jl --solver=sds [--backend=cuda|oneapi|cpu] [options]
 #
 # Options:
+#   --out=name          CSV basename under bench/comparison/ (default: the solver, i.e.
+#                       cudss or sds); e.g. --out=sds_aurora for the oneAPI run on
+#                       Aurora, which then does not touch the H200 sds.csv
 #   --features=a,b      feature ids (default: all; see bench/features.jl)
 #   --only=m1,m2        matrix names (default: all harness matrices)
 #   --samples=5         BenchmarkTools samples per phase (after its warm-up sample)
@@ -52,36 +55,50 @@ using .BenchFeatures
 
 function parse_args(args)
     o = Dict{String, String}("solver" => "", "backend" => "cuda", "features" => "", "only" => "",
-                             "samples" => "5", "seconds" => "60", "single-run-above" => "5", "suitesparse" => "true", "dumps" => "true")
+                             "samples" => "5", "seconds" => "60", "single-run-above" => "5", "suitesparse" => "true", "dumps" => "true",
+                             "out" => "")
     for a in args
         if a in ("--no-suitesparse", "--no-dumps")
             o[a[6:end]] = "false"
-        elseif (m = match(r"^--(solver|backend|features|only|samples|seconds|single-run-above)=(.*)$", a)) !== nothing
+        elseif (m = match(r"^--(solver|backend|features|only|samples|seconds|single-run-above|out)=(.*)$", a)) !== nothing
             o[m[1]] = m[2]
         else
             error("unknown argument \"$a\"; see the header of bench/compare.jl")
         end
     end
     o["solver"] in ("cudss", "sds") || error("--solver=cudss or --solver=sds is required")
-    o["backend"] in ("cuda", "cpu") || error("--backend must be cuda or cpu")
+    o["backend"] in ("cuda", "oneapi", "cpu") || error("--backend must be cuda, oneapi or cpu")
+    o["solver"] == "cudss" && o["backend"] == "oneapi" && error("cuDSS runs on CUDA only")
+    isempty(o["out"]) && (o["out"] = o["solver"])
     return o
 end
 
 const OPTS = parse_args(ARGS)
 const SOLVER = OPTS["solver"]
-const ON_GPU = SOLVER == "cudss" || OPTS["backend"] == "cuda"
+const BACKEND = SOLVER == "cudss" ? :cuda : Symbol(OPTS["backend"])
+const ON_GPU = BACKEND != :cpu
 
 if SOLVER == "cudss"
     using CUDA, CUDA.cuSPARSE, CUDSS
 else
     using SparseDirectSolver, Metis   # Metis: nested dissection in the default ordering
     using SparseDirectSolver.KernelAbstractions: get_backend
-    ON_GPU && using CUDA, CUDA.cuSPARSE
+    if BACKEND == :cuda
+        using CUDA, CUDA.cuSPARSE
+    elseif BACKEND == :oneapi
+        using oneAPI, oneAPI.oneMKL
+    end
 end
 
-dev(x) = ON_GPU ? CUDA.CuArray(x) : x
-dev_csr(A) = ON_GPU ? CUDA.cuSPARSE.CuSparseMatrixCSR(A) : A
-sync() = ON_GPU ? CUDA.synchronize() : nothing
+dev(x) = BACKEND == :cuda ? CUDA.CuArray(x) : BACKEND == :oneapi ? oneAPI.oneArray(x) : x
+dev_csr(A) = BACKEND == :cuda ? CUDA.cuSPARSE.CuSparseMatrixCSR(A) : BACKEND == :oneapi ? one_csr(A) : A
+# the CSR arrays of A (those of the CSC of its transpose) with Cint indices, as CuSparseMatrixCSR has
+function one_csr(A::SparseMatrixCSC{T}) where {T}
+    At = sparse(transpose(A))
+    return oneAPI.oneMKL.oneSparseMatrixCSR{T, Cint}(oneAPI.oneVector{Cint}(At.colptr), oneAPI.oneVector{Cint}(At.rowval),
+                                                    oneAPI.oneVector{T}(At.nzval), size(A))
+end
+sync() = BACKEND == :cuda ? CUDA.synchronize() : BACKEND == :oneapi ? oneAPI.synchronize() : nothing
 
 # The GPU drops to a low-clock power state while the host runs the (untimed)
 # setup, and the timed phase then starts slow: on the RTX 4080, lap2d_300
@@ -91,11 +108,11 @@ const SPIN_SECONDS = 0.2
 const SPIN_BUFFER = Ref{Any}(nothing)
 function spin_device()
     ON_GPU || return
-    SPIN_BUFFER[] === nothing && (SPIN_BUFFER[] = CUDA.zeros(Float32, 2^24))
+    SPIN_BUFFER[] === nothing && (SPIN_BUFFER[] = dev(zeros(Float32, 2^24)))
     buf, t0 = SPIN_BUFFER[], time()
     while time() - t0 < SPIN_SECONDS
         buf .= sin.(buf) .+ 1f0
-        CUDA.synchronize()
+        sync()
     end
 end
 
@@ -253,7 +270,8 @@ cell(x) = x === missing || x === nothing ? "" : x isa AbstractFloat ? repr(Float
 clean(msg) = first(strip(replace(msg, r"[,\"\s]+" => " ")), 200)
 
 function device_name()
-    ON_GPU && return replace(CUDA.name(CUDA.device()), "," => " ")
+    BACKEND == :cuda && return replace(CUDA.name(CUDA.device()), "," => " ")
+    BACKEND == :oneapi && return replace(oneAPI.properties(oneAPI.device()).name, "," => " ")
     return "CPU (KernelAbstractions, $(Threads.nthreads()) threads)"
 end
 
@@ -308,7 +326,8 @@ end
 # --- driver ------------------------------------------------------------------
 
 function main()
-    ON_GPU && !CUDA.functional() && error("CUDA is not functional on this machine")
+    BACKEND == :cuda && !CUDA.functional() && error("CUDA is not functional on this machine")
+    BACKEND == :oneapi && !oneAPI.functional() && error("oneAPI is not functional on this machine")
     samples, seconds = parse(Int, OPTS["samples"]), parse(Float64, OPTS["seconds"])
     single_run_above = parse(Float64, OPTS["single-run-above"])
     ids = filter(!isempty, split(OPTS["features"], ','))
@@ -317,7 +336,7 @@ function main()
     only_names = filter(!isempty, split(OPTS["only"], ','))
     isempty(only_names) || filter!(M -> M.name in only_names, mats)
     meta = [device_name(), API.version, git_sha(), string(today())]
-    out = joinpath(@__DIR__, "comparison", "$SOLVER.csv")
+    out = joinpath(@__DIR__, "comparison", OPTS["out"] * ".csv")
     println(SOLVER, " ", API.version, " on ", meta[1], ", samples = ", samples)
 
     if SOLVER == "sds"

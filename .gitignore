@@ -9,4 +9,6 @@ docs/build/
 .vscode/
 bench/kkt/
 docs/src/assets/comparison.png
+docs/src/assets/comparison_aurora.png
 bench/*.bin
+bench/comparison/aurora_logs/

@@ -39,6 +39,10 @@ MadNLPExt === nothing && error("the MadNLP extension did not load")
 mkpath(joinpath(@__DIR__, "src", "assets"))
 cp(joinpath(@__DIR__, "..", "bench", "comparison", "comparison.png"),
    joinpath(@__DIR__, "src", "assets", "comparison.png"); force = true)
+# the same against SDS on Aurora (Intel Max 1550, bench/aurora/compare.pbs), when it has been run
+let aurora = joinpath(@__DIR__, "..", "bench", "comparison", "comparison_aurora.png")
+    isfile(aurora) && cp(aurora, joinpath(@__DIR__, "src", "assets", "comparison_aurora.png"); force = true)
+end
 
 DocMeta.setdocmeta!(SparseDirectSolver, :DocTestSetup, :(using SparseDirectSolver); recursive = true)
 
