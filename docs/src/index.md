@@ -28,11 +28,13 @@ oneAPI, Metal and the KernelAbstractions CPU backend.
     evidence. Validate the numerics on your own matrices before relying on them.
 
 !!! warning "Status"
-    Version 0.2 is under construction. The CPU backend, CUDA, AMDGPU, oneAPI
-    (tested on an Intel Data Center GPU Max 1550) and Metal (`Float32`, tested
-    on an M4 Max) are tested; non-uniform batches and mixed precision are not
-    there yet. Unsupported structures, phases and parameters raise
-    [`NotSupportedError`](@ref) rather than falling back silently.
+    Version 0.3.0 is the first registered release. The CPU backend, CUDA,
+    AMDGPU, oneAPI (tested on an Intel Data Center GPU Max 1550) and Metal
+    (`Float32`, tested by hand on an M4 Max) are tested; non-uniform batches and
+    mixed precision are not there yet. Unsupported structures, phases and
+    parameters raise [`NotSupportedError`](@ref) rather than falling back
+    silently. [What to expect](@ref) summarizes what the release covers, how it
+    compares with cuDSS and what is missing.
 
 ## Features
 
@@ -68,12 +70,16 @@ oneAPI, Metal and the KernelAbstractions CPU backend.
 
 ## Installation
 
-The package is not registered yet. Julia 1.13 or later is required.
+Julia 1.13 or later is required.
 
 ```julia
 using Pkg
-Pkg.add(url = "https://github.com/exanauts/SparseDirectSolver.jl")
+Pkg.add("SparseDirectSolver")
 ```
+
+Until the registration pull request in the General registry is merged, install
+from the repository with
+`Pkg.add(url = "https://github.com/exanauts/SparseDirectSolver.jl")`.
 
 The CUDA extension is triggered by CUDA.jl's packages CUDACore, cuBLAS,
 cuSOLVER and cuSPARSE, which `using CUDA` loads (`CuSparseMatrixCSR` and
@@ -94,6 +100,7 @@ the `SDSSolver` linear solver ([MadNLP](@ref)).
 * [Backends](@ref): CUDA, AMDGPU, oneAPI, Metal and the CPU backend.
 * [MadNLP](@ref): the `SDSSolver` linear solver and its options.
 * [Performance](@ref): comparison with cuDSS.
+* [What to expect](@ref): scope, performance, accuracy and limits of this release.
 * The design documents in the repository: [`PLAN.md`](https://github.com/exanauts/SparseDirectSolver.jl/blob/main/PLAN.md)
   (architecture and API), [`TASKS.md`](https://github.com/exanauts/SparseDirectSolver.jl/blob/main/TASKS.md)
   (implementation tasks and their reports) and

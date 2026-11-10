@@ -57,8 +57,10 @@ It is restricted to what the kernels do: a GPU backend (the
 dependency-counter kernels spin on resident workgroups, so the
 KernelAbstractions CPU backend is refused), real `"SPD"` matrices and real
 `"S"` matrices factored without pivoting, one right-hand side, no uniform
-batch, Schur complement, matching, iterative refinement, deterministic mode or
-mixed precision; each raises `NotSupportedError` (the docstring lists them).
+batch, Schur complement, matching, iterative refinement or mixed precision;
+each raises `NotSupportedError` (the docstring lists them). Its factorization
+is bitwise reproducible and `deterministic_mode = 1` selects the reproducible
+forward sweep of its solve (T35).
 [`DirectSolver`](@ref) remains the general solver; its `solve_alg = "algo1"`
 (below) runs the same solve after the stock factorization, and T37–T38 move
 the rest of the pipeline under its `execute!`.
