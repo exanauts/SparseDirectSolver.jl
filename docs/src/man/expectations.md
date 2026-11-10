@@ -66,10 +66,12 @@ timed less.
   scaled KKT systems also need the matching and scaling of
   `matching_alg = "algo5"` ([Symmetric indefinite systems](@ref)).
 * **No pivoting.** The fused pipeline and `solve_alg = "algo1"` factor `"S"`
-  matrices in the identity pivot order (`pivot_type = 'N'`), which relies on
-  the regularization of the interior-point method; [`KKTSolver`](@ref) (and
-  through it MadNLP's `SDSSolver`) reports the true inertia from the signs of
-  ``D``.
+  matrices in the identity pivot order (`pivot_type = 'N'`; a pivot below
+  `pivot_epsilon` is replaced, counted in `"npivots"`), which relies on the
+  regularization of the interior-point method or on the matching and scaling
+  of `matching_alg = "algo5"`; [`KKTSolver`](@ref) (and through it MadNLP's
+  `SDSSolver`) reports the inertia from the signs of ``D``, a replaced pivot
+  counted with the sign it was given.
 * **`"algo1"` residuals.** The partitioned-inverse solve multiplies by explicit
   inverses of the diagonal blocks of each front. On ill-conditioned blocks its
   residual is larger than that of the level sweeps: 1.1–3.3× on the condensed

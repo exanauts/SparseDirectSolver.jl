@@ -2580,8 +2580,11 @@ these arguments (a [`CSR`](@ref SparseDirectSolver.CSR), `CuSparseMatrixCSR`/`Cu
 `nzval`, so writing new values into it and calling `refactorize!` is the
 interior-point loop (`update!` with the same pattern is forwarded).
 
-`structure` is `"SPD"` (fused Cholesky) or `"S"` (fused LDLᵀ without pivoting:
-`pivot_type = 'N'`, `pivot_pairs = "none"`). `tuning` is an
+`structure` is `"SPD"` (fused Cholesky) or `"S"` (fused LDLᵀ with static
+pivoting: `pivot_type = 'N'`, a pivot `d` with `|d| < pivot_epsilon` replaced by
+`±pivot_epsilon` as in the stock no-pivot LDLᵀ, optionally with a matching;
+`pivot_pairs = "none"` without a matching, `"default"` with one, so that the
+pairs of its cycles shape the ordering). `tuning` is an
 [`SDSTuning`](@ref SparseDirectSolver.Fused.SDSTuning), `nothing` meaning
 [`default_tuning`](@ref SparseDirectSolver.Fused.default_tuning)`(backend)`,
 resolved by [`resolve_tuning`](@ref SparseDirectSolver.Fused.resolve_tuning);
@@ -2599,8 +2602,12 @@ Phases (`execute!(phase, F, X, B; asynchronous = true)`):
 * `"factorization"`, `"refactorization"` (needs a previous
   `"factorization"`): the fused factorization of the current values, then the
   inverses of the diagonal blocks; sets `"info"` (`0`, or the original column
-  of the first failed pivot: a non-positive Cholesky pivot, or for `"S"` a zero
-  or non-finite pivot). A failed factorization does not throw. `"S"` factors
+  of the first failed pivot: a non-positive Cholesky pivot, or for `"S"` a
+  zero pivot under `pivot_epsilon = 0`, or a non-finite pivot). A failed
+  factorization does not throw. Unlike the stock kernel, which replaces a NaN
+  pivot and accepts an infinite one, the fused LDLᵀ fails the factorization on
+  both under any `pivot_epsilon`, so a NaN or Inf in the matrix is reported
+  rather than factored. `"S"` factors
   its wide fronts in the fused kernel under either `wides` strategy (a front's
   pivots may take both signs), so the in-kernel wide-front limit applies to it
   on every part: a front with more than `1023 · 32` rows below a panel raises
@@ -2610,9 +2617,13 @@ Phases (`execute!(phase, F, X, B; asynchronous = true)`):
   is the one of `DirectSolver`'s `solve_alg = "algo1"` (one driver, T36).
 
 `setparam!` accepts `"user_perm"`, `"reordering_alg"`, `"nd_nseps"`,
-`"nd_seed"` and `"pivot_epsilon"` (the Cholesky pivot epsilon; the fused
-LDLᵀ factors with epsilon `0`), all read by the next analysis, and
-`"deterministic_mode"`, read at every solve. The factorization is
+`"nd_seed"`, `"pivot_epsilon"` (the pivot epsilon of both modes, default
+`1e-13` for `Float64` and `1e-5` for `Float32`; `0` replaces no `"S"` pivot),
+and for `"S"` `"pivot_sign"` (the sign a replaced pivot takes, per row of the
+matrix) and `"matching_alg"` (`"algo1"`–`"algo6"`; the values are scaled
+before the fused factorization and the solve undoes the scaling), all read by
+the next analysis (the fused plans capture `pivot_epsilon` and `pivot_sign`
+there), and `"deterministic_mode"`, read at every solve. The factorization is
 deterministic under either mode: the children of a parent add in
 `child_list` order and the panels of an in-kernel wide front apply in order,
 with plain adds, so factor and `D` are bitwise reproducible for the same
@@ -2623,10 +2634,12 @@ run to run; `deterministic_mode = 1` runs the forward sweep without atomics
 children's buffers in order), and the solution is bitwise reproducible too.
 `getparam`
 returns `"info"`, `"inertia"` (`(npos, nneg)`; `"SPD"`: the positive pivots and
-`0`; `"S"`: the counts of positive and negative entries of `D`), `"npivots"`
-(`0` for `"S"`: the fused LDLᵀ perturbs no pivot), the analysis data
+`0`; `"S"`: the counts of positive and negative entries of `D`, a replaced
+pivot counted with the sign it was given), `"npivots"` (`"S"`: the number of
+replaced pivots, valid when `"info"` is `0`), the analysis data
 `"perm_reorder_row"`, `"perm_reorder_col"`, `"perm_row"`, `"perm_col"`,
-`"lu_nnz"`, `"flops"`, `"nsuperpanels"` of the inner solver,
+`"lu_nnz"`, `"flops"`, `"nsuperpanels"` of the inner solver, with a matching
+`"perm_matching"`, `"scale_row"` and `"scale_col"`,
 `"memory_estimates"` (the inner solver's, plus after the analysis the fused
 plans' device buffers: slot 13 the private contribution blocks of the fused
 factorization, slot 14 every other buffer of the plans, both added to slots
@@ -2640,9 +2653,10 @@ other backend without inter-workgroup forward progress (Metal), complex
 element types, the structures `"HPD"`, `"H"` and `"G"`, a uniform batch
 (`nbatch > 1`), `nrhs > 1`, a transposed solve (`solve_mode ≠ 0`), the solve
 sub-phases (`"solve_fwd_perm"` … `"solve_refinement"`, the Schur phases),
-Schur mode, `matching_alg ≠ "default"`, `ir_n_steps > 0`,
+Schur mode, `"SPD"` with `matching_alg ≠ "default"`, `ir_n_steps > 0`,
 a `factor_precision` other than the working precision, `"S"` with
-`pivot_type ≠ 'N'`, a matrix without a front of width ≤ 256 for the fused
+`pivot_type ≠ 'N'` or `pivot_epsilon_alg ≠ "default"`, `"pivot_sign"` on
+`"SPD"`, a matrix without a front of width ≤ 256 for the fused
 solve, and every `setparam!` name not listed above. The options of the inner
 solver are checked again at the analysis. [`DirectSolver`](@ref SparseDirectSolver.DirectSolver) remains the
 general solver.

@@ -34,19 +34,21 @@ solve!(S, xb)                                  # xb holds b on entry, x on retur
 On the CPU backend and on Metal the same calls run the stock pipeline;
 `pivoting = :bk` selects the Bunch–Kaufman pivoting of the stock `L D Lᵀ` on
 every backend ([Symmetric indefinite systems](@ref)), and `fused = false`
-forces the stock pipeline. The fused `L D Lᵀ` has no matching and replaces no
-pivot, so `fused = nothing` also selects the stock pipeline for an `L D Lᵀ`
-with `matching` (the `"matching_alg"` of the analysis, `"algo5"` and `"algo6"`
-also giving the 2×2 pivot pairs of the ordering), `pivot_epsilon` or
-`pivot_sign`, and `fused = true` refuses them with a
-[`NotSupportedError`](@ref). Matching and the pivot pairs are decided from the
-values of the analysis: when the solver is built before the matrix holds its
-first values, as an interior-point method builds it, pass
-`deferred_analysis = true`.
+forces the stock pipeline. Both pipelines run the static `L D Lᵀ` with
+`matching` (the `"matching_alg"` of the analysis: `"algo5"` and `"algo6"` scale
+the matrix and give the 2×2 pivot pairs of the ordering) and pivot replacement
+(`pivot_epsilon`, `pivot_sign`: a pivot below `pivot_epsilon` becomes
+`±pivot_epsilon`, with the requested sign). On the fused pipeline a NaN or
+infinite pivot always fails the factorization (`info ≠ 0`), where the stock
+kernel replaces a NaN pivot and accepts an infinite one. Matching and the
+pivot pairs are decided from the values of the analysis: when the solver is
+built before the matrix holds its first values, as an interior-point method
+builds it, pass `deferred_analysis = true`.
 
 ```julia
-S = KKTSolver(Kd, 'L'; factorization = :ldl, matching = "algo6", pivot_epsilon = 1e-10,
-              deferred_analysis = true)        # options checked, nothing analyzed yet
+sgn = vcat(ones(Int8, n_primal), fill(Int8(-1), n_dual))   # the sign a replaced pivot takes
+S = KKTSolver(Kd, 'L'; factorization = :ldl, matching = "algo5", pivot_epsilon = 1e-10,
+              pivot_sign = sgn, deferred_analysis = true)   # options checked, nothing analyzed yet
 Kd.nzVal .= first_values
 factorize!(S)                                  # analysis (matching, pairs) and first factorization
 Kd.nzVal .= new_values
