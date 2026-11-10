@@ -6,10 +6,31 @@ phase (BenchmarkTools medians), geometric mean over the benchmark matrices
 
 ![SparseDirectSolver.jl vs cuDSS time ratio per feature](../assets/comparison.png)
 
-The comparison was measured at commit d750376 (2026-10-28), before T33 moved
-the construction of the fused plans into the analysis; the `cholesky_fused`
-factorization column there still includes building the plans. The per-matrix
-numbers are in
+The comparison was measured at commit 352271c (2026-11-09) against cuDSS
+1.0.0 (CUDSS.jl 1.0) on an NVIDIA H200. The cuDSS matching is set explicitly:
+off for every feature except `ldlt_matching` (`"algo5"` on both sides), since
+cuDSS 1.0 matches and scales `"S"`/`"H"`/`"G"` matrices by default and
+SparseDirectSolver.jl only when `matching_alg` is set. The lower panel of the
+plot keeps the MadNLP KKT dumps only. SDS/cuDSS ratios (geometric means):
+
+| feature | matrices | factorization | refactorization | solve | KKT refactorization | KKT solve |
+| --- | --- | --- | --- | --- | --- | --- |
+| Cholesky, Float64 | 15 | 3.13× | 3.84× | 3.84× | 2.44× | 2.83× |
+| Cholesky, 16 right-hand sides | 15 | 3.16× | 3.83× | 3.20× | 2.44× | 2.75× |
+| LDLᵀ, static pivoting | 24 | 5.64× | 6.87× | 4.66× | 6.00× | 4.20× |
+| LDLᵀ + 2 refinement steps, K2 dumps | 9 | 4.20× | 5.46× | 10.24× | 5.46× | 10.24× |
+| Uniform batch of 8, Cholesky | 10 | 1.15× | 1.76× | 2.60× | 1.76× | 2.60× |
+| LU, unsymmetric | 2 | 13.82× | 15.19× | 5.46× | – | – |
+| Schur complement, Cholesky | 10 | 2.01× | 2.54× | 4.25× | 2.54× | 4.25× |
+| LDLᵀ + matching (algo5), K2 dumps | 9 | 3.57× | 4.21× | 4.21× | 4.21× | 4.21× |
+| Cholesky, fused pipeline (the `SDSSolver` path) | 15 | 1.38× | 1.62× | 1.92× | 1.48× | 1.62× |
+| Cholesky, `solve_alg = "algo1"` | 15 | 3.41× | 4.01× | 1.83× | 2.60× | 1.41× |
+| LDLᵀ without pivoting, `solve_alg = "algo1"`, condensed dumps | 10 | 4.23× | 5.24× | 1.39× | 5.24× | 1.39× |
+
+On the condensed KKT systems the fused pipeline is within 1.48× of cuDSS
+for the refactorization and 1.62× for the solve; on the SuiteSparse and
+Laplacian matrices the stock handle API is 9.52× behind for the
+Cholesky refactorization. The per-matrix numbers are in
 [`bench/comparison/comparison.md`](https://github.com/exanauts/SparseDirectSolver.jl/blob/main/bench/comparison/comparison.md).
 The benchmark harness and the cuDSS baselines are described in
 [`bench/README.md`](https://github.com/exanauts/SparseDirectSolver.jl/blob/main/bench/README.md);
@@ -70,5 +91,14 @@ KernelAbstractions CPU backend or Metal). Anything else raises
 `NotSupportedError` at the analysis, the factorization (`pivot_type` changed
 to pivoting) or the solve, never a silent fallback to the level sweeps;
 `"algo1"` set after the analysis, or a factorization run with `"default"`
-before an `"algo1"` solve, raises too. `"default"` stays the level sweeps
-(the T36 Report in `TASKS.md` has the measurements behind that choice).
+before an `"algo1"` solve, raises too.
+
+In the comparison (`cholesky_algo1`, `ldlt_algo1`) the solve drops from
+10.3 ms to 2.33 ms on the 78k-bus condensed KKT system (cuDSS:
+1.63 ms), and the geometric mean of the SDS/cuDSS solve ratio from
+3.84× (level sweeps, `cholesky_f64`) to 1.83× over the same 15
+matrices. `"default"` stays the level sweeps: the `"algo1"` residuals are up to
+38× higher without refinement (bcsstk38), the default `"S"` pivoting is
+outside its scope, it costs device memory and one launch per factorization,
+and it was measured on sm_90 only (the T36 Report in `TASKS.md` has the
+measurements behind that choice).
