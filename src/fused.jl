@@ -2558,11 +2558,11 @@ end
 # the parameters `setparam!` accepts on a FusedSolver (read by the next analysis; deterministic_mode by the
 # next solve)
 const FUSED_SETTABLE = ("user_perm", "reordering_alg", "nd_nseps", "nd_seed", "pivot_epsilon", "pivot_sign",
-                        "deterministic_mode")
+                        "matching_alg", "deterministic_mode")
 
 # the analysis data parameters `getparam` forwards to the inner DirectSolver
 const FUSED_FORWARDED = ("perm_reorder_row", "perm_reorder_col", "perm_row", "perm_col", "lu_nnz", "flops",
-                         "nsuperpanels", "memory_estimates")
+                         "nsuperpanels", "memory_estimates", "perm_matching", "scale_row", "scale_col")
 
 """
     FusedSolver(A, structure, view; tuning = nothing, index = 'O')
@@ -2716,7 +2716,9 @@ function _fused_solver(s::SDS.DirectSolver{T, INT}, tuning::Union{Nothing, SDSTu
         SDS.setparam!(s, "pivot_type", 'N')
         # no-pivot LDL never consumes 2x2 pivot pairs, and "S" analysis pays dearly for
         # detecting them on saddle systems (augmented 78k KKT, n = 2.09M: analysis 316 s
-        # with the default pair detection, 64 s without -- measured on a GV100)
+        # with the default pair detection, 64 s without -- measured on a GV100). The
+        # constructor default; with matching the pairs of its cycles shape the ordering,
+        # and every analysis re-applies the rule (`_fused_pairs!`)
         SDS.setparam!(s, "pivot_pairs", "none")
     end
     _apply_tuning!(s, t)
@@ -2741,7 +2743,8 @@ end
 function _check_fused_options(F::FusedSolver{T}) where {T}
     o = F.inner.options
     unsupported(what) = throw(SDS.NotSupportedError("FusedSolver: $what is not supported; use DirectSolver"))
-    o.matching_alg == SDS.MATCHING_NONE || unsupported("matching_alg = \"$(convert(String, o.matching_alg))\"")
+    F.ldl || o.matching_alg == SDS.MATCHING_NONE ||
+        unsupported("structure \"SPD\" with matching_alg = \"$(convert(String, o.matching_alg))\"")
     o.schur_mode == 0 || unsupported("schur_mode = 1")
     o.ir_n_steps == 0 || unsupported("ir_n_steps = $(o.ir_n_steps) (iterative refinement)")
     o.factor_precision === nothing || o.factor_precision === real(T) ||
@@ -2754,6 +2757,15 @@ function _check_fused_options(F::FusedSolver{T}) where {T}
         unsupported("structure \"S\" with pivot_epsilon_alg = \"$(convert(String, o.pivot_epsilon_alg))\"")
     o.user_schur_indices === nothing || unsupported("user_schur_indices")
     return nothing
+end
+
+# the 2×2 pivot pairs of an "S" analysis: none without matching (the no-pivot LDLᵀ consumes no pair, and
+# detecting them is expensive on saddle systems), the pairs of the matching's cycles with it (they shape the
+# ordering, as on the stock pipeline of `KKTSolver`); evaluated at every analysis
+function _fused_pairs!(F::FusedSolver)
+    F.ldl || return F
+    SDS.setparam!(F.inner, "pivot_pairs", F.inner.options.matching_alg == SDS.MATCHING_NONE ? "none" : "default")
+    return F
 end
 
 # drop the plans of an earlier analysis (a new analysis rebuilds them)
@@ -2877,7 +2889,10 @@ function _fused_solve!(F::FusedSolver, X, B)
     b = _fused_rhs(F, B, "B")
     det = o.deterministic_mode == 1               # read at every solve, as DirectSolver does
     F.fs.graph = _graph_solve_ok(F)               # the tuning may change between solves
-    fused_solve!(F.fs, F.inner, x, b, det)        # the solve driver of solve_alg = "algo1" (T36)
+    # the solve driver of solve_alg = "algo1" (T36), with the matching's permutations and scalings (no extra
+    # launch: they are applied inside the two permutation kernels)
+    pin, sin, pout, sout = SDS.solve_io(F.inner.symbolic, SDS._solve_scaling(F.inner), false)
+    fused_solve!(F.fs, F.inner, x, b, det; pin, scale_in = sin, pout, scale_out = sout)
     return F
 end
 
@@ -2885,6 +2900,7 @@ function SDS.execute!(phase::AbstractString, F::FusedSolver, X, B; asynchronous:
     p = SDS._parse_phase(phase)
     if p == SDS.PHASE_REORDERING || p == SDS.PHASE_ANALYSIS
         _check_fused_options(F)
+        _fused_pairs!(F)
         _clear_plans!(F)
         F.stage = SDS.STAGE_NONE
         SDS.execute!("reordering", F.inner, nothing, nothing; asynchronous = false)
@@ -2935,6 +2951,15 @@ function SDS.setparam!(F::FusedSolver, name::AbstractString, value)
                                     join(("\"$p\"" for p in FUSED_SETTABLE), ", ") * " (use DirectSolver)"))
     name == "pivot_sign" && !F.ldl &&
         throw(SDS.NotSupportedError("FusedSolver: \"pivot_sign\" applies to the LDLᵀ of structure \"S\" only"))
+    if name == "matching_alg" && !F.ldl
+        SDS.setparam!(F.inner, name, value)        # parses the value (bad strings: InvalidValueError)
+        if F.inner.options.matching_alg != SDS.MATCHING_NONE
+            F.inner.options.matching_alg = SDS.MATCHING_NONE
+            throw(SDS.NotSupportedError("FusedSolver: matching_alg = $(repr(value)) applies to structure \"S\" " *
+                                        "only (the fused Cholesky has no matching)"))
+        end
+        return nothing
+    end
     SDS.setparam!(F.inner, name, value)
     return nothing
 end
