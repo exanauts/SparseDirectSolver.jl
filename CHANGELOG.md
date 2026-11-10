@@ -26,13 +26,21 @@ whose Report blocks hold the details and the measurements.
   in place, and the public `inertia` and `pipeline`. The keyword `matching`
   sets the `matching_alg` of an `L D Lᵀ` (`"algo5"`/`"algo6"` also give the
   2×2 pivot pairs, with or without pivoting), `deferred_analysis = true`
-  leaves the analysis to the first `factorize!` on the values present then,
-  and an `L D Lᵀ` with matching, `pivot_epsilon` or `pivot_sign` runs on the
-  stock pipeline, which replaces small pivots (`fused = true` refuses them
-  instead of dropping them; #193). A `SparseMatrixCSC` is read in place, as
-  `csr_of_transpose` reads it: one with spare capacity in `rowval`/`nzval`
-  raises `InvalidValueError`. With `"algo1"`–`"algo4"` and no pivoting the
-  analysis looks for no 2×2 pivot pairs, as without matching.
+  leaves the analysis to the first `factorize!` on the values present then.
+  A `SparseMatrixCSC` is read in place, as `csr_of_transpose` reads it: one
+  with spare capacity in `rowval`/`nzval` raises `InvalidValueError`. With
+  `"algo1"`–`"algo4"` and no pivoting the analysis looks for no 2×2 pivot
+  pairs, as without matching.
+- The fused `L D Lᵀ` (`FusedSolver` with structure `"S"`, and so `KKTSolver`'s
+  default `:ldl` pipeline on CUDA, AMDGPU and oneAPI) replaces small pivots as
+  the stock no-pivot `L D Lᵀ` does (`pivot_epsilon`, `pivot_sign`; counted in
+  `"npivots"`) and runs with a matching (`matching_alg`: scaled values, the
+  2×2 pivot pairs of the ordering, the scaling undone in the solve), so
+  `KKTSolver` no longer moves an `L D Lᵀ` with `matching`, `pivot_epsilon` or
+  `pivot_sign` to the stock pipeline (#193, #194). Its default
+  `pivot_epsilon` is now the stock one (`1e-13` for `Float64`, `1e-5` for
+  `Float32`; it factored with `0` before), `pivot_epsilon = 0` keeps the old
+  behaviour; a NaN or infinite pivot still fails the factorization.
 - `SDSTuning` and `default_tuning` are exported from the top module.
 - `matching_alg = "none"` is accepted as the cuDSS 1.0 spelling of matching
   off.

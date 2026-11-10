@@ -35,6 +35,38 @@ function fused_cycle_allocated(F, x, b)
     return @allocated cycle()
 end
 
+# #194: the kernel site that factors each column of an "S" FusedSolver: :A (regime-A subtree), :P (narrow panel
+# with the in-panel TRSM, at most SYRK_IN rows below the panel), :PT (narrow panel with the TRSM and TILE roles), :W
+# (in-kernel wide panel)
+function fused_column_sites(F)
+    S = F.inner.symbolic
+    sp = to_host(S.super_ptr)
+    site = fill(:none, length(sp) - 1)
+    site[to_host(S.subtree_nodes)] .= :A
+    role, ra = to_host(F.fp.role), to_host(F.fp.ra)
+    for k in eachindex(role)
+        v = Int(ra[k])
+        if role[k] == SDS.Fused.ROLE_PANEL_B || role[k] == SDS.Fused.ROLE_PANEL_C
+            site[v] = S.schedule.rows[v] - S.schedule.width[v] <= SDS.Fused.SYRK_IN ? :P : :PT
+        elseif role[k] == SDS.Fused.ROLE_WPANEL
+            site[v] = :W
+        end
+    end
+    return [site[v] for v in 1:(length(sp) - 1) for _ in sp[v]:(sp[v + 1] - 1)]
+end
+
+# #194: refactorize the inner DirectSolver of an analyzed "S" FusedSolver with the stock static LDLᵀ (same analysis,
+# values, scaling, pivot_epsilon and pivot_sign), then the FusedSolver; returns the host copies of both factors (Nh
+# fused, Nr stock) and the stock "info", "npivots" and "inertia"
+function fused_stock_oracle(F)
+    execute!("refactorization", F.inner, nothing, nothing; asynchronous = false)
+    Nr = SDS.host_numeric(F.inner.numeric)
+    stock = (; info = getparam(F.inner, "info"), npivots = getparam(F.inner, "npivots"),
+             inertia = getparam(F.inner, "inertia"))
+    refactorize!(F)
+    return SDS.host_numeric(F.inner.numeric), Nr, stock
+end
+
 # The SPD generators of test/matrices.jl (the well-conditioned ones: `tol(T)` gates the residual), at sizes
 # that give regime-A subtrees, regime-C fronts (wide, handled by the tuning's wide strategy) and, for the
 # 18³ Laplacian, a root front wider than 256 (the vendor dense path of the solve).
@@ -175,6 +207,7 @@ end
         n, j = 40, 17
         A = singular_block_matrix(T, n, j; stored_zero = true)
         F = FusedSolver(fused_matrix(backend, A), "S", 'L')
+        setparam!(F, "pivot_epsilon", 0.0)            # epsilon 0 replaces no pivot (#194): the failure path
         analyze!(F)
         factorize!(F)
         @test getparam(F, "info") != 0
@@ -185,6 +218,133 @@ end
         copyto!(F.inner.A.nzval, to_device(backend, fused_values(A)))
         refactorize!(F)
         @test getparam(F, "info") == 0
+    end
+
+    # #194: static pivot replacement, the rule of the stock no-pivot LDLᵀ. The zero pivot of singular_block_matrix
+    # (any order meets it) becomes pivot_sign[j]·ε exactly, with the default ε and a larger one; the fused factor
+    # matches the stock factor of the inner solver on the same analysis (pivot kinds exactly, D within growth_tol)
+    @testset "\"S\": a zero pivot replaced with pivot_sign $sgn, pivot_epsilon = $eps: $T" for T in eltypes_among((Float32, Float64)),
+                                                                                         sgn in (1, -1),
+                                                                                         eps in (nothing, 1.0e-3)
+        n, j = 40, 17
+        R = real(T)
+        A = singular_block_matrix(T, n, j; stored_zero = true)
+        psign = zeros(Int8, n)
+        psign[j] = sgn
+        F = FusedSolver(fused_matrix(backend, A), "S", 'L')
+        setparam!(F, "pivot_sign", psign)
+        eps === nothing || setparam!(F, "pivot_epsilon", eps)
+        analyze!(F)
+        factorize!(F)
+        @test getparam(F, "info") == 0
+        @test getparam(F, "npivots") == 1
+        @test getparam(F, "inertia") == (sgn > 0 ? (n, 0) : (n - 1, 1))
+        Nh, Nr, stock = fused_stock_oracle(F)
+        @test stock.info == 0 && stock.npivots == 1
+        @test Nh.pivot_kind == Nr.pivot_kind
+        @test d_error(Nh, Nr) <= growth_tol(T, Nr)
+        k = findfirst(==(SDS.PIVOT_KIND_PERTURBED), Nh.pivot_kind)
+        @test k !== nothing && to_host(F.inner.symbolic.perm)[k] == j     # factor column k is row j
+        @test Nh.d[k] == sgn * R(something(eps, SDS.default_pivot_epsilon(R)))
+        x0 = rand(T, n)
+        x0[j] = 0
+        b = A * x0                                    # consistent right-hand side
+        x = to_host(F \ to_device(backend, b))
+        @test relres(A, x, b) <= 1.0e-6
+    end
+
+    # #194: every kernel site replaces pivots. grid_kkt_matrix 40×40 with δ = 1 has no pivot of modulus in
+    # (1.57, 2.98) (Float32 and Float64), so ε = 2.5 replaces the same 1545 pivots in both factorizations, among them
+    # pivots of regime-A subtrees, narrow panels on both TRSM paths and in-kernel wide panels
+    @testset "\"S\": pivot replacement at every kernel site: $T" for T in eltypes_among((Float32, Float64))
+        nx = 40
+        m = nx * nx
+        A = grid_kkt_matrix(T, nx, nx, 1.0)
+        F = FusedSolver(fused_matrix(backend, A), "S", 'L')
+        setparam!(F, "pivot_epsilon", 2.5)
+        setparam!(F, "pivot_sign", vcat(fill(1, m), fill(-1, m)))
+        analyze!(F)
+        factorize!(F)
+        @test getparam(F, "info") == 0
+        Nh, Nr, stock = fused_stock_oracle(F)
+        @test getparam(F, "info") == 0
+        @test Nh.pivot_kind == Nr.pivot_kind
+        @test getparam(F, "npivots") == stock.npivots > 0
+        @test getparam(F, "inertia") == stock.inertia == (m, m)
+        @test d_error(Nh, Nr) <= growth_tol(T, Nr)
+        sites = fused_column_sites(F)
+        replaced = sites[Nh.pivot_kind[1:(2m)] .== SDS.PIVOT_KIND_PERTURBED]
+        for site in (:A, :P, :PT, :W)
+            @test count(==(site), replaced) > 0
+        end
+    end
+
+    # #194: matching on "S" (the scaled values, the pivot pairs of its cycles in the ordering, the scaling undone in
+    # the solve), with pivot replacement on kkt_slack_matrix (δ = 0: the odd slacks and duals meet zero pivots in
+    # the static order, which bounds its accuracy as on the stock pipeline: no residual gate there). Against the
+    # inner stock factor, a refactorization with new values, bitwise reproducible factor and D, the graph replay
+    # (CUDA) equal to the eager factorization, and the allocation budget
+    @testset "\"S\", matching_alg = $alg, $label: $T" for T in eltypes_among((Float32, Float64)),
+                                                         alg in ("algo5", "algo6"),
+                                                         (label, slack) in (("grid_kkt_matrix 30×30", false),
+                                                                            ("kkt_slack_matrix 200+2·100, δ = 0", true))
+        Random.seed!(666)
+        A = slack ? kkt_slack_matrix(T, 200, 100, 0.0) : grid_kkt_matrix(T, 30, 30, 1.0)
+        n = size(A, 1)
+        Ad = fused_matrix(backend, A)
+        F = FusedSolver(Ad, "S", 'L')
+        setparam!(F, "matching_alg", alg)
+        @test getparam(F, "matching_alg") == alg
+        analyze!(F)
+        @test getparam(F, "pivot_pairs") == "default"            # the pairs of the matching shape the ordering
+        slack && @test !isempty(F.inner.ordering.pairs)
+        @test length(getparam(F, "scale_row")) == n
+        @test length(getparam(F, "perm_matching")) == n
+        factorize!(F)
+        @test getparam(F, "info") == 0
+        b = rand(T, n)
+        bd = to_device(backend, b)
+        xd = similar(bd)
+        solve!(F, xd, bd; asynchronous = false)
+        slack || @test relres(A, to_host(xd), b) <= tol(T)
+        Nh, Nr, stock = fused_stock_oracle(F)
+        @test Nh.pivot_kind == Nr.pivot_kind
+        @test getparam(F, "npivots") == stock.npivots
+        @test getparam(F, "inertia") == stock.inertia
+        @test d_error(Nh, Nr) <= growth_tol(T, Nr)
+        slack && @test stock.npivots > 0
+        # the next interior-point values: refactorization with the matching and the scaling of the analysis
+        A2 = slack ? (Dg = Diagonal(T.(1 .+ rand(n))); sparse(Dg * A * Dg)) : grid_kkt_matrix(T, 30, 30, 0.5)
+        copyto!(Ad.nzVal, fused_values(A2))
+        refactorize!(F)
+        @test getparam(F, "info") == 0
+        solve!(F, xd, bd; asynchronous = false)
+        slack || @test relres(A2, to_host(xd), b) <= tol(T)
+        N = F.inner.numeric
+        f1, d1 = to_host(N.factor), to_host(N.d)
+        same = 0
+        for _ in 1:3
+            refactorize!(F)
+            same += to_host(N.factor) == f1 && to_host(N.d) == d1
+        end
+        @test same == 3
+        bytes = fused_cycle_allocated(F, xd, bd)
+        @test bytes <= fused_cycle_alloc_budget(backend)
+        # the graph replay of the refactorization (the scale launch runs eagerly before it) against the first,
+        # eager factorization
+        G = FusedSolver(Ad, "S", 'L'; tuning = SDS.Fused.SDSTuning(; graph_max_n = typemax(Int)))
+        setparam!(G, "matching_alg", alg)
+        analyze!(G)
+        factorize!(G)
+        fg, dg = to_host(G.inner.numeric.factor), to_host(G.inner.numeric.d)
+        sameg = 0
+        for _ in 1:3
+            refactorize!(G)
+            sameg += getparam(G, "info") == 0 && to_host(G.inner.numeric.factor) == fg &&
+                     to_host(G.inner.numeric.d) == dg
+        end
+        @test sameg == 3
+        backend_name(backend) == "CUDA" && @test !(G.gfact in (nothing, false))
     end
 
     @testset "restrictions raise NotSupportedError: $T" for T in eltypes_among((Float32, Float64))
@@ -249,6 +409,17 @@ end
         G = FusedSolver(fused_matrix(backend, random_symindef(T, 50, 0.1)), "S", 'L')
         G.inner.options.pivot_type = SDS.PIVOT_AUTO
         @test_throws NotSupportedError analyze!(G)
+        # #194: pivot_sign and matching apply to "S" only; pivot_epsilon_alg = "algo1" is not supported on "S"; a
+        # pivot_sign of the wrong length is refused (by the inner solver's setparam!)
+        @test_throws NotSupportedError setparam!(F, "pivot_sign", ones(Int, n))
+        @test_throws NotSupportedError setparam!(F, "matching_alg", "algo6")
+        @test getparam(F, "matching_alg") == "default"
+        setparam!(F, "matching_alg", "none")                                    # matching off is accepted
+        G = FusedSolver(fused_matrix(backend, random_symindef(T, 50, 0.1)), "S", 'L')
+        G.inner.options.pivot_epsilon_alg = SDS.PIVOT_EPSILON_SCALED
+        @test_throws NotSupportedError analyze!(G)
+        G = FusedSolver(fused_matrix(backend, random_symindef(T, 50, 0.1)), "S", 'L')
+        @test_throws InvalidValueError setparam!(G, "pivot_sign", ones(Int, 49))
         @test_throws InvalidValueError solve!(F, to_device(backend, zeros(T, n + 1)), to_device(backend, zeros(T, n + 1)))
     end
 
