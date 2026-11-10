@@ -88,28 +88,18 @@ include("generic.jl")
 
 # the fused pipeline (factorization mega-kernel + partitioned-inverse solve),
 # its per-architecture tuning bundle and `FusedSolver`, the pipeline behind the
-# handle-layer verbs (the MadNLP extension's `SDSSolver` runs it)
+# handle-layer verbs
 include("fused.jl")
-using .Fused: FusedSolver
-export FusedSolver
+using .Fused: FusedSolver, SDSTuning, default_tuning
+export FusedSolver, SDSTuning, default_tuning
 
-# The MadNLP linear-solver type (SDSSolver) and its options type live in the
-# SparseDirectSolverMadNLPExt package extension (they subtype MadNLP types, so
-# they cannot be defined here). The standard idiom — as MadNLPGPU does for
-# CUDSSSolver — is a declared global the extension assigns in its __init__:
-# once MadNLP is loaded in the session,
-#
-#     using MadNLP, SparseDirectSolver
-#     madnlp(model; linear_solver = SDSSolver,
-#            kkt_system = MadNLP.SparseCondensedKKTSystem)
-#
-# Options go as madnlp keywords (sds_factorization = :ldl, sds_reordering,
-# sds_tuning = SparseDirectSolver.Fused.SDSTuning(; ...), sds_user_perm).
-# Before MadNLP is loaded the names exist but are unassigned (UndefVarError
-# on use), exactly like MadNLPGPU.CUDSSSolver without CUDA.
-global SDSSolver
-global SDSSolverOptions
-export SDSSolver, SDSSolverOptions
+# the front end for the KKT systems of an interior-point method: pipeline choice,
+# factorization parameters, refactorization, in-place solve and inertia. MadNLP's
+# binding (MadCoreGPU's MadCoreGPUSDSExt) is built on it. `inertia` and `pipeline`
+# are public but not exported: MadNLP has an `inertia` of its own.
+include("kkt.jl")
+export KKTSolver
+public inertia, pipeline
 
 __init__() = _init_log_level()
 
