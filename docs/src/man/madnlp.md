@@ -53,7 +53,7 @@ as keywords of `madnlp`. Each one maps to a keyword of [`KKTSolver`](@ref):
 | `sds_factorization` | `factorization` | `:cholesky` (`"SPD"`) or `:ldl` (`"S"`, inertia from the signs of `D`) |
 | `sds_pivoting` | `pivoting` | `:ldl` only: `:none` (pivot order of the analysis) or `:bk` (in-front Bunch–Kaufman, stock pipeline, [Symmetric indefinite systems](@ref)) |
 | `sds_pivot_threshold` | `pivot_threshold` | `:bk` only: the `pivot_threshold` of the acceptance test (`nothing` keeps the package default `0.01`; cuDSS's default is `1.0`) |
-| `sds_pivot_epsilon` | `pivot_epsilon` | the `pivot_epsilon` below which a pivot is replaced (the fused `L D Lᵀ` replaces no pivot) |
+| `sds_pivot_epsilon` | `pivot_epsilon` | the `pivot_epsilon` below which a pivot is replaced; for `:ldl` it selects the stock pipeline, since the fused `L D Lᵀ` replaces no pivot (`fused = true` refuses it) |
 | `sds_reordering` | `reordering` | the `reordering_alg` of the analysis: `"algo4"` nested dissection (METIS), `"algo3"` AMD, `"default"` the cost-model choice ([Parameters](parameters.md)) |
 | `sds_user_perm` | `user_perm` | a 1-based permutation of length `n` that replaces the reordering, for instance a cached one; every solver instance otherwise recomputes its ordering |
 | `sds_tuning` | `tuning` | an [`SDSTuning`](@ref SparseDirectSolver.Fused.SDSTuning) bundle of performance settings; `nothing` selects the measured per-architecture defaults of [`default_tuning`](@ref SparseDirectSolver.Fused.default_tuning) |
@@ -62,11 +62,25 @@ as keywords of `madnlp`. Each one maps to a keyword of [`KKTSolver`](@ref):
 The sizes of the primal and dual blocks, which MadNLP's KKT system knows, give
 the `pivot_sign` of `KKTSolver` (`1` for the primal and `-1` for the dual
 rows): the sign a replaced pivot takes in a stock `L D Lᵀ` without pivoting.
+Like `pivot_epsilon`, it selects the stock pipeline for `:ldl`.
 
-With `pivoting = :bk` the 2×2 pivot pairs of the `"S"` analysis are chosen
-from the values present in the KKT matrix when the solver is built (see
-[Pivot pairs](@ref) under Parameters); with `:none` the pairs are off, since
-a factorization without pivoting never consumes them.
+`KKTSolver` has two keywords for the setting of MadNLP's cuDSS preset (an
+`L D Lᵀ` with matching and pivot epsilon, analyzed on the first KKT values),
+whatever MadNLP's binding exposes of them:
+
+* `matching` (default `"none"`): the `"matching_alg"` of the analysis, `:ldl`
+  only, on the stock pipeline (`fused = true` refuses it). With `"algo5"` and
+  `"algo6"` the 2×2 pivot pairs of the ordering come from the cycles of the
+  scaled symmetric matching, with `pivoting = :none` as with `:bk`.
+* `deferred_analysis` (default `false`): the constructor checks the options
+  but neither analyzes nor factorizes; the first `factorize!` analyzes the
+  values present then (the counterpart of the cuDSS binding's deferred
+  analysis), the later ones refactorize.
+
+Without matching, with `pivoting = :bk` the 2×2 pivot pairs of the `"S"`
+analysis are chosen from the values present in the KKT matrix at the analysis
+(see [Pivot pairs](@ref) under Parameters); with `:none` the pairs are off,
+since a factorization without pivoting never consumes them.
 
 ## What runs underneath
 
@@ -74,7 +88,8 @@ a factorization without pivoting never consumes them.
 [`SparseDirectSolver.pipeline`](@ref) tells which one runs.
 
 * **Fused pipeline** (the default for `pivoting = :none` on CUDA, AMDGPU and
-  oneAPI, the backends with forward progress between workgroups): the inner
+  oneAPI, the backends with forward progress between workgroups, unless an
+  `L D Lᵀ` asks for matching, `pivot_epsilon` or `pivot_sign`): the inner
   solver is a [`FusedSolver`](@ref SparseDirectSolver.FusedSolver) over the
   symbolic analysis of a regular [`DirectSolver`](@ref). One
   dependency-counter kernel per refactorization covers the whole elimination
@@ -85,7 +100,8 @@ a factorization without pivoting never consumes them.
   solve is a partitioned-inverse sweep, one dependency-counter kernel per
   direction. This is the path that `cholesky_fused` measures on the
   [Performance](@ref) page.
-* **Stock pipeline** (`pivoting = :bk`, `fused = false`, and every
+* **Stock pipeline** (`pivoting = :bk`, `fused = false`, an `L D Lᵀ` with
+  `matching`, `pivot_epsilon` or `pivot_sign`, and every
   factorization on the KernelAbstractions CPU backend and on Metal): the inner
   solver is a [`DirectSolver`](@ref) with the same tuning, driven through
   `refactorize!` and `solve!` at the level-batched speed of

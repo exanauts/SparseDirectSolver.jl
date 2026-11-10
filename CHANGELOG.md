@@ -23,7 +23,13 @@ whose Report blocks hold the details and the measurements.
   pipeline choice (the fused pipeline where the backend runs it, else the stock
   `DirectSolver`), the factorization parameters of `:cholesky` and `:ldl` (no
   pivoting or Bunch–Kaufman), `factorize!` for the refactorization, `solve!`
-  in place, and the public `inertia` and `pipeline`.
+  in place, and the public `inertia` and `pipeline`. The keyword `matching`
+  sets the `matching_alg` of an `L D Lᵀ` (`"algo5"`/`"algo6"` also give the
+  2×2 pivot pairs, with or without pivoting), `deferred_analysis = true`
+  leaves the analysis to the first `factorize!` on the values present then,
+  and an `L D Lᵀ` with matching, `pivot_epsilon` or `pivot_sign` runs on the
+  stock pipeline, which replaces small pivots (`fused = true` refuses them
+  instead of dropping them; #193).
 - `SDSTuning` and `default_tuning` are exported from the top module.
 - `matching_alg = "none"` is accepted as the cuDSS 1.0 spelling of matching
   off.

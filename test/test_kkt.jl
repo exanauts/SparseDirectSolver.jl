@@ -116,6 +116,28 @@ end
             @test_throws SDS.NotSupportedError KKTSolver(args...; fused = true)
             @test_throws SDS.NotSupportedError KKTSolver(args...; factorization = :ldl, fused = true)
         end
+        # matching (#193): `:ldl` only, a matching_alg string, on the stock pipeline
+        @test_throws SDS.InvalidValueError KKTSolver(args...; matching = "algo5")
+        @test_throws SDS.InvalidValueError KKTSolver(args...; matching = "algo6", factorization = :cholesky)
+        @test_throws SDS.InvalidValueError KKTSolver(args...; factorization = :ldl, matching = "algo9")
+        @test_throws SDS.InvalidValueError KKTSolver(args...; factorization = :ldl, matching = "mc64")
+        if SDS.forward_progress(backend)
+            # the fused LDLᵀ has no matching and replaces no pivot: fused = true refuses what would be dropped
+            n = size(A, 1)
+            @test_throws SDS.NotSupportedError KKTSolver(args...; factorization = :ldl, matching = "algo6",
+                                                         fused = true)
+            @test_throws SDS.NotSupportedError KKTSolver(args...; factorization = :ldl, pivot_epsilon = 1.0e-10,
+                                                         fused = true)
+            @test_throws SDS.NotSupportedError KKTSolver(args...; factorization = :ldl, pivot_sign = ones(Int, n),
+                                                         fused = true)
+            # the fused Cholesky reads pivot_epsilon
+            Kc = KKTSolver(args...; pivot_epsilon = 1.0e-10, fused = true)
+            @test SDS.pipeline(Kc) === :fused
+            @test getparam(Kc, "pivot_epsilon") == 1.0e-10
+        end
+        # the options are checked at construction also when the analysis is deferred
+        @test_throws SDS.InvalidValueError KKTSolver(args...; matching = "algo5", deferred_analysis = true)
+        @test_throws SDS.InvalidValueError KKTSolver(args...; pivoting = :bk, deferred_analysis = true)
     end
     if backend isa CPU
         # a complex element type and a uniform batch are DirectSolver's
@@ -139,6 +161,19 @@ end
         @test SDS.pipeline(Kc) === expected
         @test SDS.pipeline(Kl) === expected
         @test SDS.pipeline(Kb) === :stock
+        # matching and pivot replacement of an LDLᵀ (#193) select the stock pipeline on every backend
+        for kw in ((; matching = "algo5"), (; matching = "algo6"), (; pivot_epsilon = 1.0e-10),
+                   (; pivot_sign = ones(Int, n)), (; matching = "algo6", pivot_epsilon = 1.0e-10))
+            Ks = KKTSolver(args...; factorization = :ldl, kw...)
+            @test SDS.pipeline(Ks) === :stock
+            @test Ks.inner isa SDS.DirectSolver
+            @test getparam(Ks, "info") == 0
+            @test SDS.inertia(Ks) == (n, 0, 0)
+        end
+        # matching off ("none", "default") keeps the default pipeline, and :cholesky with pivot_epsilon too
+        @test SDS.pipeline(KKTSolver(args...; factorization = :ldl, matching = "none")) === expected
+        @test SDS.pipeline(KKTSolver(args...; factorization = :ldl, matching = "default")) === expected
+        @test SDS.pipeline(KKTSolver(args...; pivot_epsilon = 1.0e-10)) === expected
         @test Kc.inner isa (expected === :fused ? SDS.FusedSolver : SDS.DirectSolver)
         @test Kb.inner isa SDS.DirectSolver
         backend isa CPU && @test expected === :stock
@@ -238,6 +273,67 @@ end
         @test rs.r2 <= tol(T)
     end
 
+    # matching (#193): the stock LDLᵀ with the scaled symmetric matching of "algo5"/"algo6", whose cycles give the 2×2
+    # pivot pairs of the ordering with either pivoting; then the next iteration's values, refactorized
+    @testset ":ldl, matching = $matching, :$pivoting, grid_kkt_matrix 30×30: $T" for
+            T in eltypes_among((Float32, Float64)), matching in ("algo5", "algo6"), pivoting in (:none, :bk)
+        m = 30 * 30
+        A = grid_kkt_matrix(T, 30, 30, 1.0)
+        args, nzval = kkt_input(backend, A)
+        K = KKTSolver(args...; factorization = :ldl, pivoting, matching)
+        @test SDS.pipeline(K) === :stock
+        @test getparam(K, "matching_alg") == matching
+        @test getparam(K, "info") == 0
+        @test SDS.inertia(K) == (m, 0, m)
+        rs = kkt_solves(backend, K, A)
+        @test rs.r1 <= tol(T)
+        @test rs.r2 <= tol(T)
+        A2 = grid_kkt_matrix(T, 30, 30, 0.5)
+        kkt_set_values!(nzval, A2)
+        factorize!(K)
+        @test getparam(K, "info") == 0
+        @test SDS.inertia(K) == (m, 0, m)
+        rs = kkt_solves(backend, K, A2)
+        @test rs.r1 <= tol(T)
+        @test rs.r2 <= tol(T)
+    end
+
+    # deferred analysis (#193): built on an all-zero nzval (no KKT values yet, as MadNLP builds its linear solver), the
+    # first factorize! analyzes the values written since (matching and pivot pairs included), the next refactorizes
+    @testset "deferred_analysis, $label: $T" for T in eltypes_among((Float32, Float64)),
+                                                 (label, kw) in (("default pipeline", (;)),
+                                                                 ("matching = algo6", (; matching = "algo6")),
+                                                                 ("matching = algo5, :bk", (; matching = "algo5",
+                                                                                            pivoting = :bk)))
+        m = 30 * 30
+        A = grid_kkt_matrix(T, 30, 30, 1.0)
+        args, nzval = kkt_input(backend, A)
+        fill!(nzval, zero(T))
+        K = KKTSolver(args...; factorization = :ldl, deferred_analysis = true, kw...)
+        @test SDS.pipeline(K) === (isempty(kw) ? kkt_default_pipeline(backend) : :stock)
+        # before the first factorization: "info" is 0, solve! and inertia raise, show prints
+        @test getparam(K, "info") == 0
+        @test_throws SDS.FactorizationError SDS.inertia(K)
+        @test_throws SDS.FactorizationError solve!(K, to_device(backend, ones(T, 2m)))
+        @test occursin("not factorized", sprint(show, K))
+        kkt_set_values!(nzval, A)
+        @test factorize!(K) === K
+        @test getparam(K, "info") == 0
+        @test SDS.inertia(K) == (m, 0, m)
+        @test occursin("info = 0", sprint(show, K))
+        rs = kkt_solves(backend, K, A)
+        @test rs.r1 <= tol(T)
+        @test rs.r2 <= tol(T)
+        A2 = grid_kkt_matrix(T, 30, 30, 0.5)
+        kkt_set_values!(nzval, A2)
+        factorize!(K)
+        @test getparam(K, "info") == 0
+        @test SDS.inertia(K) == (m, 0, m)
+        rs = kkt_solves(backend, K, A2)
+        @test rs.r1 <= tol(T)
+        @test rs.r2 <= tol(T)
+    end
+
     # a failed factorization does not throw: "info" is nonzero; the regularized
     # matrix then factors
     @testset ":cholesky on an indefinite matrix: $T" for T in eltypes_among((Float32, Float64))
@@ -262,12 +358,14 @@ end
 
 @testset "options on $(backend_name(backend))" for backend in BACKENDS
     # pivot_sign and pivot_epsilon on the stock no-pivot LDLᵀ: +1 for the primal, -1 for the dual rows, as an
-    # interior-point method passes them; no pivot of grid_kkt_matrix is small, so the inertia is unchanged
-    @testset "pivot_sign, pivot_epsilon (stock :ldl): $T" for T in eltypes_among((Float32, Float64))
+    # interior-point method passes them; no pivot of grid_kkt_matrix is small, so the inertia is unchanged. With
+    # `fused = nothing` they select the stock pipeline too (#193: the fused LDLᵀ replaces no pivot)
+    @testset "pivot_sign, pivot_epsilon (stock :ldl), fused = $fused: $T" for T in eltypes_among((Float32, Float64)),
+                                                                             fused in (false, nothing)
         m = 30 * 30
         A = grid_kkt_matrix(T, 30, 30, 1.0)
         args, _ = kkt_input(backend, A)
-        K = KKTSolver(args...; factorization = :ldl, fused = false, pivot_sign = vcat(fill(1, m), fill(-1, m)),
+        K = KKTSolver(args...; factorization = :ldl, fused, pivot_sign = vcat(fill(1, m), fill(-1, m)),
                       pivot_epsilon = 1.0e-10)
         @test SDS.pipeline(K) === :stock
         @test getparam(K, "pivot_epsilon") == 1.0e-10
