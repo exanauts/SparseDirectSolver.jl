@@ -1,8 +1,9 @@
 # State of SparseDirectSolver.jl (2026-11-09)
 
-Snapshot of `main` at 202d793, after T36 (PR #187, `solve_alg = "algo1"` on
-`DirectSolver`) and the chore PR #189 (#188: the CPU allocation checks run in a
-child process, the KernelAbstractions cap is lifted). It replaces the snapshot
+Snapshot of `main` at baf3b2f, after T36 (PR #187, `solve_alg = "algo1"` on
+`DirectSolver`), the chore PR #189 (#188: the CPU allocation checks run in a
+child process, the KernelAbstractions cap is lifted) and the bench PR #190 (the
+cuDSS 1.0 comparison for the 0.3.0 release). It replaces the snapshot
 of 2026-11-04; the history is in git (`git log -- STATE.md`). Sources: the Report blocks of `TASKS.md`, the open and
 closed issues, `PLAN.md` §5, `bench/comparison/comparison.md`,
 `bench/ARCH-TUNING.md`, `PERFORMANCE.md` and `bench/PERFORMANCE-2026-10.md`.
@@ -34,22 +35,46 @@ type, budgets unchanged.
 
 ## 2. Where the numbers stand
 
-`bench/comparison/comparison.md`, cuDSS 0.8.0 vs SDS 0.2.0 on an H200
-(2026-10-30, repository 95ee682, before T34/T35/T32), geometric means of the
-SDS/cuDSS time ratio:
+`bench/comparison/comparison.md`, cuDSS 1.0.0 (CUDSS.jl 1.0.0) vs SDS at
+352271c on an H200 through Slurm (2026-11-09, PR #190; cuDSS matching set
+explicitly: off except on the algo5 row), geometric means of the SDS/cuDSS time
+ratio, all matrices / the condensed and K2 KKT dumps only:
 
-| feature | analysis | factorization | refactorization | solve |
-| --- | --- | --- | --- | --- |
-| Cholesky, Float64 (14 matrices) | 0.52× | 3.23× | 3.70× | 3.75× |
-| LDLᵀ, static pivoting (23) | 0.83× | 3.69× | 6.63× | 3.98× |
-| LDLᵀ + matching (algo5), K2 dumps (9) | 0.48× | 3.67× | 5.13× | 2.22× |
-| Uniform batch of 8, Cholesky (9) | 0.35× | 0.98× | 1.62× | 1.89× |
-| Cholesky, fused pipeline (`FusedSolver`, 14) | 0.70× | 1.71× | 2.00× | 2.31× |
+| feature | matrices | analysis | factorization | refactorization | solve |
+| --- | --- | --- | --- | --- | --- |
+| Cholesky, Float64 | 15 / 10 | 0.58× / 0.40× | 3.13× / 1.88× | 3.84× / 2.44× | 3.84× / 2.83× |
+| Cholesky, 16 right-hand sides | 15 / 10 | 0.58× / 0.40× | 3.16× / 1.92× | 3.83× / 2.44× | 3.20× / 2.75× |
+| LDLᵀ, static pivoting | 24 / 19 | 1.07× / 1.01× | 5.64× / 4.73× | 6.87× / 6.00× | 4.66× / 4.20× |
+| LDLᵀ + 2 refinement steps, K2 dumps | 9 | 2.64× | 4.20× | 5.46× | 10.24× |
+| Uniform batch of 8, Cholesky | 10 | 0.40× | 1.15× | 1.76× | 2.60× |
+| LU, unsymmetric | 2 | 1.17× | 13.82× | 15.19× | 5.46× |
+| Schur complement, Cholesky | 10 | 0.43× | 2.01× | 2.54× | 4.25× |
+| LDLᵀ + matching (algo5), K2 dumps | 9 | 0.74× | 3.57× | 4.21× | 4.21× |
+| Cholesky, fused pipeline (`FusedSolver`) | 15 / 10 | 0.74× / 0.50× | 1.38× / 1.21× | 1.62× / 1.48× | 1.92× / 1.62× |
+| Cholesky, `solve_alg = "algo1"` | 15 / 10 | 0.62× / 0.43× | 3.41× / 2.10× | 4.01× / 2.60× | 1.83× / 1.41× |
+| LDLᵀ no pivoting, `"algo1"`, condensed dumps | 10 | 0.46× | 4.23× | 5.24× | 1.39× |
 
-The fused pipeline after T34 (H200, `fused_probe.jl` medians, T34 Report):
-78k condensed KKT refactorization 18.6 ms vs cuDSS 11.2 ms (1.66×), solve
-2.28 vs 1.67 ms (1.37×); lap3d_40 27.5 vs 14.4 ms (1.91×) and 6.5 vs 1.4 ms
-(4.7×, the wide fronts near the root). T35 made the fused factorization
+On the SuiteSparse and Laplacian matrices alone (apache2, bcsstk17/38,
+lap2d_300, lap3d_40) the stock Cholesky is 9.5× behind on refactorization and
+7.1× on solve, the fused pipeline 1.9× / 2.7×, `"algo1"` 3.1× on solve: the
+wide fronts' vendor dense sweeps. On the 78k-bus condensed KKT (now in the
+harness) the fused refactorization is 16.6 vs 10.4 ms (1.60×) and its solve
+2.34 vs 1.63 ms (1.44×); the stock refactorization 71.9 ms, the `"algo1"` solve
+2.33 vs the level sweeps' 10.3 ms; static-pivoting LDLᵀ refactorization 354 vs
+15.8 ms; the batch of 8 100 vs 57.7 ms. Against the October run (cuDSS 0.8.0,
+95ee682) the SDS handle API moved within ±4% on factorization and up to +15% on
+solve, the fused pipeline got 17% faster, and cuDSS 1.0 sped up its solves
+(Schur 0.69×, matching 0.60×, refinement 0.77× of the 0.8 times) and the
+matching analysis (0.58×), so several SDS solve ratios read worse than in
+October without a regression on our side. Residual notes: cuDSS 1.0 with algo5
+fixed its case1354 K2 residuals (2e-2 → 5e-6); LU without matching is unusable
+on rajat21/TSOPF on both sides, as before; `"algo1"` on bcsstk38 is 38× the
+level sweeps' residual.
+
+The fused pipeline after T34 (`fused_probe.jl` medians, T34 Report, now
+superseded by the comparison above: 78k 18.6 vs 11.2 ms and 2.28 vs 1.67 ms;
+lap3d_40 27.5 vs 14.4 ms and 6.5 vs 1.4 ms, the wide fronts near the root).
+T35 made the fused factorization
 bitwise reproducible in both modes at no cost (the parent-pull extend-add
 replaced the atomic one everywhere); `deterministic_mode = 1` selects the pull
 forward sweep, 4–8% slower on the solve, so the default stays `0`. With the
@@ -72,10 +97,11 @@ it), measured on sm_90 only, so `"default"` stays the level sweeps. On lap3d_40
 and apache2 the vendor dense sweeps of the fronts wider than 256 are where the
 remaining gap to cuDSS sits.
 
-The handle-API gap on KKT systems is launch- and level-bound (#82). The
-`cholesky_fused` row above predates T34 and charges the plan construction to
-the factorization (T33 moved it to the analysis); `bench/comparison` is
-regenerated by hand (`bench/compare.jl`, one solver per process).
+The handle-API gap on KKT systems is launch- and level-bound (#82).
+`bench/comparison` is regenerated by hand (`bench/compare.jl`, one solver per
+process, each on an exclusive GPU through Slurm; the SuiteSparse matrices load
+from local copies on `kkt`, an uncommitted workaround for the 403 downloads
+that belongs upstream); the report has an all-matrices and a KKT-only overview.
 
 ## 3. Open tasks and their order
 

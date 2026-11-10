@@ -413,8 +413,9 @@ VII; the shallow ND ordering (#108) is a precondition. On `DirectSolver` (T36)
 every run of plan entries whose fronts are all of width ≤ 256 is one
 dependency-counter segment (the later ones, near the root, with 256-wide
 workgroups) and the wider fronts stay on the vendor dense sweeps; on an H200
-this beats the level sweeps on every harness matrix (78k 10.1 → 2.1 ms, cuDSS
-1.4; lap3d_40 11.7 → 7.0, cuDSS 1.3; apache2 70.5 → 47.9, cuDSS 3.3), with
+this beats the level sweeps on every harness matrix (T36 Report; the cuDSS 1.0
+comparison of 2026-11-09 reads 78k 10.3 → 2.33 ms, cuDSS 1.63; lap3d_40 11.7 →
+7.0, cuDSS 1.3; apache2 70.5 → 47.9, cuDSS 3.3), with
 residuals up to 35× larger on ill-conditioned blocks, so `"default"` stays the
 level sweeps. Graph replay (§2.7, §3.9) may contain vendor dense
 calls: the CUDA extension binds the cuSOLVER/cuBLAS handles to the capture
@@ -758,14 +759,17 @@ oneAPI and Metal (T31, PR #136); CI runs the CPU suite on the self-hosted
 every leg required; Metal (`Float32` only) is tested by hand on an M4 Max.
 The `:ka` fallbacks are allocation-free and precede `:generic` under `:auto`
 (T32, #146; the unblocked `ka_potrf!`/`ka_trsm!` on wide fronts are #183). The M3 target (1.5× cuDSS
-on condensed pglib systems) is not met through the handle API: 2.4×
-factorization / 3.9× refactorization / 3.5× solve for Cholesky, 5.1× / 7.3× /
-4.3× for LDLᵀ (geometric means, RTX 4080, `bench/comparison/comparison.md`);
-the fused pipeline of `src/fused.jl` reads 2.7× refactorization / 1.9× solve
-on the same harness and runs the 78k-bus ACOPF end to end on seven GPUs
-(`bench/PERFORMANCE-2026-10.md`). The remaining gap on KKT systems is launch-
+on condensed pglib systems) is not met through the handle API: against cuDSS
+1.0 on an H200 (2026-11-09, `bench/comparison/comparison.md`, geometric means
+over the KKT dumps) Cholesky is 1.9× factorization / 2.4× refactorization /
+2.8× solve (1.4× solve with `solve_alg = "algo1"`), static-pivoting LDLᵀ 4.7× /
+6.0× / 4.2×; the fused pipeline of `src/fused.jl` is at 1.2× / 1.5× / 1.6× on
+the KKT dumps (78k-bus condensed KKT: refactorization 16.6 vs 10.4 ms, solve
+2.34 vs 1.63 ms) and runs the 78k-bus ACOPF end to end on seven GPUs
+(`bench/PERFORMANCE-2026-10.md`); on the SuiteSparse and Laplacian matrices
+the wide fronts' vendor dense sweeps leave the stock path 9.5× behind. The remaining gap on KKT systems is launch-
 and level-bound (#82); T36 moved the fused solve under `execute!`
-(`solve_alg = "algo1"`, H200: 78k solve 10.1 → 2.1 ms against cuDSS 1.4),
+(`solve_alg = "algo1"`, H200: 78k solve 10.3 → 2.33 ms against cuDSS 1.63),
 T37–T38 move the fused factorization and add graph capture.
 Measurements and the experiment plan are in `PERFORMANCE.md`.
 
