@@ -2,10 +2,9 @@
 # as a backend-portable submodule: the fused factorization (Cholesky and
 # no-pivot LDL^T) and the partitioned-inverse/fused solve, on CUDA and AMDGPU
 # alike. The plans are built on the solver's backend and carry their own device
-# state (no module globals). Consumed by the MadNLP package extension
-# (ext/SparseDirectSolverMadNLPExt.jl); the tuning bundle `SDSTuning` /
-# `default_tuning` lives here because it parameterizes these kernels, not the
-# MadNLP glue.
+# state (no module globals). Consumed by `FusedSolver` and the `KKTSolver`
+# front end (src/kkt.jl); the tuning bundle `SDSTuning` / `default_tuning` lives
+# here because it parameterizes these kernels, not the front end.
 module Fused
 
 using LinearAlgebra
@@ -2488,16 +2487,16 @@ function refact_fused_launches!(s, nzval, fp)
     # pivot sets a front's info while the reduced slot keeps reporting the stale
     # success of an earlier factorization. In LDL mode N.stats' positive-pivot
     # fields are Cholesky-interpretation garbage; inertia comes from the signs of
-    # d (the MadNLP extension), never from these stats.
+    # d (`getparam(F, "inertia")` of a FusedSolver), never from these stats.
     SDS.cholesky_stats!(N, S)
     return nothing
 end
 
 # ---------------------------------------------------------------------------
 # FusedSolver: the fused pipeline behind the handle-layer verbs of PLAN §3.1 (T33).
-# The recipe below is the one the MadNLP extension ran inline before (inner
-# DirectSolver: tuning, analysis, factorization, a solve; then the three plans), so
-# the kernels, plans and launch sequence are those of `SDSSolver`.
+# The recipe below: an inner DirectSolver (tuning, analysis, factorization, a
+# solve), then the three plans. `KKTSolver` (src/kkt.jl) builds its fused pipeline
+# through it.
 
 # the knobs of an `SDSTuning` that live in the options of a DirectSolver, and the
 # native nested dissection with the tuning's METIS knobs (a `user_perm` set later wins)
@@ -2527,8 +2526,8 @@ const FUSED_FORWARDED = ("perm_reorder_row", "perm_reorder_col", "perm_row", "pe
     FusedSolver(rowptr, colval, nzval, structure, view; tuning = nothing, index = 'O')
 
 The fused pipeline of `SparseDirectSolver.Fused` (dependency-counter
-factorization mega-kernel and partitioned-inverse solve, the `SDSSolver` path
-of the MadNLP extension) as an `AbstractDirectSolver`, driven by the same verbs
+factorization mega-kernel and partitioned-inverse solve, the fused pipeline of
+[`KKTSolver`](@ref SparseDirectSolver.KKTSolver)) as an `AbstractDirectSolver`, driven by the same verbs
 as [`DirectSolver`](@ref SparseDirectSolver.DirectSolver): [`execute!`](@ref SparseDirectSolver.execute!), [`analyze!`](@ref SparseDirectSolver.analyze!),
 [`factorize!`](@ref SparseDirectSolver.factorize!), [`refactorize!`](@ref SparseDirectSolver.refactorize!), [`solve!`](@ref SparseDirectSolver.solve!),
 [`setparam!`](@ref SparseDirectSolver.setparam!), [`getparam`](@ref SparseDirectSolver.getparam), [`update!`](@ref SparseDirectSolver.update!), `ldiv!` and `\\`
@@ -2647,7 +2646,7 @@ function FusedSolver(rowptr::AbstractVector{<:Integer}, colval::AbstractVector{<
 end
 
 # the tuning a solver on `backend` runs with (`nothing`: the architecture default); shared
-# with the `:bk` path of the MadNLP extension
+# with the stock pipeline of `KKTSolver`
 _resolved_tuning(tuning, backend) = resolve_tuning(something(tuning, default_tuning(backend)), backend)
 
 function _fused_solver(s::SDS.DirectSolver{T, INT}, tuning::Union{Nothing, SDSTuning}) where {T, INT}

@@ -19,12 +19,13 @@ factors symmetric positive definite (LLᵀ/LLᴴ), symmetric indefinite (LDLᵀ/
 with 1×1 and 2×2 pivots) and general (LDU) sparse matrices and solves with them
 on the device. It keeps the parameter names and phases of
 [CUDSS.jl](https://github.com/exanauts/CUDSS.jl), the Julia interface of NVIDIA
-cuDSS, so that [MadNLP](https://github.com/MadNLP/MadNLP.jl) and other cuDSS
+cuDSS, so that [MadNLP](https://github.com/madsuite-org/MadNLP.jl) and other cuDSS
 users can switch mechanically, and it is not tied to one vendor.
 
 ## Status
 
-Version 0.3.0, the first release registered in the Julia General registry.
+Version 0.4.0; 0.3.0 was the first release registered in the Julia General
+registry.
 Julia 1.13 or later. Every backend below runs the same multifrontal kernels;
 only the dense operations on the large fronts go through a vendor library.
 It is young: complete enough for the MadNLP workload and checked against CPU
@@ -101,12 +102,16 @@ and parameters raise `NotSupportedError`; there is no silent fallback.
   side; the factorization is bitwise reproducible, `deterministic_mode = 1`
   makes the solve so too. Tuned per architecture through `SDSTuning`,
   including optional CUDA-graph replay of the refactorization and the solve
-  (`graph_max_n`). This is the path the MadNLP extension runs.
-* **MadNLP** (`using MadNLP`): the linear solver `SDSSolver` with the options
-  `sds_factorization` (`:cholesky`, `:ldl`), `sds_pivoting` (`:none` on the
-  fused pipeline, `:bk` on the stock in-front Bunch–Kaufman path, which is
-  also the CPU-backend path), `sds_pivot_threshold`, `sds_reordering`,
-  `sds_user_perm` and `sds_tuning`.
+  (`graph_max_n`).
+* **`KKTSolver`**, the front end for the KKT systems of an interior-point
+  method: pipeline choice (fused where the backend runs it, else the stock
+  `DirectSolver`), refactorization, in-place solve and inertia
+  (`SparseDirectSolver.inertia`), for `:cholesky` and `:ldl` (no pivoting or
+  Bunch–Kaufman).
+* **MadNLP**: the binding is MadNLP's (MadNLP 0.12, `SDSSolver` of
+  `MadCoreGPU`, built on `KKTSolver`): the default sparse solver of
+  `rocMadNLP`, `oneMadNLP` and `mtlMadNLP`, and selectable in `cuMadNLP`. The
+  MadNLP extension of 0.3 was removed in 0.4.0.
 
 **Not there yet.** The fused factorization on `DirectSolver` itself, and
 CUDA-graph capture of the stock refactorization and solve (tasks T37–T38 of
@@ -123,7 +128,7 @@ Time of SparseDirectSolver.jl divided by the time of cuDSS 1.0.0 (CUDSS.jl
 1.0) per feature and phase, geometric mean over the benchmark matrices (below
 1 is faster), on an NVIDIA H200 allocated exclusively through Slurm (commit
 352271c, 2026-11-09). Every row is a feature through the handle API;
-`cholesky_fused` is the fused pipeline the MadNLP extension runs,
+`cholesky_fused` is the fused pipeline that `KKTSolver` (and MadNLP) runs,
 `cholesky_algo1` and `ldlt_algo1` the `solve_alg = "algo1"` solve on
 `DirectSolver`. The cuDSS matching is off except in `ldlt_matching` (cuDSS 1.0
 turns it on by default for `S`/`G`), as on the SDS side. The lower panel
@@ -166,8 +171,7 @@ split packages CUDACore, cuBLAS, cuSOLVER and cuSPARSE trigger the CUDA
 extension; `using CUDA` loads them all. CUDA.jl 6.5 exports an `update!` of
 its own, so this package does not export its `update!`: write
 `SparseDirectSolver.update!` or `using SparseDirectSolver: update!`.
-`using Krylov` enables FGMRES refinement, `using MadNLP` the `SDSSolver`
-linear solver.
+`using Krylov` enables FGMRES refinement.
 
 ## Usage
 
@@ -257,13 +261,21 @@ refactorize!(F)
 solve!(F, x_gpu, b_gpu)
 ```
 
-With MadNLP, on a GPU:
+For the KKT systems of an interior-point method, `KKTSolver` refactorizes,
+solves in place and gives the inertia:
 
 ```julia
-using MadNLP, MadNLPGPU, CUDA, SparseDirectSolver
-result = madnlp(model; linear_solver = SDSSolver,
-                kkt_system = MadNLP.SparseCondensedKKTSystem)
+K = KKTSolver(A_gpu, 'L'; factorization = :ldl)   # analysis and first factorization
+nonzeros(A_gpu) .= new_values                     # same pattern
+factorize!(K)
+npos, nzero, nneg = SparseDirectSolver.inertia(K)
+solve!(K, xb_gpu)                                 # xb_gpu holds b, then x
 ```
+
+With MadNLP 0.12 on an AMD, Intel or Apple GPU, `SDSSolver` is the default
+(`using rocMadNLP`, `oneMadNLP` or `mtlMadNLP`); with `cuMadNLP` it is selected
+with `linear_solver = SDSSolver` once SparseDirectSolver is loaded (see the
+[MadNLP](https://exanauts.github.io/SparseDirectSolver.jl/dev/man/madnlp/) page).
 
 ## Running the tests
 

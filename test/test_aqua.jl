@@ -6,14 +6,10 @@
 # CUDA job), so give it more headroom; a real persistent task still
 # fails, it just takes longer to report.
 
-# undefined_exports is excluded HERE only: SDSSolver/SDSSolverOptions are declared
-# globals the MadNLP extension assigns, and MadNLP is not in the test environment.
-# CI's Aqua workflow loads MadNLP and runs that check with the exports assigned.
 # persistent_tasks is skipped: under KernelAbstractions 0.10 it reports the backend,
 # not this package. KA 0.10's CPU backend keeps worker tasks alive at exit, and in
 # Aqua's fresh temporary project its pocl_standalone_jll dependency fails to
 # precompile ("Cannot load SLEEF_jll into module pocl_standalone_jll", seen on CI).
 # Upstream; re-enable (with `tmax = 120`, see above) when both are fixed. CI's Aqua
 # workflow skips it the same way.
-Aqua.test_all(SparseDirectSolver; ambiguities = false, undefined_exports = false,
-              persistent_tasks = false)
+Aqua.test_all(SparseDirectSolver; ambiguities = false, persistent_tasks = false)

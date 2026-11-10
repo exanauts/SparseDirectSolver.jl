@@ -12,7 +12,7 @@ It factors
 
 and solves with them on the GPU. It keeps the parameter names and the phases of
 [CUDSS.jl](https://github.com/exanauts/CUDSS.jl), the Julia interface of NVIDIA
-cuDSS, so that [MadNLP](https://github.com/MadNLP/MadNLP.jl) and other cuDSS
+cuDSS, so that [MadNLP](https://github.com/madsuite-org/MadNLP.jl) and other cuDSS
 users can switch to it mechanically ([Migrating from CUDSS.jl](@ref)). Unlike
 cuDSS it is open source and not tied to one vendor: it runs on CUDA, AMDGPU,
 oneAPI, Metal and the KernelAbstractions CPU backend.
@@ -28,7 +28,7 @@ oneAPI, Metal and the KernelAbstractions CPU backend.
     evidence. Validate the numerics on your own matrices before relying on them.
 
 !!! warning "Status"
-    Version 0.3.0 is the first registered release. The CPU backend, CUDA,
+    Version 0.4.0; 0.3.0 was the first registered release. The CPU backend, CUDA,
     AMDGPU, oneAPI (tested on an Intel Data Center GPU Max 1550) and Metal
     (`Float32`, tested by hand on an M4 Max) are tested; non-uniform batches and
     mixed precision are not there yet. Unsupported structures, phases and
@@ -66,7 +66,10 @@ oneAPI, Metal and the KernelAbstractions CPU backend.
   dependency-counter factorization kernel for the whole elimination tree and a
   partitioned-inverse solve, behind the same verbs as `DirectSolver`; GPU
   backends only, real `"SPD"` and no-pivot `"S"` matrices, one right-hand side.
-* **MadNLP extension**: the `SDSSolver` linear solver ([MadNLP](@ref)).
+* **KKT solver** ([`KKTSolver`](@ref)): the front end for the KKT systems of
+  an interior-point method (refactorization, one right-hand side, inertia),
+  on the fused pipeline where the backend runs it. MadNLP binds it as its
+  `SDSSolver` linear solver ([MadNLP](@ref)).
 
 ## Installation
 
@@ -89,8 +92,8 @@ AMDGPU.jl enables the AMDGPU extension (`ROCSparseMatrixCSR` and
 oneAPI.jl enables the oneAPI extension (`oneSparseMatrixCSR` and
 `oneSparseMatrixCSC` inputs, oneMKL BLAS kernels); loading Metal.jl enables the
 Metal extension ([`CSR`](@ref) of `MtlArray`s, `Float32`, MPS Cholesky for wide
-fronts); loading Krylov.jl enables FGMRES refinement; loading MadNLP.jl enables
-the `SDSSolver` linear solver ([MadNLP](@ref)).
+fronts); loading Krylov.jl enables FGMRES refinement. The MadNLP binding lives
+in MadNLP's own packages ([MadNLP](@ref)).
 
 ## Where to go next
 
@@ -98,7 +101,7 @@ the `SDSSolver` linear solver ([MadNLP](@ref)).
 * [Phases](man/phases.md) and [Parameters](man/parameters.md): the handle API, phase by phase.
 * [Symmetric indefinite systems](@ref): KKT matrices, pivoting and inertia.
 * [Backends](@ref): CUDA, AMDGPU, oneAPI, Metal and the CPU backend.
-* [MadNLP](@ref): the `SDSSolver` linear solver and its options.
+* [MadNLP](@ref): MadNLP's `SDSSolver`, its options and what runs underneath.
 * [Performance](@ref): comparison with cuDSS.
 * [What to expect](@ref): scope, performance, accuracy and limits of this release.
 * The design documents in the repository: [`PLAN.md`](https://github.com/exanauts/SparseDirectSolver.jl/blob/main/PLAN.md)

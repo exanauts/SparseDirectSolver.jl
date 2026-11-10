@@ -15,8 +15,8 @@ systems of an interior-point method are. `A` is anything
 [`DirectSolver`](@ref) accepts (a [`CSR`](@ref), a `SparseMatrixCSC`, a vendor
 CSR or CSC matrix such as `CuSparseMatrixCSC`, `ROCSparseMatrixCSC` or
 `oneSparseMatrixCSC`) and `view` the stored triangle (`'L'`, `'U'` or `'F'`); a
-CSC matrix is read without a copy, as the CSR of its transpose. The backend is
-the one of the arrays.
+CSC matrix, `SparseMatrixCSC` included, is read without a copy, as the CSR of
+its transpose. The backend is the one of the arrays.
 
 The constructor chooses the pipeline, runs the analysis and factorizes the
 values `A` holds. The values alias the caller's `nzval`: write the new values
@@ -84,6 +84,15 @@ mutable struct KKTSolver{T, INT, S <: AbstractDirectSolver{T, INT}, V <: Abstrac
 end
 
 KKTSolver(A, view::Char = 'L'; kwargs...) = _kkt_solver(structure -> DirectSolver(A, structure, view); kwargs...)
+
+# a SparseMatrixCSC is read in place as the CSR of its transpose, the stored triangle being the other one
+# (`DirectSolver(::SparseMatrixCSC, …)` converts to CSR, a copy the caller's new values would not reach)
+function KKTSolver(A::SparseMatrixCSC, view::Char = 'L'; kwargs...)
+    size(A, 1) == size(A, 2) ||
+        throw(InvalidValueError("the matrix must be square, got $(size(A, 1)) × $(size(A, 2))"))
+    flipped = view == 'L' ? 'U' : view == 'U' ? 'L' : view
+    return KKTSolver(A.colptr, A.rowval, A.nzval, flipped; kwargs...)
+end
 
 function KKTSolver(rowptr::AbstractVector{<:Integer}, colval::AbstractVector{<:Integer}, nzval::AbstractVector,
                    view::Char = 'L'; kwargs...)

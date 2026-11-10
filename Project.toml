@@ -1,6 +1,6 @@
 name = "SparseDirectSolver"
 uuid = "dc8e0fd9-41f1-440b-9624-22817132f700"
-version = "0.3.0"
+version = "0.4.0"
 authors = ["Michel Schanen <Michel.Schanen@gmail.com>"]
 
 [deps]
@@ -17,7 +17,6 @@ SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
 AMDGPU = "21141c5a-9bdb-4563-92ae-f87d6854732e"
 CUDACore = "bd0ed864-bdfe-4181-a5ed-ce625a5fdea2"
 Krylov = "ba0b0d4f-ebba-5204-a429-3ac8c609bfb7"
-MadNLP = "2621e9c9-9eb4-46b1-8089-e8c72242dfb6"
 Metal = "dde4c033-4e86-420c-a63e-0dd931031962"
 oneAPI = "8f75cd03-7ff8-4ecb-9b8f-daf728133b1b"
 cuBLAS = "182d3088-87b7-4494-8cad-fc6afaa545bc"
@@ -28,7 +27,6 @@ cuSPARSE = "b26da814-b3bc-49ef-b0ee-c816305aa060"
 SparseDirectSolverAMDGPUExt = "AMDGPU"
 SparseDirectSolverCUDAExt = ["CUDACore", "cuBLAS", "cuSOLVER", "cuSPARSE"]
 SparseDirectSolverKrylovExt = "Krylov"
-SparseDirectSolverMadNLPExt = "MadNLP"
 SparseDirectSolverMetalExt = "Metal"
 SparseDirectSolverOneAPIExt = "oneAPI"
 
@@ -42,7 +40,6 @@ CliqueTrees = "1"
 KernelAbstractions = "0.10.3"
 Krylov = "0.10"
 LinearAlgebra = "1.13"
-MadNLP = "0.11"
 Metal = "1.11"
 Metis = "1"
 SparseArrays = "1.13"

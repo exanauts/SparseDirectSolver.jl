@@ -5,6 +5,35 @@ All notable changes to SparseDirectSolver.jl are listed here. The format follows
 [Semantic Versioning](https://semver.org/). Task ids (`TNN`) refer to `TASKS.md`,
 whose Report blocks hold the details and the measurements.
 
+## [0.4.0] - 2026-11-13
+
+### Breaking
+
+- The MadNLP extension (`ext/SparseDirectSolverMadNLPExt.jl`) and the exports
+  `SDSSolver` and `SDSSolverOptions` are removed, and MadNLP is no longer a
+  weak dependency. The binding is MadNLP's own: `MadCoreGPU.SDSSolver` in
+  MadNLP 0.12 (the default sparse solver of `rocMadNLP`, `oneMadNLP` and
+  `mtlMadNLP`, selectable in `cuMadNLP`), built on `KKTSolver`. The scripts of
+  `bench/e2e/` still use the removed `SDSSolver` and need SparseDirectSolver
+  0.3 with MadNLP 0.11 until they are ported.
+
+### Added
+
+- `KKTSolver`, the front end for the KKT systems of an interior-point method:
+  pipeline choice (the fused pipeline where the backend runs it, else the stock
+  `DirectSolver`), the factorization parameters of `:cholesky` and `:ldl` (no
+  pivoting or Bunch–Kaufman), `factorize!` for the refactorization, `solve!`
+  in place, and the public `inertia` and `pipeline`.
+- `SDSTuning` and `default_tuning` are exported from the top module.
+- `matching_alg = "none"` is accepted as the cuDSS 1.0 spelling of matching
+  off.
+
+### Changed
+
+- On the CPU backend and on Metal, Cholesky and `L D Lᵀ` without pivoting run
+  through `KKTSolver` on the stock pipeline; the removed MadNLP extension
+  refused them on the CPU backend.
+
 ## [0.3.0] - 2026-11-09
 
 First registered release.
@@ -76,4 +105,5 @@ First registered release.
 Internal versions, never released or registered; the history is in `TASKS.md`
 and the git log.
 
+[0.4.0]: https://github.com/exanauts/SparseDirectSolver.jl/releases/tag/v0.4.0
 [0.3.0]: https://github.com/exanauts/SparseDirectSolver.jl/releases/tag/v0.3.0

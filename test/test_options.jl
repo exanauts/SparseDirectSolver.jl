@@ -158,6 +158,34 @@ end
     @test opts.amalgamation isa SDS.AmalgamationParams
 end
 
+@testset "matching_alg = \"none\" is matching off (the cuDSS 1.0 spelling)" begin
+    opts = Options()
+    setparam!(opts, "matching_alg", "algo6")
+    @test setparam!(opts, "matching_alg", "none") === nothing
+    @test opts.matching_alg == SDS.MATCHING_NONE
+    @test getparam(opts, "matching_alg") == "default"   # read back with the canonical spelling
+    @test convert(SDS.MatchingAlg, "none") === SDS.MATCHING_NONE
+    @test convert(String, SDS.MATCHING_NONE) == "default"
+    @test Options(matching_alg = "none").matching_alg == SDS.MATCHING_NONE
+    # the alias belongs to matching_alg only
+    for name in ("reordering_alg", "factorization_alg", "solve_alg", "pivot_epsilon_alg")
+        @test thrown(() -> setparam!(opts, name, "none")) isa InvalidValueError
+    end
+    @test occursin("\"none\"", sprint(showerror, thrown(() -> setparam!(opts, "matching_alg", "off"))))
+    # the checks that refuse matching compare the stored value, so "none" is off for them: schur_mode = 1
+    Random.seed!(666)
+    A = laplacian2d(Float64, 6, 6)
+    n = size(A, 1)
+    solver = DirectSolver(tril(A), "SPD", 'L')
+    setparam!(solver, "matching_alg", "none")
+    @test getparam(solver, "matching_alg") == "default"
+    setparam!(solver, "schur_mode", 1)
+    setparam!(solver, "user_schur_indices", [i > n - 3 ? 1 : 0 for i in 1:n])
+    analyze!(solver)                                     # matching with schur_mode = 1 raises NotSupportedError
+    @test solver.host_matching === nothing
+    @test thrown(() -> getparam(solver, "perm_matching")) isa InvalidValueError
+end
+
 @testset "user-provided data parameters" begin
     opts = Options()
     for backend in BACKENDS
