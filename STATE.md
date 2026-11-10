@@ -1,9 +1,13 @@
 # State of SparseDirectSolver.jl (2026-11-09)
 
-Snapshot of `main` at baf3b2f, after T36 (PR #187, `solve_alg = "algo1"` on
+Snapshot of `main` at 163bf96, after T36 (PR #187, `solve_alg = "algo1"` on
 `DirectSolver`), the chore PR #189 (#188: the CPU allocation checks run in a
-child process, the KernelAbstractions cap is lifted) and the bench PR #190 (the
-cuDSS 1.0 comparison for the 0.3.0 release). It replaces the snapshot
+child process, the KernelAbstractions cap is lifted), the bench PR #190 (the
+cuDSS 1.0 comparison) and the release PR #191 (version 0.3.0, `CHANGELOG.md`,
+the docs page "What to expect"). Registration in General is the owner's next
+step: `JuliaRegistrator register` on the merge commit of #191 with the
+CHANGELOG section as release notes; General waits 3 days for a new package;
+TagBot then tags `v0.3.0` and `Documentation.yml` deploys `stable`. It replaces the snapshot
 of 2026-11-04; the history is in git (`git log -- STATE.md`). Sources: the Report blocks of `TASKS.md`, the open and
 closed issues, `PLAN.md` §5, `bench/comparison/comparison.md`,
 `bench/ARCH-TUNING.md`, `PERFORMANCE.md` and `bench/PERFORMANCE-2026-10.md`.
@@ -215,5 +219,8 @@ assume:
   `bench/PERFORMANCE-2026-10.md` the GV100 record of the MadNLP end-to-end
   runs. The PR #107 prototypes and the GPU METIS port live at tag
   `prototypes-2026-10`.
+- Releases: `CHANGELOG.md` (Keep a Changelog; TagBot cannot read it, so the
+  register comment carries the section as `Release notes:`). Version 0.3.0 is
+  the first release; 0.2.0 and earlier were internal, never tagged.
 - Documentation: `https://exanauts.github.io/SparseDirectSolver.jl/dev/`,
   built on the `cuda` runner for every push to `main`.
