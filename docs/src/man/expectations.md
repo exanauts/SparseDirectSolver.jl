@@ -47,9 +47,11 @@ wide fronts go through the vendor dense calls, the stock Cholesky
 refactorization is 9.5× behind (the fused pipeline 1.9×). On the 78k-bus
 condensed ACOPF system (n = 674 562) the fused pipeline refactorizes in
 16.6 ms against 10.4 ms for cuDSS and solves in 2.34 ms against 1.63 ms. The
-symbolic analysis is faster than cuDSS's on the KKT systems (0.40×). LU is
-13.8× behind on factorization and 15.2× on refactorization (two matrices). The numbers were measured on
-one GPU architecture (sm_90); other GPUs, AMD in particular, were timed less.
+symbolic analysis is faster than cuDSS's on the KKT systems for the Cholesky
+features (0.40×) and on par for LDLᵀ (1.01×). LU is 13.8× behind on
+factorization and 15.2× on refactorization (two matrices). The numbers were
+measured on one GPU architecture (sm_90); other GPUs, AMD in particular, were
+timed less.
 
 ## Accuracy
 
