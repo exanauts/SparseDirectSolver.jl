@@ -2583,8 +2583,9 @@ interior-point loop (`update!` with the same pattern is forwarded).
 `structure` is `"SPD"` (fused Cholesky) or `"S"` (fused LDLᵀ with static
 pivoting: `pivot_type = 'N'`, a pivot `d` with `|d| < pivot_epsilon` replaced by
 `±pivot_epsilon` as in the stock no-pivot LDLᵀ, optionally with a matching;
-`pivot_pairs = "none"` without a matching, `"default"` with one, so that the
-pairs of its cycles shape the ordering). `tuning` is an
+`pivot_pairs = "none"` without a matching or with `"algo1"`–`"algo4"`,
+`"default"` with `"algo5"`/`"algo6"`, so that the pairs of its cycles shape the
+ordering). `tuning` is an
 [`SDSTuning`](@ref SparseDirectSolver.Fused.SDSTuning), `nothing` meaning
 [`default_tuning`](@ref SparseDirectSolver.Fused.default_tuning)`(backend)`,
 resolved by [`resolve_tuning`](@ref SparseDirectSolver.Fused.resolve_tuning);
@@ -2801,7 +2802,7 @@ end
 # ordering, as on the stock pipeline of `KKTSolver`); evaluated at every analysis
 function _fused_pairs!(F::FusedSolver)
     F.ldl || return F
-    SDS.setparam!(F.inner, "pivot_pairs", F.inner.options.matching_alg == SDS.MATCHING_NONE ? "none" : "default")
+    SDS.setparam!(F.inner, "pivot_pairs", SDS.matching_job(F.inner.options.matching_alg) == 5 ? "default" : "none")
     return F
 end
 
