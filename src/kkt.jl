@@ -16,7 +16,9 @@ systems of an interior-point method are. `A` is anything
 CSR or CSC matrix such as `CuSparseMatrixCSC`, `ROCSparseMatrixCSC` or
 `oneSparseMatrixCSC`) and `view` the stored triangle (`'L'`, `'U'` or `'F'`); a
 CSC matrix, `SparseMatrixCSC` included, is read without a copy, as the CSR of
-its transpose. The backend is the one of the arrays.
+its transpose (a `SparseMatrixCSC` with spare capacity in `rowval`/`nzval`
+raises [`InvalidValueError`](@ref), see [`csr_of_transpose`](@ref)). The
+backend is the one of the arrays.
 
 The constructor chooses the pipeline, sets the parameters, runs the analysis
 and factorizes the values `A` holds; with `deferred_analysis = true` it stops
@@ -45,8 +47,9 @@ Keywords:
 * `matching::AbstractString = "none"`: `:ldl` only, the `"matching_alg"` of the
   analysis (`"none"` or `"default"` off, `"algo1"`–`"algo6"`; `"algo5"` and
   `"algo6"` also choose the 2×2 pivot pairs of the ordering from the cycles of
-  the matching, with either `pivoting`). Matching runs on the stock pipeline
-  only. It reads the values present at the analysis, so pass
+  the matching, with either `pivoting`; with `"algo1"`–`"algo4"` and
+  `pivoting = :none` the analysis looks for no pairs, as without matching).
+  Matching runs on the stock pipeline only. It reads the values present at the analysis, so pass
   `deferred_analysis = true` when the matrix holds no real values yet.
 * `fused::Union{Nothing, Bool} = nothing`: `true` runs the fused pipeline (a
   [`FusedSolver`](@ref)), `false` the stock one (a [`DirectSolver`](@ref)).
@@ -107,14 +110,11 @@ end
 
 KKTSolver(A, view::Char = 'L'; kwargs...) = _kkt_solver(structure -> DirectSolver(A, structure, view); kwargs...)
 
-# a SparseMatrixCSC is read in place as the CSR of its transpose, the stored triangle being the other one
-# (`DirectSolver(::SparseMatrixCSC, …)` converts to CSR, a copy the caller's new values would not reach)
-function KKTSolver(A::SparseMatrixCSC, view::Char = 'L'; kwargs...)
-    size(A, 1) == size(A, 2) ||
-        throw(InvalidValueError("the matrix must be square, got $(size(A, 1)) × $(size(A, 2))"))
-    flipped = view == 'L' ? 'U' : view == 'U' ? 'L' : view
-    return KKTSolver(A.colptr, A.rowval, A.nzval, flipped; kwargs...)
-end
+# a SparseMatrixCSC is read in place as the CSR of its transpose (`DirectSolver(::SparseMatrixCSC, …)` converts to
+# CSR, a copy the caller's new values would not reach); the solver flips the view of a transposed CSR, and
+# csr_of_transpose refuses spare capacity in rowval/nzval
+KKTSolver(A::SparseMatrixCSC, view::Char = 'L'; kwargs...) =
+    _kkt_solver(structure -> DirectSolver(csr_of_transpose(A), structure, view); kwargs...)
 
 function KKTSolver(rowptr::AbstractVector{<:Integer}, colval::AbstractVector{<:Integer}, nzval::AbstractVector,
                    view::Char = 'L'; kwargs...)
@@ -171,8 +171,9 @@ function _kkt_solver(make; factorization::Symbol = :cholesky, pivoting::Symbol =
             pivot_threshold === nothing || setparam!(d, "pivot_threshold", pivot_threshold)
         elseif ldl
             setparam!(d, "pivot_type", 'N')
-            # no-pivot LDLᵀ consumes no 2×2 pair, but with matching the pairs of its cycles shape the ordering
-            matched || setparam!(d, "pivot_pairs", "none")
+            # no-pivot LDLᵀ consumes no 2×2 pair, but the pairs of the cycles of a job-5 matching ("algo5", "algo6")
+            # shape the ordering; jobs 1–4 would fall back to the value-based detection, skipped as without matching
+            matched && matching_job(d.options.matching_alg) == 5 || setparam!(d, "pivot_pairs", "none")
         end
         ldl && pivot_sign !== nothing && setparam!(d, "pivot_sign", pivot_sign)
         d
