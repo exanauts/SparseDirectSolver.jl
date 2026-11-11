@@ -410,21 +410,22 @@ end
         @test relres(A2, to_host(xd), b) <= tol(T)
         bytes = fused_cycle_allocated(F, xd, bd)
         @test bytes <= fused_cycle_alloc_budget(backend)
-        # the solve graph replays the corrections too: bitwise equal to the eager solve (deterministic_mode = 1)
-        G = FusedSolver(Ad, "S", 'L'; tuning = SDS.Fused.SDSTuning(; graph_max_n = typemax(Int)))
-        for (name, value) in (("matching_alg", "algo5"), ("deterministic_mode", 1), ("ir_n_steps", 2))
-            setparam!(G, name, value)
-        end
-        analyze!(G)
-        factorize!(G)
+        # the solve graph replays the corrections too: bitwise equal to the eager solve (deterministic_mode = 1) of
+        # the same solver (the same analysis, factor and tuning but graph_max_n; the tuning is read at every solve,
+        # as in the #174 testset). A fresh solver would not do: its analysis of A2 (the scaling, hence the pivot
+        # pairs and the ordering) differs from F's analysis of A, and its tuning from the platform's (solve_workgroup)
         x2 = to_host(xd)
+        eager = F.tuning
+        F.tuning = SDS.Fused.SDSTuning((f === :graph_max_n ? typemax(Int) : getfield(eager, f)
+                                        for f in fieldnames(SDS.Fused.SDSTuning))...)
         same = 0
-        for _ in 1:3
-            solve!(G, xb, bd; asynchronous = false)
+        for _ in 1:3                                    # eager sweeps and capture at the first solve, then replays
+            solve!(F, xb, bd; asynchronous = false)
             same += to_host(xb) == x2
         end
         @test same == 3
-        backend_name(backend) == "CUDA" && @test !(G.gsolve in (nothing, false))
+        backend_name(backend) == "CUDA" && @test !(F.gsolve in (nothing, false))
+        F.tuning = eager
     end
 
     @testset "restrictions raise NotSupportedError: $T" for T in eltypes_among((Float32, Float64))
