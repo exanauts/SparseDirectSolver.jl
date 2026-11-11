@@ -313,7 +313,7 @@ end
         A = grid_kkt_matrix(T, 30, 30, 1.0)
         args, _ = kkt_input(backend, A)
         K = KKTSolver(args...; factorization = :ldl, matching)
-        @test SDS.pipeline(K) === :stock
+        @test SDS.pipeline(K) === kkt_default_pipeline(backend)
         @test getparam(K, "pivot_pairs") == (matching == "algo1" ? "none" : "default")
         @test getparam(K, "info") == 0
         @test SDS.inertia(K) == (m, 0, m)
