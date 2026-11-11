@@ -52,7 +52,7 @@ the steps run without a host synchronization.
 ```julia
 sgn = vcat(ones(Int8, n_primal), fill(Int8(-1), n_dual))   # the sign a replaced pivot takes
 S = KKTSolver(Kd, 'L'; factorization = :ldl, matching = "algo5", pivot_epsilon = 1e-10,
-              pivot_sign = sgn, ir_n_steps = 1,             # one refinement step per solve
+              pivot_sign = sgn, ir_n_steps = 2,             # two refinement steps per solve
               deferred_analysis = true)                     # options checked, nothing analyzed yet
 Kd.nzVal .= first_values
 factorize!(S)                                  # analysis (matching, pairs) and first factorization

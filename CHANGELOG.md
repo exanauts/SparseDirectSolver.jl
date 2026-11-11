@@ -37,10 +37,7 @@ whose Report blocks hold the details and the measurements.
   `"npivots"`) and runs with a matching (`matching_alg`: scaled values, the
   2×2 pivot pairs of the ordering, the scaling undone in the solve), so
   `KKTSolver` no longer moves an `L D Lᵀ` with `matching`, `pivot_epsilon` or
-  `pivot_sign` to the stock pipeline (#193, #194). Its default
-  `pivot_epsilon` is now the stock one (`1e-13` for `Float64`, `1e-5` for
-  `Float32`; it factored with `0` before), `pivot_epsilon = 0` keeps the old
-  behaviour; a NaN or infinite pivot still fails the factorization.
+  `pivot_sign` to the stock pipeline (#193, #194).
 - Iterative refinement on the fused pipeline: `FusedSolver` accepts
   `ir_n_steps` (plain refinement, the residual of the caller's unscaled matrix
   values, the corrections through the fused solve, no host synchronization;
@@ -55,6 +52,10 @@ whose Report blocks hold the details and the measurements.
 - On the CPU backend and on Metal, Cholesky and `L D Lᵀ` without pivoting run
   through `KKTSolver` on the stock pipeline; the removed MadNLP extension
   refused them on the CPU backend.
+- The fused `L D Lᵀ` (`FusedSolver` with structure `"S"`) factors with the
+  stock default `pivot_epsilon` (`1e-13` for `Float64`, `1e-5` for `Float32`)
+  where it used `0` and failed on a zero pivot; `pivot_epsilon = 0` keeps the
+  old behaviour. A NaN or infinite pivot still fails the factorization (#194).
 
 ## [0.3.0] - 2026-11-09
 

@@ -81,9 +81,16 @@ whatever MadNLP's binding exposes of them:
 many steps of iterative refinement inside the solver, on both pipelines, the
 residual taken with the KKT values MadNLP passed (not the scaled ones of a
 matching, not the replaced pivots); it is the counterpart of cuDSS's
-`ir_n_steps`. MadNLP refines the solution of its KKT system itself, so it is
-off by default; one step recovers most of the accuracy that static pivot
-replacement costs.
+`ir_n_steps`. It is off by default, since MadNLP refines the solution of its
+KKT system itself, but static pivot replacement needs it: on the KKT systems
+of a flowsheet design problem (static pivoting with `matching = "algo6"`,
+`pivot_epsilon = 1e-10`, `pivot_sign`), the interior-point method without
+refinement in the solver did not converge on either pipeline, as the matching
+of the analysis went stale over the iterations, while two steps
+(`ir_n_steps = 2`) converged in 104 iterations on both (90 with the matching
+recomputed at every factorization and no refinement). One step converged in
+104 iterations on the fused pipeline but took 274 on the stock one, so use
+two.
 
 Without matching, with `pivoting = :bk` the 2×2 pivot pairs of the `"S"`
 analysis are chosen from the values present in the KKT matrix at the analysis
