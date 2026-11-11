@@ -71,7 +71,10 @@ timed less.
   regularization of the interior-point method or on the matching and scaling
   of `matching_alg = "algo5"`; [`KKTSolver`](@ref) (and through it MadNLP's
   `SDSSolver`) reports the inertia from the signs of ``D``, a replaced pivot
-  counted with the sign it was given.
+  counted with the sign it was given. Plain iterative refinement
+  (`ir_n_steps`, the `KKTSolver` keyword of the same name) runs on both
+  pipelines and recovers the accuracy that a replaced pivot costs; the fused
+  pipeline has no `ir_tol` early exit and no FGMRES refinement.
 * **`"algo1"` residuals.** The partitioned-inverse solve multiplies by explicit
   inverses of the diagonal blocks of each front. On ill-conditioned blocks its
   residual is larger than that of the level sweeps: 1.1–3.3× on the condensed

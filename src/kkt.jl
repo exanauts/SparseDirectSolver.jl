@@ -70,6 +70,13 @@ Keywords:
   the `"pivot_sign"` a replaced pivot takes (an interior-point method passes
   `1` for the primal and `-1` for the dual rows; `0` or `nothing`: the sign of
   the pivot), on both pipelines.
+* `ir_n_steps::Union{Nothing, Integer} = nothing`: the `"ir_n_steps"` of the
+  solve, on both pipelines: every [`solve!`](@ref) is followed by that many
+  steps of plain iterative refinement against the matrix values the caller
+  passed (not the scaled values of a matching, not the replaced pivots), which
+  recovers accuracy lost to static pivot replacement. `nothing` or `0`: no
+  refinement. The steps run without a host synchronization; `getparam(K,
+  "ir_n_steps")` reports the steps of the last solve.
 * `reordering::String = "algo4"`: the `"reordering_alg"` of the analysis
   (`"algo4"` nested dissection, `"algo3"` AMD, `"default"` the choice of the
   cost model).
@@ -126,7 +133,8 @@ end
 function _kkt_solver(make; factorization::Symbol = :cholesky, pivoting::Symbol = :none,
                      matching::AbstractString = "none", fused::Union{Nothing, Bool} = nothing,
                      pivot_threshold = nothing, pivot_epsilon = nothing, pivot_sign = nothing,
-                     reordering::AbstractString = "algo4", user_perm = nothing,
+                     ir_n_steps::Union{Nothing, Integer} = nothing, reordering::AbstractString = "algo4",
+                     user_perm = nothing,
                      tuning::Union{Nothing, Fused.SDSTuning} = nothing, deferred_analysis::Bool = false)
     factorization in (:cholesky, :ldl) ||
         throw(InvalidValueError("factorization must be :cholesky or :ldl, got $(repr(factorization))"))
@@ -170,6 +178,7 @@ function _kkt_solver(make; factorization::Symbol = :cholesky, pivoting::Symbol =
     end
     ldl && pivot_sign !== nothing && setparam!(inner, "pivot_sign", pivot_sign)
     pivot_epsilon === nothing || setparam!(inner, "pivot_epsilon", pivot_epsilon)
+    ir_n_steps === nothing || setparam!(inner, "ir_n_steps", ir_n_steps)
     if user_perm !== nothing
         setparam!(inner, "user_perm", user_perm)
     else

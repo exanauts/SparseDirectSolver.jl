@@ -41,6 +41,11 @@ whose Report blocks hold the details and the measurements.
   `pivot_epsilon` is now the stock one (`1e-13` for `Float64`, `1e-5` for
   `Float32`; it factored with `0` before), `pivot_epsilon = 0` keeps the old
   behaviour; a NaN or infinite pivot still fails the factorization.
+- Iterative refinement on the fused pipeline: `FusedSolver` accepts
+  `ir_n_steps` (plain refinement, the residual of the caller's unscaled matrix
+  values, the corrections through the fused solve, no host synchronization;
+  `ir_tol > 0` and `ir_mode = "fgmres"` raise `NotSupportedError`), and
+  `KKTSolver` has the keyword `ir_n_steps`, set on either pipeline (#194).
 - `SDSTuning` and `default_tuning` are exported from the top module.
 - `matching_alg = "none"` is accepted as the cuDSS 1.0 spelling of matching
   off.

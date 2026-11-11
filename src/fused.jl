@@ -2555,10 +2555,10 @@ function _apply_tuning!(s, t::SDSTuning)
     return s
 end
 
-# the parameters `setparam!` accepts on a FusedSolver (read by the next analysis; deterministic_mode by the
-# next solve)
+# the parameters `setparam!` accepts on a FusedSolver (read by the next analysis; deterministic_mode and
+# ir_n_steps by the next solve)
 const FUSED_SETTABLE = ("user_perm", "reordering_alg", "nd_nseps", "nd_seed", "pivot_epsilon", "pivot_sign",
-                        "matching_alg", "deterministic_mode")
+                        "matching_alg", "deterministic_mode", "ir_n_steps")
 
 # the analysis data parameters `getparam` forwards to the inner DirectSolver
 const FUSED_FORWARDED = ("perm_reorder_row", "perm_reorder_col", "perm_row", "perm_col", "lu_nnz", "flops",
@@ -2615,6 +2615,13 @@ Phases (`execute!(phase, F, X, B; asynchronous = true)`):
 * `"solve"`: `X = A⁻¹ B` with the partitioned-inverse solve, for a vector (or
   an `n × 1` matrix) on the solver's backend; `X === B` is allowed. The solve
   is the one of `DirectSolver`'s `solve_alg = "algo1"` (one driver, T36).
+  With `ir_n_steps = k > 0` it is followed by `k` steps of plain iterative
+  refinement, as on `DirectSolver`: the residual `B - A X` of the matrix values
+  the caller passed (neither scaled by the matching nor with the replaced
+  pivots), its correction through the fused solve, added to `X`. The steps run
+  without a host synchronization (no `ir_tol` early exit); the refinement
+  workspace is allocated by the analysis, or by `setparam!(F, "ir_n_steps", k)`
+  after it.
 
 `setparam!` accepts `"user_perm"`, `"reordering_alg"`, `"nd_nseps"`,
 `"nd_seed"`, `"pivot_epsilon"` (the pivot epsilon of both modes, default
@@ -2623,7 +2630,8 @@ and for `"S"` `"pivot_sign"` (the sign a replaced pivot takes, per row of the
 matrix) and `"matching_alg"` (`"algo1"`–`"algo6"`; the values are scaled
 before the fused factorization and the solve undoes the scaling), all read by
 the next analysis (the fused plans capture `pivot_epsilon` and `pivot_sign`
-there), and `"deterministic_mode"`, read at every solve. The factorization is
+there), and `"deterministic_mode"` and `"ir_n_steps"` (default `0`: no
+refinement), read at every solve. The factorization is
 deterministic under either mode: the children of a parent add in
 `child_list` order and the panels of an in-kernel wide front apply in order,
 with plain adds, so factor and `D` are bitwise reproducible for the same
@@ -2638,7 +2646,9 @@ returns `"info"`, `"inertia"` (`(npos, nneg)`; `"SPD"`: the positive pivots and
 pivot counted with the sign it was given), `"npivots"` (`"S"`: the number of
 replaced pivots, valid when `"info"` is `0`), the analysis data
 `"perm_reorder_row"`, `"perm_reorder_col"`, `"perm_row"`, `"perm_col"`,
-`"lu_nnz"`, `"flops"`, `"nsuperpanels"` of the inner solver, with a matching
+`"lu_nnz"`, `"flops"`, `"nsuperpanels"` of the inner solver, `"ir_n_steps"` (the
+refinement steps of the last solve, the configured value before the first
+solve, as on `DirectSolver`), with a matching
 `"perm_matching"`, `"scale_row"` and `"scale_col"`,
 `"memory_estimates"` (the inner solver's, plus after the analysis the fused
 plans' device buffers: slot 13 the private contribution blocks of the fused
@@ -2653,7 +2663,7 @@ other backend without inter-workgroup forward progress (Metal), complex
 element types, the structures `"HPD"`, `"H"` and `"G"`, a uniform batch
 (`nbatch > 1`), `nrhs > 1`, a transposed solve (`solve_mode ≠ 0`), the solve
 sub-phases (`"solve_fwd_perm"` … `"solve_refinement"`, the Schur phases),
-Schur mode, `"SPD"` with `matching_alg ≠ "default"`, `ir_n_steps > 0`,
+Schur mode, `"SPD"` with `matching_alg ≠ "default"`, `ir_mode = "fgmres"`, `ir_tol > 0`,
 a `factor_precision` other than the working precision, `"S"` with
 `pivot_type ≠ 'N'` or `pivot_epsilon_alg ≠ "default"`, `"pivot_sign"` on
 `"SPD"`, a matrix without a front of width ≤ 256 for the fused
@@ -2760,7 +2770,7 @@ function _check_fused_options(F::FusedSolver{T}) where {T}
     F.ldl || o.matching_alg == SDS.MATCHING_NONE ||
         unsupported("structure \"SPD\" with matching_alg = \"$(convert(String, o.matching_alg))\"")
     o.schur_mode == 0 || unsupported("schur_mode = 1")
-    o.ir_n_steps == 0 || unsupported("ir_n_steps = $(o.ir_n_steps) (iterative refinement)")
+    _check_fused_refinement(o)
     o.factor_precision === nothing || o.factor_precision === real(T) ||
         unsupported("factor_precision = $(o.factor_precision) for $T input")
     o.ubatch_size == 0 || o.ubatch_size == 1 || unsupported("ubatch_size = $(o.ubatch_size)")
@@ -2770,6 +2780,19 @@ function _check_fused_options(F::FusedSolver{T}) where {T}
     F.ldl && o.pivot_epsilon_alg != SDS.PIVOT_EPSILON_DEFAULT &&
         unsupported("structure \"S\" with pivot_epsilon_alg = \"$(convert(String, o.pivot_epsilon_alg))\"")
     o.user_schur_indices === nothing || unsupported("user_schur_indices")
+    return nothing
+end
+
+# the refinement the fused solve runs: plain refinement (`ir_mode = "ir"`) for `ir_n_steps` steps without the
+# early exit of `ir_tol > 0`, which reads the residual norms on the host at every step (a host synchronization
+# inside the solve phase); FGMRES-IR is not offered. Checked at every analysis and every solve
+function _check_fused_refinement(o)
+    o.ir_mode == SDS.IR_PLAIN ||
+        throw(SDS.NotSupportedError("FusedSolver: ir_mode = \"$(convert(String, o.ir_mode))\" is not supported " *
+                                    "(the fused solve refines with plain iterative refinement); use DirectSolver"))
+    iszero(o.ir_tol) ||
+        throw(SDS.NotSupportedError("FusedSolver: ir_tol = $(o.ir_tol) is not supported (the early exit " *
+                                    "synchronizes with the host at every step); use DirectSolver"))
     return nothing
 end
 
@@ -2817,6 +2840,10 @@ function _fused_symbolic!(F::FusedSolver{T}) where {T}
     # the solve plan (the one of solve_alg = "algo1"): the inverses and one merged dependency-counter
     # sweep over the whole tree
     fs = fused_solve_plan(s; workgroup = t.solve_workgroup, graph = _graph_solve_ok(F))
+    # the refinement workspace (residual map, residual, copy of the right-hand side) when the solve refines; the
+    # stock solve above has allocated it then, `_refinement!` only returns it
+    s.options.ir_n_steps > 0 && SDS._refinement!(s, 1)
+    s.ir_steps = -1                               # "ir_n_steps": the configured value until the first solve
     F.nzval = SDS._factor_values(s)
     F.fp = fp
     F.fs = fs
@@ -2897,16 +2924,32 @@ function _fused_solve!(F::FusedSolver, X, B)
     o = F.inner.options
     o.solve_mode == 0 ||
         throw(SDS.NotSupportedError("FusedSolver: solve_mode = $(o.solve_mode) (transposed solve) is not supported"))
-    o.ir_n_steps == 0 ||
-        throw(SDS.NotSupportedError("FusedSolver: ir_n_steps = $(o.ir_n_steps) (iterative refinement) is not supported"))
     x = _fused_rhs(F, X, "X")
     b = _fused_rhs(F, B, "B")
+    s = F.inner
     det = o.deterministic_mode == 1               # read at every solve, as DirectSolver does
     F.fs.graph = _graph_solve_ok(F)               # the tuning may change between solves
     # the solve driver of solve_alg = "algo1" (T36), with the matching's permutations and scalings (no extra
     # launch: they are applied inside the two permutation kernels)
-    pin, sin, pout, sout = SDS.solve_io(F.inner.symbolic, SDS._solve_scaling(F.inner), false)
-    fused_solve!(F.fs, F.inner, x, b, det; pin, scale_in = sin, pout, scale_out = sout)
+    pin, sin, pout, sout = SDS.solve_io(s.symbolic, SDS._solve_scaling(s), false)
+    if o.ir_n_steps == 0
+        fused_solve!(F.fs, s, x, b, det; pin, scale_in = sin, pout, scale_out = sout)
+        s.ir_steps = 0
+        return F
+    end
+    # iterative refinement (the stock driver of `_solve_phase!`, `refine!` with `fused`): the residual
+    # b - A x of the caller's values (unscaled, without the replaced pivots), its correction through the
+    # matching's permutations and scalings and the fused sweeps (the solve graph when captured), added to x.
+    # `ir_tol = 0`: no host synchronization; the workspace is the analysis's (or `setparam!`'s)
+    _check_fused_refinement(o)
+    W = SDS._refinement!(s, 1)
+    bs = b
+    if Base.mightalias(x, b)                      # the solve overwrites b: keep a copy for the residual
+        SDS.copy_rhs!(W.Bc, b; nrhs = 1)
+        bs = W.Bc
+    end
+    fused_solve!(F.fs, s, x, b, det; pin, scale_in = sin, pout, scale_out = sout)
+    SDS._refine_phase!(s, W, s.workspace, x, bs, false, false, false, det, false, F.fs)
     return F
 end
 
@@ -2975,6 +3018,9 @@ function SDS.setparam!(F::FusedSolver, name::AbstractString, value)
         return nothing
     end
     SDS.setparam!(F.inner, name, value)
+    # a refining solve after the analysis: the refinement workspace now, outside the solve phase
+    name == "ir_n_steps" && F.inner.options.ir_n_steps > 0 && F.stage >= SDS.STAGE_ANALYZED &&
+        SDS._refinement!(F.inner, 1)
     return nothing
 end
 
@@ -2992,6 +3038,7 @@ function SDS.getparam(F::FusedSolver{T, INT}, name::AbstractString) where {T, IN
         return (INT(count(>(zero(T)), d)), INT(count(<(zero(T)), d)))
     end
     name == "memory_estimates" && return _fused_memory_estimates(F)
+    name == "ir_n_steps" && return SDS.getparam(F.inner, name)   # the steps of the last solve, as DirectSolver
     name in FUSED_FORWARDED && return SDS.getparam(F.inner, name)
     spec.status === :output || spec.status === :solver ||
         return SDS.getparam(F.inner.options, name)
