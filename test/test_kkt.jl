@@ -436,6 +436,38 @@ end
         @test rs.r2 <= weak_pivot_tol(T)
     end
 
+    # #194: ir_n_steps on every pipeline the backend runs. kkt_slack_matrix with δ = 0 under algo5 meets zero pivots,
+    # replaced by ±pivot_epsilon (the default), which costs the unrefined solve its accuracy; refinement against the
+    # caller's values restores it, on the fused pipeline as on the stock one, and both agree
+    @testset ":ldl, matching = algo5, pivot replacement, ir_n_steps: $T" for T in eltypes_among((Float32, Float64))
+        Random.seed!(666)
+        A = kkt_slack_matrix(T, 200, 100, 0.0)
+        n = size(A, 1)
+        args, _ = kkt_input(backend, A)
+        b = rand(T, n)
+        bd = to_device(backend, b)
+        xs = Dict{Any, Vector{T}}()
+        for fused in (SDS.forward_progress(backend) ? (false, true) : (false,)), k in (nothing, 0, 2)
+            K = KKTSolver(args...; factorization = :ldl, matching = "algo5", fused, ir_n_steps = k)
+            @test SDS.pipeline(K) === (fused ? :fused : :stock)
+            @test getparam(K, "info") == 0
+            @test getparam(K, "npivots") > 0
+            x = to_device(backend, zeros(T, n))
+            solve!(K, x, bd)
+            @test getparam(K, "ir_n_steps") == something(k, 0)
+            xs[(fused, k)] = to_host(x)
+            r = relres(A, xs[(fused, k)], b)
+            something(k, 0) == 0 ? (@test r > tol(T)) : (@test r <= tol(T))
+            rs = kkt_solves(backend, K, A)                              # in place and with two vectors
+            something(k, 0) == 0 || @test rs.r1 <= tol(T) && rs.r2 <= tol(T) && rs.b_kept
+        end
+        xr = xs[(false, 2)]
+        if SDS.forward_progress(backend)
+            @test norm(xs[(true, 2)] - xr) / norm(xr) <= tol(T)
+        end
+        @test_throws SDS.InvalidValueError KKTSolver(args...; factorization = :ldl, ir_n_steps = -1)
+    end
+
     @testset "reordering = \"algo3\": $T" for T in eltypes_among((Float32, Float64))
         A = laplacian2d(T, 20, 20)
         n = size(A, 1)

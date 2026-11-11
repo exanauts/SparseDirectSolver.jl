@@ -43,12 +43,17 @@ infinite pivot always fails the factorization (`info ≠ 0`), where the stock
 kernel replaces a NaN pivot and accepts an infinite one. Matching and the
 pivot pairs are decided from the values of the analysis: when the solver is
 built before the matrix holds its first values, as an interior-point method
-builds it, pass `deferred_analysis = true`.
+builds it, pass `deferred_analysis = true`. `ir_n_steps = k` follows every
+`solve!` with `k` steps of plain iterative refinement on either pipeline, the
+residual taken with the caller's matrix values (unscaled, without the
+replaced pivots), which recovers the accuracy that pivot replacement costs;
+the steps run without a host synchronization.
 
 ```julia
 sgn = vcat(ones(Int8, n_primal), fill(Int8(-1), n_dual))   # the sign a replaced pivot takes
 S = KKTSolver(Kd, 'L'; factorization = :ldl, matching = "algo5", pivot_epsilon = 1e-10,
-              pivot_sign = sgn, deferred_analysis = true)   # options checked, nothing analyzed yet
+              pivot_sign = sgn, ir_n_steps = 1,             # one refinement step per solve
+              deferred_analysis = true)                     # options checked, nothing analyzed yet
 Kd.nzVal .= first_values
 factorize!(S)                                  # analysis (matching, pairs) and first factorization
 Kd.nzVal .= new_values

@@ -77,6 +77,14 @@ whatever MadNLP's binding exposes of them:
   values present then (the counterpart of the cuDSS binding's deferred
   analysis), the later ones refactorize.
 
+`ir_n_steps` (default `nothing`, no refinement) follows every solve with that
+many steps of iterative refinement inside the solver, on both pipelines, the
+residual taken with the KKT values MadNLP passed (not the scaled ones of a
+matching, not the replaced pivots); it is the counterpart of cuDSS's
+`ir_n_steps`. MadNLP refines the solution of its KKT system itself, so it is
+off by default; one step recovers most of the accuracy that static pivot
+replacement costs.
+
 Without matching, with `pivoting = :bk` the 2×2 pivot pairs of the `"S"`
 analysis are chosen from the values present in the KKT matrix at the analysis
 (see [Pivot pairs](@ref) under Parameters); with `:none` the pairs are off,

@@ -347,6 +347,86 @@ end
         backend_name(backend) == "CUDA" && @test !(G.gfact in (nothing, false))
     end
 
+    # #194: iterative refinement on the fused solve (ir_n_steps, read at every solve) with matching and pivot
+    # replacement. kkt_slack_matrix with δ = 0 under algo5 meets zero pivots, replaced by ±ε (the default ε), which
+    # leaves the unrefined solve inaccurate; the residual of each step is the one of the caller's values (neither
+    # scaled nor with the replaced pivots), so one step restores the accuracy. In place (X === B: the copy of B for the
+    # residual) equal to out of place under deterministic_mode = 1; against a stock DirectSolver with the same
+    # analysis options and refinement (the same ordering); the graph replay of the corrections (CUDA) equal to the
+    # eager solve; the allocation budget of a refining cycle
+    @testset "\"S\", ir_n_steps with matching and pivot replacement: $T" for T in eltypes_among((Float32, Float64))
+        Random.seed!(666)
+        A = kkt_slack_matrix(T, 200, 100, 0.0)
+        n = size(A, 1)
+        Ad = fused_matrix(backend, A)
+        F = FusedSolver(Ad, "S", 'L')
+        for (name, value) in (("matching_alg", "algo5"), ("deterministic_mode", 1))
+            setparam!(F, name, value)
+        end
+        analyze!(F)
+        factorize!(F)
+        @test getparam(F, "info") == 0
+        @test getparam(F, "npivots") > 0
+        @test getparam(F, "ir_n_steps") == 0
+        b = rand(T, n)
+        bd = to_device(backend, b)
+        xd = similar(bd)
+        res = zeros(real(T), 3)
+        xk = Vector{Vector{T}}(undef, 3)
+        for k in 0:2
+            setparam!(F, "ir_n_steps", k)
+            @test F.inner.refinement !== nothing || k == 0             # the workspace exists before the solve
+            solve!(F, xd, bd; asynchronous = false)
+            @test getparam(F, "ir_n_steps") == k                       # the steps of the last solve
+            xk[k + 1] = to_host(xd)
+            res[k + 1] = relres(A, xk[k + 1], b)
+        end
+        @test to_host(bd) == b                                         # B is not touched
+        @test res[1] > tol(T)                                          # the replaced pivots cost accuracy
+        @test res[2] <= tol(T) && res[2] < res[1] / 10
+        @test res[3] <= tol(T)
+        xb = copy(bd)
+        solve!(F, xb, xb; asynchronous = false)                        # X === B: B kept for the residual
+        @test to_host(xb) == xk[3]
+        # the stock pipeline with the same options and the same refinement
+        D = DirectSolver(Ad, "S", 'L')
+        SDS.Fused._apply_tuning!(D, F.tuning)
+        for (name, value) in (("pivot_type", 'N'), ("matching_alg", "algo5"), ("ir_n_steps", 2))
+            setparam!(D, name, value)
+        end
+        analyze!(D)
+        factorize!(D)
+        @test getparam(D, "perm_reorder_row") == getparam(F, "perm_reorder_row")
+        @test getparam(D, "npivots") == getparam(F, "npivots")
+        xs = to_host(D \ bd)
+        @test relres(A, xs, b) <= tol(T)
+        @test norm(xk[3] - xs) / norm(xs) <= tol(T)
+        # a refactorization with new values keeps refining
+        A2 = (Dg = Diagonal(T.(1 .+ rand(n))); sparse(Dg * A * Dg))
+        copyto!(Ad.nzVal, fused_values(A2))
+        refactorize!(F)
+        @test getparam(F, "info") == 0
+        solve!(F, xd, bd; asynchronous = false)
+        @test relres(A2, to_host(xd), b) <= tol(T)
+        bytes = fused_cycle_allocated(F, xd, bd)
+        @test bytes <= fused_cycle_alloc_budget(backend)
+        # the solve graph replays the corrections too: bitwise equal to the eager solve (deterministic_mode = 1)
+        G = FusedSolver(Ad, "S", 'L'; tuning = SDS.Fused.SDSTuning(; graph_max_n = typemax(Int)))
+        for (name, value) in (("matching_alg", "algo5"), ("deterministic_mode", 1), ("ir_n_steps", 2))
+            setparam!(G, name, value)
+        end
+        analyze!(G)
+        factorize!(G)
+        x2 = to_host(xd)
+        same = 0
+        for _ in 1:3
+            solve!(G, xb, bd; asynchronous = false)
+            same += to_host(xb) == x2
+        end
+        @test same == 3
+        backend_name(backend) == "CUDA" && @test !(G.gsolve in (nothing, false))
+    end
+
     @testset "restrictions raise NotSupportedError: $T" for T in eltypes_among((Float32, Float64))
         Random.seed!(666)
         A = laplacian2d(T, 12, 12)
@@ -363,7 +443,7 @@ end
         F = FusedSolver(Ad, "SPD", 'L')
         # every parameter outside the five of the analysis
         for (name, value) in (("schur_mode", 1), ("user_schur_indices", [i > n - 3 ? 1 : 0 for i in 1:n]),
-                              ("matching_alg", "algo5"), ("ir_n_steps", 2),
+                              ("matching_alg", "algo5"), ("ir_tol", 1.0e-10), ("ir_mode", "fgmres"),
                               ("solve_mode", 1), ("pivot_type", 'B'), ("pivot_threshold", 0.1),
                               ("ubatch_size", 2), ("factor_precision", Float32), ("solve_alg", "algo1"),
                               ("info", 0))
@@ -400,7 +480,20 @@ end
         F.inner.options.solve_mode = 1
         @test_throws NotSupportedError solve!(F, x, b)
         F.inner.options.solve_mode = 0
-        for (field, value) in ((:ir_n_steps, 2), (:schur_mode, 1),
+        # refinement (#194): plain steps on either structure; the early exit (ir_tol, a host synchronization per step)
+        # and FGMRES-IR, set behind the back after the analysis, are refused at the solve
+        setparam!(F, "ir_n_steps", 2)
+        solve!(F, x, b; asynchronous = false)
+        @test getparam(F, "ir_n_steps") == 2
+        @test relres(A, to_host(x), to_host(b)) <= tol(T)
+        F.inner.options.ir_tol = 1.0e-10
+        @test_throws NotSupportedError solve!(F, x, b)
+        F.inner.options.ir_tol = 0.0
+        F.inner.options.ir_mode = SDS.IR_FGMRES
+        @test_throws NotSupportedError solve!(F, x, b)
+        F.inner.options.ir_mode = SDS.IR_PLAIN
+        setparam!(F, "ir_n_steps", 0)
+        for (field, value) in ((:ir_tol, 1.0e-10), (:ir_mode, SDS.IR_FGMRES), (:schur_mode, 1),
                                (:matching_alg, SDS.MATCHING_MAX_DIAG_PRODUCT), (:factor_precision, T == Float64 ? Float32 : Float64))
             G = FusedSolver(Ad, "SPD", 'L')
             setfield!(G.inner.options, field, value)
