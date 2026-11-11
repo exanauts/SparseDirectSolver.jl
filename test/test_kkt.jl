@@ -96,6 +96,13 @@ end
                 @test rs.r1 <= tol(T)
                 @test rs.r2 <= tol(T)
             end
+            # spare capacity in rowval/nzval beyond nnz (a valid SparseMatrixCSC) cannot be read in place
+            M = tril(A)
+            push!(M.rowval, 1)
+            push!(M.nzval, one(T))
+            @test nnz(M) < length(nonzeros(M))
+            @test_throws SDS.InvalidValueError KKTSolver(M, 'L')
+            @test_throws SDS.InvalidValueError KKTSolver(M, 'L'; factorization = :ldl, deferred_analysis = true)
         end
     end
 end
@@ -296,6 +303,25 @@ end
         rs = kkt_solves(backend, K, A2)
         @test rs.r1 <= tol(T)
         @test rs.r2 <= tol(T)
+    end
+
+    # matching jobs 1–4 have no scaling and give no 2×2 pairs: with pivoting = :none the analysis skips the
+    # value-based pair detection as without matching; "algo5" keeps the pairs of its cycles
+    @testset ":ldl, :none, matching = $matching, pivot_pairs: $T" for T in eltypes_among((Float32, Float64)),
+                                                                     matching in ("algo1", "algo5")
+        m = 30 * 30
+        A = grid_kkt_matrix(T, 30, 30, 1.0)
+        args, _ = kkt_input(backend, A)
+        K = KKTSolver(args...; factorization = :ldl, matching)
+        @test SDS.pipeline(K) === :stock
+        @test getparam(K, "pivot_pairs") == (matching == "algo1" ? "none" : "default")
+        @test getparam(K, "info") == 0
+        @test SDS.inertia(K) == (m, 0, m)
+        rs = kkt_solves(backend, K, A)
+        @test rs.r1 <= tol(T)
+        @test rs.r2 <= tol(T)
+        # :bk keeps the default pair detection with every job
+        @test getparam(KKTSolver(args...; factorization = :ldl, pivoting = :bk, matching), "pivot_pairs") == "default"
     end
 
     # deferred analysis (#193): built on an all-zero nzval (no KKT values yet, as MadNLP builds its linear solver), the

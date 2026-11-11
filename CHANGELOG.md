@@ -29,7 +29,10 @@ whose Report blocks hold the details and the measurements.
   leaves the analysis to the first `factorize!` on the values present then,
   and an `L D Lᵀ` with matching, `pivot_epsilon` or `pivot_sign` runs on the
   stock pipeline, which replaces small pivots (`fused = true` refuses them
-  instead of dropping them; #193).
+  instead of dropping them; #193). A `SparseMatrixCSC` is read in place, as
+  `csr_of_transpose` reads it: one with spare capacity in `rowval`/`nzval`
+  raises `InvalidValueError`. With `"algo1"`–`"algo4"` and no pivoting the
+  analysis looks for no 2×2 pivot pairs, as without matching.
 - `SDSTuning` and `default_tuning` are exported from the top module.
 - `matching_alg = "none"` is accepted as the cuDSS 1.0 spelling of matching
   off.
