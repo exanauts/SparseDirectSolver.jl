@@ -250,7 +250,7 @@ end
         x0[j] = 0
         b = A * x0                                    # consistent right-hand side
         x = to_host(F \ to_device(backend, b))
-        @test relres(A, x, b) <= 1.0e-6
+        @test relres(A, x, b) <= tol(T)
     end
 
     # #194: every kernel site replaces pivots. grid_kkt_matrix 40×40 with δ = 1 has no pivot of modulus in
