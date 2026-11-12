@@ -106,7 +106,9 @@ nothing falls back silently ([Parameters](parameters.md)).
 * **AMDGPU**: tested in CI on every pull request, timed far less than CUDA.
 * **oneAPI**: tested in CI on Aurora (Intel Data Center GPU Max 1550). Every
   oneMKL call synchronizes the host, and the LAPACK steps (`potrf`, `getrf`)
-  run on the KernelAbstractions kernels, which are slow on wide fronts.
+  run on the KernelAbstractions kernels, which are slow on wide fronts:
+  roughly 4× slower than on an H200 overall, much more on large fronts (see
+  the Performance page).
 * **Metal**: `Float32` only, tested by hand on an M4 Max, no CI. No fused
   pipeline and no `"algo1"`.
 

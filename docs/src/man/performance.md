@@ -44,54 +44,30 @@ julia --project=bench/report bench/compare_report.jl
 
 ## Intel Data Center GPU Max 1550 (Aurora)
 
-The same comparison with SparseDirectSolver.jl on one tile of an Intel Data
-Center GPU Max 1550 (Aurora, ALCF; oneAPI backend). cuDSS runs on NVIDIA
-GPUs only, so the cuDSS times are the H200 ones from the comparison above:
-**the ratios compare two devices**, SparseDirectSolver.jl on the Max 1550
-against cuDSS on the H200. The matrices are the same (134 pairs, every
-row of the cuDSS run), except that the pglib case14/118/1354 KKT dumps were
-regenerated on Aurora with `bench/dump_madnlp_kkt.jl`.
+On one tile of an Intel Data Center GPU Max 1550 (Aurora, ALCF; oneAPI
+backend) SparseDirectSolver.jl is roughly **4× slower than on the H200** in
+the refactorization and **2.4× slower** in the solve (geometric means over
+the 134 matrix and feature pairs of the comparison above; 3.2× and 2.2× on
+the MadNLP KKT dumps). The gap grows with the fronts: about 3× on the small
+KKT systems, 6× for the 78k-bus condensed KKT system and 40–75× on
+`lap3d_40` and `GHS_psdef/apache2`, where the dense panel work dominates.
+Most of that is the single-workgroup KernelAbstractions `potrf` the oneAPI
+backend uses for the diagonal blocks; routing it to oneMKL cut the
+refactorization of apache2 from 38.7 s to 1.39 s and of `lap3d_40` from
+8.27 s to 0.54 s in a test
+([#196](https://github.com/exanauts/SparseDirectSolver.jl/issues/196)).
+The fused pipeline holds up best (apache2 factorized in 4.4 s against 38.7 s
+for the stock handle API). Against cuDSS on the H200 this makes the Max 1550
+about 20× slower over all matrices and 8× on the KKT refactorizations
+(Cholesky); cuDSS itself does not run on Intel GPUs.
 
-![SparseDirectSolver.jl on the Max 1550 vs cuDSS on the H200, time ratio per feature](../assets/comparison_aurora.png)
-
-Measured on 2026-11-10 with SparseDirectSolver.jl 0.3.0 (commit e95a302 plus
-the oneAPI support of the benchmark scripts), oneAPI.jl 2.10.0, Julia 1.13.3
-and the Aurora LTS driver stack (Level Zero 1.3.33578), with
-`ONEAPI_SYNC_EACH_SUBMISSION=1`, the workaround the Aurora CI job runs with
-(it synchronizes after every submission). SDS on the Max 1550 / cuDSS on
-the H200 (geometric means):
-
-| feature | matrices | factorization | refactorization | solve | KKT refactorization | KKT solve |
-| --- | --- | --- | --- | --- | --- | --- |
-| Cholesky, Float64 | 15 | 17.33× | 21.28× | 9.28× | 8.08× | 6.26× |
-| Cholesky, 16 right-hand sides | 15 | 17.32× | 21.07× | 7.69× | 7.99× | 6.19× |
-| LDLᵀ, static pivoting | 24 | 18.48× | 22.55× | 10.41× | 19.81× | 8.88× |
-| LDLᵀ + 2 refinement steps, K2 dumps | 9 | 14.26× | 18.59× | 20.56× | 18.59× | 20.56× |
-| Uniform batch of 8, Cholesky | 10 | 3.80× | 5.77× | 5.63× | 5.77× | 5.63× |
-| LU, unsymmetric | 2 | 48.04× | 52.93× | 11.40× | – | – |
-| Schur complement, Cholesky | 10 | 7.29× | 9.06× | 7.02× | 9.06× | 7.02× |
-| LDLᵀ + matching (algo5), K2 dumps | 9 | 12.39× | 14.57× | 7.52× | 14.57× | 7.52× |
-| Cholesky, fused pipeline (the `SDSSolver` path) | 15 | 7.17× | 8.37× | 7.10× | 4.19× | 3.79× |
-| Cholesky, `solve_alg = "algo1"` | 15 | 18.24× | 21.48× | 6.19× | 8.25× | 3.46× |
-| LDLᵀ without pivoting, `solve_alg = "algo1"`, condensed dumps | 10 | 11.29× | 13.89× | 3.76× | 13.89× | 3.76× |
-
-Against SparseDirectSolver.jl itself on the H200, the Max 1550 is 4.1×
-slower in the refactorization and 2.4× in the solve (geometric means over
-the 134 pairs; 3.2× and 2.2× on the KKT dumps). The gap grows with the
-fronts: 6.4× for the Cholesky refactorization of the 78k-bus condensed KKT
-system, 39× on `lap3d_40` and 76× on `GHS_psdef/apache2`, where the dense
-panel work dominates. The fused pipeline, with its own dense kernels, factorizes
-apache2 in 4.4 s against 38.7 s for the stock handle API, and is the closest
-to cuDSS on the KKT systems (4.19× for the refactorization). The
-per-matrix numbers are in
-[`bench/comparison/comparison_aurora.md`](https://github.com/exanauts/SparseDirectSolver.jl/blob/main/bench/comparison/comparison_aurora.md);
-the run is a chain of PBS jobs (`bench/aurora/compare.pbs`, described in
-[`bench/README.md`](https://github.com/exanauts/SparseDirectSolver.jl/blob/main/bench/README.md)):
-
-```bash
-nohup bench/aurora/compare_all.sh <project> > bench/comparison/aurora_logs/compare_all.log 2>&1 &
-julia --project=bench/report bench/compare_report.jl --sds=sds_aurora --tag=aurora
-```
+Measured on 2026-11-10 with SparseDirectSolver.jl 0.3.0, oneAPI.jl 2.10.0
+and the Aurora LTS driver stack, with `ONEAPI_SYNC_EACH_SUBMISSION=1` (the
+workaround the Aurora CI job runs with). The per-matrix numbers and the plot
+are in
+[`bench/comparison/comparison_aurora.md`](https://github.com/exanauts/SparseDirectSolver.jl/blob/main/bench/comparison/comparison_aurora.md),
+the PBS jobs that produce them in `bench/aurora/` (see
+[`bench/README.md`](https://github.com/exanauts/SparseDirectSolver.jl/blob/main/bench/README.md)).
 
 ## Fused pipeline
 
