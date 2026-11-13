@@ -25,7 +25,9 @@ and factorizes the values `A` holds; with `deferred_analysis = true` it stops
 after the parameters, and the first [`factorize!`](@ref) runs the analysis on
 the values present then. The values alias the caller's `nzval`: write the new
 values into it and call [`factorize!`](@ref), then [`solve!`](@ref) and
-[`inertia`](@ref SparseDirectSolver.inertia).
+[`inertia`](@ref SparseDirectSolver.inertia). [`analyze!`](@ref analyze!(::KKTSolver))
+redoes the analysis on the values present then and factorizes; the later
+[`factorize!`](@ref) calls use the new analysis.
 
 ```julia
 K = KKTSolver(A, 'L'; factorization = :ldl)   # analysis and first factorization
@@ -52,7 +54,9 @@ Keywords:
   `"algo1"`–`"algo4"` and `pivoting = :none` the stock analysis looks for no
   pairs, as without matching), on both pipelines. It reads the values present
   at the analysis, so pass
-  `deferred_analysis = true` when the matrix holds no real values yet.
+  `deferred_analysis = true` when the matrix holds no real values yet, and call
+  [`analyze!`](@ref analyze!(::KKTSolver)) to redo the analysis on the current
+  values when the matching of an earlier matrix has gone stale.
 * `fused::Union{Nothing, Bool} = nothing`: `true` runs the fused pipeline (a
   [`FusedSolver`](@ref)), `false` the stock one (a [`DirectSolver`](@ref)).
   `nothing` selects the fused pipeline where it runs: `pivoting = :none` on a
@@ -229,7 +233,7 @@ pipeline(K::KKTSolver) = K.inner isa Fused.FusedSolver ? :fused : :stock
     factorize!(K::KKTSolver) -> K
 
 Factorize the values the matrix of `K` holds now, with the analysis of the
-constructor. With `deferred_analysis = true` the first call runs the analysis
+constructor or of the last [`analyze!`](@ref analyze!(::KKTSolver)). With `deferred_analysis = true` the first call runs the analysis
 (ordering, matching, 2×2 pivot pairs) on these values and then the first
 factorization; the later calls refactorize with that analysis. The call returns
 when the factorization is complete. A failed factorization does not throw:
@@ -241,6 +245,33 @@ function factorize!(K::KKTSolver)
     refactorize!(K.inner, K.x, K.b; asynchronous = false)
     K.info = Int(getparam(K.inner, "info"))
     return K
+end
+
+"""
+    analyze!(K::KKTSolver) -> K
+
+Redo the analysis on the values the matrix of `K` holds now and factorize
+them: the ordering (unless `user_perm` is set), the matching and its scaling,
+the 2×2 pivot pairs and the symbolic factorization, then the factorization, on
+either pipeline. The parameters of the constructor (`pivot_epsilon`,
+`pivot_sign`, `ir_n_steps`, `tuning`, …) are kept, and the later
+[`factorize!`](@ref) calls refactorize with the new analysis. Before the first
+factorization (`deferred_analysis = true`) it is the first factorization.
+
+An interior-point method calls it when the analysis of an earlier matrix has
+gone stale, for instance when iterative refinement rejects a solve: the
+matching and the pivot pairs are decided from the values of the analysis
+(MadNLP's `sds_reanalyze_on_improve`, the counterpart of cuDSS's
+`analysis` phase on a factorized solver). The call returns when the
+factorization is complete; as with [`factorize!`](@ref) a failed factorization
+does not throw, `getparam(K, "info")` is then the column of the first failed
+pivot, and `0` otherwise. If the analysis throws, the next
+[`factorize!`](@ref) runs the analysis again.
+"""
+function analyze!(K::KKTSolver)
+    K.factorized = false          # as before the first factorization until the analysis completes
+    K.info = 0
+    return _first_factorization!(K)
 end
 
 """

@@ -12,8 +12,11 @@ first factorization (with `deferred_analysis = true` the first `factorize!`
 does, on the values present then); afterwards the loop calls only
 [`factorize!`](@ref factorize!(::KKTSolver)),
 [`solve!`](@ref solve!(::KKTSolver, ::AbstractVector, ::AbstractVector)) and
-[`inertia`](@ref SparseDirectSolver.inertia). MadNLP's SparseDirectSolver
-binding is built on it ([MadNLP](@ref)).
+[`inertia`](@ref SparseDirectSolver.inertia). When the analysis of an earlier
+matrix has gone stale (the matching and the 2×2 pivot pairs are decided from
+the values of the analysis), [`analyze!`](@ref analyze!(::KKTSolver)) redoes it
+on the current values and factorizes; the later `factorize!` calls use the new
+analysis. MadNLP's SparseDirectSolver binding is built on it ([MadNLP](@ref)).
 
 ```julia
 using SparseDirectSolver, SparseArrays, CUDA, CUDA.CUSPARSE
@@ -58,6 +61,7 @@ Kd.nzVal .= first_values
 factorize!(S)                                  # analysis (matching, pairs) and first factorization
 Kd.nzVal .= new_values
 factorize!(S)                                  # refactorization
+analyze!(S)                                    # analysis redone on new_values, then factorization
 ```
 
 The performance settings are an
@@ -71,6 +75,7 @@ of its own): write `SparseDirectSolver.inertia` or
 ```@docs
 KKTSolver
 factorize!(::KKTSolver)
+analyze!(::KKTSolver)
 solve!(::KKTSolver, ::AbstractVector, ::AbstractVector)
 SparseDirectSolver.inertia
 SparseDirectSolver.pipeline

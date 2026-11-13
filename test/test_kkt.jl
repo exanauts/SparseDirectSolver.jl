@@ -360,6 +360,97 @@ end
         @test rs.r2 <= tol(T)
     end
 
+    # analyze!(K): the analysis redone on the current values (as MadNLP's binding does when its refinement rejects a
+    # solve). Built on grid_kkt_matrix with δ = 100, whose dual diagonal dominates, the matching of "algo6" is (close
+    # to) the identity and gives no pairs; with δ = 0 that analysis meets zero dual pivots, replaced (npivots > 0).
+    # After analyze! the matching pairs each dual with a primal, as a solver built on the δ = 0 values does: the same
+    # inertia, no replaced pivot, the same accuracy; the next iteration refactorizes with the new analysis
+    @testset "analyze!, matching = algo6, :$pivoting, fused = $fused: $T" for T in eltypes_among((Float32, Float64)),
+                                                                             (pivoting, fused) in (
+                                                                                 (:none, nothing), (:none, false),
+                                                                                 (:bk, nothing))
+        m = 30 * 30
+        A1 = grid_kkt_matrix(T, 30, 30, 100.0)
+        A2 = grid_kkt_matrix(T, 30, 30, 0.0)
+        kw = (; factorization = :ldl, pivoting, fused, matching = "algo6", pivot_sign = vcat(fill(1, m), fill(-1, m)),
+              pivot_epsilon = T == Float64 ? 1.0e-10 : 1.0e-5)
+        args, nzval = kkt_input(backend, A1)
+        K = KKTSolver(args...; kw...)
+        @test SDS.pipeline(K) === (pivoting === :none && fused === nothing ? kkt_default_pipeline(backend) : :stock)
+        kkt_set_values!(nzval, A2)
+        factorize!(K)
+        @test getparam(K, "info") == 0
+        @test getparam(K, "npivots") > 0                                # the stale matching
+        @test analyze!(K) === K
+        @test getparam(K, "info") == 0
+        @test SDS.pipeline(K) === (pivoting === :none && fused === nothing ? kkt_default_pipeline(backend) : :stock)
+        # the parameters of the constructor are kept
+        @test getparam(K, "matching_alg") == "algo6"
+        @test getparam(K, "pivot_epsilon") == kw.pivot_epsilon
+        # a solver built on the same values
+        args2, _ = kkt_input(backend, A2)
+        F = KKTSolver(args2...; kw...)
+        @test getparam(F, "info") == 0
+        @test SDS.inertia(K) == SDS.inertia(F) == (m, 0, m)
+        @test getparam(K, "npivots") == getparam(F, "npivots") == 0
+        rs, rf = kkt_solves(backend, K, A2), kkt_solves(backend, F, A2)
+        @test rs.r1 <= weak_pivot_tol(T)
+        @test rs.r2 <= weak_pivot_tol(T)
+        @test rs.r1 <= 2 * max(rf.r1, rf.r2, tol(T))
+        # the next iteration refactorizes with the new analysis
+        A3 = grid_kkt_matrix(T, 30, 30, 1.0e-8)
+        kkt_set_values!(nzval, A3)
+        @test factorize!(K) === K
+        @test getparam(K, "info") == 0
+        @test SDS.inertia(K) == (m, 0, m)
+        @test getparam(K, "npivots") == 0
+        rs = kkt_solves(backend, K, A3)
+        @test rs.r1 <= weak_pivot_tol(T)
+        @test rs.r2 <= weak_pivot_tol(T)
+    end
+
+    # analyze!(K) before the first factorization (deferred_analysis = true) is the first factorization, and repeated
+    # re-analyses keep ir_n_steps (the refinement workspace of each new analysis) and the Cholesky of a default solver
+    @testset "analyze!, deferred_analysis, repeated, $label: $T" for T in eltypes_among((Float32, Float64)),
+                                                                     (label, kw) in (
+                                                                         ("cholesky", (;)),
+                                                                         ("ldl, matching = algo5, ir_n_steps = 2",
+                                                                          (; factorization = :ldl, matching = "algo5",
+                                                                           ir_n_steps = 2)),
+                                                                         ("ldl, matching = algo5, ir_n_steps = 2, stock",
+                                                                          (; factorization = :ldl, matching = "algo5",
+                                                                           ir_n_steps = 2, fused = false)))
+        ldl = get(kw, :factorization, :cholesky) === :ldl
+        A = ldl ? kkt_slack_matrix(T, 200, 100, 0.0) : laplacian2d(T, 20, 20)
+        # the inertia of the factorization of a solver built on the values (replaced pivots count with their sign)
+        args0, _ = kkt_input(backend, A)
+        inertia = SDS.inertia(KKTSolver(args0...; kw...))
+        args, nzval = kkt_input(backend, A)
+        fill!(nzval, zero(T))
+        K = KKTSolver(args...; deferred_analysis = true, kw...)
+        @test SDS.pipeline(K) === (get(kw, :fused, nothing) === false ? :stock : kkt_default_pipeline(backend))
+        @test_throws SDS.FactorizationError SDS.inertia(K)
+        kkt_set_values!(nzval, A)
+        @test analyze!(K) === K                                         # the first factorization
+        @test getparam(K, "info") == 0
+        @test occursin("info = 0", sprint(show, K))
+        for _ in 1:3
+            analyze!(K)
+            @test getparam(K, "info") == 0
+            @test SDS.inertia(K) == inertia
+            rs = kkt_solves(backend, K, A)
+            @test getparam(K, "ir_n_steps") == get(kw, :ir_n_steps, 0)
+            @test rs.r1 <= tol(T)
+            @test rs.r2 <= tol(T)
+            @test rs.b_kept
+        end
+        factorize!(K)
+        @test getparam(K, "info") == 0
+        rs = kkt_solves(backend, K, A)
+        @test rs.r1 <= tol(T)
+        @test rs.r2 <= tol(T)
+    end
+
     # a failed factorization does not throw: "info" is nonzero; the regularized
     # matrix then factors
     @testset ":cholesky on an indefinite matrix: $T" for T in eltypes_among((Float32, Float64))
