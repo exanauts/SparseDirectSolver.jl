@@ -4,14 +4,13 @@ Snapshot of `main` at 163bf96, after T36 (PR #187, `solve_alg = "algo1"` on
 `DirectSolver`), the chore PR #189 (#188: the CPU allocation checks run in a
 child process, the KernelAbstractions cap is lifted), the bench PR #190 (the
 cuDSS 1.0 comparison) and the release PR #191 (version 0.3.0, `CHANGELOG.md`,
-the docs page "What to expect"). Registration in General is the owner's next
-step: `JuliaRegistrator register` on the merge commit of #191 with the
-CHANGELOG section as release notes; General waits 3 days for a new package;
-TagBot then tags `v0.3.0` and `Documentation.yml` deploys `stable`. Version 0.4.0
-is prepared on branch `maint/kkt-solver-0.4.0`: `KKTSolver` (`src/kkt.jl`), the
-public front end for interior-point KKT systems, replaces the MadNLP extension,
-whose binding moves to MadNLP 0.12 (`MadCoreGPU.SDSSolver`); it is merged and
-registered after General PR 175567 (0.3.0) merges (`CHANGELOG.md` [0.4.0]). It replaces the snapshot
+the docs page "What to expect"). Version 0.3.0 is registered in General (PR
+175567, merged 2026-11-13) and tagged `v0.3.0`. Version 0.4.0 is on `main`
+(PRs #192 and #195): `KKTSolver` (`src/kkt.jl`), the public front end for
+interior-point KKT systems, replaces the MadNLP extension, whose binding moves
+to MadNLP 0.12 (`MadCoreGPU.SDSSolver`); branch `maint/release-0.4.0` prepares
+the release (`analyze!(::KKTSolver)`, README and docs), which is registered
+next (`CHANGELOG.md` [0.4.0]). It replaces the snapshot
 of 2026-11-04; the history is in git (`git log -- STATE.md`). Sources: the Report blocks of `TASKS.md`, the open and
 closed issues, `PLAN.md` §5, `bench/comparison/comparison.md`,
 `bench/ARCH-TUNING.md`, `PERFORMANCE.md` and `bench/PERFORMANCE-2026-10.md`.
@@ -24,7 +23,7 @@ closed issues, `PLAN.md` §5, `bench/comparison/comparison.md`,
 | M1 symbolic | T05–T07, T22 | done; ND-tree export/import and the ordering cache are T30 (parked, #117); `max_lu_nnz` is accepted and stored but not checked (#159 warns once) |
 | M2 numeric kernels | T09–T11, T23, T31, T32 | done; regime A/B/C Cholesky, LDLᵀ, LU; CUDA, AMDGPU, oneAPI and Metal extensions; `:ka` fallbacks allocation-free and ahead of `:generic` under `:auto` (T32). Deviations from PLAN §5: no vendor batched calls in regime B, no vendor `sytrf`/`getrf` in regime C; the unblocked `ka_potrf!`/`ka_trsm!` on wide fronts are #183 |
 | M3 SPD/HPD v0.1 | T12, T13 | done; the 1.5× cuDSS target is not met through the handle API (§2) |
-| M4 LDLᵀ MadNLP-ready | T14, T15, External | T14/T15 done; the MadNLP extension `SDSSolver` (`ext/SparseDirectSolverMadNLPExt.jl`, tested since #176) is the in-repository stand-in for the External MadNLPGPU task (#28, open) |
+| M4 LDLᵀ MadNLP-ready | T14, T15, External | T14/T15 done; the MadNLP extension `SDSSolver` of 0.3 (`ext/SparseDirectSolverMadNLPExt.jl`) is removed in 0.4.0: the binding is MadNLP's own (`MadCoreGPU.SDSSolver` on `KKTSolver`, madsuite-org/MadNLP.jl#728) for the External MadNLPGPU task (#28, open) |
 | M5 solve extras | T16, T18 | done |
 | M6 uniform batch | T17 | done |
 | M7 general LU | T19 | done; BLAS-3 for `L₂₁`/`U₁₂` is #75, unscheduled |
@@ -225,8 +224,9 @@ assume:
   `prototypes-2026-10`.
 - Releases: `CHANGELOG.md` (Keep a Changelog; TagBot cannot read it, so the
   register comment carries the section as `Release notes:`). Version 0.3.0 is
-  the first release; 0.2.0 and earlier were internal, never tagged. 0.4.0
-  (`KKTSolver`, MadNLP binding moved to MadNLP) waits on branch
-  `maint/kkt-solver-0.4.0` for General PR 175567 (0.3.0) to merge.
+  the first release (registered through General PR 175567 and tagged `v0.3.0`
+  on 2026-11-13); 0.2.0 and earlier were internal, never tagged. 0.4.0
+  (`KKTSolver`, MadNLP binding moved to MadNLP) is on `main` and is
+  registered next.
 - Documentation: `https://exanauts.github.io/SparseDirectSolver.jl/dev/`,
   built on the `cuda` runner for every push to `main`.

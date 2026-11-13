@@ -35,10 +35,24 @@ result = madnlp(nlp; linear_solver = SDSSolver)
 
 The installation of the entry points (some are not registered yet) and the
 choice of the KKT system and preset are described in MadNLP's documentation.
-MadNLP's default preset on a GPU asks for an `L D Lᵀ` without pivoting
-(`sds_factorization = :ldl`, `sds_pivoting = :none`) with a pivot bound
-(`sds_pivot_epsilon`), the counterpart of cuDSS's pivot epsilon in the same
-preset. The binding reads MadNLP's lower-triangular KKT matrix
+MadNLP's presets set the `sds_*` options (table below):
+
+* `ShiftedPreset` (the default on a GPU) and `CondensedPreset`: a static
+  `L D Lᵀ` without pivoting (`sds_factorization = :ldl`,
+  `sds_pivoting = :none`, so the fused pipeline where the backend runs it)
+  after the scaled matching `sds_matching = "algo6"`, with the analysis
+  deferred to the first KKT matrix (`sds_deferred_analysis = true`), pivots
+  below MadNLP's preset perturbation replaced (`sds_pivot_epsilon`, `1e-10` in
+  `Float64`; the counterpart of cuDSS's pivot epsilon in the same presets) and
+  two steps of iterative refinement inside the solver (`sds_ir = 2`).
+* `AugmentedPreset`: an `L D Lᵀ` with Bunch–Kaufman pivoting
+  (`sds_factorization = :ldl`, `sds_pivoting = :bk`, stock pipeline) after
+  `sds_matching = "algo6"`, with deferred analysis and
+  `sds_reanalyze_on_improve = true`, as the cuDSS binding under the same
+  preset: when MadNLP's refinement rejects a solve, the analysis is redone on
+  the current KKT values.
+
+The binding reads MadNLP's lower-triangular KKT matrix
 (a device CSC matrix) as the CSR of its upper triangle, exactly as the cuDSS
 binding does; `Float32` and `Float64` are supported (`Float32` only on Metal
 and on Intel GPUs without `Float64`).
@@ -46,7 +60,9 @@ and on Intel GPUs without `Float64`).
 ## Options
 
 The `sds_*` options belong to MadNLP and are documented there; they are passed
-as keywords of `madnlp`. Each one maps to a keyword of [`KKTSolver`](@ref):
+as keywords of `madnlp`. Each one maps to a keyword of [`KKTSolver`](@ref),
+except `sds_reanalyze_on_improve`, which decides when the binding calls a
+method:
 
 | MadNLP option | `KKTSolver` keyword | meaning |
 | :--- | :--- | :--- |
@@ -54,6 +70,10 @@ as keywords of `madnlp`. Each one maps to a keyword of [`KKTSolver`](@ref):
 | `sds_pivoting` | `pivoting` | `:ldl` only: `:none` (pivot order of the analysis) or `:bk` (in-front Bunch–Kaufman, stock pipeline, [Symmetric indefinite systems](@ref)) |
 | `sds_pivot_threshold` | `pivot_threshold` | `:bk` only: the `pivot_threshold` of the acceptance test (`nothing` keeps the package default `0.01`; cuDSS's default is `1.0`) |
 | `sds_pivot_epsilon` | `pivot_epsilon` | the `pivot_epsilon` below which a pivot is replaced, on both pipelines (`nothing`: `1e-13` for `Float64`, `1e-5` for `Float32`) |
+| `sds_matching` | `matching` | `:ldl` only: the `"matching_alg"` of the analysis, on both pipelines (default `"none"`; `"algo1"`–`"algo6"`). With `"algo5"` and `"algo6"` the matrix is scaled and the 2×2 pivot pairs of the ordering come from the cycles of the scaled symmetric matching, with `pivoting = :none` as with `:bk`. It is computed from the values of the analysis |
+| `sds_deferred_analysis` | `deferred_analysis` | `false` (default): the solver is analyzed and factorized when it is built; `true`: the constructor checks the options but neither analyzes nor factorizes, and the first `factorize!` analyzes the values present then (the counterpart of the cuDSS binding's deferred analysis); the later ones refactorize |
+| `sds_ir` | `ir_n_steps` | the steps of iterative refinement inside the solver after every solve (default `0`), the counterpart of `cudss_ir`; see below |
+| `sds_reanalyze_on_improve` | [`analyze!`](@ref analyze!(::KKTSolver)) | a `Bool` (default `false`): when MadNLP's refinement rejects a solve, the binding calls `analyze!(K)` once per factorization (ordering, matching, pivot pairs and symbolic analysis redone on the current KKT values, then the factorization) and retries the solve; the counterpart of `cudss_reanalyze_on_improve` |
 | `sds_reordering` | `reordering` | the `reordering_alg` of the analysis: `"algo4"` nested dissection (METIS), `"algo3"` AMD, `"default"` the cost-model choice ([Parameters](parameters.md)) |
 | `sds_user_perm` | `user_perm` | a 1-based permutation of length `n` that replaces the reordering, for instance a cached one; every solver instance otherwise recomputes its ordering |
 | `sds_tuning` | `tuning` | an [`SDSTuning`](@ref SparseDirectSolver.Fused.SDSTuning) bundle of performance settings; `nothing` selects the measured per-architecture defaults of [`default_tuning`](@ref SparseDirectSolver.Fused.default_tuning) |
@@ -64,18 +84,13 @@ the `pivot_sign` of `KKTSolver` (`1` for the primal and `-1` for the dual
 rows): the sign a replaced pivot takes in an `L D Lᵀ` without pivoting, on
 both pipelines.
 
-`KKTSolver` has two keywords for the setting of MadNLP's cuDSS preset (an
-`L D Lᵀ` with matching and pivot epsilon, analyzed on the first KKT values),
-whatever MadNLP's binding exposes of them:
-
-* `matching` (default `"none"`): the `"matching_alg"` of the analysis, `:ldl`
-  only, on both pipelines. With `"algo5"` and `"algo6"` the matrix is scaled
-  and the 2×2 pivot pairs of the ordering come from the cycles of the scaled
-  symmetric matching, with `pivoting = :none` as with `:bk`.
-* `deferred_analysis` (default `false`): the constructor checks the options
-  but neither analyzes nor factorizes; the first `factorize!` analyzes the
-  values present then (the counterpart of the cuDSS binding's deferred
-  analysis), the later ones refactorize.
+The matching and the 2×2 pivot pairs are decided from the values of the
+analysis, so the presets defer it to the first KKT matrix
+(`sds_deferred_analysis`), and over the iterations of the interior-point method
+that analysis goes stale. Two remedies follow the cuDSS binding: refinement
+inside the solver (`sds_ir`, below), and a new analysis on the current values
+when MadNLP's own refinement rejects a solve (`sds_reanalyze_on_improve`,
+[`analyze!`](@ref analyze!(::KKTSolver))).
 
 `ir_n_steps` (default `nothing`, no refinement) follows every solve with that
 many steps of iterative refinement inside the solver, on both pipelines, the
