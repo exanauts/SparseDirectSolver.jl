@@ -80,10 +80,6 @@ using Pkg
 Pkg.add("SparseDirectSolver")
 ```
 
-Until the registration pull request in the General registry is merged, install
-from the repository with
-`Pkg.add(url = "https://github.com/exanauts/SparseDirectSolver.jl")`.
-
 The CUDA extension is triggered by CUDA.jl's packages CUDACore, cuBLAS,
 cuSOLVER and cuSPARSE, which `using CUDA` loads (`CuSparseMatrixCSR` and
 `CuSparseMatrixCSC` inputs, cuBLAS and cuSOLVER dense kernels); loading

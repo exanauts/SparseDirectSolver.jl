@@ -159,13 +159,6 @@ using Pkg
 Pkg.add("SparseDirectSolver")
 ```
 
-Until the registration pull request in General is merged, install from the
-repository:
-
-```julia
-Pkg.add(url = "https://github.com/exanauts/SparseDirectSolver.jl")
-```
-
 The backend extensions load with the backend package (table above). CUDA.jl's
 split packages CUDACore, cuBLAS, cuSOLVER and cuSPARSE trigger the CUDA
 extension; `using CUDA` loads them all. CUDA.jl 6.5 exports an `update!` of
