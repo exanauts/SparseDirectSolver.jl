@@ -31,6 +31,13 @@ whose Report blocks hold the details and the measurements.
   with spare capacity in `rowval`/`nzval` raises `InvalidValueError`. With
   `"algo1"`–`"algo4"` and no pivoting the analysis looks for no 2×2 pivot
   pairs, as without matching.
+- `analyze!(K::KKTSolver)` redoes the analysis (ordering unless `user_perm` is
+  set, matching and scaling, 2×2 pivot pairs, symbolic) on the values the
+  matrix holds now and factorizes, on either pipeline, keeping the parameters
+  of the constructor; the later `factorize!` calls refactorize with the new
+  analysis. It is the counterpart of cuDSS's `"analysis"` phase on a
+  factorized solver, which MadNLP's binding calls when its refinement rejects a
+  solve (`sds_reanalyze_on_improve`, as `cudss_reanalyze_on_improve`).
 - The fused `L D Lᵀ` (`FusedSolver` with structure `"S"`, and so `KKTSolver`'s
   default `:ldl` pipeline on CUDA, AMDGPU and oneAPI) replaces small pivots as
   the stock no-pivot `L D Lᵀ` does (`pivot_epsilon`, `pivot_sign`; counted in
