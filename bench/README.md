@@ -76,7 +76,7 @@ MatrixDepot downloads and the KKT dumps):
 
 ```bash
 # the whole run: a chain of debug-scaling jobs, one at a time, resumable
-nohup bench/aurora/compare_all.sh <project> > bench/comparison/aurora_logs/compare_all.log 2>&1 &
+nohup bench/aurora/compare_all.sh <project> > compare_all.log 2>&1 &
 # one job; a value with commas is single-quoted inside the double quotes (qsub -v splits on commas)
 qsub -A <project> -v "SDS_JULIA_DEPOT=$JULIA_DEPOT_PATH,SDS_COMPARE_ARGS='--features=cholesky_f64,ldlt'" bench/aurora/compare.pbs
 # = julia --project=bench bench/compare.jl --solver=sds --backend=oneapi --out=sds_aurora --features=cholesky_f64,ldlt
