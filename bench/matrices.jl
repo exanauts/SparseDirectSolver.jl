@@ -111,21 +111,26 @@ _full(A) = SparseMatrixCSC{Float64,Int}(sparse(A))
 """
     suitesparse_matrices(; names = [s.name for s in SUITESPARSE]) -> Vector{BenchMatrix}
 
-Downloads (first use) and loads the named SuiteSparse matrices through
-MatrixDepot.jl. Returns an empty vector with a warning when MatrixDepot is not
-installed; a matrix that fails to load is skipped with a warning.
+Loads the named SuiteSparse matrices: from a local copy
+`bench/data/suitesparse/<group>/<name>/<name>.mtx` (the layout of the
+collection's MatrixMarket tarballs) when there is one, otherwise through
+MatrixDepot.jl, which downloads on first use. The local copy is for machines
+whose network the collection's file server refuses (Aurora at ALCF) and for
+compute nodes without network. A matrix that is neither local nor loadable
+through MatrixDepot (or MatrixDepot is not installed) is skipped with a warning.
 """
 function suitesparse_matrices(; names = [s.name for s in SUITESPARSE])
-    if !HAS_MATRIXDEPOT
-        @warn "MatrixDepot.jl is not installed in this environment; skipping SuiteSparse matrices"
-        return BenchMatrix[]
+    local_mtx(name) = joinpath(DATA_DIR, "suitesparse", name, basename(name) * ".mtx")
+    if !HAS_MATRIXDEPOT && !all(isfile ∘ local_mtx, names)
+        @warn "MatrixDepot.jl is not installed in this environment; skipping SuiteSparse matrices without a copy in $(joinpath(DATA_DIR, "suitesparse"))"
     end
     get!(ENV, "DATADEPS_ALWAYS_ACCEPT", "true")
     out = BenchMatrix[]
     for name in names
         entry = findfirst(s -> s.name == name, SUITESPARSE)
+        isfile(local_mtx(name)) || HAS_MATRIXDEPOT || continue
         try
-            A = _full(MatrixDepot.mdopen(name).A)
+            A = isfile(local_mtx(name)) ? _full(read_mtx(local_mtx(name))) : _full(MatrixDepot.mdopen(name).A)
             structures = if entry === nothing
                 issymmetric(A) ? ["S"] : ["G"]
             else

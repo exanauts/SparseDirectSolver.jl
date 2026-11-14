@@ -42,6 +42,33 @@ julia --project=bench bench/compare.jl --solver=sds --backend=cuda
 julia --project=bench/report bench/compare_report.jl
 ```
 
+## Intel Data Center GPU Max 1550 (Aurora)
+
+On one tile of an Intel Data Center GPU Max 1550 (Aurora, ALCF; oneAPI
+backend) SparseDirectSolver.jl is roughly **4× slower than on the H200** in
+the refactorization and **2.4× slower** in the solve (geometric means over
+the 134 matrix and feature pairs of the comparison above; 3.2× and 2.2× on
+the MadNLP KKT dumps). The gap grows with the fronts: about 3× on the small
+KKT systems, 6× for the 78k-bus condensed KKT system and 40–75× on
+`lap3d_40` and `GHS_psdef/apache2`, where the dense panel work dominates.
+Most of that is the single-workgroup KernelAbstractions `potrf` the oneAPI
+backend uses for the diagonal blocks; routing it to oneMKL cut the
+refactorization of apache2 from 38.7 s to 1.39 s and of `lap3d_40` from
+8.27 s to 0.54 s in a test
+([#196](https://github.com/exanauts/SparseDirectSolver.jl/issues/196)).
+The fused pipeline holds up best (apache2 factorized in 4.4 s against 38.7 s
+for the stock handle API). Against cuDSS on the H200 this makes the Max 1550
+about 20× slower over all matrices and 8× on the KKT refactorizations
+(Cholesky); cuDSS itself does not run on Intel GPUs.
+
+Measured on 2026-11-10 with SparseDirectSolver.jl 0.3.0, oneAPI.jl 2.10.0
+and the Aurora LTS driver stack, with `ONEAPI_SYNC_EACH_SUBMISSION=1` (the
+workaround the Aurora CI job runs with). The per-matrix numbers and the plot
+are in
+[`bench/comparison/comparison_aurora.md`](https://github.com/exanauts/SparseDirectSolver.jl/blob/main/bench/comparison/comparison_aurora.md),
+the PBS jobs that produce them in `bench/aurora/` (see
+[`bench/README.md`](https://github.com/exanauts/SparseDirectSolver.jl/blob/main/bench/README.md)).
+
 ## Fused pipeline
 
 [`FusedSolver`](@ref SparseDirectSolver.FusedSolver) is the fast path of the
