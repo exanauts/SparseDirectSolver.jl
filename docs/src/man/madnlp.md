@@ -67,8 +67,8 @@ method:
 | MadNLP option | `KKTSolver` keyword | meaning |
 | :--- | :--- | :--- |
 | `sds_factorization` | `factorization` | `:cholesky` (`"SPD"`) or `:ldl` (`"S"`, inertia from the signs of `D`) |
-| `sds_pivoting` | `pivoting` | `:ldl` only: `:none` (pivot order of the analysis) or `:bk` (in-front Bunch–Kaufman, stock pipeline, [Symmetric indefinite systems](@ref)) |
-| `sds_pivot_threshold` | `pivot_threshold` | `:bk` only: the `pivot_threshold` of the acceptance test (`nothing` keeps the package default `0.01`; cuDSS's default is `1.0`) |
+| `sds_pivoting` | `pivoting` | `:ldl` only: `:none` (pivot order of the analysis), `:diagonal` (1×1 diagonal pivoting inside the fronts, `pivot_type = 'D'`, on both pipelines; the fused one pivots in the regime-A subtrees and the fronts of width ≤ 64 only) or `:bk` (in-front Bunch–Kaufman, stock pipeline, [Symmetric indefinite systems](@ref)) |
+| `sds_pivot_threshold` | `pivot_threshold` | `:diagonal` and `:bk` only: the `pivot_threshold` of the acceptance test (`nothing` keeps the package default `0.01`; cuDSS's default is `1.0`) |
 | `sds_pivot_epsilon` | `pivot_epsilon` | the `pivot_epsilon` below which a pivot is replaced, on both pipelines (`nothing`: `1e-13` for `Float64`, `1e-5` for `Float32`) |
 | `sds_matching` | `matching` | `:ldl` only: the `"matching_alg"` of the analysis, on both pipelines (default `"none"`; `"algo1"`–`"algo6"`). With `"algo5"` and `"algo6"` the matrix is scaled and the 2×2 pivot pairs of the ordering come from the cycles of the scaled symmetric matching, with `pivoting = :none` as with `:bk`. It is computed from the values of the analysis |
 | `sds_deferred_analysis` | `deferred_analysis` | `false` (default): the solver is analyzed and factorized when it is built; `true`: the constructor checks the options but neither analyzes nor factorizes, and the first `factorize!` analyzes the values present then (the counterpart of the cuDSS binding's deferred analysis); the later ones refactorize |
@@ -81,8 +81,8 @@ method:
 
 The sizes of the primal and dual blocks, which MadNLP's KKT system knows, give
 the `pivot_sign` of `KKTSolver` (`1` for the primal and `-1` for the dual
-rows): the sign a replaced pivot takes in an `L D Lᵀ` without pivoting, on
-both pipelines.
+rows): the sign a replaced pivot takes in an `L D Lᵀ` without pivoting or
+with diagonal pivoting, on both pipelines.
 
 The matching and the 2×2 pivot pairs are decided from the values of the
 analysis, so the presets defer it to the first KKT matrix
@@ -109,17 +109,21 @@ two.
 
 Without matching, with `pivoting = :bk` the 2×2 pivot pairs of the `"S"`
 analysis are chosen from the values present in the KKT matrix at the analysis
-(see [Pivot pairs](@ref) under Parameters); with `:none` the pairs are off,
-since a factorization without pivoting never consumes them.
+(see [Pivot pairs](@ref) under Parameters); with `:none` and `:diagonal` the
+pairs are off, since a factorization without pivoting or with 1×1 pivots only
+never consumes them.
 
 ## What runs underneath
 
 [`KKTSolver`](@ref) chooses the pipeline;
 [`SparseDirectSolver.pipeline`](@ref) tells which one runs.
 
-* **Fused pipeline** (the default for `pivoting = :none` on CUDA, AMDGPU and
-  oneAPI, the backends with forward progress between workgroups, with or
-  without matching, `pivot_epsilon` and `pivot_sign`): the inner
+* **Fused pipeline** (the default for `pivoting = :none` and `:diagonal` on
+  CUDA, AMDGPU and oneAPI, the backends with forward progress between
+  workgroups, with or without matching, `pivot_epsilon` and `pivot_sign`;
+  `:diagonal` pivots in the regime-A subtrees and the fronts of width ≤ 64
+  with the pivot rule of the stock pipeline and factors the wider fronts
+  without interchanges): the inner
   solver is a [`FusedSolver`](@ref SparseDirectSolver.FusedSolver) over the
   symbolic analysis of a regular [`DirectSolver`](@ref). One
   dependency-counter kernel per refactorization covers the whole elimination
@@ -138,8 +142,8 @@ since a factorization without pivoting never consumes them.
   the same options, and `fused = true` raises `NotSupportedError`): the inner
   solver is a [`DirectSolver`](@ref) with the same tuning, driven through
   `refactorize!` and `solve!` at the level-batched speed of
-  [`execute!`](@ref). Cholesky, `L D Lᵀ` without pivoting and Bunch–Kaufman
-  `L D Lᵀ` all run on it.
+  [`execute!`](@ref). Cholesky, `L D Lᵀ` without pivoting, with diagonal
+  pivoting (in every front) and Bunch–Kaufman `L D Lᵀ` all run on it.
 
 The inertia after each factorization comes from
 [`SparseDirectSolver.inertia`](@ref): for `:ldl` from the signs of `D` (2×2
