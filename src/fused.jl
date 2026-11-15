@@ -1548,15 +1548,23 @@ end
                                     @Const(child_list), @Const(relind_ptr), @Const(relind), base,
                                     @Const(wbase), wupd, wpdone2, wtrsml, wcbl, scap, epsc, d, @Const(super_ptr),
                                     @Const(pl_c), @Const(pl_q0), @Const(pl_q1), wcell, @Const(wcbase),
-                                    @Const(psg), pivot_kind, ::Val{LDL}, ::Val{WG}) where {LDL, WG}
+                                    @Const(psg), pivot_kind, gpiv, @Const(psgo), @Const(gperm), @Const(aux),
+                                    prm::SDS._LDLTDevice, ::Val{LDL}, ::Val{WG}, ::Val{PIV}) where {LDL, WG, PIV}
     @uniform TT = eltype(factor)
     @uniform RT = real(eltype(factor))
+    @uniform IT = eltype(front_ptr)
     li = @index(Local, Linear)
     G = Int(base) + @index(Group, Linear)
     sh = @localmem TT (NL64,)
     st = @localmem Int32 (1,)
     piv = @localmem RT (1,)
     fscr = @localmem Int32 (1,)   # spin-backoff scratch (integer: no Float64 in kernels)
+    # PIV (pivot_type = 'D' on the narrow panels, issue #167): the control words, pivot slots and reduction lanes
+    # of the stock pivot search (src/numeric/ldlt.jl); one entry each without pivoting
+    ctl = @localmem IT (PIV ? SDS._LT_CTL : 1,)
+    lpv = @localmem TT (PIV ? SDS._LT_NPV : 1,)
+    red = @localmem RT (PIV ? 3 * WG : 1,)
+    redi = @localmem IT (PIV ? 2 * WG : 1,)
     @inbounds begin
         r = role[G]
         if r == ROLE_EA
@@ -1656,39 +1664,86 @@ end
             @synchronize
             w = Int(front_ncols[v])
             g0 = Int(super_ptr[v]) - 1
-            for j in 1:w
-                if LDL
-                    _front_ldl_update!(sh, st, piv, j, v, li, front_ncols, d, g0, epsc, psg, pivot_kind, Val(WG))
-                else
-                    SDS._front_chol_update!(sh, st, j, v, li, front_ncols, epsc, Val(64), Val(WG))
-                end
-                @synchronize
-                if LDL
-                    _front_ldl_scale!(sh, st, piv, j, v, li, front_ncols, Val(WG))
-                else
-                    SDS._front_chol_scale!(sh, st, j, v, li, front_ncols, epsc, Val(64), Val(WG))
-                end
-                @synchronize
-            end
             f = Int(front_nrows[v])
             p0 = Int(front_ptr[v])
-            for q in (li - 1):WG:(w * w - 1)
-                j = q ÷ w + 1
-                i = q - (j - 1) * w + 1
-                i >= j && (factor[p0 + (j - 1) * f + i - 1] = (LDL && i == j) ? one(TT) :
-                                                              sh[SDS._packed(i, j, 64)])
-            end
             m = f - w
-            if st[1] == Int32(0) && m <= SYRK_IN
-                for i in (w + li):WG:f
-                    for kk in 1:w
-                        x = factor[p0 + (kk - 1) * f + i - 1]
-                        for j in 1:(kk - 1)
-                            lij = factor[p0 + (j - 1) * f + i - 1]
-                            x -= LDL ? lij * (real(sh[SDS._packed(j, j, 64)]) * sh[SDS._packed(kk, j, 64)]) :
-                                       lij * sh[SDS._packed(kk, j, 64)]
+            if PIV
+                # pivot_type = 'D' (issue #167): the pivot steps of the stock regime-B kernel (`front_ldlt_kernel!`)
+                # on the same split front, F₁₁ in `sh` (packed 64 × 64, the stock `_SplitFront` with W = 64) and
+                # the rows below it in the panel: the cooperative search with the stock threshold test against the
+                # whole remaining column (rows k:f, so the rows below are updated right-looking at every step and
+                # no TRSM role follows), the interchanges inside F₁₁ with the earlier panel columns (LAPACK
+                # style), D, `piv` and `pivot_kind` written by `_lt_select!`, the stock perturbation with
+                # `pivot_sign`. Only 1×1 pivots: `prm` has the diagonal search, the Bunch–Kaufman pass 2 is not
+                # instantiated here. After `_lt_finalize!` the diagonal slots of `sh` hold D (the CB update reads
+                # them) and the stored panel is unit lower in factor order
+                if li == 1
+                    ctl[SDS._ST_NODE] = v % IT
+                    ctl[SDS._ST_F] = front_nrows[v] % IT
+                    ctl[SDS._ST_W] = front_ncols[v] % IT
+                    ctl[SDS._ST_LF] = front_ptr[v] % IT
+                    SDS._lt_reset!(ctl, super_ptr[v])
+                end
+                @synchronize
+                SDS._lt_init_piv!(gpiv, ctl, li, Val(WG))
+                SDS._lt_pass1!((sh, factor), ctl, red, redi, li, Val(WG), prm, Val(64))
+                @synchronize
+                for _ in 1:w
+                    SDS._lt_stage1!(red, redi, ctl, li, Val(WG), Val(1))
+                    @synchronize
+                    li == 1 && SDS._lt_decide1!((sh, factor), ctl, lpv, red, redi, d, pivot_kind, gpiv, psgo, gperm,
+                                                aux, prm, Val(WG), Val(64), Val(true))
+                    @synchronize
+                    if ctl[SDS._LT_PHASE] == 3              # the fallback scan (uniform over the workgroup)
+                        SDS._lt_pass3!((sh, factor), ctl, red, redi, li, Val(WG), aux, prm, Val(64))
+                        @synchronize
+                        SDS._lt_stage1!(red, redi, ctl, li, Val(WG), Val(3))
+                        @synchronize
+                        li == 1 && SDS._lt_decide3!((sh, factor), ctl, lpv, red, redi, d, pivot_kind, gpiv, psgo,
+                                                    gperm, aux, prm, Val(WG), Val(64), Val(true))
+                        @synchronize
+                    end
+                    SDS._lt_swap!((sh, factor), ctl, lpv, gpiv, li, Val(WG), Val(64), Val(true))
+                    @synchronize
+                    SDS._lt_update!((sh, factor), ctl, lpv, red, redi, li, Val(WG), Val(true), prm, Val(64), Val(true))
+                    @synchronize
+                end
+                SDS._lt_finalize!((sh, factor), ctl, d, pivot_kind, li, Val(WG), Val(64), Val(true))
+                @synchronize
+                SDS._lt_stage!(sh, factor, ctl, li, Val(64), Val(WG), false)
+                li == 1 && (st[1] = Int32(ctl[SDS._ST_STATUS]))    # the failed assembled column, as stock
+            else
+                for j in 1:w
+                    if LDL
+                        _front_ldl_update!(sh, st, piv, j, v, li, front_ncols, d, g0, epsc, psg, pivot_kind, Val(WG))
+                    else
+                        SDS._front_chol_update!(sh, st, j, v, li, front_ncols, epsc, Val(64), Val(WG))
+                    end
+                    @synchronize
+                    if LDL
+                        _front_ldl_scale!(sh, st, piv, j, v, li, front_ncols, Val(WG))
+                    else
+                        SDS._front_chol_scale!(sh, st, j, v, li, front_ncols, epsc, Val(64), Val(WG))
+                    end
+                    @synchronize
+                end
+                for q in (li - 1):WG:(w * w - 1)
+                    j = q ÷ w + 1
+                    i = q - (j - 1) * w + 1
+                    i >= j && (factor[p0 + (j - 1) * f + i - 1] = (LDL && i == j) ? one(TT) :
+                                                                  sh[SDS._packed(i, j, 64)])
+                end
+                if st[1] == Int32(0) && m <= SYRK_IN
+                    for i in (w + li):WG:f
+                        for kk in 1:w
+                            x = factor[p0 + (kk - 1) * f + i - 1]
+                            for j in 1:(kk - 1)
+                                lij = factor[p0 + (j - 1) * f + i - 1]
+                                x -= LDL ? lij * (real(sh[SDS._packed(j, j, 64)]) * sh[SDS._packed(kk, j, 64)]) :
+                                           lij * sh[SDS._packed(kk, j, 64)]
+                            end
+                            factor[p0 + (kk - 1) * f + i - 1] = x / sh[SDS._packed(kk, kk, 64)]
                         end
-                        factor[p0 + (kk - 1) * f + i - 1] = x / sh[SDS._packed(kk, kk, 64)]
                     end
                 end
             end
@@ -1714,7 +1769,18 @@ end
                 SDS.device_fence(factor)      # ALL threads (gfx9)
                 @synchronize
                 if li == 1
-                    Atomix.@atomic panel_done[v] += Int32(1)
+                    if PIV
+                        # the rows below are factored: this panel is the front's one TRSM (trsm_base = 1, no
+                        # TRSM role), and signals as the last TRSM role does (see ROLE_TRSM)
+                        left = (Atomix.@atomic trsm_left[v] += Int32(-1))
+                        if left == Int32(0) && tiles_base[v] == Int32(0)
+                            Atomix.@atomic cb_done[v] += Int32(1)
+                            pv = Int(snparent[v])
+                            pv > 0 && (Atomix.@atomic arrived[pv] += Int32(1))
+                        end
+                    else
+                        Atomix.@atomic panel_done[v] += Int32(1)
+                    end
                 end
             end
         elseif r == ROLE_TRSM
@@ -1915,6 +1981,8 @@ end
                     dj = real(sh[SDS._packed(j, j, 64)])
                     if LDL
                         gj = Int(super_ptr[v]) - 1 + c0 + j
+                        # PIV: the wide fronts are factored without interchanges (identity local order)
+                        PIV && (gpiv[gj] = gj % eltype(gpiv))
                         dj, rep = _ldl_static_pivot(dj, epsc, psg, gj)
                         if st[1] == Int32(0) && isfinite(dj) && !iszero(dj)
                             piv[1] = dj                      # d stays on the diagonal
@@ -2223,6 +2291,26 @@ function launch_subtrees_sorted!(N, S, nzval, list, lb, backend, ldl::Bool = fal
         _sorted_subtree_launch(N, S, nzval, list, Val(ldl), LBv, Val(SDS.SUBTREE_WORKGROUP), backend, epsc, psg)
     end
 end
+
+# the subtrees of a pivoted LDLᵀ plan (pivot_type = 'D', issue #167): the stock regime-A kernel
+# (`SDS.subtree_ldlt_kernel!`, the same budget classes and local-memory reserve as the no-pivot variant) on the
+# sorted list; `prm` the plan's `_LDLTDevice`, `psgo` the `pivot_sign` per original row. A regime-A subtree reads
+# nothing outside itself, so its fronts are bitwise those of the stock factorization of the same analysis
+function launch_subtrees_pivoted!(N, S, nzval, list, lb, backend, prm, psgo)
+    SDS._with_local_bytes(Int(lb)) do LBv
+        _sorted_subtree_launch_pivoted(N, S, nzval, list, LBv, Val(SDS.SUBTREE_WORKGROUP), backend, prm, psgo)
+    end
+end
+function _sorted_subtree_launch_pivoted(N::SDS.Numeric{T}, S, nzval, list, ::Val{LB}, ::Val{WG}, backend, prm,
+                                        psgo) where {T, LB, WG}
+    bm = SDS.batch_map(N; first = 1)
+    k! = SDS.subtree_ldlt_kernel!(backend, WG)
+    k!(N.factor, N.stack, N.info, N.stats, N.d, N.piv, N.pivot_kind, psgo, S.perm, N.aux, nzval, S.amap,
+       S.amap_ptr, S.amap_src, list, bm, S.subtree_ptr, S.subtree_nodes, S.super_ptr, S.front_ptr, S.front_nrows,
+       S.front_ncols, S.cb_ptr, S.local_front, S.local_cb, S.child_ptr, S.child_list, S.relind_ptr, S.relind, prm,
+       Val((LB - SDS.SUBTREE_LOCAL_RESERVE_LDLT) ÷ sizeof(T)), Val(WG); ndrange = WG * length(list) * bm.nact)
+    return nothing
+end
 function _sorted_subtree_launch(N::SDS.Numeric{T}, S, nzval, list, ::Val{LDL}, ::Val{LB}, ::Val{WG},
                                 backend, epsc::Real = 0.0, psg = nothing) where {T, LDL, LB, WG}
     bm = SDS.batch_map(N; first = 1)
@@ -2246,15 +2334,27 @@ end
 
 # ---------------------------------------------------------------------------
 # host: the topologically ordered role list + counter bases + stream-2 program
+#
+# `pivot = true` (LDL only, issue #167): 1×1 diagonal pivoting (`pivot_type = 'D'`) with the stock semantics in the
+# regime-A subtrees (the stock subtree kernel) and the narrow panels (the stock pivot steps in the PANEL roles,
+# which then factor the rows below the panel too: no TRSM role, the panel stands for the front's one TRSM); the
+# in-kernel wide fronts (wider than 64) are factored without interchanges, with the static replacement of the
+# no-pivot mode and an identity `piv`. The factor is in the stock pivoted layout (`piv`, `pivot_kind`), the
+# input of the pivot-aware fused solve (`set_pivoted!`). A 2×2 mode would add the Bunch–Kaufman pass 2 to the
+# PANEL step loop and 2×2-aware D reads to the CB updates (`_front_ldl_syrk!`, the TILE roles) and the wide
+# fronts
 function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, Bool} = nothing,
                           wides_potrf::Bool = false, merge_segments::Bool = false,
                           wgf::Int = WGF, scap::Integer = 128, ea_chunk::Integer = 16384,
-                          host_min::Integer = typemax(Int))
+                          host_min::Integer = typemax(Int), pivot::Bool = false)
     S = s.symbolic
     plan = s.numeric.plan
     backend = KA.get_backend(s.numeric.factor)
     T = eltype(s.numeric.factor)
     ldl && (T <: Real || throw(SDS.NotSupportedError("fused LDL mode: real element types only")))
+    pivot && !ldl && throw(SDS.InvalidValueError("fused plan: pivot = true needs the LDL mode"))
+    pivot && wides_potrf &&
+        throw(SDS.NotSupportedError("fused LDL plan: wides_potrf has no pivoting; set pivot = false"))
     # the tile roles keep cld(TILE*TILE, wgf) partial sums in exactly 8 registers per
     # thread; a smaller workgroup needs more than 8 and would silently drop/reuse slots
     (wgf >= 128 && wgf % 32 == 0) ||
@@ -2280,6 +2380,15 @@ function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, B
     else
         psg = KA.zeros(backend, Int8, ldl ? max(S.n, 1) : 1)   # Cholesky: never read
     end
+    # pivot = true: `pivot_sign` per original row (the stock kernels read psign[perm[piv[g]]]: the sign follows the
+    # column that is eliminated), and the parameters of the stock diagonal pivot search (`pivot_threshold`, the
+    # static `pivot_epsilon`; FusedSolver refuses the scaled epsilon). Without pivoting a one-entry placeholder and
+    # the no-pivot parameters, never read
+    RT = real(T)
+    psgo = pivot ? (ps === nothing ? KA.zeros(backend, Int8, max(S.n, 1)) : _dvec(backend, Int8.(ps))) :
+                   KA.zeros(backend, Int8, 1)
+    prm = SDS._LDLTDevice{RT, true}(pivot ? SDS._LT_PIVOT_DIAGONAL : SDS._LT_PIVOT_NONE,
+                                     RT(s.options.pivot_threshold), RT(pivot_eps), false)
     nodes = S.schedule.group_nodes
     rows_h = S.schedule.rows
     width_h = S.schedule.width
@@ -2397,9 +2506,13 @@ function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, B
     emit_split(v) = begin
         m = rows_h[v] - width_h[v]
         m > SYRK_IN || return nothing
-        for ch in 1:cld(m, wgf)
-            push!(role, ROLE_TRSM); push!(ra, Int32(v)); push!(rb, Int32(ch)); push!(rc, Int32(0))
-            trsm_left[v] += 1
+        if pivot
+            trsm_left[v] = 1                     # the pivoted panel factors the rows below itself
+        else
+            for ch in 1:cld(m, wgf)
+                push!(role, ROLE_TRSM); push!(ra, Int32(v)); push!(rb, Int32(ch)); push!(rc, Int32(0))
+                trsm_left[v] += 1
+            end
         end
         if cbp[v] > 0
             # ntl, not T: this closure assigns in function scope, and T is the element type
@@ -2562,7 +2675,10 @@ function build_fused_plan(s; ldl::Bool = false, inkernel_wides::Union{Nothing, B
             # the pivot epsilon of the narrow kernels; LDL: the static-pivot epsilon (#194)
             pivot_eps, psg,
             ldl_potrf = ldl && wides_potrf,
-            sptr_h = Array(S.super_ptr))
+            sptr_h = Array(S.super_ptr),
+            # pivot = true (issue #167): captured at plan build as pivot_epsilon (pivot_type, pivot_threshold,
+            # pivot_sign); `pivv` the kernel's compile-time switch
+            piv = pivot, pivv = Val(pivot), prm, psgo)
 end
 
 # the fused factorization of `nzval`; returns the info (one host read after the launches of
@@ -2599,7 +2715,11 @@ function refact_fused_launches!(s, nzval, fp)
     copyto!(fp.wcb, fp.wcb_b)
     fp.nwcells > 0 && fill!(fp.wcell, Int32(0))
     for k in eachindex(plan.sub_first)
-        launch_subtrees_sorted!(N, S, nzval, fp.ssub[k], plan.sub_local[k], backend, fp.ldl, fp.pivot_eps, fp.psg)
+        if fp.piv
+            launch_subtrees_pivoted!(N, S, nzval, fp.ssub[k], plan.sub_local[k], backend, fp.prm, fp.psgo)
+        else
+            launch_subtrees_sorted!(N, S, nzval, fp.ssub[k], plan.sub_local[k], backend, fp.ldl, fp.pivot_eps, fp.psg)
+        end
     end
     fill!(fp.pcb, zero(eltype(fp.pcb)))
     isempty(fp.czero) ||                               # zero + scatter A into every C-group front (panel only)
@@ -2615,7 +2735,8 @@ function refact_fused_launches!(s, nzval, fp)
                                              Int32(base), fp.wbase, fp.wupd, fp.wpd, fp.wtl, fp.wcb,
                                              fp.scap, real(eltype(N.factor))(fp.pivot_eps), N.d,
                                              S.super_ptr, fp.pl_c, fp.pl_q0, fp.pl_q1, fp.wcell,
-                                             fp.wcbase, fp.psg, N.pivot_kind, fp.ldlv, fp.wgv;
+                                             fp.wcbase, fp.psg, N.pivot_kind, N.piv, fp.psgo, S.perm, N.aux,
+                                             fp.prm, fp.ldlv, fp.wgv, fp.pivv;
                                              ndrange = fp.wgf * count)
         for v in gwides                              # host-wide fronts at the segment boundary
             if fp.ldl && fp.ldl_potrf
@@ -2669,7 +2790,7 @@ end
 # the parameters `setparam!` accepts on a FusedSolver (read by the next analysis; deterministic_mode and
 # ir_n_steps by the next solve)
 const FUSED_SETTABLE = ("user_perm", "reordering_alg", "nd_nseps", "nd_seed", "pivot_epsilon", "pivot_sign",
-                        "matching_alg", "deterministic_mode", "ir_n_steps")
+                        "pivot_type", "pivot_threshold", "matching_alg", "deterministic_mode", "ir_n_steps")
 
 # the analysis data parameters `getparam` forwards to the inner DirectSolver
 const FUSED_FORWARDED = ("perm_reorder_row", "perm_reorder_col", "perm_row", "perm_col", "lu_nnz", "flops",
@@ -2696,7 +2817,19 @@ pivoting: `pivot_type = 'N'`, a pivot `d` with `|d| < pivot_epsilon` replaced by
 `±pivot_epsilon` as in the stock no-pivot LDLᵀ, optionally with a matching;
 `pivot_pairs = "none"` without a matching or with `"algo1"`–`"algo4"`,
 `"default"` with `"algo5"`/`"algo6"`, so that the pairs of its cycles shape the
-ordering). `tuning` is an
+ordering). `"S"` also takes `pivot_type = 'D'`, 1×1 diagonal pivoting inside
+the fronts, with the pivot choice of the stock LDLᵀ ([`DirectSolver`](@ref SparseDirectSolver.DirectSolver),
+`pivot_threshold` acceptance against the whole remaining front column, the
+acceptable diagonal of largest modulus otherwise, interchanges inside the
+fully-summed block, a tiny pivot replaced by `±pivot_epsilon` with
+`pivot_sign`), in the regime-A subtrees and in the fronts of width ≤ 64; the
+fronts wider than 64 (factored in 64-column panels by the fused kernel) are
+factored **without interchanges**, with the static replacement of
+`pivot_type = 'N'`. On a matrix whose fronts are all at most 64 wide the
+pivot order and `D` are those of the stock `'D'` factorization of the same
+analysis (up to rounding); with wide fronts they differ there and in the
+fronts above them (the inertia, counted from `D`, agrees unless pivots are
+replaced). The fused solve applies the pivot order of the factor. `tuning` is an
 [`SDSTuning`](@ref SparseDirectSolver.Fused.SDSTuning), `nothing` meaning
 [`default_tuning`](@ref SparseDirectSolver.Fused.default_tuning)`(backend)`,
 resolved by [`resolve_tuning`](@ref SparseDirectSolver.Fused.resolve_tuning);
@@ -2719,7 +2852,9 @@ Phases (`execute!(phase, F, X, B; asynchronous = true)`):
   factorization does not throw. Unlike the stock kernel, which replaces a NaN
   pivot and accepts an infinite one, the fused LDLᵀ fails the factorization on
   both under any `pivot_epsilon`, so a NaN or Inf in the matrix is reported
-  rather than factored. `"S"` factors
+  rather than factored (with `pivot_type = 'D'` only in the fronts wider than
+  64: the subtrees and the narrow fronts then run the stock pivot rule, NaN
+  and Inf included). `"S"` factors
   its wide fronts in the fused kernel under either `wides` strategy (a front's
   pivots may take both signs), so the in-kernel wide-front limit applies to it
   on every part: a front with more than `1023 · 32` rows below a panel raises
@@ -2739,10 +2874,14 @@ Phases (`execute!(phase, F, X, B; asynchronous = true)`):
 `"nd_seed"`, `"pivot_epsilon"` (the pivot epsilon of both modes, default
 `1e-13` for `Float64` and `1e-5` for `Float32`; `0` replaces no `"S"` pivot),
 and for `"S"` `"pivot_sign"` (the sign a replaced pivot takes, per row of the
-matrix) and `"matching_alg"` (`"algo1"`–`"algo6"`; the values are scaled
+matrix), `"pivot_type"` (`'N'`, the default, or `'D'`), `"pivot_threshold"`
+(the acceptance threshold of `'D'`, default `0.01`) and `"matching_alg"`
+(`"algo1"`–`"algo6"`; the values are scaled
 before the fused factorization and the solve undoes the scaling), all read by
-the next analysis (the fused plans capture `pivot_epsilon` and `pivot_sign`
-there), and `"deterministic_mode"` and `"ir_n_steps"` (default `0`: no
+the next analysis (the fused plans capture `pivot_epsilon`, `pivot_sign`,
+`pivot_type` and `pivot_threshold` there; a refactorization with new values
+chooses a new pivot sequence with the same plans), and `"deterministic_mode"`
+and `"ir_n_steps"` (default `0`: no
 refinement), read at every solve. The factorization is
 deterministic under either mode: the children of a parent add in
 `child_list` order and the panels of an in-kernel wide front apply in order,
@@ -2776,9 +2915,10 @@ element types, the structures `"HPD"`, `"H"` and `"G"`, a uniform batch
 (`nbatch > 1`), `nrhs > 1`, a transposed solve (`solve_mode ≠ 0`), the solve
 sub-phases (`"solve_fwd_perm"` … `"solve_refinement"`, the Schur phases),
 Schur mode, `"SPD"` with `matching_alg ≠ "default"`, `ir_mode = "fgmres"`, `ir_tol > 0`,
-a `factor_precision` other than the working precision, `"S"` with
-`pivot_type ≠ 'N'` or `pivot_epsilon_alg ≠ "default"`, `"pivot_sign"` on
-`"SPD"`, a matrix without a front of width ≤ 256 for the fused
+a `factor_precision` other than the working precision, `"S"` with a
+`pivot_type` other than `'N'` and `'D'` (Bunch–Kaufman) or
+`pivot_epsilon_alg ≠ "default"`, `"pivot_sign"`, `"pivot_type"` and
+`"pivot_threshold"` on `"SPD"`, a matrix without a front of width ≤ 256 for the fused
 solve, and every `setparam!` name not listed above. The options of the inner
 solver are checked again at the analysis. [`DirectSolver`](@ref SparseDirectSolver.DirectSolver) remains the
 general solver.
@@ -2786,7 +2926,7 @@ general solver.
 mutable struct FusedSolver{T, INT, S <: SDS.DirectSolver{T, INT}} <: SDS.AbstractDirectSolver{T, INT}
     inner::S                 # the DirectSolver: analysis, numeric storage, solve workspace
     tuning::SDSTuning        # resolved (`wides` is :host or :merged)
-    ldl::Bool                # "S": no-pivot LDLᵀ
+    ldl::Bool                # "S": LDLᵀ (no pivoting, or 'D' in the subtrees and narrow fronts)
     nzval::Any               # the values the fused factorization reads (`_factor_values(inner)`)
     fp::Any                  # factorization plan (`build_fused_plan`)
     fs::Any                  # the fused solve (`FusedSolve`: inverses, segments, solve graph), shared
@@ -2887,13 +3027,18 @@ function _check_fused_options(F::FusedSolver{T}) where {T}
         unsupported("factor_precision = $(o.factor_precision) for $T input")
     o.ubatch_size == 0 || o.ubatch_size == 1 || unsupported("ubatch_size = $(o.ubatch_size)")
     o.solve_alg == SDS.SOLVE_DEFAULT || unsupported("solve_alg = \"$(convert(String, o.solve_alg))\"")
-    F.ldl && o.pivot_type != SDS.PIVOT_NONE &&
-        unsupported("structure \"S\" with pivot_type = '$(convert(Char, o.pivot_type))'")
+    F.ldl && !_fused_pivot_type_ok(o.pivot_type) &&
+        unsupported("structure \"S\" with pivot_type = '$(convert(Char, o.pivot_type))' (the fused LDLᵀ takes " *
+                    "'N' and 'D')")
     F.ldl && o.pivot_epsilon_alg != SDS.PIVOT_EPSILON_DEFAULT &&
         unsupported("structure \"S\" with pivot_epsilon_alg = \"$(convert(String, o.pivot_epsilon_alg))\"")
     o.user_schur_indices === nothing || unsupported("user_schur_indices")
     return nothing
 end
+
+# the pivot types of the fused LDLᵀ: none, and 1×1 diagonal pivoting (issue #167); Bunch–Kaufman ('A', 'B', 'L') is
+# the stock pipeline's
+_fused_pivot_type_ok(p) = p == SDS.PIVOT_NONE || p == SDS.PIVOT_DIAGONAL
 
 # the refinement the fused solve runs: plain refinement (`ir_mode = "ir"`) for `ir_n_steps` steps without the
 # early exit of `ir_tol > 0`, which reads the residual norms on the host at every step (a host synchronization
@@ -2954,11 +3099,14 @@ function _fused_symbolic!(F::FusedSolver{T}; strict::Bool = true) where {T}
     # `wide_host_min`: the per-front wide strategy of a merged Cholesky plan (LDL keeps every
     # wide front in-kernel, see above)
     host_min = merged && !F.ldl ? t.wide_host_min : typemax(Int)
+    # pivot_type = 'D' (issue #167): diagonal pivoting in the subtrees and narrow panels, captured by the plan
+    pivot = F.ldl && s.options.pivot_type == SDS.PIVOT_DIAGONAL
     fp = build_fused_plan(s; ldl = F.ldl, inkernel_wides = inkernel, merge_segments = merged,
-                          wides_potrf = false, wgf = t.workgroup, scap = t.spin_cap, host_min)
+                          wides_potrf = false, wgf = t.workgroup, scap = t.spin_cap, host_min, pivot)
     # the solve plan (the one of solve_alg = "algo1"): the inverses and one merged dependency-counter
-    # sweep over the whole tree
+    # sweep over the whole tree; with pivoting the sweeps apply the pivot order of the factor
     fs = fused_solve_plan(s; workgroup = t.solve_workgroup, graph = _graph_solve_ok(F))
+    set_pivoted!(fs, pivot)
     # the refinement workspace (residual map, residual, copy of the right-hand side) when the solve refines; the
     # stock solve above has allocated it then, `_refinement!` only returns it
     s.options.ir_n_steps > 0 && SDS._refinement!(s, 1)
@@ -3016,6 +3164,9 @@ function _fused_factorize!(F::FusedSolver, p::SDS.Phase)
     p == SDS.PHASE_REFACTORIZATION && F.stage < SDS.STAGE_FACTORIZED &&
         throw(SDS._phase_error(name, "needs a previous \"factorization\""))
     F.nzval = SDS._factor_values(F.inner)
+    # the solve applies the pivot order of the factor exactly when the plan pivots (a no-op after the analysis
+    # set it; the solve kernels read `piv` on the device, so a captured solve graph replays any pivot sequence)
+    set_pivoted!(F.fs, F.fp.piv)
     F.info = _fused_refactor!(F)
     F.stage = SDS.STAGE_FACTORIZED
     return F
@@ -3142,8 +3293,21 @@ function SDS.setparam!(F::FusedSolver, name::AbstractString, value)
     name in FUSED_SETTABLE ||
         throw(SDS.NotSupportedError("FusedSolver: parameter \"$name\" cannot be set; the fused pipeline takes " *
                                     join(("\"$p\"" for p in FUSED_SETTABLE), ", ") * " (use DirectSolver)"))
-    name == "pivot_sign" && !F.ldl &&
-        throw(SDS.NotSupportedError("FusedSolver: \"pivot_sign\" applies to the LDLᵀ of structure \"S\" only"))
+    name in ("pivot_sign", "pivot_type", "pivot_threshold") && !F.ldl &&
+        throw(SDS.NotSupportedError("FusedSolver: \"$name\" applies to the LDLᵀ of structure \"S\" only"))
+    if name == "pivot_type"
+        o = F.inner.options
+        old = o.pivot_type
+        SDS.setparam!(F.inner, name, value)        # parses the value (bad values: InvalidValueError)
+        if !_fused_pivot_type_ok(o.pivot_type)
+            p = o.pivot_type
+            o.pivot_type = old
+            throw(SDS.NotSupportedError("FusedSolver: pivot_type = '$(convert(Char, p))' is not supported; the " *
+                                        "fused LDLᵀ takes 'N' (no pivoting) and 'D' (diagonal pivoting); " *
+                                        "Bunch–Kaufman runs on DirectSolver"))
+        end
+        return nothing
+    end
     if name == "matching_alg" && !F.ldl
         SDS.setparam!(F.inner, name, value)        # parses the value (bad strings: InvalidValueError)
         if F.inner.options.matching_alg != SDS.MATCHING_NONE

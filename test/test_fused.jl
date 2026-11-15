@@ -67,6 +67,57 @@ function fused_stock_oracle(F)
     return SDS.host_numeric(F.inner.numeric), Nr, stock
 end
 
+# #167: per factor column of an "S" FusedSolver, whether it belongs to an in-kernel wide front (`wide`) or to a front
+# whose values depend on one (`tainted`: the wide fronts and their ancestors). With pivot_type = 'D' the wide fronts
+# factor without interchanges and the stock LDLᵀ with them, so only the other columns can match the stock pivot order
+function fused_wide_columns(F)
+    S = F.inner.symbolic
+    sp = to_host(S.super_ptr)
+    ns = length(sp) - 1
+    wide = falses(ns)
+    role, ra = to_host(F.fp.role), to_host(F.fp.ra)
+    for k in eachindex(role)
+        role[k] == SDS.Fused.ROLE_WPANEL && (wide[Int(ra[k])] = true)
+    end
+    par = S.partition.snparent
+    tainted = falses(ns)
+    for v in 1:ns
+        u = wide[v] ? v : 0
+        while u > 0
+            tainted[u] = true
+            u = par[u]
+        end
+    end
+    percol(x) = [x[v] for v in 1:ns for _ in sp[v]:(sp[v + 1] - 1)]
+    return (; wide = percol(wide), tainted = percol(tainted))
+end
+
+# #167: an "S" FusedSolver with diagonal pivoting (pivot_type = 'D', pivot_threshold u) on the values of Ad
+function fused_diagonal(Ad, u = nothing; tuning = nothing, kwargs...)
+    F = FusedSolver(Ad, "S", 'L'; tuning)
+    setparam!(F, "pivot_type", 'D')
+    u === nothing || setparam!(F, "pivot_threshold", u)
+    for (name, value) in kwargs
+        setparam!(F, String(name), value)
+    end
+    return F
+end
+
+# #167: the fused factor Nh with diagonal pivoting against the stock one Nr (the inner DirectSolver with the same
+# options on the same analysis, `fused_stock_oracle`): the pivot order and kinds exactly, D within growth_tol, on the
+# columns outside the wide fronts and their ancestors; identity order in the wide fronts
+function fused_diagonal_matches(F, Nh, Nr, ::Type{T}) where {T}
+    n = size(F, 1)
+    wc = fused_wide_columns(F)
+    keep = .!wc.tainted
+    ok_piv = Nh.piv[1:n][keep] == Nr.piv[1:n][keep]
+    ok_kind = Nh.pivot_kind[1:n][keep] == Nr.pivot_kind[1:n][keep]
+    dmax = maximum(abs, view(Nr.d, 1:n))
+    ok_d = maximum(abs, (Nh.d[1:n] - Nr.d[1:n])[keep]; init = zero(real(T))) / dmax <= growth_tol(T, Nr)
+    ok_wide = all(g -> !wc.wide[g] || Nh.piv[g] == g, 1:n)
+    return (; ok_piv, ok_kind, ok_d, ok_wide, nkeep = count(keep))
+end
+
 # The SPD generators of test/matrices.jl (the well-conditioned ones: `tol(T)` gates the residual), at sizes
 # that give regime-A subtrees, regime-C fronts (wide, handled by the tuning's wide strategy) and, for the
 # 18³ Laplacian, a root front wider than 256 (the vendor dense path of the solve).
@@ -428,6 +479,215 @@ end
         F.tuning = eager
     end
 
+    # #167: diagonal pivoting (pivot_type = 'D') in the fused factorization: the stock pivot search in the regime-A
+    # subtrees (the stock subtree kernel) and the narrow panels (the stock pivot steps, rows below included), no
+    # interchange in the in-kernel wide fronts. kkt_matrix with a weak Hessian (no wide front) and the scaled
+    # grid_kkt_matrix 40×40 (an 80-wide root; the scaling breaks the ties of the grid's equal diagonals) both
+    # interchange at every narrow site with pivot_threshold = 0.5 and stay well conditioned. Against the stock 'D' of the
+    # inner solver on the same analysis: the pivot order exactly outside the wide fronts and their ancestors (identity in
+    # the wide fronts), D within growth_tol there, the same info, inertia and npivots. Then values that change the pivot
+    # sequence (another symmetric scaling) refactorized without a new plan, bitwise reproducible factor, D and order,
+    # and the graph replay (CUDA) of both phases against the eager ones
+    @testset "\"S\", pivot_type = 'D' ($label): $T" for T in eltypes_among((Float32, Float64)),
+                                                       (label, gen) in (
+            ("kkt_matrix 1000+500, weak Hessian", () -> kkt_matrix(T, 1000, 500, 1.0; hessian_scale = 1.0e-2)),
+            ("grid_kkt_matrix 40×40, scaled",
+             () -> (Dg = Diagonal(T.(1 .+ rand(2 * 40 * 40))); sparse(Dg * grid_kkt_matrix(T, 40, 40, 1.0) * Dg))))
+        Random.seed!(666)
+        A = gen()
+        n = size(A, 1)
+        Ad = fused_matrix(backend, A)
+        F = fused_diagonal(Ad, 0.5)
+        @test getparam(F, "pivot_type") == 'D'
+        @test getparam(F, "pivot_threshold") == 0.5
+        analyze!(F)
+        @test F.fp.piv && F.fs.pivoted
+        @test count(==(SDS.Fused.ROLE_TRSM), to_host(F.fp.role)) == 0     # the pivoted panels factor their rows below
+        factorize!(F)
+        @test getparam(F, "info") == 0
+        b = rand(T, n)
+        bd = to_device(backend, b)
+        xd = similar(bd)
+        solve!(F, xd, bd; asynchronous = false)
+        @test relres(A, to_host(xd), b) <= tol(T)
+        Nh, Nr, stock = fused_stock_oracle(F)
+        @test stock.info == 0
+        @test getparam(F, "inertia") == stock.inertia
+        @test getparam(F, "npivots") == stock.npivots
+        sites = fused_column_sites(F)
+        for site in (:A, :P, :PT)                                       # interchanges at every narrow kernel site
+            @test count(g -> sites[g] == site && Nh.piv[g] != g, 1:n) > 0
+        end
+        label == "grid_kkt_matrix 40×40, scaled" && @test count(==(:W), sites) > 0     # a wide front exists
+        m = fused_diagonal_matches(F, Nh, Nr, T)
+        @test m.nkeep > n ÷ 2
+        @test m.ok_piv
+        @test m.ok_kind
+        @test m.ok_d
+        @test m.ok_wide
+        # the solve applies the pivot order: without it the solution is wrong
+        solve!(F, xd, bd; asynchronous = false)
+        x1 = to_host(xd)
+        @test relres(A, x1, b) <= tol(T)
+        SDS.Fused.set_pivoted!(F.fs, false)
+        solve!(F, xd, bd; asynchronous = false)
+        @test relres(A, to_host(xd), b) > 1.0e3 * tol(T)
+        SDS.Fused.set_pivoted!(F.fs, true)
+        # values that change the pivot sequence, refactorized with the plan of the analysis
+        Dg = Diagonal(T.(1 .+ 3 .* rand(n)))
+        A2 = sparse(Dg * A * Dg)
+        copyto!(Ad.nzVal, fused_values(A2))
+        refactorize!(F)
+        @test getparam(F, "info") == 0
+        solve!(F, xd, bd; asynchronous = false)
+        @test relres(A2, to_host(xd), b) <= tol(T)
+        Nh2, Nr2, stock2 = fused_stock_oracle(F)
+        @test Nh2.piv != Nh.piv                                         # a new pivot sequence
+        @test getparam(F, "inertia") == stock2.inertia == stock.inertia  # a congruence
+        m2 = fused_diagonal_matches(F, Nh2, Nr2, T)
+        @test m2.ok_piv && m2.ok_kind && m2.ok_d && m2.ok_wide
+        N = F.inner.numeric
+        f1, d1, p1 = to_host(N.factor), to_host(N.d), to_host(N.piv)
+        same = 0
+        for _ in 1:3
+            refactorize!(F)
+            same += to_host(N.factor) == f1 && to_host(N.d) == d1 && to_host(N.piv) == p1
+        end
+        @test same == 3
+        bytes = fused_cycle_allocated(F, xd, bd)
+        @test bytes <= fused_cycle_alloc_budget(backend)
+        # graph replay: the refactorization of the values of A2 (eager first, then capture and replays), then the
+        # values of A (a replay with another pivot sequence) against the eager refactorization of the same solver;
+        # the solve graph (deterministic_mode = 1) against the eager solve
+        eager = SDS.Fused.SDSTuning()
+        graph = SDS.Fused.SDSTuning(; graph_max_n = typemax(Int))
+        G = fused_diagonal(Ad, 0.5; tuning = graph, deterministic_mode = 1)
+        analyze!(G)
+        factorize!(G)
+        NG = G.inner.numeric
+        fg, pg = to_host(NG.factor), to_host(NG.piv)
+        solve!(G, xd, bd; asynchronous = false)
+        xg = to_host(xd)
+        sameg = 0
+        for _ in 1:3
+            refactorize!(G)
+            solve!(G, xd, bd; asynchronous = false)
+            sameg += getparam(G, "info") == 0 && to_host(NG.factor) == fg && to_host(NG.piv) == pg && to_host(xd) == xg
+        end
+        @test sameg == 3
+        copyto!(Ad.nzVal, fused_values(A))
+        G.tuning = eager
+        refactorize!(G)
+        solve!(G, xd, bd; asynchronous = false)
+        fe, pe, xe = to_host(NG.factor), to_host(NG.piv), to_host(xd)
+        @test pe != pg
+        @test relres(A, xe, b) <= tol(T)
+        G.tuning = graph
+        refactorize!(G)
+        solve!(G, xd, bd; asynchronous = false)
+        @test to_host(NG.factor) == fe && to_host(NG.piv) == pe && to_host(xd) == xe
+        backend_name(backend) == "CUDA" && @test !(G.gfact in (nothing, false)) && !(G.gsolve in (nothing, false))
+    end
+
+    @testset "\"S\", pivot_type = 'D', Int64 indices: $T" for T in eltypes_among((Float32, Float64))
+        Random.seed!(666)
+        A = kkt_matrix(T, 300, 150, 1.0; hessian_scale = 1.0e-2)
+        F = fused_diagonal(fused_matrix(backend, A, Int64), 0.5)
+        @test F isa FusedSolver{T, Int64}
+        analyze!(F)
+        factorize!(F)
+        @test getparam(F, "info") == 0
+        b = rand(T, size(A, 1))
+        @test relres(A, to_host(F \ to_device(backend, b)), b) <= tol(T)
+        Nh, Nr, stock = fused_stock_oracle(F)
+        @test count(g -> Nh.piv[g] != g, eachindex(Nh.piv)) > 0
+        @test getparam(F, "inertia") == stock.inertia
+        m = fused_diagonal_matches(F, Nh, Nr, T)
+        @test m.ok_piv && m.ok_kind && m.ok_d
+    end
+
+    # #167: the static pivot replacement of 'D' (no acceptable pivot left in the front: the zero row of
+    # singular_block_matrix is eliminated last and replaced by pivot_sign[j]·ε, as on the stock pipeline), and with
+    # pivot_epsilon = 0 the zero pivot fails the factorization without throwing; a regular matrix factors again
+    @testset "\"S\", pivot_type = 'D': a zero pivot replaced with pivot_sign $sgn, pivot_epsilon = $eps: $T" for
+            T in eltypes_among((Float32, Float64)), sgn in (1, -1), eps in (nothing, 1.0e-3, 0.0)
+        n, j = 40, 17
+        R = real(T)
+        A = singular_block_matrix(T, n, j; stored_zero = true)
+        psign = zeros(Int8, n)
+        psign[j] = sgn
+        Ad = fused_matrix(backend, A)
+        F = fused_diagonal(Ad; pivot_sign = psign)
+        eps === nothing || setparam!(F, "pivot_epsilon", eps)
+        analyze!(F)
+        factorize!(F)
+        if eps == 0
+            @test getparam(F, "info") != 0
+            A[j, j] = 3
+            copyto!(Ad.nzVal, fused_values(A))
+            refactorize!(F)
+            @test getparam(F, "info") == 0
+            @test getparam(F, "inertia") == (n, 0)
+        else
+            @test getparam(F, "info") == 0
+            @test getparam(F, "npivots") == 1
+            @test getparam(F, "inertia") == (sgn > 0 ? (n, 0) : (n - 1, 1))
+            Nh, Nr, stock = fused_stock_oracle(F)
+            @test stock.info == 0 && stock.npivots == 1
+            @test Nh.piv == Nr.piv && Nh.pivot_kind == Nr.pivot_kind
+            @test d_error(Nh, Nr) <= growth_tol(T, Nr)
+            k = findfirst(==(SDS.PIVOT_KIND_PERTURBED), Nh.pivot_kind)
+            @test k !== nothing && to_host(F.inner.symbolic.perm)[Nh.piv[k]] == j   # factor column k eliminates row j
+            @test Nh.d[k] == sgn * R(something(eps, SDS.default_pivot_epsilon(R)))
+            x0 = rand(T, n)
+            x0[j] = 0
+            b = A * x0                                    # consistent right-hand side
+            @test relres(A, to_host(F \ to_device(backend, b)), b) <= tol(T)
+        end
+    end
+
+    # #167: 'D' with the matching of "algo5"/"algo6" (scaled values, the pairs of its cycles in the ordering) and plain
+    # refinement, the MadNLP configuration (pivot_epsilon, pivot_sign +1 primal / −1 dual and slack rows, ir_n_steps
+    # = 2), on kkt_slack_matrix with δ = 0 (zero diagonals in the static order) and grid_kkt_matrix: the same inertia,
+    # npivots and pivot order (outside the wide fronts) as the stock 'D' on the same analysis; the refined solve
+    # accurate; refactorization with the next values
+    @testset "\"S\", pivot_type = 'D', matching_alg = $alg, $label: $T" for T in eltypes_among((Float32, Float64)),
+                                                                          alg in ("algo5", "algo6"),
+                                                                          (label, slack) in (("grid_kkt_matrix 30×30", false),
+                                                                                             ("kkt_slack_matrix 200+2·100, δ = 0", true))
+        Random.seed!(666)
+        A = slack ? kkt_slack_matrix(T, 200, 100, 0.0) : grid_kkt_matrix(T, 30, 30, 1.0)
+        n = size(A, 1)
+        nprimal = slack ? 200 : 900
+        Ad = fused_matrix(backend, A)
+        F = fused_diagonal(Ad; matching_alg = alg, pivot_epsilon = T == Float64 ? 1.0e-10 : 1.0e-5,
+                           pivot_sign = vcat(fill(1, nprimal), fill(-1, n - nprimal)), ir_n_steps = 2)
+        analyze!(F)
+        @test getparam(F, "pivot_pairs") == "default"
+        factorize!(F)
+        @test getparam(F, "info") == 0
+        b = rand(T, n)
+        bd = to_device(backend, b)
+        xd = similar(bd)
+        solve!(F, xd, bd; asynchronous = false)
+        @test getparam(F, "ir_n_steps") == 2
+        @test relres(A, to_host(xd), b) <= tol(T)
+        Nh, Nr, stock = fused_stock_oracle(F)
+        @test stock.info == 0
+        @test getparam(F, "inertia") == stock.inertia
+        @test getparam(F, "npivots") == stock.npivots
+        m = fused_diagonal_matches(F, Nh, Nr, T)
+        @test m.ok_piv && m.ok_kind && m.ok_wide
+        Dg = Diagonal(T.(1 .+ rand(n)))
+        A2 = sparse(Dg * A * Dg)
+        copyto!(Ad.nzVal, fused_values(A2))
+        refactorize!(F)
+        @test getparam(F, "info") == 0
+        @test getparam(F, "inertia") == stock.inertia
+        solve!(F, xd, bd; asynchronous = false)
+        @test relres(A2, to_host(xd), b) <= tol(T)
+    end
+
     @testset "restrictions raise NotSupportedError: $T" for T in eltypes_among((Float32, Float64))
         Random.seed!(666)
         A = laplacian2d(T, 12, 12)
@@ -502,6 +762,24 @@ end
         end
         G = FusedSolver(fused_matrix(backend, random_symindef(T, 50, 0.1)), "S", 'L')
         G.inner.options.pivot_type = SDS.PIVOT_AUTO
+        @test_throws NotSupportedError analyze!(G)
+        # #167: "S" takes pivot_type 'N' and 'D' (and pivot_threshold); Bunch–Kaufman ('A', 'B', 'L') stays refused,
+        # the option unchanged; "SPD" takes neither; a bad value is an InvalidValueError
+        G = FusedSolver(fused_matrix(backend, random_symindef(T, 50, 0.1)), "S", 'L')
+        for p in ('A', 'B', 'L')
+            @test_throws NotSupportedError setparam!(G, "pivot_type", p)
+            @test getparam(G, "pivot_type") == 'N'
+        end
+        @test_throws InvalidValueError setparam!(G, "pivot_type", 'X')
+        setparam!(G, "pivot_type", 'D')
+        setparam!(G, "pivot_threshold", 0.1)
+        @test getparam(G, "pivot_type") == 'D' && getparam(G, "pivot_threshold") == 0.1
+        @test_throws NotSupportedError setparam!(G, "pivot_type", 'B')
+        @test getparam(G, "pivot_type") == 'D'
+        setparam!(G, "pivot_type", 'N')
+        @test getparam(G, "pivot_type") == 'N'
+        @test_throws NotSupportedError setparam!(F, "pivot_type", 'D')
+        G.inner.options.pivot_type = SDS.PIVOT_BUNCH_KAUFMAN
         @test_throws NotSupportedError analyze!(G)
         # #194: pivot_sign and matching apply to "S" only; pivot_epsilon_alg = "algo1" is not supported on "S"; a
         # pivot_sign of the wrong length is refused (by the inner solver's setparam!)
