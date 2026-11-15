@@ -1,8 +1,9 @@
 # KKTSolver: the front end for the linear systems of an interior-point method (one
 # symmetric matrix with a fixed pattern, factorized again with new values at every
 # iteration, one right-hand side, the inertia read after each factorization). It picks
-# the pipeline (the fused one of src/fused.jl where the backend runs it, else the stock
-# DirectSolver), sets the parameters of the chosen factorization and drives the phases.
+# the pipeline (the fused one of src/fused.jl where the backend runs it and the matrix has a
+# front of width <= 256 for its solve, else the stock DirectSolver), sets the parameters of
+# the chosen factorization and drives the phases.
 # MadNLP's SparseDirectSolver binding (MadCoreGPU's MadCoreGPUSDSExt) is a shell over it.
 
 """
@@ -61,7 +62,14 @@ Keywords:
   [`FusedSolver`](@ref)), `false` the stock one (a [`DirectSolver`](@ref)).
   `nothing` selects the fused pipeline where it runs: `pivoting = :none` on a
   backend with forward progress between workgroups (CUDA, AMDGPU, oneAPI).
-  The CPU backend, Metal and `pivoting = :bk` get the stock pipeline.
+  The CPU backend, Metal and `pivoting = :bk` get the stock pipeline. The
+  fused solve needs a front of width ≤ 256: when the analysis finds none (a
+  dense or nearly dense matrix), `nothing` falls back to the stock pipeline,
+  with every other keyword kept, and stays on it for the later analyses;
+  `pipeline(K)` then reports `:stock`. With `deferred_analysis = true` this is
+  decided at the first factorization, so `pipeline(K)` may change from
+  `:fused` to `:stock` there. `fused = true` raises
+  [`NotSupportedError`](@ref) for such a matrix instead.
 * `pivot_threshold = nothing`: `:bk` only, the `"pivot_threshold"` of the
   acceptance test.
 * `pivot_epsilon = nothing`: the `"pivot_epsilon"` below which a pivot is
@@ -108,10 +116,14 @@ or `matching`, for `:bk` without `:ldl` or with `fused = true`, for matching
 without `:ldl`, for `pivot_threshold` without `:bk` and for `pivot_sign`
 without `:ldl`; [`NotSupportedError`](@ref) for a complex element type, a
 uniform batch and `fused = true` on a backend that cannot run the fused
-pipeline. Every option is checked by the constructor, also with
+pipeline (and, at the analysis, `fused = true` on a matrix without a front of
+width ≤ 256). Every option is checked by the constructor, also with
 `deferred_analysis = true`.
 """
 mutable struct KKTSolver{T, INT, S <: AbstractDirectSolver{T, INT}, V <: AbstractVector{T}}
+    # with `fused = nothing` on a fused-capable backend `S` is `Union{FusedSolver{T, INT, D}, D}` (D the
+    # DirectSolver the FusedSolver wraps): an analysis that finds no front of width <= 256 replaces the
+    # FusedSolver by its DirectSolver (`_fall_back!`); the hot paths split on the two concrete types
     inner::S
     x::V
     b::V
@@ -119,6 +131,8 @@ mutable struct KKTSolver{T, INT, S <: AbstractDirectSolver{T, INT}, V <: Abstrac
     factorized::Bool          # false until the first factorization (deferred_analysis = true)
     factorization::Symbol
     pivoting::Symbol
+    auto::Bool                # fused = nothing chose the fused pipeline: it may fall back to the stock one
+    stock_options::NamedTuple # the DirectSolver options the fused tuning replaced, restored by the fallback
 end
 
 KKTSolver(A, view::Char = 'L'; kwargs...) = _kkt_solver(structure -> DirectSolver(A, structure, view); kwargs...)
@@ -165,6 +179,10 @@ function _kkt_solver(make; factorization::Symbol = :cholesky, pivoting::Symbol =
     # the fused pipeline factors without pivoting; it has the matching and the static pivot replacement of the
     # stock no-pivot LDLᵀ (#194), so only Bunch–Kaufman and a backend without forward progress need the stock one
     use_fused = something(fused, !bk && forward_progress(backend))
+    auto = fused === nothing && use_fused
+    # the stock pipeline keeps the defaults of DirectSolver for tuning = nothing: the options the fused tuning
+    # replaces, put back if the automatic choice falls back to the stock pipeline (`_fall_back!`)
+    stock_options = auto && tuning === nothing ? _tuned_options(d.options) : (;)
     inner = if use_fused
         # "S": pivot_type = 'N'; the pivot pairs follow the matching at every analysis (`Fused._fused_pairs!`)
         Fused._fused_solver(d, tuning)
@@ -192,14 +210,48 @@ function _kkt_solver(make; factorization::Symbol = :cholesky, pivoting::Symbol =
     x = similar(d.A.nzval, n)
     b = similar(d.A.nzval, n)
     INT = eltype(d.A.rowptr)
-    K = KKTSolver{T, INT, typeof(inner), typeof(x)}(inner, x, b, 0, false, factorization, pivoting)
+    S = auto ? Union{typeof(inner), typeof(d)} : typeof(inner)
+    K = KKTSolver{T, INT, S, typeof(x)}(inner, x, b, 0, false, factorization, pivoting, auto, stock_options)
     deferred_analysis || _first_factorization!(K)
+    return K
+end
+
+# the DirectSolver options `Fused._apply_tuning!` sets (reordering_alg aside, which KKTSolver sets after it)
+_tuned_options(o::Options) =
+    (; amalgamation = o.amalgamation, regime_c_width = o.regime_c_width, regime_c_rows = o.regime_c_rows,
+     subtree_parallelism = o.subtree_parallelism, subtree_budgets = copy(o.subtree_budgets),
+     nd_nseps = o.nd_nseps, nd_seed = o.nd_seed)
+
+# the automatic choice falls back to the stock pipeline: the DirectSolver the FusedSolver wraps (analyzed with the
+# options of the fused pipeline, which are those of the stock one but the tuning) becomes the inner solver, with
+# the DirectSolver defaults of the tuned options when the constructor had no `tuning`. Returns whether the analysis
+# must be redone (it must when options were restored)
+function _fall_back!(K::KKTSolver)
+    d = K.inner.inner
+    o = d.options
+    for (name, value) in pairs(K.stock_options)
+        setproperty!(o, name, value)
+    end
+    K.inner = d
+    _log(LOG_INFO, () -> "KKTSolver: no front of width <= $(Fused.MW) for the fused solve; stock pipeline")
+    return !isempty(K.stock_options)
+end
+
+# the analysis of the inner solver; with `fused = nothing` a fused analysis that finds no front of width <= 256
+# falls back to the stock pipeline, for good (the later analyses are the stock pipeline's)
+function _analyze_inner!(K::KKTSolver)
+    inner = K.inner
+    if K.auto && inner isa Fused.FusedSolver
+        Fused._try_analysis!(inner) && return K
+        _fall_back!(K) || return K
+    end
+    analyze!(K.inner, K.x, K.b; asynchronous = false)
     return K
 end
 
 # the analysis and the first factorization (a refactorization needs one), on the values the matrix holds now
 function _first_factorization!(K::KKTSolver)
-    analyze!(K.inner, K.x, K.b; asynchronous = false)
+    _analyze_inner!(K)
     factorize!(K.inner, K.x, K.b; asynchronous = false)
     K.factorized = true
     K.info = Int(getparam(K.inner, "info"))
@@ -225,7 +277,9 @@ end
 
 `:fused` when `K` runs the fused pipeline (`K.inner` is a
 [`FusedSolver`](@ref)), `:stock` when it runs the stock one (a
-[`DirectSolver`](@ref)).
+[`DirectSolver`](@ref)). With `fused = nothing` an analysis that finds no
+front of width ≤ 256 switches `K` from `:fused` to `:stock` (see
+[`KKTSolver`](@ref)).
 """
 pipeline(K::KKTSolver) = K.inner isa Fused.FusedSolver ? :fused : :stock
 
@@ -256,7 +310,9 @@ the 2×2 pivot pairs and the symbolic factorization, then the factorization, on
 either pipeline. The parameters of the constructor (`pivot_epsilon`,
 `pivot_sign`, `ir_n_steps`, `tuning`, …) are kept, and the later
 [`factorize!`](@ref) calls refactorize with the new analysis. Before the first
-factorization (`deferred_analysis = true`) it is the first factorization.
+factorization (`deferred_analysis = true`) it is the first factorization. With
+`fused = nothing`, a new analysis that finds no front of width ≤ 256 for the
+fused solve falls back to the stock pipeline, as the first one does.
 
 An interior-point method calls it when the analysis of an earlier matrix has
 gone stale, for instance when iterative refinement rejects a solve: the

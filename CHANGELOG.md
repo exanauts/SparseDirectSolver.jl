@@ -5,6 +5,22 @@ All notable changes to SparseDirectSolver.jl are listed here. The format follows
 [Semantic Versioning](https://semver.org/). Task ids (`TNN`) refer to `TASKS.md`,
 whose Report blocks hold the details and the measurements.
 
+## [0.4.1] - unreleased
+
+### Fixed
+
+- `KKTSolver` with the default `fused = nothing` falls back to the stock
+  pipeline when the matrix has no front of width ≤ 256 for the fused solve (a
+  dense or nearly dense matrix, such as a KKT system with a dense Hessian or
+  Jacobian), instead of raising `NotSupportedError: fused solve: no plan entry
+  with fronts of width <= 256` at the first factorization (#200). The choice is
+  made at the analysis (the constructor's, the first `factorize!` of a
+  deferred analysis, or `analyze!`), right after the symbolic phase, keeps every
+  other keyword (the stock pipeline's DirectSolver defaults replace the fused
+  tuning when no `tuning` was passed), and holds for the later analyses;
+  `pipeline(K)` reports `:stock` from then on. Matrices with such a front stay
+  on the fused pipeline, and `fused = true` still raises `NotSupportedError`.
+
 ## [0.4.0] - 2026-11-13
 
 ### Breaking

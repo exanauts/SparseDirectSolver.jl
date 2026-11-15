@@ -451,6 +451,94 @@ end
         @test rs.r2 <= tol(T)
     end
 
+    # #200: the fused solve needs a front of width <= 256. A dense matrix has one front n wide: n = 300 has none, so
+    # `fused = nothing` falls back to the stock pipeline (at the constructor's analysis, at the first factorize! of a
+    # deferred analysis, at analyze!) with every keyword kept, and the tuning defaults of DirectSolver without
+    # `tuning`; n = 200 stays on the default pipeline; `fused = true` raises at the analysis
+    @testset "dense, n = $n, $label (#200): $T" for T in eltypes_among((Float32, Float64)), n in (200, 300),
+                                                    label in ("ldl", "ldl, matching, pivot_sign, ir_n_steps",
+                                                              "ldl, user_perm", "cholesky, algo3",
+                                                              "cholesky, tuning")
+        ldl = startswith(label, "ldl")
+        nneg = ldl ? n ÷ 3 : 0
+        kw = Dict("ldl" => (; factorization = :ldl),
+                  "ldl, matching, pivot_sign, ir_n_steps" =>
+                      (; factorization = :ldl, matching = "algo5", pivot_sign = vcat(fill(1, n - nneg), fill(-1, nneg)),
+                       pivot_epsilon = T == Float64 ? 1.0e-10 : 1.0e-5, ir_n_steps = 2),
+                  "ldl, user_perm" => (; factorization = :ldl, user_perm = randperm(n)),
+                  "cholesky, algo3" => (; reordering = "algo3"),
+                  "cholesky, tuning" => (; tuning = SDSTuning(; nd_nseps = 2)))[label]
+        A = dense_sym_sparse(T, n, nneg)
+        inertia = (n - nneg, 0, nneg)
+        default = kkt_default_pipeline(backend)
+        expected = n > 256 ? :stock : default
+        function check(K, A)
+            @test SDS.pipeline(K) === expected
+            @test K.inner isa (expected === :fused ? SDS.FusedSolver : SDS.DirectSolver)
+            @test getparam(K, "info") == 0
+            @test SDS.inertia(K) == inertia
+            rs = kkt_solves(backend, K, A)
+            @test rs.r1 <= tol(T)
+            @test rs.r2 <= tol(T)
+            @test rs.b_kept
+            # the keywords hold on either pipeline
+            haskey(kw, :matching) && @test getparam(K, "matching_alg") == kw.matching
+            haskey(kw, :pivot_epsilon) && @test getparam(K, "pivot_epsilon") == kw.pivot_epsilon
+            haskey(kw, :ir_n_steps) && @test getparam(K, "ir_n_steps") == kw.ir_n_steps
+            haskey(kw, :reordering) && @test getparam(K, "reordering_alg") == kw.reordering
+            haskey(kw, :tuning) && @test getparam(K, "nd_nseps") == 2
+            if expected === :stock && !haskey(kw, :tuning)
+                # the stock pipeline without `tuning` keeps the defaults of DirectSolver, also after the fallback
+                o, o0 = K.inner.options, SDS.Options()
+                @test o.amalgamation == o0.amalgamation
+                @test o.regime_c_width == o0.regime_c_width
+                @test o.nd_nseps == o0.nd_nseps
+            end
+        end
+        # the constructor's analysis, then the next iteration's values
+        args, nzval = kkt_input(backend, A)
+        K = KKTSolver(args...; kw...)
+        check(K, A)
+        kkt_set_values!(nzval, 2A)
+        factorize!(K)
+        check(K, 2A)
+        # analyze! on a built solver keeps the pipeline
+        @test analyze!(K) === K
+        check(K, 2A)
+        # deferred analysis: the pipeline is decided at the first factorize!
+        args, nzval = kkt_input(backend, A)
+        fill!(nzval, zero(T))
+        Kd = KKTSolver(args...; deferred_analysis = true, kw...)
+        @test SDS.pipeline(Kd) === default
+        kkt_set_values!(nzval, A)
+        @test factorize!(Kd) === Kd
+        check(Kd, A)
+        kkt_set_values!(nzval, 2A)
+        factorize!(Kd)
+        check(Kd, 2A)
+        # analyze! as the first factorization of a deferred analysis, and again
+        args, nzval = kkt_input(backend, A)
+        fill!(nzval, zero(T))
+        Ka = KKTSolver(args...; deferred_analysis = true, kw...)
+        kkt_set_values!(nzval, A)
+        @test analyze!(Ka) === Ka
+        check(Ka, A)
+        analyze!(Ka)
+        check(Ka, A)
+        if SDS.forward_progress(backend)
+            # fused = true: the fused pipeline or NotSupportedError, at the constructor or the first factorize!
+            args, nzval = kkt_input(backend, A)
+            if n > 256
+                @test_throws SDS.NotSupportedError KKTSolver(args...; kw..., fused = true)
+                Kf = KKTSolver(args...; kw..., fused = true, deferred_analysis = true)
+                @test_throws SDS.NotSupportedError factorize!(Kf)
+                @test SDS.pipeline(Kf) === :fused
+            else
+                @test SDS.pipeline(KKTSolver(args...; kw..., fused = true)) === :fused
+            end
+        end
+    end
+
     # a failed factorization does not throw: "info" is nonzero; the regularized
     # matrix then factors
     @testset ":cholesky on an indefinite matrix: $T" for T in eltypes_among((Float32, Float64))

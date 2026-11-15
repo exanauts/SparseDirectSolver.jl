@@ -37,7 +37,12 @@ solve!(S, xb)                                  # xb holds b on entry, x on retur
 On the CPU backend and on Metal the same calls run the stock pipeline;
 `pivoting = :bk` selects the Bunch–Kaufman pivoting of the stock `L D Lᵀ` on
 every backend ([Symmetric indefinite systems](@ref)), and `fused = false`
-forces the stock pipeline. Both pipelines run the static `L D Lᵀ` with
+forces the stock pipeline. The fused solve needs a front of width ≤ 256: on a
+matrix without one (a dense or nearly dense matrix, where the whole matrix is a
+single front) the default `fused = nothing` falls back to the stock pipeline at
+the analysis, with every other keyword kept, and `pipeline` then reports
+`:stock` (with `deferred_analysis = true` from the first `factorize!` on);
+`fused = true` raises `NotSupportedError` there. Both pipelines run the static `L D Lᵀ` with
 `matching` (the `"matching_alg"` of the analysis: `"algo5"` and `"algo6"` scale
 the matrix and give the 2×2 pivot pairs of the ordering) and pivot replacement
 (`pivot_epsilon`, `pivot_sign`: a pivot below `pivot_epsilon` becomes

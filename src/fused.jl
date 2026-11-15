@@ -829,6 +829,29 @@ end
     end
 end
 
+# a plan entry of the fused solve segments: outside the regime-A subtrees, every front of width <= wcap
+_narrow_entry(plan, nodes, widths, k, wcap) =
+    plan.kind[k] != SDS.SOLVE_SUBTREES && all(widths[nodes[q]] <= wcap for q in plan.first[k]:plan.last[k])
+
+# the first narrow plan entry from `kstart` of the analysis of `s` (host data of its schedule and solve
+# plan, available after the symbolic phase), 0 when there is none
+function _first_narrow_entry(s, kstart::Int, wcap::Int)
+    plan = s.workspace.plan
+    nodes = s.symbolic.schedule.group_nodes
+    widths = s.symbolic.schedule.width
+    for k in kstart:length(plan.kind)
+        _narrow_entry(plan, nodes, widths, k, wcap) && return k
+    end
+    return 0
+end
+
+# whether the fused solve can be planned on the symbolic analysis of `s` (a DirectSolver after its symbolic
+# phase): false when no plan entry has fronts of width <= MW (a dense or nearly dense matrix), for which
+# `fused_solve_plan` raises NotSupportedError. Host data only: no factorization, no device work
+fused_solve_feasible(s) = _first_narrow_entry(s, 1, MW) != 0
+
+_no_narrow_entry_error() = SDS.NotSupportedError("fused solve: no plan entry with fronts of width <= $MW")
+
 # fused segment: the maximal run of plan entries from `kstart` in which every
 # front has width <= wcap (regime-A subtree entries break a run)
 function build_fused(s; kstart::Int = 1, wcap::Int = MW, merged::Bool = (kstart == 1))
@@ -837,13 +860,9 @@ function build_fused(s; kstart::Int = 1, wcap::Int = MW, merged::Bool = (kstart 
     plan = ws.plan
     nodes = S.schedule.group_nodes
     widths = S.schedule.width
-    narrow(k) = plan.kind[k] != SDS.SOLVE_SUBTREES &&
-                all(widths[nodes[q]] <= wcap for q in plan.first[k]:plan.last[k])
-    i1 = kstart
-    while i1 <= length(plan.kind) && !narrow(i1)
-        i1 += 1
-    end
-    i1 > length(plan.kind) && return nothing
+    narrow(k) = _narrow_entry(plan, nodes, widths, k, wcap)
+    i1 = _first_narrow_entry(s, kstart, wcap)
+    i1 == 0 && return nothing
     i2 = i1
     while i2 + 1 <= length(plan.kind) && narrow(i2 + 1)
         i2 += 1
@@ -1108,7 +1127,7 @@ function fused_solve_plan(s; workgroup::Int, graph::Bool = false, all_segments::
     _check_solve_workgroup(upper_workgroup)
     inv11, inv_ptr, invertf, bytes = build_inverse(s)
     fz1 = build_fused(s; kstart = 1, wcap = MW)
-    fz1 === nothing && throw(SDS.NotSupportedError("fused solve: no plan entry with fronts of width <= $MW"))
+    fz1 === nothing && throw(_no_narrow_entry_error())
     segs = [(fz1, workgroup)]
     while all_segments
         fzk = build_fused(s; kstart = last(segs)[1].i2 + 1, wcap = MW, merged = false)
@@ -2815,10 +2834,17 @@ function _clear_plans!(F::FusedSolver)
 end
 
 # the symbolic part of the analysis: inner symbolic phase, one stock factorization and
-# solve (the solve workspace), then the three fused plans
-function _fused_symbolic!(F::FusedSolver{T}) where {T}
+# solve (the solve workspace), then the three fused plans. Returns true; when the fused solve has
+# no plan entry to start from (`fused_solve_feasible`, decided right after the inner symbolic
+# phase) it raises NotSupportedError, or with `strict = false` returns false with `F` left at
+# STAGE_REORDERED and its inner DirectSolver analyzed (`KKTSolver`'s fallback to the stock pipeline)
+function _fused_symbolic!(F::FusedSolver{T}; strict::Bool = true) where {T}
     s = F.inner
     SDS.execute!("symbolic_factorization", s, nothing, nothing; asynchronous = false)
+    if !fused_solve_feasible(s)
+        strict && throw(_no_narrow_entry_error())
+        return false
+    end
     n = size(s, 1)
     x = KA.zeros(s.backend, T, n)
     b = KA.zeros(s.backend, T, n)
@@ -2850,7 +2876,7 @@ function _fused_symbolic!(F::FusedSolver{T}) where {T}
     F.fs = fs
     F.info = 0
     F.stage = SDS.STAGE_ANALYZED
-    return F
+    return true
 end
 
 # the device work of the fused factorization and the inverses behind a function barrier (the
@@ -2954,15 +2980,32 @@ function _fused_solve!(F::FusedSolver, X, B)
     return F
 end
 
+# the "reordering" phase of `F` (the first step of "analysis")
+function _fused_reorder!(F::FusedSolver)
+    _check_fused_options(F)
+    _fused_pairs!(F)
+    _clear_plans!(F)
+    F.stage = SDS.STAGE_NONE
+    SDS.execute!("reordering", F.inner, nothing, nothing; asynchronous = false)
+    F.stage = SDS.STAGE_REORDERED
+    return F
+end
+
+# the "analysis" phase for `KKTSolver`'s automatic pipeline choice (`fused = nothing`): false, without a throw,
+# when the fused solve has no plan entry to start from (a matrix without a front of width <= MW), decided on the
+# symbolic analysis before the stock factorization and the fused plans; the inner DirectSolver is then analyzed
+# (with the options of the fused pipeline) and `F` cannot factorize. Every other error raises as in "analysis"
+function _try_analysis!(F::FusedSolver)
+    _fused_reorder!(F)
+    ok = _fused_symbolic!(F; strict = false)
+    KA.synchronize(F.inner.backend)
+    return ok
+end
+
 function SDS.execute!(phase::AbstractString, F::FusedSolver, X, B; asynchronous::Bool = true)
     p = SDS._parse_phase(phase)
     if p == SDS.PHASE_REORDERING || p == SDS.PHASE_ANALYSIS
-        _check_fused_options(F)
-        _fused_pairs!(F)
-        _clear_plans!(F)
-        F.stage = SDS.STAGE_NONE
-        SDS.execute!("reordering", F.inner, nothing, nothing; asynchronous = false)
-        F.stage = SDS.STAGE_REORDERED
+        _fused_reorder!(F)
         p == SDS.PHASE_ANALYSIS && _fused_symbolic!(F)
     elseif p == SDS.PHASE_SYMBOLIC_FACTORIZATION
         F.stage >= SDS.STAGE_REORDERED || throw(SDS._phase_error(phase, "needs \"reordering\""))

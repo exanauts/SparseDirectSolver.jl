@@ -407,6 +407,23 @@ function dense_hpd(::Type{T}, n::Integer; rng::AbstractRNG = Random.default_rng(
 end
 
 """
+    dense_sym_sparse(T, n, nneg = 0; rng)
+
+Real symmetric `n × n` matrix with every entry stored, as a `SparseMatrixCSC`:
+`B + Bᵀ + 2n D` with `B` standard normal and `D` diagonal, `+1` on the first
+`n - nneg` and `-1` on the last `nneg` rows (#200: a matrix whose one front is
+`n` wide). Strictly diagonally dominant with high probability (the absolute
+row sums of `B + Bᵀ` are about `1.13 n`), so its inertia is
+`(n - nneg, 0, nneg)` and an LDLᵀ without pivoting is stable.
+"""
+function dense_sym_sparse(::Type{T}, n::Integer, nneg::Integer = 0;
+                          rng::AbstractRNG = Random.default_rng()) where {T <: Real}
+    B = randn(rng, T, n, n)
+    d = T(2n) .* vcat(ones(T, n - nneg), -ones(T, nneg))
+    return sparse(B + B' + Diagonal(d))
+end
+
+"""
     dense_triangular(T, n; uplo = :L, unit = false, rng)
 
 Well-conditioned dense triangular `n × n` matrix (the other triangle is random

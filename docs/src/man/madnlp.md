@@ -77,7 +77,7 @@ method:
 | `sds_reordering` | `reordering` | the `reordering_alg` of the analysis: `"algo4"` nested dissection (METIS), `"algo3"` AMD, `"default"` the cost-model choice ([Parameters](parameters.md)) |
 | `sds_user_perm` | `user_perm` | a 1-based permutation of length `n` that replaces the reordering, for instance a cached one; every solver instance otherwise recomputes its ordering |
 | `sds_tuning` | `tuning` | an [`SDSTuning`](@ref SparseDirectSolver.Fused.SDSTuning) bundle of performance settings; `nothing` selects the measured per-architecture defaults of [`default_tuning`](@ref SparseDirectSolver.Fused.default_tuning) |
-| `sds_fused` | `fused` | `true` the fused pipeline, `false` the stock one, `nothing` the default of the backend |
+| `sds_fused` | `fused` | `true` the fused pipeline, `false` the stock one, `nothing` the default of the backend (the stock pipeline for a KKT matrix without a front of width ≤ 256, see below) |
 
 The sizes of the primal and dual blocks, which MadNLP's KKT system knows, give
 the `pivot_sign` of `KKTSolver` (`1` for the primal and `-1` for the dual
@@ -130,8 +130,12 @@ since a factorization without pivoting never consumes them.
   solve is a partitioned-inverse sweep, one dependency-counter kernel per
   direction. This is the path that `cholesky_fused` measures on the
   [Performance](@ref) page.
-* **Stock pipeline** (`pivoting = :bk`, `fused = false`, and every
-  factorization on the KernelAbstractions CPU backend and on Metal): the inner
+* **Stock pipeline** (`pivoting = :bk`, `fused = false`, every
+  factorization on the KernelAbstractions CPU backend and on Metal, and with
+  `fused = nothing` a KKT matrix without a front of width ≤ 256, such as one
+  with a dense Hessian or Jacobian, where the partitioned-inverse solve has no
+  front to start from; the analysis then falls back to the stock pipeline with
+  the same options, and `fused = true` raises `NotSupportedError`): the inner
   solver is a [`DirectSolver`](@ref) with the same tuning, driven through
   `refactorize!` and `solve!` at the level-batched speed of
   [`execute!`](@ref). Cholesky, `L D Lᵀ` without pivoting and Bunch–Kaufman
