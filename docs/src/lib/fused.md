@@ -6,7 +6,9 @@ factorization and partitioned-inverse solve of `SparseDirectSolver.Fused`
 [`execute!`](@ref) phases, [`setparam!`](@ref), [`getparam`](@ref) and
 [`SparseDirectSolver.update!`](@ref), for one right-hand side, on a GPU backend, for `"SPD"` and
 `"S"` real matrices (`L D Lᵀ` with static pivoting: pivot replacement
-under `pivot_epsilon` and `pivot_sign`, optionally with a matching), with
+under `pivot_epsilon` and `pivot_sign`, optionally with a matching; with
+`pivot_type = 'D'` also 1×1 diagonal pivoting inside the regime-A subtrees and
+the fronts of width ≤ 64, the wider fronts without interchanges), with
 plain iterative refinement of the solve (`ir_n_steps`). It is the inner solver that [`KKTSolver`](@ref)
 selects on GPU backends with forward progress ([KKT solver](kkt.md)), and so
 the default path of MadNLP's binding ([MadNLP](@ref)); [Performance](@ref) says
