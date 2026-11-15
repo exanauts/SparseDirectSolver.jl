@@ -46,23 +46,31 @@ Keywords:
   the inertia from `D`.
 * `pivoting::Symbol = :none`: `:ldl` only. `:none` factors in the pivot order
   of the analysis (static pivoting: a pivot below `pivot_epsilon` is
-  replaced); `:bk` uses Bunch–Kaufman pivoting inside the fronts, which the
-  stock pipeline provides.
+  replaced); `:diagonal` uses 1×1 diagonal pivoting inside the fronts
+  (`pivot_type = 'D'`: a pivot that fails the `pivot_threshold` test against
+  its column is exchanged for the acceptable diagonal entry of largest modulus
+  of the front's fully-summed block; a pivot below `pivot_epsilon` is still
+  replaced), on both pipelines: the fused one pivots in the regime-A subtrees
+  and the fronts of width ≤ 64 and factors the wider fronts without
+  interchanges (see [`FusedSolver`](@ref)), the stock one pivots in every
+  front; `:bk` uses Bunch–Kaufman pivoting inside the fronts, which the stock
+  pipeline provides.
 * `matching::AbstractString = "none"`: `:ldl` only, the `"matching_alg"` of the
   analysis (`"none"` or `"default"` off, `"algo1"`–`"algo6"`; `"algo5"` and
   `"algo6"` also scale the matrix and choose the 2×2 pivot pairs of the
-  ordering from the cycles of the matching, with either `pivoting`; with
-  `"algo1"`–`"algo4"` and `pivoting = :none` the stock analysis looks for no
-  pairs, as without matching), on both pipelines. It reads the values present
+  ordering from the cycles of the matching, with every `pivoting`; with
+  `"algo1"`–`"algo4"` and `pivoting = :none` or `:diagonal` the analysis looks
+  for no pairs, as without matching), on both pipelines. It reads the values present
   at the analysis, so pass
   `deferred_analysis = true` when the matrix holds no real values yet, and call
   [`analyze!`](@ref analyze!(::KKTSolver)) to redo the analysis on the current
   values when the matching of an earlier matrix has gone stale.
 * `fused::Union{Nothing, Bool} = nothing`: `true` runs the fused pipeline (a
   [`FusedSolver`](@ref)), `false` the stock one (a [`DirectSolver`](@ref)).
-  `nothing` selects the fused pipeline where it runs: `pivoting = :none` on a
-  backend with forward progress between workgroups (CUDA, AMDGPU, oneAPI).
-  The CPU backend, Metal and `pivoting = :bk` get the stock pipeline. The
+  `nothing` selects the fused pipeline where it runs: `pivoting = :none` or
+  `:diagonal` on a backend with forward progress between workgroups (CUDA,
+  AMDGPU, oneAPI). The CPU backend, Metal and `pivoting = :bk` get the stock
+  pipeline. The
   fused solve needs a front of width ≤ 256: when the analysis finds none (a
   dense or nearly dense matrix), `nothing` falls back to the stock pipeline,
   with every other keyword kept, and stays on it for the later analyses;
@@ -70,14 +78,16 @@ Keywords:
   decided at the first factorization, so `pipeline(K)` may change from
   `:fused` to `:stock` there. `fused = true` raises
   [`NotSupportedError`](@ref) for such a matrix instead.
-* `pivot_threshold = nothing`: `:bk` only, the `"pivot_threshold"` of the
-  acceptance test.
+* `pivot_threshold = nothing`: `:diagonal` and `:bk` only, the
+  `"pivot_threshold"` of the acceptance test (`nothing`: `0.01`).
 * `pivot_epsilon = nothing`: the `"pivot_epsilon"` below which a pivot is
   replaced (`nothing`: `1e-13` for `Float64`, `1e-5` for `Float32`, as in
-  cuDSS), on both pipelines. With `:ldl` and `pivoting = :none` a pivot `d`
-  with `|d| < pivot_epsilon` becomes `±pivot_epsilon`; `0` replaces none, and
-  a zero pivot then fails the factorization. On the fused pipeline a NaN or
-  infinite pivot always fails the factorization (`info ≠ 0`).
+  cuDSS), on both pipelines. With `:ldl` and `pivoting = :none` or
+  `:diagonal` a pivot `d` with `|d| < pivot_epsilon` becomes
+  `±pivot_epsilon`; `0` replaces none, and a zero pivot then fails the
+  factorization. On the fused pipeline a NaN or infinite pivot fails the
+  factorization (`info ≠ 0`); with `:diagonal` only in the fronts wider than
+  64, the others follow the stock rule.
 * `pivot_sign = nothing`: `:ldl` only, a vector of `n` entries in `(-1, 0, 1)`,
   the `"pivot_sign"` a replaced pivot takes (an interior-point method passes
   `1` for the primal and `-1` for the dual rows; `0` or `nothing`: the sign of
@@ -112,8 +122,9 @@ Keywords:
 [`pipeline`](@ref SparseDirectSolver.pipeline) tells which one runs.
 
 Raises [`InvalidValueError`](@ref) for an unknown `factorization`, `pivoting`
-or `matching`, for `:bk` without `:ldl` or with `fused = true`, for matching
-without `:ldl`, for `pivot_threshold` without `:bk` and for `pivot_sign`
+or `matching`, for `:diagonal` or `:bk` without `:ldl`, for `:bk` with
+`fused = true`, for matching without `:ldl`, for `pivot_threshold` without
+`:diagonal` or `:bk` and for `pivot_sign`
 without `:ldl`; [`NotSupportedError`](@ref) for a complex element type, a
 uniform batch and `fused = true` on a backend that cannot run the fused
 pipeline (and, at the analysis, `fused = true` on a matrix without a front of
@@ -156,13 +167,17 @@ function _kkt_solver(make; factorization::Symbol = :cholesky, pivoting::Symbol =
                      tuning::Union{Nothing, Fused.SDSTuning} = nothing, deferred_analysis::Bool = false)
     factorization in (:cholesky, :ldl) ||
         throw(InvalidValueError("factorization must be :cholesky or :ldl, got $(repr(factorization))"))
-    pivoting in (:none, :bk) || throw(InvalidValueError("pivoting must be :none or :bk, got $(repr(pivoting))"))
+    pivoting in (:none, :diagonal, :bk) ||
+        throw(InvalidValueError("pivoting must be :none, :diagonal or :bk, got $(repr(pivoting))"))
     ldl = factorization === :ldl
     bk = pivoting === :bk
-    bk && !ldl && throw(InvalidValueError("pivoting = :bk needs factorization = :ldl"))
+    diagonal = pivoting === :diagonal
+    pivoting === :none || ldl || throw(InvalidValueError("pivoting = $(repr(pivoting)) needs factorization = :ldl"))
     bk && fused === true &&
-        throw(InvalidValueError("fused = true needs pivoting = :none (the fused pipeline does not pivot)"))
-    bk || pivot_threshold === nothing || throw(InvalidValueError("pivot_threshold needs pivoting = :bk"))
+        throw(InvalidValueError("fused = true needs pivoting = :none or :diagonal (the fused pipeline has no " *
+                                "Bunch–Kaufman pivoting)"))
+    bk || diagonal || pivot_threshold === nothing ||
+        throw(InvalidValueError("pivot_threshold needs pivoting = :diagonal or :bk"))
     ldl || pivot_sign === nothing || throw(InvalidValueError("pivot_sign needs factorization = :ldl"))
 
     d = make(ldl ? "S" : "SPD")
@@ -176,8 +191,9 @@ function _kkt_solver(make; factorization::Symbol = :cholesky, pivoting::Symbol =
     matched && !ldl &&
         throw(InvalidValueError("matching = $(repr(matching)) needs factorization = :ldl"))
     backend = d.backend
-    # the fused pipeline factors without pivoting; it has the matching and the static pivot replacement of the
-    # stock no-pivot LDLᵀ (#194), so only Bunch–Kaufman and a backend without forward progress need the stock one
+    # the fused pipeline factors without pivoting or with diagonal pivoting (#167); it has the matching and the static
+    # pivot replacement of the stock LDLᵀ (#194), so only Bunch–Kaufman and a backend without forward progress need
+    # the stock one
     use_fused = something(fused, !bk && forward_progress(backend))
     auto = fused === nothing && use_fused
     # the stock pipeline keeps the defaults of DirectSolver for tuning = nothing: the options the fused tuning
@@ -191,12 +207,17 @@ function _kkt_solver(make; factorization::Symbol = :cholesky, pivoting::Symbol =
         if bk
             pivot_threshold === nothing || setparam!(d, "pivot_threshold", pivot_threshold)
         elseif ldl
-            setparam!(d, "pivot_type", 'N')
-            # no-pivot LDLᵀ consumes no 2×2 pair, but the pairs of the cycles of a job-5 matching ("algo5", "algo6")
+            setparam!(d, "pivot_type", diagonal ? 'D' : 'N')
+            # 1×1 pivots consume no 2×2 pair, but the pairs of the cycles of a job-5 matching ("algo5", "algo6")
             # shape the ordering; jobs 1–4 would fall back to the value-based detection, skipped as without matching
             matched && matching_job(d.options.matching_alg) == 5 || setparam!(d, "pivot_pairs", "none")
         end
         d
+    end
+    # diagonal pivoting on either pipeline (the fused one: the subtrees and the narrow fronts, see FusedSolver)
+    if diagonal
+        setparam!(inner, "pivot_type", 'D')
+        pivot_threshold === nothing || setparam!(inner, "pivot_threshold", pivot_threshold)
     end
     ldl && pivot_sign !== nothing && setparam!(inner, "pivot_sign", pivot_sign)
     pivot_epsilon === nothing || setparam!(inner, "pivot_epsilon", pivot_epsilon)

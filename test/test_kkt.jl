@@ -141,9 +141,21 @@ end
             @test SDS.pipeline(Kc) === :fused
             @test getparam(Kc, "pivot_epsilon") == 1.0e-10
         end
+        # #167: :diagonal needs :ldl and takes pivot_threshold, on the default pipeline; fused = true needs a backend
+        # with forward progress
+        @test_throws SDS.InvalidValueError KKTSolver(args...; pivoting = :diagonal)
+        @test_throws SDS.InvalidValueError KKTSolver(args...; pivoting = :diagonal, pivot_threshold = 0.1)
+        Kd = KKTSolver(args...; factorization = :ldl, pivoting = :diagonal, pivot_threshold = 0.1)
+        @test SDS.pipeline(Kd) === kkt_default_pipeline(backend)
+        @test getparam(Kd, "pivot_type") == 'D'
+        @test getparam(Kd, "pivot_threshold") == 0.1
+        @test getparam(Kd, "info") == 0
+        SDS.forward_progress(backend) ||
+            @test_throws SDS.NotSupportedError KKTSolver(args...; factorization = :ldl, pivoting = :diagonal, fused = true)
         # the options are checked at construction also when the analysis is deferred
         @test_throws SDS.InvalidValueError KKTSolver(args...; matching = "algo5", deferred_analysis = true)
         @test_throws SDS.InvalidValueError KKTSolver(args...; pivoting = :bk, deferred_analysis = true)
+        @test_throws SDS.InvalidValueError KKTSolver(args...; pivoting = :diagonal, deferred_analysis = true)
     end
     if backend isa CPU
         # a complex element type and a uniform batch are DirectSolver's
@@ -164,9 +176,15 @@ end
         Kc = KKTSolver(args...)
         Kl = KKTSolver(args...; factorization = :ldl)
         Kb = KKTSolver(args...; factorization = :ldl, pivoting = :bk)
+        Kd = KKTSolver(args...; factorization = :ldl, pivoting = :diagonal)
         @test SDS.pipeline(Kc) === expected
         @test SDS.pipeline(Kl) === expected
         @test SDS.pipeline(Kb) === :stock
+        @test SDS.pipeline(Kd) === expected                    # diagonal pivoting runs on both pipelines (#167)
+        @test Kd.inner isa (expected === :fused ? SDS.FusedSolver : SDS.DirectSolver)
+        @test getparam(Kd, "pivot_type") == 'D'
+        @test getparam(Kd, "info") == 0
+        @test SDS.inertia(Kd) == (n, 0, 0)
         # matching and pivot replacement of an LDLᵀ keep the default pipeline: both pipelines have them (#194)
         for kw in ((; matching = "algo5"), (; matching = "algo6"), (; pivot_epsilon = 1.0e-10),
                    (; pivot_sign = ones(Int, n)), (; matching = "algo6", pivot_epsilon = 1.0e-10))
@@ -196,8 +214,18 @@ end
                 @test rs.r2 <= tol(T)
                 @test SDS.pipeline(KKTSolver(args...; factorization, fused = true)) === :fused
             end
+            # #167: :diagonal honours fused = false and fused = true
+            for fused in (false, true)
+                Ks = KKTSolver(args...; factorization = :ldl, pivoting = :diagonal, fused)
+                @test SDS.pipeline(Ks) === (fused ? :fused : :stock)
+                @test getparam(Ks, "pivot_type") == 'D'
+                @test getparam(Ks, "info") == 0
+                rs = kkt_solves(backend, Ks, A)
+                @test rs.r1 <= tol(T)
+                @test rs.r2 <= tol(T)
+            end
         end
-        for K in (Kc, Kl, Kb)
+        for K in (Kc, Kl, Kb, Kd)
             s = sprint(show, K)
             @test occursin("KKTSolver", s)
             @test occursin("pipeline = :$(SDS.pipeline(K))", s)
@@ -279,16 +307,56 @@ end
         @test rs.r2 <= tol(T)
     end
 
+    # #167: diagonal pivoting on every pipeline the backend runs. The scaled grid_kkt_matrix 40×40 (an 80-wide root
+    # front, no ties between equal diagonals) and kkt_matrix with a weak Hessian interchange in the fronts with
+    # pivot_threshold = 0.5; the inertia is (primal, 0, dual) in both. Then the next iteration's values (another
+    # scaling, a congruence: the same inertia, another pivot sequence)
+    @testset ":ldl, :diagonal, $label, fused = $fused: $T" for T in eltypes_among((Float32, Float64)),
+                                                              (label, gen, np) in (
+            ("grid_kkt_matrix 40×40, scaled",
+             () -> (Dg = Diagonal(T.(1 .+ rand(3200))); sparse(Dg * grid_kkt_matrix(T, 40, 40, 1.0) * Dg)), 1600),
+            ("kkt_matrix 1000+500, weak Hessian", () -> kkt_matrix(T, 1000, 500, 1.0; hessian_scale = 1.0e-2), 1000)),
+                                                              fused in (SDS.forward_progress(backend) ?
+                                                                        (nothing, false, true) : (nothing, false))
+        Random.seed!(666)
+        A = gen()
+        n = size(A, 1)
+        args, nzval = kkt_input(backend, A)
+        K = KKTSolver(args...; factorization = :ldl, pivoting = :diagonal, pivot_threshold = 0.5, fused)
+        @test SDS.pipeline(K) === (fused === nothing ? kkt_default_pipeline(backend) : fused ? :fused : :stock)
+        @test getparam(K, "pivot_type") == 'D'
+        @test getparam(K, "info") == 0
+        @test SDS.inertia(K) == (np, 0, n - np)
+        @test getparam(K, "npivots") == 0
+        rs = kkt_solves(backend, K, A)
+        @test rs.r1 <= tol(T)
+        @test rs.r2 <= tol(T)
+        @test rs.same && rs.b_kept
+        piv1 = to_host(K.inner isa SDS.FusedSolver ? K.inner.inner.numeric.piv : K.inner.numeric.piv)
+        @test count(g -> piv1[g] != g, 1:n) > 0                         # interchanges took place
+        Dg = Diagonal(T.(1 .+ 3 .* rand(n)))
+        A2 = sparse(Dg * A * Dg)
+        kkt_set_values!(nzval, A2)
+        factorize!(K)
+        @test getparam(K, "info") == 0
+        @test SDS.inertia(K) == (np, 0, n - np)
+        piv2 = to_host(K.inner isa SDS.FusedSolver ? K.inner.inner.numeric.piv : K.inner.numeric.piv)
+        @test piv2 != piv1
+        rs = kkt_solves(backend, K, A2)
+        @test rs.r1 <= tol(T)
+        @test rs.r2 <= tol(T)
+    end
+
     # matching (#193, #194): the LDLᵀ with the scaled symmetric matching of "algo5"/"algo6", whose cycles give the 2×2
-    # pivot pairs of the ordering with either pivoting (`:none` on the default pipeline, `:bk` on the stock one); then
-    # the next iteration's values, refactorized
+    # pivot pairs of the ordering with every pivoting (`:none` and `:diagonal` (#167) on the default pipeline, `:bk` on
+    # the stock one); then the next iteration's values, refactorized
     @testset ":ldl, matching = $matching, :$pivoting, grid_kkt_matrix 30×30: $T" for
-            T in eltypes_among((Float32, Float64)), matching in ("algo5", "algo6"), pivoting in (:none, :bk)
+            T in eltypes_among((Float32, Float64)), matching in ("algo5", "algo6"), pivoting in (:none, :diagonal, :bk)
         m = 30 * 30
         A = grid_kkt_matrix(T, 30, 30, 1.0)
         args, nzval = kkt_input(backend, A)
         K = KKTSolver(args...; factorization = :ldl, pivoting, matching)
-        @test SDS.pipeline(K) === (pivoting === :none ? kkt_default_pipeline(backend) : :stock)
+        @test SDS.pipeline(K) === (pivoting === :bk ? :stock : kkt_default_pipeline(backend))
         @test getparam(K, "matching_alg") == matching
         @test getparam(K, "info") == 0
         @test SDS.inertia(K) == (m, 0, m)
@@ -329,6 +397,8 @@ end
     @testset "deferred_analysis, $label: $T" for T in eltypes_among((Float32, Float64)),
                                                  (label, kw) in (("default pipeline", (;)),
                                                                  ("matching = algo6", (; matching = "algo6")),
+                                                                 ("matching = algo6, :diagonal",
+                                                                  (; matching = "algo6", pivoting = :diagonal)),
                                                                  ("matching = algo5, :bk", (; matching = "algo5",
                                                                                             pivoting = :bk)))
         m = 30 * 30
@@ -368,6 +438,7 @@ end
     @testset "analyze!, matching = algo6, :$pivoting, fused = $fused: $T" for T in eltypes_among((Float32, Float64)),
                                                                              (pivoting, fused) in (
                                                                                  (:none, nothing), (:none, false),
+                                                                                 (:diagonal, nothing), (:diagonal, false),
                                                                                  (:bk, nothing))
         m = 30 * 30
         A1 = grid_kkt_matrix(T, 30, 30, 100.0)
@@ -376,14 +447,15 @@ end
               pivot_epsilon = T == Float64 ? 1.0e-10 : 1.0e-5)
         args, nzval = kkt_input(backend, A1)
         K = KKTSolver(args...; kw...)
-        @test SDS.pipeline(K) === (pivoting === :none && fused === nothing ? kkt_default_pipeline(backend) : :stock)
+        expected = pivoting !== :bk && fused === nothing ? kkt_default_pipeline(backend) : :stock
+        @test SDS.pipeline(K) === expected
         kkt_set_values!(nzval, A2)
         factorize!(K)
         @test getparam(K, "info") == 0
         @test getparam(K, "npivots") > 0                                # the stale matching
         @test analyze!(K) === K
         @test getparam(K, "info") == 0
-        @test SDS.pipeline(K) === (pivoting === :none && fused === nothing ? kkt_default_pipeline(backend) : :stock)
+        @test SDS.pipeline(K) === expected
         # the parameters of the constructor are kept
         @test getparam(K, "matching_alg") == "algo6"
         @test getparam(K, "pivot_epsilon") == kw.pivot_epsilon
@@ -457,14 +529,17 @@ end
     # `tuning`; n = 200 stays on the default pipeline; `fused = true` raises at the analysis
     @testset "dense, n = $n, $label (#200): $T" for T in eltypes_among((Float32, Float64)), n in (200, 300),
                                                     label in ("ldl", "ldl, matching, pivot_sign, ir_n_steps",
-                                                              "ldl, user_perm", "cholesky, algo3",
-                                                              "cholesky, tuning")
+                                                              "ldl, diagonal, matching", "ldl, user_perm",
+                                                              "cholesky, algo3", "cholesky, tuning")
         ldl = startswith(label, "ldl")
         nneg = ldl ? n ÷ 3 : 0
         kw = Dict("ldl" => (; factorization = :ldl),
                   "ldl, matching, pivot_sign, ir_n_steps" =>
                       (; factorization = :ldl, matching = "algo5", pivot_sign = vcat(fill(1, n - nneg), fill(-1, nneg)),
                        pivot_epsilon = T == Float64 ? 1.0e-10 : 1.0e-5, ir_n_steps = 2),
+                  "ldl, diagonal, matching" =>
+                      (; factorization = :ldl, pivoting = :diagonal, pivot_threshold = 0.1, matching = "algo6",
+                       pivot_sign = vcat(fill(1, n - nneg), fill(-1, nneg)), ir_n_steps = 2),
                   "ldl, user_perm" => (; factorization = :ldl, user_perm = randperm(n)),
                   "cholesky, algo3" => (; reordering = "algo3"),
                   "cholesky, tuning" => (; tuning = SDSTuning(; nd_nseps = 2)))[label]
@@ -483,6 +558,7 @@ end
             @test rs.b_kept
             # the keywords hold on either pipeline
             haskey(kw, :matching) && @test getparam(K, "matching_alg") == kw.matching
+            haskey(kw, :pivoting) && @test getparam(K, "pivot_type") == 'D' && getparam(K, "pivot_threshold") == 0.1
             haskey(kw, :pivot_epsilon) && @test getparam(K, "pivot_epsilon") == kw.pivot_epsilon
             haskey(kw, :ir_n_steps) && @test getparam(K, "ir_n_steps") == kw.ir_n_steps
             haskey(kw, :reordering) && @test getparam(K, "reordering_alg") == kw.reordering
@@ -645,6 +721,46 @@ end
             @test norm(xs[(true, 2)] - xr) / norm(xr) <= tol(T)
         end
         @test_throws SDS.InvalidValueError KKTSolver(args...; factorization = :ldl, ir_n_steps = -1)
+    end
+
+    # #167: MadNLP's configuration with diagonal pivoting (its binding's `sds_pivoting = :diagonal`): matching "algo6",
+    # pivot_epsilon, pivot_sign (+1 primal, -1 slack and dual rows), two refinement steps, the analysis deferred to the
+    # first factorization, on every pipeline the backend runs. kkt_slack_matrix with δ = 0: the inertia of the stock
+    # pipeline, the refined solves accurate, then the next iteration's values
+    @testset ":ldl, :diagonal, matching = algo6, pivot_sign, ir_n_steps = 2, deferred, fused = $fused: $T" for
+            T in eltypes_among((Float32, Float64)),
+            fused in (SDS.forward_progress(backend) ? (nothing, false, true) : (nothing, false))
+        Random.seed!(666)
+        A = kkt_slack_matrix(T, 200, 100, 0.0)
+        n = size(A, 1)
+        kw = (; factorization = :ldl, pivoting = :diagonal, matching = "algo6",
+              pivot_epsilon = T == Float64 ? 1.0e-10 : 1.0e-5, pivot_sign = vcat(fill(1, 200), fill(-1, n - 200)),
+              ir_n_steps = 2)
+        # the stock pipeline's inertia on the same values
+        args0, _ = kkt_input(backend, A)
+        inertia = SDS.inertia(KKTSolver(args0...; kw..., fused = false))
+        args, nzval = kkt_input(backend, A)
+        fill!(nzval, zero(T))
+        K = KKTSolver(args...; kw..., fused, deferred_analysis = true)
+        @test SDS.pipeline(K) === (fused === nothing ? kkt_default_pipeline(backend) : fused ? :fused : :stock)
+        kkt_set_values!(nzval, A)
+        factorize!(K)
+        @test getparam(K, "info") == 0
+        @test getparam(K, "pivot_type") == 'D'
+        @test SDS.inertia(K) == inertia
+        rs = kkt_solves(backend, K, A)
+        @test getparam(K, "ir_n_steps") == 2
+        @test rs.r1 <= tol(T)
+        @test rs.r2 <= tol(T)
+        Dg = Diagonal(T.(1 .+ rand(n)))
+        A2 = sparse(Dg * A * Dg)
+        kkt_set_values!(nzval, A2)
+        factorize!(K)
+        @test getparam(K, "info") == 0
+        @test SDS.inertia(K) == inertia
+        rs = kkt_solves(backend, K, A2)
+        @test rs.r1 <= tol(T)
+        @test rs.r2 <= tol(T)
     end
 
     @testset "reordering = \"algo3\": $T" for T in eltypes_among((Float32, Float64))

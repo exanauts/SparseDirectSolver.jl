@@ -7,6 +7,23 @@ whose Report blocks hold the details and the measurements.
 
 ## [0.4.1] - unreleased
 
+### Added
+
+- Diagonal pivoting on the fused pipeline (#167): `KKTSolver(...; factorization
+  = :ldl, pivoting = :diagonal)` (`pivot_type = 'D'`, with `pivot_threshold`)
+  keeps the default pipeline, so it runs fused on CUDA, AMDGPU and oneAPI and
+  stock on the CPU backend and Metal; `fused = true`/`false` and the fallback
+  of #200 apply as for `:none`. `FusedSolver` takes `pivot_type = 'D'` and
+  `pivot_threshold` for `"S"`: the regime-A subtrees and the fronts of width ≤
+  64 pivot with the stock 1×1 rule (threshold test against the whole remaining
+  column, interchanges inside the fully-summed block, pivot replacement with
+  `pivot_sign`), the wider fronts factor without interchanges; the fused solve
+  applies the pivot order. Matching, refinement, refactorization with new
+  values (a new pivot sequence with the same plans), `analyze!`, deferred
+  analysis and the graph replay work as without pivoting. Bunch–Kaufman stays
+  on the stock pipeline. MadNLP's binding can pass `pivoting = :diagonal`
+  instead of setting `pivot_type` on the stock inner solver.
+
 ### Fixed
 
 - `KKTSolver` with the default `fused = nothing` falls back to the stock

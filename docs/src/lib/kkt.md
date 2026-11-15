@@ -37,7 +37,13 @@ solve!(S, xb)                                  # xb holds b on entry, x on retur
 On the CPU backend and on Metal the same calls run the stock pipeline;
 `pivoting = :bk` selects the Bunch–Kaufman pivoting of the stock `L D Lᵀ` on
 every backend ([Symmetric indefinite systems](@ref)), and `fused = false`
-forces the stock pipeline. The fused solve needs a front of width ≤ 256: on a
+forces the stock pipeline. `pivoting = :diagonal` (`pivot_type = 'D'`, 1×1
+pivots only: a pivot that fails the `pivot_threshold` test is exchanged for
+the acceptable diagonal of largest modulus in the fully-summed block of its
+front) keeps the default pipeline: the fused pipeline pivots in the regime-A
+subtrees and in the fronts of width ≤ 64 with the pivot rule of the stock one,
+and factors the wider fronts without interchanges (with pivot replacement);
+the stock pipeline pivots in every front. The fused solve needs a front of width ≤ 256: on a
 matrix without one (a dense or nearly dense matrix, where the whole matrix is a
 single front) the default `fused = nothing` falls back to the stock pipeline at
 the analysis, with every other keyword kept, and `pipeline` then reports
@@ -47,8 +53,10 @@ the analysis, with every other keyword kept, and `pipeline` then reports
 the matrix and give the 2×2 pivot pairs of the ordering) and pivot replacement
 (`pivot_epsilon`, `pivot_sign`: a pivot below `pivot_epsilon` becomes
 `±pivot_epsilon`, with the requested sign). On the fused pipeline a NaN or
-infinite pivot always fails the factorization (`info ≠ 0`), where the stock
-kernel replaces a NaN pivot and accepts an infinite one. Matching and the
+infinite pivot fails the factorization (`info ≠ 0`), where the stock
+kernel replaces a NaN pivot and accepts an infinite one (with
+`pivoting = :diagonal` the fused subtrees and narrow fronts follow the stock
+rule). Matching and the
 pivot pairs are decided from the values of the analysis: when the solver is
 built before the matrix holds its first values, as an interior-point method
 builds it, pass `deferred_analysis = true`. `ir_n_steps = k` follows every
