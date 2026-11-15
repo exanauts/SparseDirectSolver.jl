@@ -159,6 +159,101 @@ const ALGO1_WEAK_PIVOT_LABELS = ("kkt_matrix 300+150, indefinite H",)
     end
 end
 
+# The fused solve on a factor with in-front pivoting (issue #167, stage 1): the stock LDLᵀ with pivot_type 'D'
+# (1×1 pivots, row interchanges) or 'B' (Bunch–Kaufman: interchanges and 2×2 blocks) factors, and the internal
+# partitioned-inverse fused solve of the same analysis (`Fused.fused_solve_plan`, declared pivoted with
+# `Fused.set_pivoted!`) must solve with that factor as the stock level sweeps do: per-front pivot orders applied in
+# the regime-A subtrees and narrow fronts of the dependency-counter segments, in the level-batched inverse kernels of
+# the entries after the first segment (the FusedSolver layout, `all_segments = false`) and around the vendor dense
+# calls of the fronts wider than 256, and the 2×2 blocks in the diagonal step. The test asserts that interchanges
+# happened in each of those kinds of fronts (and 2×2 blocks for 'B'), and that the fused solve that ignores the pivot
+# order is wrong on these factors, so a pass is not vacuous. One right-hand side per solve (the fused solve takes
+# one): two right-hand sides in turn.
+@testset "fused solve on a factor with in-front pivoting on $(backend_name(backend))" for backend in ALGO1_BACKENDS
+    @testset "$label, pivot_type = '$ptype': $T" for T in eltypes_among((Float32, Float64)),
+                                                     (label, gen, u) in
+                                                     (("kkt_forest_matrix, pivot_threshold 0.5",
+                                                       () -> kkt_forest_matrix(T), 0.5),
+                                                      ("kkt_matrix 300+150, weak H",
+                                                       () -> kkt_matrix(T, 300, 150, 0; hessian_scale = 1e-4), 0.01)),
+                                                     ptype in ('D', 'B')
+        Random.seed!(666)
+        A = gen()
+        n = size(A, 1)
+        s = DirectSolver(api_matrix(backend, tril(A), Int32), "S", 'L')
+        setparam!(s, "pivot_type", ptype)
+        setparam!(s, "pivot_threshold", u)
+        analyze!(s)
+        factorize!(s)
+        @test getparam(s, "info") == 0
+        st = getparam(s, "pivot_stats")
+        @test st.nperturbed == 0                          # an unperturbed factor: the residual is meaningful
+        ptype == 'B' && @test st.n2x2 > 0                # 2×2 blocks in the diagonal step
+        # the interchanges per kind of front: regime-A subtrees, the wide fronts, the narrow ones
+        S = s.symbolic
+        piv = to_host(s.numeric.piv)
+        sp = to_host(S.super_ptr)
+        widths = S.schedule.width
+        swaps(v) = count(k -> piv[k] != k, sp[v]:(sp[v + 1] - 1))
+        insub = falses(length(widths))
+        insub[to_host(S.subtree_nodes)] .= true
+        nsub = sum(v -> insub[v] ? swaps(v) : 0, eachindex(widths))
+        nwide = sum(v -> widths[v] > SDS.Fused.MW ? swaps(v) : 0, eachindex(widths))
+        nnarrow = sum(v -> !insub[v] && widths[v] <= SDS.Fused.MW ? swaps(v) : 0, eachindex(widths))
+        @test nnarrow > 0
+        if label == "kkt_forest_matrix, pivot_threshold 0.5"
+            @test nsub > 0 && nwide > 0
+        end
+        rhs = [rand(T, n), rand(T, n)]
+        xs = map(b -> (bd = to_device(backend, b); xd = similar(bd); solve!(s, xd, bd); to_host(xd)), rhs)
+        @test all(k -> relres(A, xs[k], rhs[k]) <= tol(T), eachindex(rhs))
+        wg = SDS.Fused.default_tuning(backend).solve_workgroup
+        for all_segments in (true, false)
+            fs = SDS.Fused.fused_solve_plan(s; workgroup = wg, all_segments)
+            fs.invert!()
+            plan = s.workspace.plan
+            nodes = S.schedule.group_nodes
+            covered = falses(length(plan.kind))
+            for (fzk, _) in fs.fz[1]
+                covered[fzk.i1:fzk.i2] .= true
+            end
+            # the narrow fronts of the plan entries outside the segments (level-batched inverse kernels)
+            lb = [nodes[q] for k in eachindex(plan.kind) if !covered[k] && plan.kind[k] != SDS.SOLVE_SUBTREES
+                  for q in plan.first[k]:plan.last[k] if widths[nodes[q]] <= SDS.Fused.MW]
+            if label == "kkt_forest_matrix, pivot_threshold 0.5"
+                all_segments ? (@test length(fs.fz[1]) > 1) : (@test sum(swaps, lb; init = 0) > 0)
+            end
+            fused(b, det) = (bd = to_device(backend, b); xd = similar(bd);
+                             SDS.Fused.fused_solve!(fs, s, xd, bd, det); to_host(xd))
+            # without the pivot order the fused solve is wrong on this factor (the test is not vacuous)
+            x0 = fused(rhs[1], false)
+            @test !(norm(x0 - xs[1]) / norm(xs[1]) <= tol(T))
+            SDS.Fused.set_pivoted!(fs, true)
+            for k in eachindex(rhs), det in (false, true)
+                x = fused(rhs[k], det)
+                @test norm(x - xs[k]) / norm(xs[k]) <= tol(T)
+                @test relres(A, x, rhs[k]) <= tol(T)
+            end
+            # deterministic_mode = 1: bitwise reproducible, and the three sweeps (the solve sub-phases) compose to it
+            x1 = fused(rhs[2], true)
+            @test fused(rhs[2], true) == x1
+            ws = s.workspace
+            bm = SDS.batch_map(s.numeric; nrhs = 1)
+            bd = to_device(backend, rhs[2])
+            xd = similar(bd)
+            SDS.permute_rhs!(ws.Y, bd, S.perm; transposed = false, bm)
+            SDS._fused_forward!(fs, ws, S, s.numeric, true)
+            SDS._fused_diagonal!(fs, ws, S, s.numeric)
+            SDS._fused_backward!(fs, ws, S, s.numeric)
+            SDS.unpermute_solution!(xd, ws.Y, S.perm; transposed = false, bm)
+            @test to_host(xd) == x1
+            # the bench-only chain kernel applies no pivot order: refused, never a wrong solve
+            @test_throws NotSupportedError SDS.Fused.algo2_sweeps!(s, fs.inv11, fs.inv_ptr,
+                                                                   ([(fs.fz[1][1][1], 1024)], true), false, true)
+        end
+    end
+end
+
 # the unsupported combinations raise NotSupportedError: at the analysis, the factorization or the solve
 @testset "solve_alg = \"algo1\": unsupported combinations ($(backend_name(backend)), $T)" for backend in BACKENDS,
                                                                                             T in ELTYPES

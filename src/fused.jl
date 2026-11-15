@@ -128,6 +128,34 @@ const NSTRIP = 4  # strip parallelism of the chain kernels
 end
 
 # ---------------------------------------------------------------------------
+# In-front pivoting (the kernels' `pvv = Val(true)`, issue #167). The stock LDLᵀ (src/numeric/ldlt.jl, the reference
+# src/reference/ldlt.jl) interchanges rows and columns inside the fully-summed block of front v only,
+# LAPACK-style: Pᵥ F₁₁ Pᵥᵀ, every earlier column of the panel swapped with it, so the stored panel is
+# [L₁₁; L₂₁] in factor order with the rows `w+1:f` (the contribution rows, `rowval`) never permuted, and
+#
+#     Pᵥᵀ [F₁₁ F₂₁ᵀ; F₂₁ F₂₂] Pᵥ = [L₁₁ 0; L₂₁ I] [D₁ 0; 0 S] [L₁₁ᵀ L₂₁ᵀ; 0 I]   (Pᵥ acting on rows 1:w)
+#
+# with `piv[c0 + k]` the column (before pivoting, the global supernodal numbering) eliminated at factor
+# column `c0 + k`. Every entry of `Y` outside the front being processed is in the numbering before
+# pivoting (descendants scatter into, and ancestors gather from, `rowval` rows). Hence per front:
+#
+# * forward: z = inv(L₁₁) (Pᵥᵀ y), i.e. the GEMV reads y at `piv[c0 + j]` instead of `c0 + j` (after the
+#   children's updates are in, pulled or atomic), stores z in factor order, and updates the rows below
+#   with L₂₁ z as before (those rows are not permuted);
+# * diagonal: D⁻¹ in factor order (1×1 and the 2×2 blocks of Bunch–Kaufman; L₁₁ has a zero at (k+1, k)
+#   of a 2×2 block, so the unit-triangular inverse is the same formula), `SDS.diagonal_sweep!`;
+# * backward: x = inv(L₁₁)ᵀ (z − L₂₁ᵀ x_below) in factor order, scattered back through the order:
+#   Y[piv[c0 + k]] = x_k, before the front signals its children, which then gather rows in the numbering
+#   before pivoting again.
+#
+# This is `_sv_piv_apply!` of the level sweeps folded into the reads (forward) and writes (backward) of the
+# inverse GEMVs: no extra buffer, barrier or launch. `pvv = Val(false)` (no pivoting, Cholesky) compiles to
+# the unpermuted kernels, `piv` is never read. (The closed prototype 5947a93 folded the order in the same
+# way; its testset failed because two of its three configurations, no segment and the chain kernel on the
+# merged segment, never solve the regime-A subtrees, with or without pivoting.)
+@inline _pj(piv, c0, j, ::Val{true}) = @inbounds Int(piv[c0 + j]) - c0
+@inline _pj(piv, c0, j, ::Val{false}) = j
+
 # forward: z = inv(L11) y per front, then the atomic L21 update (stock scatter)
 #
 # deterministic_mode = 1 (`DET`, T35): no atomics. Every front writes its update to its own buffer in `U`
@@ -138,7 +166,7 @@ end
                               @Const(subtree_ptr), @Const(subtree_nodes), @Const(super_ptr), @Const(rowptr),
                               @Const(rowval), @Const(front_ptr), @Const(front_nrows), @Const(front_ncols),
                               U, @Const(child_ptr), @Const(child_list), @Const(relind_ptr), @Const(relind),
-                              ::Val{SUB}, ::Val{WGV}, ::Val{DET}) where {SUB, WGV, DET}
+                              ::Val{SUB}, ::Val{WGV}, ::Val{DET}, @Const(piv), pvv::Val) where {SUB, WGV, DET}
     @uniform TT = eltype(Y)
     li = @index(Local, Linear)
     g = @index(Group, Linear)
@@ -161,11 +189,11 @@ end
                              relind_ptr, relind, li, Val(WGV))
             end
             w > MW && continue
-            # t = inv(L11) * Y[c0+1 : c0+w]
+            # t = inv(L11) * Y[c0+1 : c0+w]  (pivoted: (Pᵀ y), read through `piv`)
             for kk in li:WGV:w
                 acc = zero(TT)
                 for j in 1:w
-                    acc += inv11[ip + (j - 1) * w + kk] * Y[c0 + j]
+                    acc += inv11[ip + (j - 1) * w + kk] * Y[c0 + _pj(piv, c0, j, pvv)]
                 end
                 t[kk] = acc
             end
@@ -236,7 +264,7 @@ end
 @kernel function bwd1_kernel!(Y, @Const(factor), @Const(inv11), @Const(inv_ptr), @Const(list), first, count,
                               @Const(subtree_ptr), @Const(subtree_nodes), @Const(super_ptr), @Const(rowptr),
                               @Const(rowval), @Const(front_ptr), @Const(front_nrows), @Const(front_ncols),
-                              ::Val{SUB}, ::Val{WGV}) where {SUB, WGV}
+                              ::Val{SUB}, ::Val{WGV}, @Const(piv), pvv::Val) where {SUB, WGV}
     @uniform TT = eltype(Y)
     li = @index(Local, Linear)
     g = @index(Group, Linear)
@@ -264,14 +292,15 @@ end
                 t[kk] = Y[c0 + kk] - acc
             end
             @synchronize
-            # x = inv(L11)ᵀ t  (inv col-major: invᵀ[k, j] = inv11[(k-1)w + j], contiguous in j)
+            # x = inv(L11)ᵀ t  (inv col-major: invᵀ[k, j] = inv11[(k-1)w + j], contiguous in j);
+            # pivoted: scattered back through `piv` (the order before pivoting)
             for kk in li:WGV:w
                 acc = zero(TT)
                 cb = ip + (kk - 1) * w
                 for j in 1:w
                     acc += inv11[cb + j] * t[j]
                 end
-                Y[c0 + kk] = acc
+                Y[c0 + _pj(piv, c0, kk, pvv)] = acc
             end
             @synchronize
         end
@@ -448,7 +477,7 @@ end
                               @Const(snparent), arrived, @Const(nchild), @Const(super_ptr),
                               @Const(rowptr), @Const(rowval), @Const(front_ptr), @Const(front_nrows),
                               @Const(front_ncols), U, @Const(child_ptr), @Const(child_list), @Const(relind_ptr),
-                              @Const(relind), ::Val{WGV}, ::Val{DET}) where {WGV, DET}
+                              @Const(relind), ::Val{WGV}, ::Val{DET}, @Const(piv), pvv::Val) where {WGV, DET}
     @uniform TT = eltype(Y)
     li = @index(Local, Linear)
     g = @index(Group, Linear)
@@ -472,10 +501,10 @@ end
                 _fused_pull!(Y, U, v, w, f, rp, c0, child_ptr, child_list, rowptr, front_nrows, front_ncols,
                              relind_ptr, relind, li, Val(WGV))
             end
-            for kk in li:WGV:w
+            for kk in li:WGV:w                      # t = inv(L11) * (Pᵀ y)
                 acc = zero(TT)
                 for j in 1:w
-                    acc += inv11[ip + (j - 1) * w + kk] * Y[c0 + j]
+                    acc += inv11[ip + (j - 1) * w + kk] * Y[c0 + _pj(piv, c0, j, pvv)]
                 end
                 t[kk] = acc
             end
@@ -545,10 +574,10 @@ end
             end
         end
         @synchronize
-        for kk in li:WGV:w                          # t = inv(L11) * y
+        for kk in li:WGV:w                          # t = inv(L11) * y (pivoted: Pᵀ y, yb read through `piv`)
             acc = zero(TT)
             for j in 1:w
-                acc += inv11[ip + (j - 1) * w + kk] * yb[j]
+                acc += inv11[ip + (j - 1) * w + kk] * yb[_pj(piv, c0, j, pvv)]
             end
             t[kk] = acc
         end
@@ -583,7 +612,7 @@ end
                               @Const(flist), @Const(slist), nsub, @Const(subtree_ptr), @Const(subtree_nodes),
                               @Const(snparent), done, @Const(super_ptr), @Const(rowptr),
                               @Const(rowval), @Const(front_ptr), @Const(front_nrows), @Const(front_ncols),
-                              ::Val{WGV}) where {WGV}
+                              ::Val{WGV}, @Const(piv), pvv::Val) where {WGV}
     @uniform TT = eltype(Y)
     li = @index(Local, Linear)
     g = @index(Group, Linear)
@@ -634,7 +663,7 @@ end
                 for j in 1:w
                     acc += inv11[cb + j] * t2[j]
                 end
-                Y[c0 + kk] = acc
+                Y[c0 + _pj(piv, c0, kk, pvv)] = acc  # pivoted: back to the order before pivoting
             end
             @synchronize
         end
@@ -712,7 +741,7 @@ end
             for j in 1:w
                 acc += inv11[cb + j] * t2[j]
             end
-            Y[c0 + kk] = acc
+            Y[c0 + _pj(piv, c0, kk, pvv)] = acc      # pivoted: back to the order before pivoting
         end
         @synchronize
         if li == 1
@@ -925,10 +954,12 @@ _check_solve_workgroup(wg) = (32 <= wg <= MW && wg % 32 == 0) ||
 
 # one fused segment, forward sweep: `wg > 512` runs the single-workgroup chain kernel,
 # otherwise the dependency-counter sweep with workgroups of `wg` work items (`det`: the deterministic
-# variant, update buffers in `ws.U` pulled by the parents, T35)
-function run_fused!(fz, wg, Yv, s, inv11, inv_ptr, backend, det::Bool = false)
+# variant, update buffers in `ws.U` pulled by the parents, T35; `pvv = Val(true)`: a factor with in-front
+# pivoting, the reads and writes through `N.piv`, see `_pj`)
+function run_fused!(fz, wg, Yv, s, inv11, inv_ptr, backend, det::Bool = false, pvv::Val = Val(false))
     S, N = s.symbolic, s.numeric
     if wg > 512
+        _check_chain_pivoting(pvv)
         chain_fwd_kernel!(backend, CHWG)(Yv, N.factor, inv11, inv_ptr, fz.flist, S.super_ptr, S.rowptr,
                                          S.rowval, S.front_ptr, S.front_nrows, S.front_ncols, Val(CHWG);
                                          ndrange = CHWG)
@@ -942,17 +973,23 @@ function run_fused!(fz, wg, Yv, s, inv11, inv_ptr, backend, det::Bool = false)
             fz.arrived, fz.nchild, S.super_ptr, S.rowptr, S.rowval, S.front_ptr, S.front_nrows, S.front_ncols, Uv,
             S.child_ptr, S.child_list, S.relind_ptr, S.relind)
     if det
-        k(args..., Val(wg), Val(true); ndrange = wg * (fz.nfused + fz.nsub))
+        k(args..., Val(wg), Val(true), N.piv, pvv; ndrange = wg * (fz.nfused + fz.nsub))
     else
-        k(args..., Val(wg), Val(false); ndrange = wg * (fz.nfused + fz.nsub))
+        k(args..., Val(wg), Val(false), N.piv, pvv; ndrange = wg * (fz.nfused + fz.nsub))
     end
     return nothing
 end
 
+# the chain kernels (bench only) apply no local pivot order
+_check_chain_pivoting(::Val{false}) = nothing
+_check_chain_pivoting(::Val{true}) =
+    throw(SDS.NotSupportedError("fused solve: the chain kernel (workgroup > 512) applies no in-front pivot order"))
+
 # the backward counterpart of `run_fused!`
-function run_fused_bwd!(fz, wg, Yv, s, inv11, inv_ptr, backend)
+function run_fused_bwd!(fz, wg, Yv, s, inv11, inv_ptr, backend, pvv::Val = Val(false))
     S, N = s.symbolic, s.numeric
     if wg > 512
+        _check_chain_pivoting(pvv)
         chain_bwd_kernel!(backend, CHWG)(Yv, N.factor, inv11, inv_ptr, fz.flist, S.super_ptr, S.rowptr,
                                          S.rowval, S.front_ptr, S.front_nrows, S.front_ncols, Val(CHWG);
                                          ndrange = CHWG)
@@ -963,7 +1000,7 @@ function run_fused_bwd!(fz, wg, Yv, s, inv11, inv_ptr, backend)
     bwd2_kernel!(backend, wg)(Yv, N.factor, inv11, inv_ptr, fz.flist, fz.slist, fz.nsub, S.subtree_ptr,
                               S.subtree_nodes, S.snparent, fz.done,
                               S.super_ptr, S.rowptr, S.rowval, S.front_ptr, S.front_nrows, S.front_ncols,
-                              Val(wg); ndrange = wg * (fz.nfused + fz.nsub))
+                              Val(wg), N.piv, pvv; ndrange = wg * (fz.nfused + fz.nsub))
     return nothing
 end
 
@@ -971,12 +1008,14 @@ end
 # `(build_fused(...), wg)` pairs in plan order; plan entries outside the segments
 # run through the level-batched kernels (`fwd1_kernel!`/`bwd1_kernel!`, vendor
 # dense calls for fronts wider than MW). `det`: the deterministic forward sweep of
-# deterministic_mode = 1 (no atomics; the update buffers `ws.U` of PLAN §2.5, pulled by the parents)
-function algo2_solve!(x, s, b, inv11, inv_ptr, fz, det::Bool = false)
+# deterministic_mode = 1 (no atomics; the update buffers `ws.U` of PLAN §2.5, pulled by the parents).
+# `piv`: the factor has in-front pivoting (LDLᵀ, `N.piv` and `N.pivot_kind`, see `_pj`); `false` for
+# Cholesky and the no-pivot LDLᵀ, whose kernels never read `N.piv`
+function algo2_solve!(x, s, b, inv11, inv_ptr, fz, det::Bool = false, piv::Bool = false)
     S, N, ws = s.symbolic, s.numeric, s.workspace
     bm = SDS.batch_map(N; nrhs = 1)
     SDS.permute_rhs!(ws.Y, b, S.perm; transposed = false, bm)
-    algo2_sweeps!(s, inv11, inv_ptr, fz, det)
+    algo2_sweeps!(s, inv11, inv_ptr, fz, det, piv)
     SDS.unpermute_solution!(x, ws.Y, S.perm; transposed = false, bm)
     return x
 end
@@ -984,16 +1023,28 @@ end
 # the sweeps of `algo2_solve!` on the solve workspace `Y` (the permuted right-hand side in,
 # the permuted solution out): the part a CUDA graph replays (T34). The three parts are the
 # solve sub-phases of `solve_alg = "algo1"` ("solve_fwd", "solve_diag", "solve_bwd", T36)
-function algo2_sweeps!(s, inv11, inv_ptr, fz, det::Bool = false)
-    algo2_forward!(s, inv11, inv_ptr, fz, det)
-    algo2_diagonal!(s)
-    algo2_backward!(s, inv11, inv_ptr, fz)
+function algo2_sweeps!(s, inv11, inv_ptr, fz, det::Bool = false, piv::Bool = false)
+    algo2_forward!(s, inv11, inv_ptr, fz, det, piv)
+    algo2_diagonal!(s, piv)
+    algo2_backward!(s, inv11, inv_ptr, fz, piv)
     return nothing
 end
 
 # the forward sweep of the fused solve: the segments by the dependency-counter kernel, the
 # plan entries outside them by `fwd1_kernel!` and the vendor dense calls (fronts wider than MW)
-function algo2_forward!(s, inv11, inv_ptr, fz, det::Bool = false)
+algo2_forward!(s, inv11, inv_ptr, fz, det::Bool = false, piv::Bool = false) =
+    piv ? _algo2_forward!(s, inv11, inv_ptr, fz, det, Val(true)) :
+          _algo2_forward!(s, inv11, inv_ptr, fz, det, Val(false))
+
+# the solve kind of the dense calls of the fronts wider than MW: unit-triangular without reordering
+# (`_SV_CHOLESKY`, what the no-pivot LDLᵀ always used), or the real LDLᵀ kind, which applies the front's
+# local pivot order around them (`_piv_dense!`, through the rows 1:w of the front's buffer in `ws.U`,
+# which the deterministic forward sweep leaves unused, as in the level sweeps); D is applied by
+# `algo2_diagonal!` either way
+_dense_kind(::Val{false}) = SDS._SV_CHOLESKY
+_dense_kind(::Val{true}) = SDS._SV_LDL_HERM
+
+function _algo2_forward!(s, inv11, inv_ptr, fz, det::Bool, pvv::Val)
     S, N, ws = s.symbolic, s.numeric, s.workspace
     plan = ws.plan
     nodes = S.schedule.group_nodes
@@ -1008,8 +1059,10 @@ function algo2_forward!(s, inv11, inv_ptr, fz, det::Bool = false)
                           S.front_ncols)
     fargs(first, count) = (args(first, count)..., Uv, S.child_ptr, S.child_list, S.relind_ptr, S.relind)
     fwd1!(a, b_) = det ?
-        fwd1_kernel!(backend, WG)(fargs(a, b_ - a + 1)..., Val(false), Val(WG), Val(true); ndrange = WG * (b_ - a + 1)) :
-        fwd1_kernel!(backend, WG)(fargs(a, b_ - a + 1)..., Val(false), Val(WG), Val(false); ndrange = WG * (b_ - a + 1))
+        fwd1_kernel!(backend, WG)(fargs(a, b_ - a + 1)..., Val(false), Val(WG), Val(true), N.piv, pvv;
+                                  ndrange = WG * (b_ - a + 1)) :
+        fwd1_kernel!(backend, WG)(fargs(a, b_ - a + 1)..., Val(false), Val(WG), Val(false), N.piv, pvv;
+                                  ndrange = WG * (b_ - a + 1))
     # SOLVE_SUBTREES entries are run by run_fused!/run_fused_bwd!, so the entries launched here never pass
     # SUB = true to fwd1_kernel!/bwd1_kernel!.
     fwd_entry(k) = begin
@@ -1019,7 +1072,7 @@ function algo2_forward!(s, inv11, inv_ptr, fz, det::Bool = false)
             # deterministic: the launch also pulls the children of the fronts wider than MW
             (det || any(widths[nodes[q]] <= MW for q in a:b_)) && fwd1!(a, b_)
             for q in a:b_
-                widths[nodes[q]] > MW && SDS._fwd_dense!(ws, S, N, nodes[q], 1, det, p, SDS._SV_CHOLESKY)
+                widths[nodes[q]] > MW && SDS._fwd_dense!(ws, S, N, nodes[q], 1, det, p, _dense_kind(pvv))
             end
         else
             fwd1!(a, b_)
@@ -1030,7 +1083,7 @@ function algo2_forward!(s, inv11, inv_ptr, fz, det::Bool = false)
         while k < fzk.i1
             fwd_entry(k); k += 1
         end
-        run_fused!(fzk, wg, Yv, s, inv11, inv_ptr, backend, det)
+        run_fused!(fzk, wg, Yv, s, inv11, inv_ptr, backend, det, pvv)
         k = fzk.i2 + 1
     end
     while k <= length(plan.kind)
@@ -1039,14 +1092,18 @@ function algo2_forward!(s, inv11, inv_ptr, fz, det::Bool = false)
     return nothing
 end
 
-# the diagonal step between the unit-triangular sweeps of LDLᵀ (1×1 pivots only: D⁻¹ on the first
-# column of `Y`); nothing for Cholesky
-function algo2_diagonal!(s)
+# the diagonal step between the unit-triangular sweeps of LDLᵀ: D⁻¹ on the first column of `Y`, 1×1
+# pivots by a broadcast or (`piv`: in-front pivoting, which may hold the 2×2 blocks of Bunch–Kaufman)
+# the stock diagonal sweep (one launch, in factor order, as the forward sweep leaves `Y`); nothing for
+# Cholesky
+function algo2_diagonal!(s, piv::Bool = false)
     S, N, ws = s.symbolic, s.numeric, s.workspace
     if SDS._is_ldlt_structure(S.structure)
         n = S.n
         Yv = vec(ws.Y)
-        if length(Yv) == n
+        if piv
+            SDS.diagonal_sweep!(ws, S, N; nrhs = 1)
+        elseif length(Yv) == n
             Yv ./= view(N.d, 1:n)
         else                                     # a workspace sized for more right-hand sides
             view(Yv, 1:n) ./= view(N.d, 1:n)
@@ -1056,7 +1113,10 @@ function algo2_diagonal!(s)
 end
 
 # the backward sweep of the fused solve (the forward plan in reverse)
-function algo2_backward!(s, inv11, inv_ptr, fz)
+algo2_backward!(s, inv11, inv_ptr, fz, piv::Bool = false) =
+    piv ? _algo2_backward!(s, inv11, inv_ptr, fz, Val(true)) : _algo2_backward!(s, inv11, inv_ptr, fz, Val(false))
+
+function _algo2_backward!(s, inv11, inv_ptr, fz, pvv::Val)
     S, N, ws = s.symbolic, s.numeric, s.workspace
     plan = ws.plan
     nodes = S.schedule.group_nodes
@@ -1068,17 +1128,18 @@ function algo2_backward!(s, inv11, inv_ptr, fz)
     args(first, count) = (Yv, N.factor, inv11, inv_ptr, S.group_nodes, first, count, S.subtree_ptr,
                           S.subtree_nodes, S.super_ptr, S.rowptr, S.rowval, S.front_ptr, S.front_nrows,
                           S.front_ncols)
+    bwd1!(a, b_) = bwd1_kernel!(backend, WG)(args(a, b_ - a + 1)..., Val(false), Val(WG), N.piv, pvv;
+                                             ndrange = WG * (b_ - a + 1))
     bwd_entry(k) = begin
         a, b_ = plan.first[k], plan.last[k]
         if plan.kind[k] == SDS.SOLVE_SUBTREES
         elseif plan.kind[k] == SDS.SOLVE_DENSE
             for q in b_:-1:a
-                widths[nodes[q]] > MW && SDS._bwd_dense!(ws, S, N, nodes[q], 1, p, SDS._SV_CHOLESKY)
+                widths[nodes[q]] > MW && SDS._bwd_dense!(ws, S, N, nodes[q], 1, p, _dense_kind(pvv))
             end
-            any(widths[nodes[q]] <= MW for q in a:b_) &&
-                bwd1_kernel!(backend, WG)(args(a, b_ - a + 1)..., Val(false), Val(WG); ndrange = WG * (b_ - a + 1))
+            any(widths[nodes[q]] <= MW for q in a:b_) && bwd1!(a, b_)
         else
-            bwd1_kernel!(backend, WG)(args(a, b_ - a + 1)..., Val(false), Val(WG); ndrange = WG * (b_ - a + 1))
+            bwd1!(a, b_)
         end
     end
     k = length(plan.kind)
@@ -1086,7 +1147,7 @@ function algo2_backward!(s, inv11, inv_ptr, fz)
         while k > fzk.i2
             bwd_entry(k); k -= 1
         end
-        run_fused_bwd!(fzk, wg, Yv, s, inv11, inv_ptr, backend)
+        run_fused_bwd!(fzk, wg, Yv, s, inv11, inv_ptr, backend, pvv)
         k = fzk.i1 - 1
     end
     while k >= 1
@@ -1111,6 +1172,7 @@ mutable struct FusedSolve{VT, VI, IF, FZ}
     gsolve::Any              # the captured sweeps (`nothing`: not yet; `false`: not capturable)
     gdet::Bool               # the deterministic_mode the graph was captured with
     current::Bool            # the inverses are those of the current factor (DirectSolver's bookkeeping)
+    pivoted::Bool            # the factor has in-front pivoting (`set_pivoted!`, issue #167)
 end
 
 # the fused solve of the analysis of `s` (a DirectSolver, or anything with its `symbolic`,
@@ -1137,20 +1199,40 @@ function fused_solve_plan(s; workgroup::Int, graph::Bool = false, all_segments::
     for (fzk, _) in segs
         bytes += sum(k -> _device_bytes(fzk[k]), keys(fzk))
     end
-    return FusedSolve(inv11, inv_ptr, invertf, (segs, true), bytes, graph, nothing, false, false)
+    return FusedSolve(inv11, inv_ptr, invertf, (segs, true), bytes, graph, nothing, false, false, false)
+end
+
+"""
+    set_pivoted!(fs::FusedSolve, pivoted::Bool) -> fs
+
+Declare whether the factor the fused solve `fs` runs on has in-front pivoting (an LDLᵀ factor with
+local pivot orders `numeric.piv` and possibly the 2×2 blocks of Bunch–Kaufman in `numeric.pivot_kind`,
+as the stock LDLᵀ with `pivot_type` `'D'` or `'B'` leaves them). `true`: the sweeps apply each front's
+pivot order (the reads of the forward, the writes of the backward inverse GEMVs, see `_pj`) and the
+diagonal step solves the 2×2 blocks; `false` (the default of `fused_solve_plan`): the kernels of the
+no-pivot solve, which never read `numeric.piv`. A captured graph of the other variant is dropped.
+Internal (issue #167): the owner of `fs` sets it after each factorization to what that factorization
+did. Wrong-way round is a wrong solution for a pivoted factor, never an error.
+"""
+function set_pivoted!(fs::FusedSolve, pivoted::Bool)
+    pivoted == fs.pivoted && return fs
+    fs.pivoted = pivoted
+    fs.gsolve = nothing                             # a graph is captured for one variant
+    return fs
 end
 
 # the three sweeps on the permuted right-hand side in `s.workspace.Y`; with `fs.graph` the first
 # call per `det` runs eagerly (it compiles the kernels) and captures the graph, later calls replay it
 function fused_sweeps!(fs::FusedSolve, s, det::Bool)
+    piv = fs.pivoted
     if fs.graph
         det == fs.gdet || (fs.gsolve = nothing)    # a graph is captured for one forward-sweep variant
         if fs.gsolve === nothing
-            algo2_sweeps!(s, fs.inv11, fs.inv_ptr, fs.fz, det)
+            algo2_sweeps!(s, fs.inv11, fs.inv_ptr, fs.fz, det, piv)
             inv11, inv_ptr, fz = fs.inv11, fs.inv_ptr, fs.fz
             backend = KA.get_backend(s.workspace.Y)
-            g = det ? SDS.capture_graph(backend, () -> algo2_sweeps!(s, inv11, inv_ptr, fz, true)) :
-                      SDS.capture_graph(backend, () -> algo2_sweeps!(s, inv11, inv_ptr, fz, false))
+            g = det ? SDS.capture_graph(backend, () -> algo2_sweeps!(s, inv11, inv_ptr, fz, true, piv)) :
+                      SDS.capture_graph(backend, () -> algo2_sweeps!(s, inv11, inv_ptr, fz, false, piv))
             fs.gsolve = something(g, false)
             fs.gdet = det
             return nothing
@@ -1160,7 +1242,7 @@ function fused_sweeps!(fs::FusedSolve, s, det::Bool)
             return nothing
         end
     end
-    algo2_sweeps!(s, fs.inv11, fs.inv_ptr, fs.fz, det)
+    algo2_sweeps!(s, fs.inv11, fs.inv_ptr, fs.fz, det, piv)
     return nothing
 end
 
@@ -1192,9 +1274,11 @@ SDS._fused_current(fs::FusedSolve) = fs.current
 SDS._fused_bytes(fs::FusedSolve) = fs.bytes
 _sv(ws, S, N) = (; symbolic = S, numeric = N, workspace = ws)
 SDS._fused_sweeps!(fs::FusedSolve, ws, S, N, det::Bool) = fused_sweeps!(fs, _sv(ws, S, N), det)
-SDS._fused_forward!(fs::FusedSolve, ws, S, N, det::Bool) = algo2_forward!(_sv(ws, S, N), fs.inv11, fs.inv_ptr, fs.fz, det)
-SDS._fused_diagonal!(fs::FusedSolve, ws, S, N) = algo2_diagonal!(_sv(ws, S, N))
-SDS._fused_backward!(fs::FusedSolve, ws, S, N) = algo2_backward!(_sv(ws, S, N), fs.inv11, fs.inv_ptr, fs.fz)
+SDS._fused_forward!(fs::FusedSolve, ws, S, N, det::Bool) =
+    algo2_forward!(_sv(ws, S, N), fs.inv11, fs.inv_ptr, fs.fz, det, fs.pivoted)
+SDS._fused_diagonal!(fs::FusedSolve, ws, S, N) = algo2_diagonal!(_sv(ws, S, N), fs.pivoted)
+SDS._fused_backward!(fs::FusedSolve, ws, S, N) =
+    algo2_backward!(_sv(ws, S, N), fs.inv11, fs.inv_ptr, fs.fz, fs.pivoted)
 SDS._fused_solve_plan(s::SDS.DirectSolver) =
     fused_solve_plan(s; workgroup = default_tuning(s.backend).solve_workgroup, all_segments = true)
 
