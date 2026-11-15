@@ -194,6 +194,23 @@ block instead of eliminating a (near-)zero dual pivot on its own.
 kkt_interleaved_perm(nh::Integer, nj::Integer) = vcat([[i, nh + i] for i in 1:nj]..., (nj + 1):nh)
 
 """
+    kkt_forest_matrix(T; rng)
+
+Block-diagonal `[K₁ 0; 0 K₂]`, `n = 1950`, of two [`kkt_matrix`](@ref)
+systems with weak Hessians next to `J`, so in-front pivoting interchanges rows
+(issue #167): `K₁ = kkt_matrix(T, 300, 150, 0; density_h = 0.05, hessian_scale = 1e-4)`,
+whose dense Hessian gives a root front wider than 256, and the well-conditioned
+`K₂ = kkt_matrix(T, 1000, 500, 1.0)`, whose deeper elimination tree has
+regime-A subtrees and narrow fronts in the schedule steps after `K₁`'s wide
+root (the plan entries a fused solve runs after its first dependency-counter
+segment). With `pivot_threshold = 0.5` the interchanges reach every kind of
+front (subtrees, narrow fronts before and after the wide one, the wide front).
+"""
+kkt_forest_matrix(::Type{T}; rng::AbstractRNG = Random.default_rng()) where {T} =
+    blockdiag(kkt_matrix(T, 300, 150, 0; density_h = 0.05, hessian_scale = 1e-4, rng),
+              kkt_matrix(T, 1000, 500, 1.0; rng))
+
+"""
     grid_kkt_matrix(T, nx, ny, δ)
 
 Saddle-point matrix of a PDE-constrained problem on an `nx × ny` grid
