@@ -947,10 +947,18 @@ allowance of the GPU packages: on CUDA (RTX 4080, T33) about 256 B per
 KernelAbstractions launch and 240 B per `fill!`/`copyto!` of a view, plus the
 host read of `info`, measured at 36–42 KB per cycle for n = 400 to 5832
 (Float32 and Float64, `"SPD"` and `"S"`), independent of n; the stock
-`DirectSolver` allocates 130–190 KB for the same cycle. oneAPI.jl allocates
-352–368 B per launch and per `fill!` of a view (Aurora, Max 1550, LTS stack),
-measured at 66–78 KB per cycle for the same matrices, with or without
-`ONEAPI_SYNC_EACH_SUBMISSION` and coverage, hence 96 KiB there.
+`DirectSolver` allocates 130–190 KB for the same cycle. oneAPI.jl (2.10,
+Aurora, Max 1550, LTS stack) allocates 352 B per launch and per `fill!` of a
+view only for a kernel with at most 30 arguments: from 31 arguments on (32
+with the KernelAbstractions context) its launch converts the argument tuple
+through Base's `map` for long tuples, which is not inferred, and the launch
+allocates about 1 KB per argument (30 array arguments 2.8 KB, 31 16 KB, 56
+43 KB; #205). The one
+launch of the fused factorization kernel per cycle (56 arguments since the
+diagonal pivoting of #167) is 42 KB of a cycle measured at 79–82 KB for the
+same matrices, and at 101.6 KB for the cycle with the most solves
+(`ir_n_steps = 2`, three solves), with or without
+`ONEAPI_SYNC_EACH_SUBMISSION`, hence 112 KiB there.
 """
 fused_cycle_alloc_budget(backend) = 64 * 1024
-ONEAPI_LOADED && (fused_cycle_alloc_budget(::oneAPIBackend) = 96 * 1024)
+ONEAPI_LOADED && (fused_cycle_alloc_budget(::oneAPIBackend) = 112 * 1024)
