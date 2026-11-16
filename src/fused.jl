@@ -1037,12 +1037,12 @@ algo2_forward!(s, inv11, inv_ptr, fz, det::Bool = false, piv::Bool = false) =
           _algo2_forward!(s, inv11, inv_ptr, fz, det, Val(false))
 
 # the solve kind of the dense calls of the fronts wider than MW: unit-triangular without reordering
-# (`_SV_CHOLESKY`, what the no-pivot LDLᵀ always used), or the real LDLᵀ kind, which applies the front's
-# local pivot order around them (`_piv_dense!`, through the rows 1:w of the front's buffer in `ws.U`,
+# (`_SV_CHOLESKY`, what the no-pivot LDLᵀ always used), or the LDLᵀ kind of the structure and element type
+# (`SDS._solve_kind`), which applies the front's local pivot order around them (`_piv_dense!`, through the rows 1:w of the front's buffer in `ws.U`,
 # which the deterministic forward sweep leaves unused, as in the level sweeps); D is applied by
 # `algo2_diagonal!` either way
-_dense_kind(::Val{false}) = SDS._SV_CHOLESKY
-_dense_kind(::Val{true}) = SDS._SV_LDL_HERM
+_dense_kind(::Val{false}, S, ::Type) = SDS._SV_CHOLESKY
+_dense_kind(::Val{true}, S, ::Type{T}) where {T} = SDS._solve_kind(S, T)
 
 function _algo2_forward!(s, inv11, inv_ptr, fz, det::Bool, pvv::Val)
     S, N, ws = s.symbolic, s.numeric, s.workspace
@@ -1072,7 +1072,8 @@ function _algo2_forward!(s, inv11, inv_ptr, fz, det::Bool, pvv::Val)
             # deterministic: the launch also pulls the children of the fronts wider than MW
             (det || any(widths[nodes[q]] <= MW for q in a:b_)) && fwd1!(a, b_)
             for q in a:b_
-                widths[nodes[q]] > MW && SDS._fwd_dense!(ws, S, N, nodes[q], 1, det, p, _dense_kind(pvv))
+                widths[nodes[q]] > MW &&
+                    SDS._fwd_dense!(ws, S, N, nodes[q], 1, det, p, _dense_kind(pvv, S, eltype(ws.Y)))
             end
         else
             fwd1!(a, b_)
@@ -1135,7 +1136,7 @@ function _algo2_backward!(s, inv11, inv_ptr, fz, pvv::Val)
         if plan.kind[k] == SDS.SOLVE_SUBTREES
         elseif plan.kind[k] == SDS.SOLVE_DENSE
             for q in b_:-1:a
-                widths[nodes[q]] > MW && SDS._bwd_dense!(ws, S, N, nodes[q], 1, p, _dense_kind(pvv))
+                widths[nodes[q]] > MW && SDS._bwd_dense!(ws, S, N, nodes[q], 1, p, _dense_kind(pvv, S, eltype(ws.Y)))
             end
             any(widths[nodes[q]] <= MW for q in a:b_) && bwd1!(a, b_)
         else
