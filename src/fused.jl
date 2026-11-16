@@ -2688,6 +2688,13 @@ function refact_fused!(s, nzval, fp)
     return SDS._numeric_info!(s.numeric, s.symbolic, true)
 end
 
+# the arrays only the pivoted fused kernel reads (`gpiv`, `psgo`, `gperm`, `aux`; issue #167). Without pivoting
+# `nothing` (ghost arguments, never read: every use is under `PIV`), so that the no-pivot launch converts and tracks
+# no more arrays than before pivoting existed: the GPU packages allocate host memory per array argument of a launch
+# (CUDA.jl: 176 B per fused launch for these four; oneAPI.jl allocates more per launch argument)
+_fused_pivot_args(::Val{true}, N, S, fp) = (N.piv, fp.psgo, S.perm, N.aux)
+_fused_pivot_args(::Val{false}, N, S, fp) = (nothing, nothing, nothing, nothing)
+
 # the device work of `refact_fused!`: no host synchronization, the part a CUDA graph
 # replays when no front takes the host vendor path (T34)
 function refact_fused_launches!(s, nzval, fp)
@@ -2725,6 +2732,9 @@ function refact_fused_launches!(s, nzval, fp)
     isempty(fp.czero) ||                               # zero + scatter A into every C-group front (panel only)
         czero_scatter_kernel!(backend, WGF)(N.factor, nzval, S.amap, S.amap_ptr, S.amap_src, fp.czero, S.front_ptr,
                                             S.front_nrows, S.front_ncols, Val(WGF); ndrange = WGF * length(fp.czero))
+    # destructured, not splatted into the launch: a splat into this many arguments is not inlined, and the launch
+    # would box its arguments
+    gpiv, psgo, gperm, aux = _fused_pivot_args(fp.pivv, N, S, fp)
     for (base, count, gwides) in fp.segments
         count > 0 &&
             fp.kfact(N.factor, N.stack, fp.pcb, N.info, nzval, S.amap, S.amap_ptr,
@@ -2735,7 +2745,7 @@ function refact_fused_launches!(s, nzval, fp)
                                              Int32(base), fp.wbase, fp.wupd, fp.wpd, fp.wtl, fp.wcb,
                                              fp.scap, real(eltype(N.factor))(fp.pivot_eps), N.d,
                                              S.super_ptr, fp.pl_c, fp.pl_q0, fp.pl_q1, fp.wcell,
-                                             fp.wcbase, fp.psg, N.pivot_kind, N.piv, fp.psgo, S.perm, N.aux,
+                                             fp.wcbase, fp.psg, N.pivot_kind, gpiv, psgo, gperm, aux,
                                              fp.prm, fp.ldlv, fp.wgv, fp.pivv;
                                              ndrange = fp.wgf * count)
         for v in gwides                              # host-wide fronts at the segment boundary
@@ -3164,9 +3174,10 @@ function _fused_factorize!(F::FusedSolver, p::SDS.Phase)
     p == SDS.PHASE_REFACTORIZATION && F.stage < SDS.STAGE_FACTORIZED &&
         throw(SDS._phase_error(name, "needs a previous \"factorization\""))
     F.nzval = SDS._factor_values(F.inner)
-    # the solve applies the pivot order of the factor exactly when the plan pivots (a no-op after the analysis
-    # set it; the solve kernels read `piv` on the device, so a captured solve graph replays any pivot sequence)
-    set_pivoted!(F.fs, F.fp.piv)
+    # the solve applies the pivot order of the factor exactly when the plan pivots: `_fused_symbolic!` sets it on
+    # the solve plan it builds with the factorization plan (both fixed until the next analysis), and the solve
+    # kernels read `piv` on the device, so a captured solve graph replays any pivot sequence. Not re-set here: the
+    # read of the untyped plan field allocated on every refactorization
     F.info = _fused_refactor!(F)
     F.stage = SDS.STAGE_FACTORIZED
     return F
