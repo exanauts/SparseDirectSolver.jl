@@ -2559,18 +2559,25 @@ end
 # solve), then the three plans. `KKTSolver` (src/kkt.jl) builds its fused pipeline
 # through it.
 
+# the knobs of an `SDSTuning` that live in the options of a DirectSolver under the same name: the fields
+# `_apply_tuning!` writes directly (regime_c_rows: the fused kernels own both phases, no coupling conflict) and
+# the parameters it sets through `setparam!`. `KKTSolver` saves and restores the same names for its fallback
+# to the stock pipeline (`_tuned_options` in src/kkt.jl), so a new knob is added here only
+const TUNED_OPTION_FIELDS = (:amalgamation, :regime_c_width, :regime_c_rows, :subtree_parallelism, :subtree_budgets)
+const TUNED_PARAMETERS = (:nd_nseps, :nd_seed)
+
 # the knobs of an `SDSTuning` that live in the options of a DirectSolver, and the
 # native nested dissection with the tuning's METIS knobs (a `user_perm` set later wins)
 function _apply_tuning!(s, t::SDSTuning)
     o = s.options
-    o.amalgamation = t.amalgamation
-    o.regime_c_width = t.regime_c_width
-    o.regime_c_rows = t.regime_c_rows          # the fused kernels own both phases: no coupling conflict
-    o.subtree_parallelism = t.subtree_parallelism
-    o.subtree_budgets = copy(t.subtree_budgets)
+    for name in TUNED_OPTION_FIELDS
+        value = getfield(t, name)
+        setproperty!(o, name, value isa AbstractArray ? copy(value) : value)
+    end
     SDS.setparam!(s, "reordering_alg", "algo4")
-    SDS.setparam!(s, "nd_nseps", t.nd_nseps)
-    SDS.setparam!(s, "nd_seed", t.nd_seed)
+    for name in TUNED_PARAMETERS
+        SDS.setparam!(s, String(name), getfield(t, name))
+    end
     return s
 end
 

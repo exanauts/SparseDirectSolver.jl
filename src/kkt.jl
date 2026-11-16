@@ -217,10 +217,13 @@ function _kkt_solver(make; factorization::Symbol = :cholesky, pivoting::Symbol =
 end
 
 # the DirectSolver options `Fused._apply_tuning!` sets (reordering_alg aside, which KKTSolver sets after it)
-_tuned_options(o::Options) =
-    (; amalgamation = o.amalgamation, regime_c_width = o.regime_c_width, regime_c_rows = o.regime_c_rows,
-     subtree_parallelism = o.subtree_parallelism, subtree_budgets = copy(o.subtree_budgets),
-     nd_nseps = o.nd_nseps, nd_seed = o.nd_seed)
+function _tuned_options(o::Options)
+    names = (Fused.TUNED_OPTION_FIELDS..., Fused.TUNED_PARAMETERS...)
+    return NamedTuple{names}(map(names) do name
+        value = getproperty(o, name)
+        value isa AbstractArray ? copy(value) : value
+    end)
+end
 
 # the automatic choice falls back to the stock pipeline: the DirectSolver the FusedSolver wraps (analyzed with the
 # options of the fused pipeline, which are those of the stock one but the tuning) becomes the inner solver, with
