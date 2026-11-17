@@ -216,7 +216,7 @@ function _kkt_solver(make; factorization::Symbol = :cholesky, pivoting::Symbol =
     end
     # diagonal pivoting on either pipeline (the fused one: the subtrees and the narrow fronts, see FusedSolver)
     if diagonal
-        setparam!(inner, "pivot_type", 'D')
+        use_fused && setparam!(inner, "pivot_type", 'D')
         pivot_threshold === nothing || setparam!(inner, "pivot_threshold", pivot_threshold)
     end
     ldl && pivot_sign !== nothing && setparam!(inner, "pivot_sign", pivot_sign)
