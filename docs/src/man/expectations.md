@@ -1,8 +1,8 @@
 # What to expect
 
-This page is about version 0.4.0, which follows 0.3.0, the first registered
-release. It says what the release covers, how fast and how accurate it is next
-to cuDSS, and what it does not do yet. The other pages of the manual have the
+This page is about version 0.4.1; 0.3.0 was the first registered release. It
+says what the release covers, how fast and how accurate it is next to cuDSS,
+and what it does not do yet. The other pages of the manual have the
 details.
 
 ## What the release covers

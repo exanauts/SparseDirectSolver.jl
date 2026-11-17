@@ -226,7 +226,9 @@ assume:
   register comment carries the section as `Release notes:`). Version 0.3.0 is
   the first release (registered through General PR 175567 and tagged `v0.3.0`
   on 2026-11-13); 0.2.0 and earlier were internal, never tagged. 0.4.0
-  (`KKTSolver`, MadNLP binding moved to MadNLP) is on `main` and is
-  registered next.
+  (`KKTSolver`, MadNLP binding moved to MadNLP) is registered (General PR
+  176092) and tagged `v0.4.0` (2026-11-13). 0.4.1 (diagonal pivoting on the
+  fused pipeline, #167; the stock fallback of `KKTSolver` for a matrix
+  without a narrow front, #200) is on `main` and is registered next.
 - Documentation: `https://exanauts.github.io/SparseDirectSolver.jl/dev/`,
   built on the `cuda` runner for every push to `main`.
