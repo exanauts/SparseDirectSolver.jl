@@ -1,0 +1,48 @@
+#!/bin/bash
+# SparseDirectSolver.jl side of the cuDSS comparison on Aurora (Intel Data Center GPU Max 1550,
+# oneAPI backend), written to bench/comparison/sds_aurora.csv. cuDSS does not run on Intel GPUs:
+# `compare_report.jl --sds=sds_aurora --tag=aurora` divides by the cuDSS rows of cudss.csv
+# (measured on an NVIDIA GPU, see the Performance page of the docs).
+#
+# Login node first (compute nodes have no outbound network):
+#   julia --project=bench -e 'using Pkg; Pkg.instantiate(); Pkg.precompile()'
+#   julia --project=bench -e 'include("bench/matrices.jl"); BenchMatrices.bench_matrices(; dumps = false)'
+#   copy the KKT dumps into bench/data/ (see EXPECTED_DUMPS in bench/matrices.jl)
+#
+# One job, from the repository root; compare.jl arguments go through SDS_COMPARE_ARGS. qsub -v
+# splits on commas, so a value with commas is single-quoted inside the double quotes:
+#   qsub -A <project> -v "SDS_JULIA_DEPOT=$JULIA_DEPOT_PATH,SDS_COMPARE_ARGS='--features=cholesky_f64 --only=lap2d_300 --samples=1'" bench/aurora/compare.pbs
+# The full run takes several debug-scaling hours: bench/aurora/compare_all.sh chains the jobs.
+#
+#PBS -N sds-compare
+#PBS -q debug-scaling
+#PBS -l select=1
+#PBS -l walltime=01:00:00
+#PBS -l filesystems=home:flare
+#PBS -j oe
+
+set +eu
+source /etc/profile >/dev/null 2>&1
+module load julia/1.13 >/dev/null 2>&1
+set -eu
+cd "${PBS_O_WORKDIR:-$(pwd)}"
+# PBS starts from a fresh environment: use the depot the login-node instantiation used
+# (qsub -v SDS_JULIA_DEPOT="$JULIA_DEPOT_PATH" ...)
+if [ -n "${SDS_JULIA_DEPOT:-}" ]; then export JULIA_DEPOT_PATH="$SDS_JULIA_DEPOT"; fi
+echo "depot=${JULIA_DEPOT_PATH:-<default>}"
+
+# the same settings as the Aurora test job of .gitlab-ci.yml: one tile per device, the LTS
+# stack, and the workaround of the LTS NEO dropped-tail corruption (oneAPI.jl
+# lib/level-zero/cmdlist.jl), which synchronizes after every submission and is part of what
+# the timings measure
+export ZE_FLAT_DEVICE_HIERARCHY=FLAT ONEAPI_LTS=1 ONEAPI_SYNC_EACH_SUBMISSION=1
+export ZE_AFFINITY_MASK=0
+# keep the site oneAPI libraries away from the oneMKL SYCL runtime of the JLL artifacts
+export LD_LIBRARY_PATH="$(echo "${LD_LIBRARY_PATH:-}" | tr ':' '\n' | grep -v '^/opt/aurora/[^/]*/oneapi/' | paste -sd:)"
+export DATADEPS_ALWAYS_ACCEPT=true
+
+julia -C "native,-avx512fp16" --project=bench -e 'using oneAPI; oneAPI.versioninfo()'
+# SDS_COMPARE_ARGS is split on spaces on purpose
+# shellcheck disable=SC2086
+julia -C "native,-avx512fp16" --project=bench bench/compare.jl --solver=sds --backend=oneapi \
+    --out=sds_aurora ${SDS_COMPARE_ARGS:-}

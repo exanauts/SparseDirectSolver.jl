@@ -67,6 +67,30 @@ julia --project=bench/report bench/compare_report.jl              # comparison.m
 julia --project=bench bench/compare.jl --solver=sds --features=ldlt
 ```
 
+**Aurora (Intel Data Center GPU Max 1550).** cuDSS runs on NVIDIA GPUs only, so
+on Aurora only the SDS side is measured, with the oneAPI backend, into its own
+CSV; the report divides it by the cuDSS rows of `cudss.csv` (another device,
+stated in the plot title and in the docs). `bench/aurora/compare.pbs` is the
+PBS job (its header lists the login-node preparation: instantiation, the
+MatrixDepot downloads and the KKT dumps):
+
+```bash
+# the whole run: a chain of debug-scaling jobs, one at a time, resumable
+nohup bench/aurora/compare_all.sh <project> > compare_all.log 2>&1 &
+# one job; a value with commas is single-quoted inside the double quotes (qsub -v splits on commas)
+qsub -A <project> -v "SDS_JULIA_DEPOT=$JULIA_DEPOT_PATH,SDS_COMPARE_ARGS='--features=cholesky_f64,ldlt'" bench/aurora/compare.pbs
+# = julia --project=bench bench/compare.jl --solver=sds --backend=oneapi --out=sds_aurora --features=cholesky_f64,ldlt
+julia --project=bench/report bench/compare_report.jl --sds=sds_aurora --tag=aurora   # comparison_aurora.{md,png}
+```
+
+`compare_all.sh` submits, per feature, a job for the matrices that have a cuDSS
+row and no Aurora row yet, and repeats until none is left; a job stopped by the
+1 h walltime keeps the rows it wrote. The SuiteSparse file server refuses ALCF,
+so the matrices are read from a copy in
+`bench/data/suitesparse/<group>/<name>/<name>.mtx` (the layout of the
+collection's MatrixMarket tarballs), which `matrices.jl` prefers to MatrixDepot
+wherever it exists; the KKT dumps go to `bench/data/` as usual.
+
 * **Features.** Every row of the overview is a capability the package
   implements; a feature is added to `features.jl` when its task lands. The SDS
   run checks that every listed task is marked done (`[x]`/`[!]`) in TASKS.md
