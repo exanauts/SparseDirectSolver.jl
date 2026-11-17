@@ -28,7 +28,7 @@ oneAPI, Metal and the KernelAbstractions CPU backend.
     evidence. Validate the numerics on your own matrices before relying on them.
 
 !!! warning "Status"
-    Version 0.4.0; 0.3.0 was the first registered release. The CPU backend, CUDA,
+    Version 0.4.1; 0.3.0 was the first registered release. The CPU backend, CUDA,
     AMDGPU, oneAPI (tested on an Intel Data Center GPU Max 1550) and Metal
     (`Float32`, tested by hand on an M4 Max) are tested; non-uniform batches and
     mixed precision are not there yet. Unsupported structures, phases and

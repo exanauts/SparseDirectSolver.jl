@@ -5,7 +5,7 @@ All notable changes to SparseDirectSolver.jl are listed here. The format follows
 [Semantic Versioning](https://semver.org/). Task ids (`TNN`) refer to `TASKS.md`,
 whose Report blocks hold the details and the measurements.
 
-## [0.4.1] - unreleased
+## [0.4.1] - 2026-11-17
 
 ### Added
 
@@ -168,5 +168,6 @@ First registered release.
 Internal versions, never released or registered; the history is in `TASKS.md`
 and the git log.
 
+[0.4.1]: https://github.com/exanauts/SparseDirectSolver.jl/releases/tag/v0.4.1
 [0.4.0]: https://github.com/exanauts/SparseDirectSolver.jl/releases/tag/v0.4.0
 [0.3.0]: https://github.com/exanauts/SparseDirectSolver.jl/releases/tag/v0.3.0

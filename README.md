@@ -24,7 +24,7 @@ users can switch mechanically, and it is not tied to one vendor.
 
 ## Status
 
-Version 0.4.0; 0.3.0 was the first release registered in the Julia General
+Version 0.4.1; 0.3.0 was the first release registered in the Julia General
 registry.
 Julia 1.13 or later. Every backend below runs the same multifrontal kernels;
 only the dense operations on the large fronts go through a vendor library.
